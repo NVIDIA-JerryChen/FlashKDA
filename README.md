@@ -27,6 +27,14 @@ FLASH_KDA_CUDA_ARCHS=all pip install -v --no-build-isolation .
 
 Supported values are `auto` (default), `all`, or a comma-separated arch list such as `90a,100a`.
 
+## Consistent recurrent forward
+
+`flash_kda.consistent_fwd` provides a separate no-grad recurrent path for training
+forward, prefill and decode. It includes explicit BF16 continuation state and CP/PD
+handoff helpers. See [installation, API and limitations](docs/consistency.en.md)
+([中文](docs/consistency.md)) and the [validation record](docs/consistency-validation.md).
+The existing `fwd` interface remains available.
+
 ## Using FlashKDA as an FLA backend
 
 Once installed, FlashKDA is auto-dispatched from `flash-linear-attention`'s `chunk_kda`. See [fla-org/flash-linear-attention#852](https://github.com/fla-org/flash-linear-attention/pull/852) for integration details.

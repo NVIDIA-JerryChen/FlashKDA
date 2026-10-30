@@ -4,7 +4,9 @@ from setuptools import setup
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension, CUDA_HOME
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
-subprocess.run(["git", "submodule", "update", "--init", "cutlass"])
+SKIP_CUDA_BUILD = os.getenv("FLASH_KDA_SKIP_CUDA_BUILD", "0") == "1"
+if not SKIP_CUDA_BUILD:
+    subprocess.run(["git", "submodule", "update", "--init", "cutlass"], check=True)
 
 
 def is_flag_set(flag: str) -> bool:
@@ -52,7 +54,7 @@ def get_arch_flags():
     return flags
 
 
-ext_modules = [
+ext_modules = [] if SKIP_CUDA_BUILD else [
     CUDAExtension(
         name='flash_kda_C',
         sources=[
@@ -101,5 +103,11 @@ setup(
     ext_modules=ext_modules,
     packages=['flash_kda'],
     cmdclass=cmdclass,
+    python_requires=">=3.10",
+    install_requires=["torch"],
+    extras_require={"consistency": ["nvidia-cutlass-dsl==4.6.2",
+                                    "apache-tvm-ffi>=0.1.11,<0.2", "cuda-python>=12.8"],
+                    "test": ["pytest"]},
+    license_files=["LICENSE", "licenses/FlashInfer-Apache-2.0.txt", "licenses/FlashInfer-NOTICE.txt"],
     zip_safe=False,
 )
