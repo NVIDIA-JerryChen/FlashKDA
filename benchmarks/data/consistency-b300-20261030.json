@@ -1,0 +1,186 @@
+{
+  "date_utc": "2026-10-30",
+  "upstream": "d7e3b3a9f448500630fa60fb5200f4f9c9b1fc72",
+  "reference": "c3af0c13328fd23b256c53b9b4f94d9e160d118c",
+  "source_sha256": "0ba2148e74f95c941a1e8a5c5ce36a526044c651e37c380ce07d80bf2f3a7f9b",
+  "kernel_sha256": "0612a6147440aa687b509b4c60b3bef540c932ad200fea55e3fdb56442d9eea5",
+  "gpu": "NVIDIA B300 SXM6 AC",
+  "nodes": 2,
+  "gpus_per_node": 4,
+  "local_topology": "all-pairs NV18",
+  "inter_node_transport": "NCCL NET/Socket (TCP)",
+  "versions": {
+    "python": "3.12.3",
+    "torch": "2.14.0a0+4fdf77b940.nv26.08",
+    "cuda": "13.4",
+    "cutlass": "4.6.2",
+    "tvm_ffi": "0.1.13.post3",
+    "cuda_python": "13.3.1",
+    "nccl": [
+      2,
+      30,
+      7
+    ],
+    "driver": "615.71.10"
+  },
+  "image": "nvcr.io/nvidia/pytorch@sha256:3becd068f49bd2ad38f90db5f9a4803019a76933a24e63d821376c44e7a9200a",
+  "clock_control": "unmodified",
+  "l2_bytes": 132644864,
+  "workload": {
+    "batch": 4,
+    "heads": 12,
+    "length_per_request": 129,
+    "head_dim": 128,
+    "state_bytes": 1572864
+  },
+  "protocols": {
+    "warm": "25 warmups, 100 calls in one CUDA event pair, mean per call, maximum across active ranks",
+    "cold": "20 samples, 256 MiB read eviction and synchronization before each event pair, per-rank median then maximum"
+  },
+  "metrics": [
+    {
+      "cp": 1,
+      "metric": "local_graph",
+      "protocol": "warm",
+      "max_rank_us": 217.41983032226562
+    },
+    {
+      "cp": 1,
+      "metric": "local_graph",
+      "protocol": "cold",
+      "max_rank_us": 270.68798828125
+    },
+    {
+      "cp": 1,
+      "metric": "state_relay",
+      "protocol": "warm",
+      "max_rank_us": 0.10335999727249146
+    },
+    {
+      "cp": 1,
+      "metric": "state_relay",
+      "protocol": "cold",
+      "max_rank_us": 5.456000328063965
+    },
+    {
+      "cp": 1,
+      "metric": "cp_eager",
+      "protocol": "warm",
+      "max_rank_us": 218.38720703125
+    },
+    {
+      "cp": 1,
+      "metric": "cp_eager",
+      "protocol": "cold",
+      "max_rank_us": 353.44000244140625
+    },
+    {
+      "cp": 2,
+      "metric": "local_graph",
+      "protocol": "warm",
+      "max_rank_us": 119.84864044189453
+    },
+    {
+      "cp": 2,
+      "metric": "local_graph",
+      "protocol": "cold",
+      "max_rank_us": 148.6719970703125
+    },
+    {
+      "cp": 2,
+      "metric": "state_relay",
+      "protocol": "warm",
+      "max_rank_us": 16.483200073242188
+    },
+    {
+      "cp": 2,
+      "metric": "state_relay",
+      "protocol": "cold",
+      "max_rank_us": 39.74399948120117
+    },
+    {
+      "cp": 2,
+      "metric": "cp_eager",
+      "protocol": "warm",
+      "max_rank_us": 139.33279418945312
+    },
+    {
+      "cp": 2,
+      "metric": "cp_eager",
+      "protocol": "cold",
+      "max_rank_us": 409.6800231933594
+    },
+    {
+      "cp": 4,
+      "metric": "local_graph",
+      "protocol": "warm",
+      "max_rank_us": 71.75296020507812
+    },
+    {
+      "cp": 4,
+      "metric": "local_graph",
+      "protocol": "cold",
+      "max_rank_us": 91.21600341796875
+    },
+    {
+      "cp": 4,
+      "metric": "state_relay",
+      "protocol": "warm",
+      "max_rank_us": 57.05376052856445
+    },
+    {
+      "cp": 4,
+      "metric": "state_relay",
+      "protocol": "cold",
+      "max_rank_us": 84.2239990234375
+    },
+    {
+      "cp": 4,
+      "metric": "cp_eager",
+      "protocol": "warm",
+      "max_rank_us": 270.72607421875
+    },
+    {
+      "cp": 4,
+      "metric": "cp_eager",
+      "protocol": "cold",
+      "max_rank_us": 518.1119995117188
+    },
+    {
+      "cp": 8,
+      "metric": "local_graph",
+      "protocol": "warm",
+      "max_rank_us": 47.28096008300781
+    },
+    {
+      "cp": 8,
+      "metric": "local_graph",
+      "protocol": "cold",
+      "max_rank_us": 61.18400192260742
+    },
+    {
+      "cp": 8,
+      "metric": "state_relay",
+      "protocol": "warm",
+      "max_rank_us": 13368.0419921875
+    },
+    {
+      "cp": 8,
+      "metric": "state_relay",
+      "protocol": "cold",
+      "max_rank_us": 14109.3603515625
+    },
+    {
+      "cp": 8,
+      "metric": "cp_eager",
+      "protocol": "warm",
+      "max_rank_us": 13366.0205078125
+    },
+    {
+      "cp": 8,
+      "metric": "cp_eager",
+      "protocol": "cold",
+      "max_rank_us": 14254.9765625
+    }
+  ]
+}

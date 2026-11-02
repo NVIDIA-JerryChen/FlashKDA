@@ -8,3 +8,6 @@ build/**
 **/__pycache__/**
 .clangd
 plot*.png
+
+# Local development artifacts and isolated worktrees.
+agent/
