@@ -13,6 +13,28 @@ namespace cfbi {
 
 int version() { return 1; }
 
+DeviceCaps device_caps(int device) {
+    if (device < 0) cudaGetDevice(&device);
+    DeviceCaps c{0, 0, 0};
+    cudaDeviceGetAttribute(&c.major, cudaDevAttrComputeCapabilityMajor, device);
+    cudaDeviceGetAttribute(&c.minor, cudaDevAttrComputeCapabilityMinor, device);
+    cudaDeviceGetAttribute(&c.smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    return c;
+}
+
+size_t k1_smem_bytes(int impl) { return (impl & IMPL_REF_CHUNK) ? ref::K1_SMEM_BYTES : K1_SMEM_BYTES; }
+
+int resolve_impl(int requested, int device) {
+    const DeviceCaps c = device_caps(device);
+    int impl = requested & (IMPL_REF_ROWS | IMPL_REF_CHUNK | IMPL_ROWS_ONLY);
+    // The optimised kernels use sm_90+ instructions (cfbi_async.cuh); below that they are compiled as traps.
+    if (c.major < 9) impl |= IMPL_REF_ROWS | IMPL_REF_CHUNK;
+    // K1 needs ~218 KiB of dynamic shared memory per CTA; where the device cannot provide it the row engine (which
+    // needs 7 KiB) evaluates every row - the same program, just row by row.
+    if (!(impl & IMPL_ROWS_ONLY) && static_cast<size_t>(c.smem_optin) < k1_smem_bytes(impl)) impl |= IMPL_ROWS_ONLY;
+    return impl;
+}
+
 void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
     Params p;
     p.q = static_cast<const __nv_bfloat16*>(a.q);
@@ -34,13 +56,14 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
     p.plan = reinterpret_cast<SeqPlan*>(a.plan);
     p.ws = a.ws;
 
-    plan_kernel<<<1, PLAN_THREADS, 0, stream>>>(a.cu_seqlens, a.fixed_len, a.pos, a.N, a.mode == 1 ? 1 : 0, p.plan);
+    const int mode = resolve_mode(a.mode, a.impl);   // the binding has already done this and supplied a state if needed
+    plan_kernel<<<1, PLAN_THREADS, 0, stream>>>(a.cu_seqlens, a.fixed_len, a.pos, a.N, mode == 1 ? 1 : 0, p.plan);
     if (a.E != nullptr) {
         // head rows (finishing the open chunk) or, in mode 1, every row
         if (a.impl & IMPL_REF_ROWS) ref::rows_kernel<<<dim3(a.N, a.H), NTHREADS, 0, stream>>>(p);
         else rows_kernel<<<dim3(a.N, a.H), NTHREADS, 0, stream>>>(p);
     }
-    if (a.mode == 0) {
+    if (mode == 0) {
         const int64_t max_chunks = (a.T_total + BT - 1) / BT + a.N;   // upper bound; extra CTAs exit at once
         if (a.impl & IMPL_REF_CHUNK) {
             cudaFuncSetAttribute(ref::k1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ref::K1_SMEM_BYTES);

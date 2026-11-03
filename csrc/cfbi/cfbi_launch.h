@@ -38,14 +38,36 @@ struct ForwardArgs {
     int* plan;         // scratch [(N+1) * PLAN_INTS_PER_SEQ] ints
     float* ws;         // scratch [(ceil(T_total/64) + N) * H * WS_FLOATS_PER_CHUNK_HEAD] floats (mode 0 only)
     int mode;          // 0: prefill / training schedule (row engine for head rows, K1+K2 for the rest)
-                       // 1: row engine for every row (decode; also a differential test of K1/K2)
-    int impl;          // IMPL_* bits: which implementation of the row engine / chunk kernels runs (0 = optimised)
+                       // 1: row engine for every row (decode; also a differential test of K1/K2); the caller maps
+                       //    mode 0 + IMPL_ROWS_ONLY to 1 (resolve_mode) and supplies a state (E, rows, pos) then
+    int impl;          // IMPL_* bits as returned by resolve_impl (the launcher does not re-resolve)
 };
 
-// Implementation selector (tests only): the frozen v1 kernels in csrc/cfbi/ref/ are the bitwise oracle of the
-// optimised ones. K1 and K2 share one bit because their workspace layouts differ between the implementations.
+// Implementation selector: the frozen v1 kernels in csrc/cfbi/ref/ are the bitwise oracle of the optimised ones.
+// K1 and K2 share one bit because their workspace layouts differ between the implementations. 0 = the optimised
+// kernels where the device can run them (see resolve_impl: otherwise the reference kernels are used).
 constexpr int IMPL_REF_ROWS = 1;    // row engine (decode, head rows)
 constexpr int IMPL_REF_CHUNK = 2;   // K1 + K2 (prefill / training forward)
+constexpr int IMPL_ROWS_ONLY = 4;   // no K1/K2: every row goes through the row engine (mode 1 semantics even for mode 0)
+
+// What a device can run. The optimised kernels need sm_90+ (bulk copies, mbarrier transaction counts); K1 needs 204 KiB
+// (optimised) / 218 KiB (reference) of dynamic shared memory per CTA, while the opt-in limit is 227 KiB on sm_90 / 100 /
+// 103, but 163 KiB on sm_80 and 99 KiB on sm_86 / 89 / 120: the chunk kernels cannot run there.
+struct DeviceCaps {
+    int major, minor;
+    int smem_optin;   // cudaDevAttrMaxSharedMemoryPerBlockOptin, bytes
+};
+DeviceCaps device_caps(int device);   // device < 0: the current device
+
+// The implementation bits that actually run for `requested` on `device` (< 0: current): compute capability < 9 forces
+// the reference kernels (IMPL_REF_ROWS | IMPL_REF_CHUNK); a device whose shared-memory opt-in limit is below the
+// chunk kernels' need gets IMPL_ROWS_ONLY. Idempotent. The row engine evaluates the same program row by row, so
+// the bits do not depend on this choice, only the speed does (tests/cfbi/test_vs_ref.py, test_arch.py).
+int resolve_impl(int requested, int device = -1);
+// Schedule that runs: mode 0 becomes mode 1 (row engine for every row) when IMPL_ROWS_ONLY is set.
+inline int resolve_mode(int mode, int impl) { return (mode == 0 && (impl & IMPL_ROWS_ONLY)) ? 1 : mode; }
+// Dynamic shared memory per CTA of the K1 kernel of the implementation selected by `impl`.
+size_t k1_smem_bytes(int impl);
 
 // Runs plan -> row engine -> K1 -> K2 -> pos update on `stream`.
 void launch_forward(const ForwardArgs& a, cudaStream_t stream);

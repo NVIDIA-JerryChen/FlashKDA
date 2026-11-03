@@ -94,7 +94,8 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     TORCH_CHECK(A_log.dim() == 1 && A_log.size(0) == H, "A_log must be [H]");
     TORCH_CHECK(dt_bias.dim() == 2 && dt_bias.size(0) == H && dt_bias.size(1) == 128, "dt_bias must be [H, 128]");
     TORCH_CHECK(mode == 0 || mode == 1, "mode must be 0 or 1");
-    TORCH_CHECK(impl >= 0 && impl <= 3, "impl must be 0..3 (bit 0: reference row engine, bit 1: reference K1/K2)");
+    TORCH_CHECK(impl >= 0 && impl <= 7,
+                "impl must be 0..7 (bit 0: reference row engine, bit 1: reference K1/K2, bit 2: row engine for every row)");
     TORCH_CHECK(lower_bound >= -5.0 && lower_bound <= 0.0, "lower_bound must be in [-5, 0]");
     const int64_t T_total = B * T;
     TORCH_CHECK(T_total < (int64_t(1) << 31) && H < 65536, "problem too large for the int32 token index / grid");
@@ -117,6 +118,11 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     const bool has_state = E.has_value();
     TORCH_CHECK(has_state == rows.has_value() && has_state == pos.has_value(),
                 "E, rows and pos must be given together");
+    // Which kernels run on this device (sm < 90: the reference kernels; no room for K1's shared memory: the row
+    // engine for every row). Bits do not depend on it, see cfbi_launch.h.
+    c10::cuda::CUDAGuard guard(q.device());
+    const int eff_impl = cfbi::resolve_impl((int)impl);
+    const int eff_mode = cfbi::resolve_mode((int)mode, eff_impl);
     if (has_state) {
         check_f32_cuda(*E, "E");
         check_f32_cuda(*rows, "rows");
@@ -135,12 +141,20 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
         check_f32_cuda(*out_f32, "out_f32");
         TORCH_CHECK(out_f32->sizes() == q.sizes(), "out_f32 must match q");
     }
-    c10::cuda::CUDAGuard guard(q.device());
     if (T_total == 0) return;   // nothing to compute; the state stays as it is
+
+    // Training forward (no state) on the row-engine-only path: the row engine needs a state, so it gets a zeroed
+    // temporary one (the empty initial state; nothing is persisted).
+    torch::Tensor tmp_E, tmp_rows, tmp_pos;
+    if (!has_state && eff_mode == 1) {
+        tmp_E = torch::zeros({N, H, 128, 128}, q.options().dtype(torch::kFloat32));
+        tmp_rows = torch::zeros({N, H, 5, 64, 128}, q.options().dtype(torch::kFloat32));
+        tmp_pos = torch::zeros({N}, q.options().dtype(torch::kInt32));
+    }
 
     auto plan = torch::empty({(N + 1) * cfbi::PLAN_INTS_PER_SEQ}, q.options().dtype(torch::kInt32));
     torch::Tensor ws;
-    if (mode == 0) {
+    if (eff_mode == 0) {
         const int64_t max_chunks = (T_total + 63) / 64 + N;
         ws = torch::empty({max_chunks * H * cfbi::WS_FLOATS_PER_CHUNK_HEAD}, q.options().dtype(torch::kFloat32));
     }
@@ -158,21 +172,39 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     a.fixed_len = (int)T;
     a.T_total = T_total;
     a.cu_seqlens = cu_ptr;
-    a.E = has_state ? E->data_ptr<float>() : nullptr;
-    a.rows = has_state ? rows->data_ptr<float>() : nullptr;
-    a.pos = has_state ? pos->data_ptr<int>() : nullptr;
+    a.E = has_state ? E->data_ptr<float>() : (tmp_E.defined() ? tmp_E.data_ptr<float>() : nullptr);
+    a.rows = has_state ? rows->data_ptr<float>() : (tmp_rows.defined() ? tmp_rows.data_ptr<float>() : nullptr);
+    a.pos = has_state ? pos->data_ptr<int>() : (tmp_pos.defined() ? tmp_pos.data_ptr<int>() : nullptr);
     a.plan = plan.data_ptr<int>();
-    a.ws = mode == 0 ? ws.data_ptr<float>() : nullptr;
-    a.mode = (int)mode;
-    a.impl = (int)impl;
+    a.ws = eff_mode == 0 ? ws.data_ptr<float>() : nullptr;
+    a.mode = eff_mode;
+    a.impl = eff_impl;
     cfbi::launch_forward(a, cur_stream());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Implementation bits that run for `impl` on `device` (< 0: the current one), see cfbi_launch.h.
+int64_t resolve_impl_py(int64_t impl, int64_t device) {
+    TORCH_CHECK(impl >= 0 && impl <= 7, "impl must be 0..7");
+    return cfbi::resolve_impl((int)impl, (int)device);
+}
+
+// {compute capability major, minor, shared-memory opt-in limit per block (bytes), K1 shared memory of the optimised
+// kernels, K1 shared memory of the reference kernels} of `device`.
+std::vector<int64_t> device_caps_py(int64_t device) {
+    const cfbi::DeviceCaps c = cfbi::device_caps((int)device);
+    return {c.major, c.minor, c.smem_optin, (int64_t)cfbi::k1_smem_bytes(0),
+            (int64_t)cfbi::k1_smem_bytes(cfbi::IMPL_REF_CHUNK)};
 }
 
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("version", &cfbi::version, "CF-BI extension version");
+    m.def("resolve_impl", &resolve_impl_py, "implementation bits that run on a device", py::arg("impl") = 0,
+          py::arg("device") = -1);
+    m.def("device_caps", &device_caps_py, "[cc major, cc minor, smem opt-in, K1 smem (optimised), K1 smem (reference)]",
+          py::arg("device") = -1);
     m.def("forward", &forward, "CF-BI forward (prefill / training forward / decode)", py::arg("q"), py::arg("k"),
           py::arg("v"), py::arg("g"), py::arg("beta"), py::arg("scale"), py::arg("out"), py::arg("A_log"),
           py::arg("dt_bias"), py::arg("lower_bound"), py::arg("E") = py::none(), py::arg("rows") = py::none(),
