@@ -217,7 +217,7 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
 
 // Implementation bits that run for `impl` on `device` (< 0: the current one), see cfbi_launch.h.
 int64_t resolve_impl_py(int64_t impl, int64_t device) {
-    TORCH_CHECK(impl >= 0 && impl <= 7, "impl must be 0..7");
+    TORCH_CHECK(impl >= 0 && impl <= 15, "impl must be 0..15");
     return cfbi::resolve_impl((int)impl, (int)device);
 }
 
