@@ -125,6 +125,26 @@ def test_allow_unvalidated_arch_switch(ext, fresh_caches, monkeypatch):
     assert api._GUARDED[dev.index] and not verify_hardware(dev)["ok"]
 
 
+def test_graph_capture_needs_a_warm_verdict(ext, fresh_caches):
+    """The battery synchronises, so it cannot run inside a CUDA graph capture: a clear error there, and no problem once the
+    verdict is cached (every cfbi entry point calls _guard, also during a capture)."""
+    dev = torch.device("cuda", torch.cuda.current_device())
+    x = torch.zeros(4, device=dev)
+    side = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(side), torch.cuda.graph(graph, stream=side):
+        x.add_(1)
+        with pytest.raises(RuntimeError, match="CUDA graph capture"):
+            api._guard(dev)
+    torch.cuda.synchronize()
+    verify_hardware()   # warm
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(side), torch.cuda.graph(graph, stream=side):
+        x.add_(1)
+        api._guard(dev)
+    torch.cuda.synchronize()
+
+
 def test_pre_ampere_is_rejected_without_building(ext, fresh_caches, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (7, 5))
     monkeypatch.setattr(verify, "load_ext", lambda: pytest.fail("must not build for sm_75"))

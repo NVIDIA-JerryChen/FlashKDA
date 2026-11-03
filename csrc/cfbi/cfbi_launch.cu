@@ -29,8 +29,8 @@ int resolve_impl(int requested, int device) {
     int impl = requested & (IMPL_REF_ROWS | IMPL_REF_CHUNK | IMPL_ROWS_ONLY);
     // The optimised kernels use sm_90+ instructions (cfbi_async.cuh); below that they are compiled as traps.
     if (c.major < 9) impl |= IMPL_REF_ROWS | IMPL_REF_CHUNK;
-    // K1 needs ~218 KiB of dynamic shared memory per CTA; where the device cannot provide it the row engine (which
-    // needs 7 KiB) evaluates every row - the same program, just row by row.
+    // K1 needs 204 KiB (optimised) / 218 KiB (reference) of dynamic shared memory per CTA; where the device cannot
+    // provide it the row engine (which needs 7 KiB) evaluates every row - the same program, just row by row.
     if (!(impl & IMPL_ROWS_ONLY) && static_cast<size_t>(c.smem_optin) < k1_smem_bytes(impl)) impl |= IMPL_ROWS_ONLY;
     return impl;
 }
