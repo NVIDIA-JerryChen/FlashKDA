@@ -77,3 +77,22 @@ def test_too_small_max_seqlen_traps_instead_of_dropping_tokens(cx):
     assert ok.returncode == 0 and "OK" in ok.stdout, ok.stderr[-500:]
     bad = subprocess.run([sys.executable, "-c", code, "64"], capture_output=True, text=True, cwd=root)
     assert bad.returncode != 0 and "OK" not in bad.stdout, "a too-small max_seqlen did not fail"
+
+
+def test_launches_on_the_current_stream(cx):
+    """The kernels run on torch's current stream (a side stream here), not on the default one."""
+    D, W = 96, 4
+    x = make_x(100, D, seed=1)
+    w, b = make_weights(D, W, seed=2, with_bias=torch.float32)
+    X = (torch.randn(70, 256, device="cuda") * 0.5).to(torch.bfloat16)
+    Wt = (torch.randn(40, 256, device="cuda") * 0.1).to(torch.bfloat16)
+    st_ref = alloc_conv_state(1, D, W)
+    ref_c, ref_l = short_conv(x, w, b, st_ref, "silu"), bi_linear(X, Wt)
+    torch.cuda.synchronize()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        st = alloc_conv_state(1, D, W)
+        out_c, out_l = short_conv(x, w, b, st, "silu"), bi_linear(X, Wt)
+    side.synchronize()
+    assert n_diff(out_c, ref_c) == 0 and n_diff(out_l, ref_l) == 0 and n_diff(st, st_ref) == 0
