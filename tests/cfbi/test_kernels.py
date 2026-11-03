@@ -76,3 +76,44 @@ def test_training_forward_equals_prefill(ext):
     ot = forward_train(case["q"], case["k"], case["v"], case["g"], case["beta"], case["scale"], case["A_log"],
                        case["dt_bias"], case["lower_bound"], out_fp32=out32)
     assert n_diff(oa, ot) == 0 and n_diff(fa, out32) == 0
+
+
+def test_arch_guard(monkeypatch):
+    """Premise validated on compute capability >= 10 only: older devices need an explicit opt-in."""
+    from flash_kda.cfbi import api
+
+    monkeypatch.setattr(api, "_ARCH_OK", {})
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
+    monkeypatch.delenv("FLASH_KDA_CFBI_ALLOW_UNVALIDATED_ARCH", raising=False)
+    with pytest.raises(RuntimeError, match="validated"):
+        api._guard(torch.device("cuda", 0))
+    monkeypatch.setenv("FLASH_KDA_CFBI_ALLOW_UNVALIDATED_ARCH", "1")
+    monkeypatch.setattr(api, "_ARCH_OK", {})
+    api._guard(torch.device("cuda", 0))
+
+
+def test_empty_call_leaves_state_alone(ext):
+    H = 2
+    case = make_case(70, H, "authors", seed=5)
+    st = alloc_state(2, H)
+    run(case, st, cu=torch.tensor([0, 70, 70], dtype=torch.int64, device="cuda"))   # sequence 1 has no tokens
+    before = st.clone()
+    empty = {k: case[k][:, :0].contiguous() for k in ("q", "k", "v", "g", "beta")}
+    empty.update({k: case[k] for k in ("A_log", "dt_bias", "scale", "lower_bound")})
+    run(empty, st, cu=torch.tensor([0, 0, 0], dtype=torch.int64, device="cuda"))
+    assert state_equal(st, before)
+    assert state_equal(st.select([0]), before.select([0])) and int(st.pos[1]) == 0
+
+
+def test_bad_arguments_are_rejected(ext):
+    case = make_case(64, 2, "authors", seed=6)
+    st = alloc_state(1, 2)
+    out = torch.zeros_like(case["q"])
+    bad = dict(case)
+    bad["q"] = case["q"].float()
+    with pytest.raises(RuntimeError, match="bfloat16"):
+        prefill(bad["q"], case["k"], case["v"], case["g"], case["beta"], 0.1, out, case["A_log"], case["dt_bias"], -5.0, st)
+    with pytest.raises(RuntimeError, match="lower_bound"):
+        prefill(case["q"], case["k"], case["v"], case["g"], case["beta"], 0.1, out, case["A_log"], case["dt_bias"], 1.0, st)
+    with pytest.raises(RuntimeError, match="must be"):   # state tensors for the wrong number of sequences
+        prefill(case["q"], case["k"], case["v"], case["g"], case["beta"], 0.1, out, case["A_log"], case["dt_bias"], -5.0, alloc_state(3, 2))

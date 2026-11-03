@@ -45,6 +45,25 @@ def median_ms(fn, warm=3, reps=10):
     return sorted(ts)[len(ts) // 2]
 
 
+def gpu_busy_ms(fn, iters=5, warm=2):
+    """Sum of the CUDA kernel durations of one call (profiler). Unlike the event wall time this does not include
+    CPU launch overhead, which dominates eager Triton baselines (FLA) at small shapes."""
+    from torch.profiler import ProfilerActivity, profile
+
+    for _ in range(warm):
+        fn()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(iters):
+            fn()
+        torch.cuda.synchronize()
+    total_us = 0.0
+    for ev in prof.events():
+        if ev.device_type == torch.autograd.DeviceType.CUDA:
+            total_us += getattr(ev, "device_time", None) or getattr(ev, "cuda_time", 0.0)
+    return total_us / iters / 1000.0
+
+
 def graph_ms_per_call(fn, iters=128, warm=3):
     """Mean GPU time of one call, from CUDA-graph replays (no Python/launch overhead)."""
     side = torch.cuda.Stream()
@@ -89,12 +108,16 @@ def bench_prefill(B, L, H, results):
     out = torch.zeros_like(q)
     st = alloc_state(B, H)
     row = {"B": B, "L": L, "H": H}
-    row["cfbi_prefill"] = median_ms(lambda: prefill(q, k, v, g, beta, scale, out, A_log, dt_bias, LB, st))
-    row["cfbi_train_fwd"] = median_ms(lambda: forward_train(q, k, v, g, beta, scale, A_log, dt_bias, LB, out=out))
+    f_pre = lambda: prefill(q, k, v, g, beta, scale, out, A_log, dt_bias, LB, st)
+    f_trn = lambda: forward_train(q, k, v, g, beta, scale, A_log, dt_bias, LB, out=out)
+    row["cfbi_prefill"], row["cfbi_prefill_gpu"] = median_ms(f_pre), gpu_busy_ms(f_pre)
+    row["cfbi_train_fwd"] = median_ms(f_trn)
     if flash_kda._fwd_raw is not None:
-        row["flashkda_fwd"] = tolerant(lambda: median_ms(lambda: flash_kda.fwd(q, k, v, g, beta, scale, out, A_log=A_log, dt_bias=dt_bias, lower_bound=LB)))
+        f_fk = lambda: flash_kda.fwd(q, k, v, g, beta, scale, out, A_log=A_log, dt_bias=dt_bias, lower_bound=LB)
+        row["flashkda_fwd"] = tolerant(lambda: median_ms(f_fk))
+        row["flashkda_fwd_gpu"] = tolerant(lambda: gpu_busy_ms(f_fk))
     else:
-        row["flashkda_fwd"] = "n/a"
+        row["flashkda_fwd"] = row["flashkda_fwd_gpu"] = "n/a"
     try:
         from fla.ops.kda import chunk_kda as fla_chunk
 
@@ -105,8 +128,9 @@ def bench_prefill(B, L, H, results):
                           safe_gate=True, lower_bound=LB)
 
         row["fla_chunk"] = tolerant(lambda: median_ms(run_fla))
+        row["fla_chunk_gpu"] = tolerant(lambda: gpu_busy_ms(run_fla))
     except ImportError:
-        row["fla_chunk"] = "n/a"
+        row["fla_chunk"] = row["fla_chunk_gpu"] = "n/a"
     results["prefill"].append(row)
     print(f"prefill B={B:3d} L={L} H={H}: " + "  ".join(f"{k}={fmt(v)}" for k, v in row.items() if k not in ("B", "L", "H")) + "  (ms)", flush=True)
     del case, q, k, v, g, beta, out, st
@@ -125,7 +149,9 @@ def bench_decode(N, H, results):
     st = alloc_state(N, H)
     row = {"N": N, "H": H}
     row["cfbi_decode_graph"] = graph_ms_per_call(lambda: decode(q, k, v, g, beta, scale, out, A_log, dt_bias, LB, st), iters=256) * 1000
-    row["cfbi_decode_eager"] = median_ms(lambda: decode(q, k, v, g, beta, scale, out, A_log, dt_bias, LB, st), reps=50) * 1000
+    f_dec = lambda: decode(q, k, v, g, beta, scale, out, A_log, dt_bias, LB, st)
+    row["cfbi_decode_eager"] = median_ms(f_dec, reps=50) * 1000
+    row["cfbi_decode_gpu"] = gpu_busy_ms(f_dec, iters=64) * 1000
     try:
         from fla.ops.kda import fused_recurrent_kda
 
@@ -139,8 +165,9 @@ def bench_decode(N, H, results):
                                     state_v_first=True)
 
         row["fla_recurrent_fp32_eager"] = tolerant(lambda: median_ms(run_rec, reps=50) * 1000)
+        row["fla_recurrent_fp32_gpu"] = tolerant(lambda: gpu_busy_ms(run_rec, iters=64) * 1000)
     except ImportError:
-        row["fla_recurrent_fp32_eager"] = "n/a"
+        row["fla_recurrent_fp32_eager"] = row["fla_recurrent_fp32_gpu"] = "n/a"
     results["decode"].append(row)
     print(f"decode N={N:4d} H={H}: " + "  ".join(f"{k}={fmt(v)}" for k, v in row.items() if k not in ("N", "H")) + "  (us per call)", flush=True)
 
@@ -157,7 +184,7 @@ def bench_train(B, L, H, results):
         chunk_kda(xs["q"], xs["k"], xs["v"], xs["g"], xs["beta"], scale, A_log.clone().requires_grad_(),
                   dt_bias.clone().requires_grad_(), LB).backward(do)
 
-    row = {"B": B, "L": L, "H": H, "cfbi_fwd_bwd": median_ms(run_cfbi, reps=5)}
+    row = {"B": B, "L": L, "H": H, "cfbi_fwd_bwd": median_ms(run_cfbi, reps=5), "cfbi_fwd_bwd_gpu": gpu_busy_ms(run_cfbi, iters=3)}
     try:
         from fla.ops.kda import chunk_kda as fla_chunk
 
@@ -170,10 +197,11 @@ def bench_train(B, L, H, results):
             o.backward(do)
 
         row["fla_fwd_bwd"] = tolerant(lambda: median_ms(run_fla, reps=5))
+        row["fla_fwd_bwd_gpu"] = tolerant(lambda: gpu_busy_ms(run_fla, iters=3))
     except ImportError:
-        row["fla_fwd_bwd"] = "n/a"
+        row["fla_fwd_bwd"] = row["fla_fwd_bwd_gpu"] = "n/a"
     results["train"].append(row)
-    print(f"train  B={B:3d} L={L} H={H}: cfbi_fwd_bwd={fmt(row['cfbi_fwd_bwd'])} fla_fwd_bwd={fmt(row['fla_fwd_bwd'])} (ms)", flush=True)
+    print(f"train  B={B:3d} L={L} H={H}: " + "  ".join(f"{k}={fmt(v)}" for k, v in row.items() if k not in ("B", "L", "H")) + "  (ms)", flush=True)
 
 
 def main():

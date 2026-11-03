@@ -108,6 +108,35 @@ flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
 - When `cu_seqlens` is provided, `B` must be 1, `T` is the total length across all sequences, and `initial_state` / `final_state` have shape `[N, H, V, K]`.
 - When `cu_seqlens` is `None`, each batch element is treated as an independent sequence, and the state shape is `[B, H, V, K]`.
 
+## Bitwise train/infer-consistent kernels (`flash_kda.cfbi`)
+
+`flash_kda.cfbi` evaluates ONE fixed-order, chunk-form floating-point program ("CF-BI": chunk 64 anchored at the
+sequence start, fp32 state, three-term TF32 tensor-core products). Prefill and the training forward evaluate many
+rows of it at once, decode evaluates one more row: the output and the continuation state have the **same bits**
+however the sequence is cut into calls, whatever else is in the batch, and whether it ran as prefill, decode or
+the training forward. Correctness-first v1 (no tcgen05/TMEM pipelining yet), validated on B300 (`sm_103a`) only.
+
+```python
+from flash_kda.cfbi import alloc_state, prefill, decode, chunk_kda
+
+state = alloc_state(N, H)                       # E fp32 [N,H,128,128], open-chunk row cache, pos
+prefill(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, state, cu_seqlens)   # any cut, in place
+decode(q1, k1, v1, g1, beta1, scale, out1, A_log, dt_bias, lower_bound, state)          # one token per sequence
+y = chunk_kda(q, k, v, g, beta, scale, A_log, dt_bias, lower_bound)                      # training: autograd
+```
+
+Same argument names/shapes as `flash_kda.fwd`; extra constraints and the backward (FLA's chunk backward on a
+recomputed forward, needs `flash-linear-attention`; `lower_bound` in `[-5, 0)` for gradients) are in the
+[design doc](docs/20261102-cfbi-design.md); the floating-point program is specified in the
+[numerical contract](docs/20261102-cfbi-numerical-contract.md).
+
+```bash
+FLASH_KDA_BUILD_EXTS=cfbi pip install -v --no-build-isolation .   # only the cfbi extension (no CUTLASS needed)
+python -m pytest tests/cfbi -q                                    # JIT-builds the extension if it is not installed
+CFBI_BIG=1 python -m pytest tests/cfbi -q                         # + 32K-token and N=512 runs
+python benchmarks/accuracy_cfbi.py && python benchmarks/bench_cfbi.py
+```
+
 ## Development
 
 To set up IntelliSense (clangd) for the CUDA/C++ sources, run:

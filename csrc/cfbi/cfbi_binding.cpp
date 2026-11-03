@@ -130,6 +130,7 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
         TORCH_CHECK(out_f32->sizes() == q.sizes(), "out_f32 must match q");
     }
     c10::cuda::CUDAGuard guard(q.device());
+    if (T_total == 0) return;   // nothing to compute; the state stays as it is
 
     auto plan = torch::empty({(N + 1) * cfbi::PLAN_INTS_PER_SEQ}, q.options().dtype(torch::kInt32));
     torch::Tensor ws;
