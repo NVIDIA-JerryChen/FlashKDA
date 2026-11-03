@@ -8,7 +8,9 @@ from ._ext import load_ext
 from .api import decode, forward_train, prefill
 from .autograd import chunk_kda
 from .state import CfbiState, alloc_state, state_equal, state_mismatch
+from .verify import verify_hardware
 
 __all__ = [
     "load_ext", "prefill", "decode", "forward_train", "chunk_kda", "CfbiState", "alloc_state", "state_equal", "state_mismatch",
+    "verify_hardware",
 ]
