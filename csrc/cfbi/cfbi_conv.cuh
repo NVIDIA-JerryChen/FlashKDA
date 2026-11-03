@@ -53,7 +53,6 @@ struct Args {
     const int64_t* cu_seqlens;  // [N+1] or null
     int64_t x_stride, y_stride;
     int64_t T;                  // tokens per sequence when cu_seqlens == null
-    int64_t n_blocks;
     int D, N, tiles;            // tiles: upper bound of ceil(len / TILE_T) over the sequences (>= 1)
     int silu, w_bf16, bias_bf16;
 };

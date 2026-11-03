@@ -276,7 +276,9 @@ Recipe for a model integration:
   slices.
 * replace `ShortConvolution` by `short_conv(x, conv.weight, conv.bias, state, "silu", cu_seqlens)`. Keep one `[N, D, W-1]` state per
   conv (q, k, v). In a scheduler, `state[slot_ids]` (gather) / scatter works exactly like the core's state in the scheduler test.
-* The gated RMSNorm after the core and `o_proj`: `o_proj` is a Linear (`bi_linear`); the gated norm is NOT covered (see 9).
+* The gated RMSNorm after the core and `o_proj`: `o_proj` is a Linear (`bi_linear`); the gated norm is NOT covered by a contract (see 9). Observation only
+  (`benchmarks/micro/fla_gated_norm_batch.py`): FLA's `FusedRMSNormGated` (bf16, head dim 128, sigmoid gate) gave 0 differing bits between M = 1, 2, 3, 8, 17, 64, 129,
+  1000 and 4096 rows on this GPU (131072 outputs compared per M), i.e. it is row-wise in practice.
 
 ## 9. Limits and what is not verified
 
