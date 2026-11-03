@@ -140,7 +140,7 @@ negative control below changes 479 of 51200 fp32 outputs and 101 `E` entries (pl
 | N | cfbi decode | FLA fused_recurrent (fp32 state) | CF-BI report (Decode B, GB300) |
 |---|---|---|---|
 | 1 | 34.9 / 33.3 | 2.6 (GPU busy) | |
-| 16 | 40.2 / 39.0 | 5.4 | |
+| 16 | 40.2 / 39.0 | 5.4 | 18.2 |
 | 64 | 106.5 / 105.5 | 16.7 | 52.5 |
 | 128 | 173.4 / 172.4 | 33.2 | 91.6 |
 
@@ -152,6 +152,24 @@ need 3-33 us), which is why GPU busy time is the comparison used here. For orien
 per-token-bf16-state `consistent_fwd` (branch `feature/kda-consistency`, same node type) gave 7.90 ms (1x4096) and
 62.4 ms (1x32768) at H=32 against 2.89 / 23.1 ms here, i.e. 2.7x faster, and FLA's fp32-state recurrent kernel 3.83 / 30.1 ms.
 The CF-BI report's own (optimised) kernels are far faster than v1 (e.g. H6 / L8K / batch 1: 0.54 ms on GB300), see 7.
+
+### Is this the CF-BI report's setup? No - read the numbers accordingly
+
+| | CF-BI report | measurements in this document |
+|---|---|---|
+| GPU | GB300 (some historical records on GB200); "148-SM historical device" | one NVIDIA B300 SXM6 AC (compute capability 10.3) on aws-pdx, driver 580.126.09 (the NGC 26.08 image asks for >= 615.65 and prints an error banner; torch/CUDA still work). SM count, clocks, power cap and HBM bandwidth were not recorded, clocks were not locked |
+| parallelism | end to end: 8 GPUs on 2 nodes, TP8 + EP8; micro-benchmarks: one GPU with the per-GPU head count after TP (H6 / H12) | one GPU only; H is set directly (6, 12, 32). No TP/EP/collectives: the head-sharding test only checks that per-head bits do not depend on how heads are grouped |
+| workload | end-to-end serving of a full model (8K in / 1K out, concurrency 1-64, prefix cache, 64 sequences, 8192-token step budget) plus attention-core micro-benchmarks | no model, no serving stack: random tensors ("authors" regime), KDA core only (no conv, projections, gated norm, communication) |
+| kernels | optimised: tcgen05 UMMA, TMEM, bulk copy + mbarrier pipelines, warp specialisation, Decode A/B | v1: mma.sync TF32, global fp32 workspace, whole-head CTA, no pipelining |
+| numerics | the CF-BI program; elementwise approximations, l2norm order and gate form are not published | same program family (chunk 64, D 128, fp32 E, 16-row sub-blocks, reference rows, three-term TF32, same state and workspace sizes) with the unpublished details fixed by this repo's contract: not bit-identical to the report's implementation |
+| shapes | prefill H6 / L8192 / batch 1, 8, 64; decode N 16..128 / H12 | the same shapes (plus H32 and N=1) |
+| timing | "core latency" with an unspecified protocol (decode: average chunk position, plus a separate cold-state probe) | prefill: median of 10 event-timed calls and profiler GPU-busy time; decode: back-to-back CUDA-graph replays over consecutive steps (all 64 chunk positions averaged, cache state not controlled) |
+
+Consequence: compare cfbi with `flash_kda.fwd` / FLA measured in the same run (same GPU, same harness); the report's
+absolute numbers are context only. Nothing here measures the end-to-end throughput loss the report quantifies, and with
+v1 kernels that are roughly 4-7x slower in prefill (3.70 / 7.42 / 55.7 ms here against the report's GB300 records of
+0.536 / 1.98 / 12.7 ms for batch 1 / 8 / 64) and ~2x in decode (N=64: 105 us against 52.5 us) than the report's optimised
+ones (different hardware, so indicative only) that loss cannot be extrapolated from these numbers.
 
 ## 7. Limits, and what v1 does not do
 
