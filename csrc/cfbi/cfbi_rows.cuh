@@ -48,6 +48,17 @@ struct RowSmem {
 };
 
 __device__ __forceinline__ void prefetch_l2(const void* ptr) { asm volatile("prefetch.global.L2 [%0];" ::"l"(ptr)); }
+__device__ __forceinline__ void prefetch_l1(const void* ptr) { asm volatile("prefetch.global.L1 [%0];" ::"l"(ptr)); }
+#ifndef CFBI_ROWS_PF_L1
+#define CFBI_ROWS_PF_L1 0
+#endif
+__device__ __forceinline__ void prefetch_state(const void* ptr) {
+#if CFBI_ROWS_PF_L1
+    prefetch_l1(ptr);
+#else
+    prefetch_l2(ptr);
+#endif
+}
 
 // Cross-sub-block products of the current row for KS = 2s k-steps: M[which][v] = dot3(A row, X[which][0:16s][v]) with
 // which = 0: akk row x UT rows, 1: akk row x W rows, 2: aqk row x U rows. 48 column tiles, 6 per warp, all B fragments
@@ -149,10 +160,10 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
         if (i == 0) {
             // pull the whole state this CTA will touch towards L2 so later phases do not pay HBM latency
             const char* eb = reinterpret_cast<const char*>(Eg);
-            prefetch_l2(eb + tid * 128);
-            prefetch_l2(eb + (tid + NTHREADS) * 128);
+            prefetch_state(eb + tid * 128);
+            prefetch_state(eb + (tid + NTHREADS) * 128);
             const int lines = pos * 4;   // 512 B per row = 4 lines of 128 B, five planes
-            for (int l = tid; l < 5 * lines; l += NTHREADS) prefetch_l2(R + (l / lines) * ROW_PLANE_FLOATS + (l % lines) * 32);
+            for (int l = tid; l < 5 * lines; l += NTHREADS) prefetch_state(R + (l / lines) * ROW_PLANE_FLOATS + (l % lines) * 32);
 #pragma unroll
             for (int jj = 0; jj < 16; ++jj) xpre[jj] = (b + jj < pos) ? Xg[(b + jj) * HEAD_K + col] : 0.f;
             if (tid < HEAD_V) {
