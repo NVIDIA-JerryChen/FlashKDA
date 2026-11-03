@@ -3,7 +3,7 @@
 Status: implemented in `csrc/cfbi/cfbi_conv.cuh` and `csrc/cfbi/cfbi_linear.cuh` (launchers `cfbi_convlin.cu`, binding
 `cfbi_convlin_binding.cpp`, extension `flash_kda_cfbi_conv_C`), Python `flash_kda.cfbi.short_conv` and
 `flash_kda.cfbi.bi_linear`. Validated on one B300 (`sm_103a`) only, like the core. This document is the *specification* of the
-two floating-point programs (sections 2 and 3), and records what was verified (section 6) and what it costs (section 8).
+two floating-point programs (sections 2 and 3), and records what was verified (section 6) and what it costs (section 5).
 The KDA core itself is specified in [20261102-cfbi-numerical-contract.md](20261102-cfbi-numerical-contract.md).
 
 ## 0. The problem in plain words
@@ -36,7 +36,7 @@ conv, one channel, W = 4, token t:   acc = fma(w3, x[t], fma(w2, x[t-1], fma(w1,
                                      y   = bf16( acc * rcp(1 + ex2(-acc * log2 e)) )
 history x[t-3 .. t-1] comes from the same call, or from the 3-input state of the previous call: the values are the same bf16.
 
-linear, one output element:          acc = mma16(x[m][240:256], w[n][240:256], ... mma16(x[m][0:16], w[n][0:16], 0))   <- K ascending, one chain
+linear, one output element (K=256): acc = mma16(x[m][240:256], w[n][240:256], ... mma16(x[m][0:16], w[n][0:16], 0))   <- K ascending, one chain
                                      out = bf16(acc)           (M = 1 or M = 8192: which lane computes it is irrelevant)
 ```
 
@@ -91,7 +91,7 @@ out[t][d] = bf16_rn(y)                                            (round to near
 
 `ex2` = `ex2.approx.ftz.f32`, `rcp` = `rcp.approx.ftz.f32` (one PTX instruction each, the same functions as the core's `sigmoid_act`
 in `cfbi_prep.cuh`; `LOG2E_F` = fp32(log2 e)). The ftz behaviour is intended: for `z < -87.3` the result is `-0.0` instead of a
-denormal (an absolute error below 1e-37). Measured accuracy of the program against the fp64 result of the same math: the
+denormal (an absolute error below 1.1e-36). Measured accuracy of the program against the fp64 result of the same math: the
 fp32 value within `2e-6 * (sum|w x| + |bias| + |ref|)`, the bf16 output within 0.5 bf16-ulp plus that slack (`test_accuracy_vs_fp64`).
 
 **State.** `state[n][d][m]`, `m = 0 .. W-2`, is the bf16 input of sequence position `m - (W-1)` of the next call, i.e. the **last
@@ -172,9 +172,10 @@ M=8192 394.5 / 85.9; `f_proj[0]` `4096->128` 11.3 / 4.3, 25.2 / 5.0, 41.9 / 8.9;
 Why it is slower than cuBLAS (reasoned, not profiled): the sum over K may not be split (no split-K), so the parallelism of a decode GEMM is the
 number of N tiles (128 CTAs at N = 4096, or 16-row CTAs re-reading the weight tile from L2 for M <= 64, which is what the shape-to-config table
 uses because it measured fastest); at M = 8192 `mma.sync` peaks well below tcgen05 (this kernel reaches 376 TFLOP/s, cuBLAS 1784). `M <= 16` is
-memory bound and within 1.1-1.3x of cuBLAS. Tried without gain beyond that (`benchmarks/micro/linear_configs.py`, all nine variants gave the
-same bits): bigger warp tiles (fewer `ldmatrix` per MMA), pipelines of 6 and 8 stages, k-tiles of 256. Making it faster means a tcgen05 /
-UMMA kernel with the same chain per element, which has to be probed for bf16 like the core's tf32 UMMA was.
+memory bound and within 1.1-1.3x of cuBLAS. A throwaway experiment with four more configurations (32x32 and 64x32 tiles with 2 warps, a 128x32 tile with
+a 32x32 warp tile, pipelines of 6 and 8 stages, k-tiles of 256; not kept, `benchmarks/micro/linear_configs.py` times the five that are) gave the same
+bits and no speed-up beyond the 16-row configuration for M <= 64. Making it faster means a tcgen05 / UMMA kernel with the same chain per element, which has
+to be probed for bf16 (the core's tf32 UMMA probe, `benchmarks/micro/umma_probe.cu`, found tcgen05 bit-identical to `mma.sync` for the three-term tf32 product).
 
 **Conv, D = 4096, W = 4, SiLU, bf16** (us per call; FLA = its Triton `ShortConvolution`, torch = `F.conv1d` + `F.silu`):
 
@@ -244,10 +245,11 @@ cuBLAS happens to use the same K order for those three batch sizes. It does not 
 | 4096 | 16 | 0.195% | 0 | 0 | 0.781% | 0.391% | 0.195% | 0.195% | 0.195% | 0.195% | 0.195% | 0.195% | 0.195% | 0 |
 | 128 | 2048 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 
-So cuBLAS is batch invariant on this GPU for some shapes (every K = 2048 shape tried) and not for others: **K >= 4096 with M <= 128 - exactly the decode
-regime - differs in 0.1-0.8% of the bf16 outputs** (a different split of the K sum; at the fp32 level nearly all values differ). That is the
-size of the error that would make a decode step disagree with the prefill row, and the reason the projection of a CF-BI layer cannot go
-through cuBLAS. In the layer chain of section 6 (hidden 4096) cuBLAS projections change 3044 bf16 values of `g` (the first `f_proj` linear is
+So cuBLAS is batch invariant on this GPU for some shapes (every K = 2048 shape tried) and not for others: for **K >= 4096 and M <= 128 - the decode
+regime - it differs from its own M = 8192 result in 0.1-0.8% of the bf16 outputs for many M** (M = 2, 4, 8 at 4096 x 4096; M = 2 .. 64 at 4096 x 2048;
+M <= 16 at 4096 x 11008; M <= 128 at 11008 x 4096; nearly every M for N = 16 and 128), because it adds the K terms in a different order (at the fp32 level nearly
+all values differ). That is the size of the error that would make a decode step disagree with the prefill row, and the reason the projection of a
+CF-BI layer cannot go through cuBLAS. In the layer chain of section 6 (hidden 4096) cuBLAS projections change 3044 bf16 values of `g` (the first `f_proj` linear is
 `4096 -> 128`), 7 of `beta` and, through the core's state, 1481 bf16 core outputs of a 150-token sequence.
 
 Accuracy is the same as cuBLAS's (`benchmarks/micro/linear_accuracy.py`): rel. RMS error against fp64 1.65e-3 for both at (256, 4096, 4096), (64, 4096, 2048),
@@ -287,8 +289,7 @@ Recipe for a model integration:
   Splitting a GEMM across TP ranks along K changes the program (it is a split-K by definition); splitting along N (column parallel)
   does not.
 * **Speed**: mma.sync only (no tcgen05 / TMA pipelines): `bi_linear` is 1.1-1.3x cuBLAS for `M <= 16` and 2.2-4.8x for larger `M` at
-  4096 x 4096 (section 5). A faster batch-invariant kernel is an engineering item (UMMA, which the core's probes showed to be
-  bit-identical for tf32, would have to be probed for bf16 too); the arithmetic per element is pinned by the contract.
+  4096 x 4096 (section 5). A faster batch-invariant kernel is an engineering item (UMMA would have to be probed for bf16, see section 5); the arithmetic per element is pinned by the contract.
 * **Backward**: plain PyTorch fp32 for the conv (it materialises a few `[tokens, D]` fp32 temporaries) and cuBLAS matmuls for the linear;
   not bit-pinned, gradients correct to the bf16 floor.
 * **`max_seqlen`** must be a true bound (a too-small one traps, see section 1).
@@ -297,7 +298,7 @@ Recipe for a model integration:
 
 ```bash
 python -m pytest tests/cfbi/test_conv.py tests/cfbi/test_linear_probe.py tests/cfbi/test_linear.py \
-                 tests/cfbi/test_layer_chain.py tests/cfbi/test_convlin_runtime.py -q      # JIT-builds flash_kda_cfbi_conv_C (+ flash_kda_cfbi_C for the chain)
+                 tests/cfbi/test_layer_chain.py tests/cfbi/test_convlin_runtime.py tests/cfbi/test_convlin_fuzz.py -q   # JIT-builds flash_kda_cfbi_conv_C (+ flash_kda_cfbi_C for the chain)
 python benchmarks/bench_conv_linear.py            # section 5
 python benchmarks/cublas_batch_variance.py        # section 7
 FLASH_KDA_BUILD_EXTS=cfbi_conv FLASH_KDA_CUDA_ARCHS=103a python setup.py build_ext --build-lib /tmp/convbuild   # only this extension
