@@ -20,6 +20,14 @@ from helpers import REGIMES, make_case, n_diff
 REF = 3
 
 
+@pytest.fixture(autouse=True)
+def _optimised_kernels_run_here(ext):
+    """Where the optimised kernels cannot run (sm < 90: ``_impl=0`` resolves to the reference kernels, see
+    ``resolve_impl``) both sides of every comparison below would be the same code: skip instead of passing vacuously."""
+    if ext.resolve_impl(0, -1) == ext.resolve_impl(REF, -1):
+        pytest.skip("the optimised kernels do not run on this device (_impl=0 resolves to the reference kernels)")
+
+
 def _cu(lens):
     cu = [0]
     for L in lens:

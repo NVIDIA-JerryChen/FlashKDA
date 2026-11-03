@@ -397,12 +397,16 @@ def test_32k_whole_vs_cuts_vs_decode(ext, regime):
 # negative control
 # ---------------------------------------------------------------------------------------------------------
 def test_negative_control_is_caught(ext):
-    """A build that replaces one fma of the row engine by mul+sub is a different program: the harness must see it."""
+    """A build that replaces one fma of the row engine by mul+sub is a different program: the harness must see it.
+    (Where K1/K2 cannot run, the sabotaged row engine is compared with the clean build's row engine instead.)"""
     bad = load_variant("negctl", ("CFBI_NEG_CONTROL=1",))
     H, T = 2, 200
     case = make_case(T, H, "authors", seed=80)
     sa, sb = alloc_state(1, H), alloc_state(1, H)
-    oa, fa = call(case, sa, mode=0, mod=bad)   # K1/K2: untouched
+    if ext.resolve_impl(0, -1) & 4:   # no K1/K2 on this device (sm_80/86/89: K1's shared memory does not fit): mode 0 is
+        oa, fa = call(case, sa, mode=1)           # the row engine too, so compare against the clean build's row engine
+    else:
+        oa, fa = call(case, sa, mode=0, mod=bad)   # K1/K2: untouched
     ob, fb = call(case, sb, mode=1, mod=bad)   # row engine: sabotaged
     assert n_diff(fa, fb) > 0, "negative control produced identical fp32 outputs: the harness is vacuous"
     print(f"\n[negative control] fp32 outputs differing: {n_diff(fa, fb)}/{fa.numel()}, bf16: {n_diff(oa, ob)}/{oa.numel()}, "
