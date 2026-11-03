@@ -10,7 +10,15 @@
 
 #include "cfbi/cfbi_common.cuh"
 
+#include <cstdio>
+
 namespace cfbi {
+
+#ifdef CFBI_ROWS_PROFILE
+#define ROWS_TS(i) do { if (threadIdx.x == 0) tp[i] = clock64(); } while (0)
+#else
+#define ROWS_TS(i) do {} while (0)
+#endif
 
 struct RowSmem {
     float k[HEAD_K];      // khat of the current row
@@ -44,8 +52,12 @@ __global__ void __launch_bounds__(NTHREADS) rows_kernel(const Params p) {
     float* Eg = p.E + ((int64_t)n * H + h) * E_FLOATS;
     const float ale = gate_a_log_exp(p.A_log[h]);
 
+#ifdef CFBI_ROWS_PROFILE
+    long long tp[9];
+#endif
     int pos = sp.pos0;
     for (int i = 0; i < nrows; ++i) {
+        ROWS_TS(0);
         const int64_t tok = (int64_t)sp.tok0 + i;
         const int64_t off = (tok * H + h) * HEAD_K;   // q/k/v/g/out row offset
 
@@ -77,6 +89,7 @@ __global__ void __launch_bounds__(NTHREADS) rows_kernel(const Params p) {
         }
         __syncthreads();
 
+        ROWS_TS(1);
         // ---- B. Akk / Aqk row against the cached rows (and the row itself for Aqk) -----------------
         const int slot = pos & 15;
         if (warp <= (pos >> 3)) {   // one 8-column tile per warp
@@ -120,6 +133,7 @@ __global__ void __launch_bounds__(NTHREADS) rows_kernel(const Params p) {
         }
         __syncthreads();
 
+        ROWS_TS(2);
         // ---- C. UT / W row: block forward substitution -------------------------------------------
         const int s = pos >> 4, b = pos & ~15;
         if (s > 0) {   // M = dot3(Akk[t, 0:b], X[0:b]) for X = UT and W (32 column tiles over 8 warps)
@@ -164,6 +178,7 @@ __global__ void __launch_bounds__(NTHREADS) rows_kernel(const Params p) {
         }
         __syncthreads();
 
+        ROWS_TS(3);
         // ---- D. P1 = dot3(W_t, E^T), P2 = dot3(GQ_t, E^T) ----------------------------------------
         for (int jb = warp; jb < 32; jb += 8) {
             const int which = jb >> 4, nt = jb & 15;
@@ -187,6 +202,7 @@ __global__ void __launch_bounds__(NTHREADS) rows_kernel(const Params p) {
         }
         __syncthreads();
 
+        ROWS_TS(4);
         // ---- E. U = UT - P1 ----------------------------------------------------------------------
         if (tid < HEAD_V) {
             const float u = fsub(S.x[0][tid], S.p1[tid]);
@@ -195,6 +211,7 @@ __global__ void __launch_bounds__(NTHREADS) rows_kernel(const Params p) {
         }
         __syncthreads();
 
+        ROWS_TS(5);
         // ---- F. O = P2 + dot3(Aqk[t, 0:b], U[0:b]) then FMA chain over j = b..t -----------------
         if (s > 0) {
             for (int nt = warp; nt < 16; nt += 8) {
@@ -225,6 +242,7 @@ __global__ void __launch_bounds__(NTHREADS) rows_kernel(const Params p) {
             if (p.out_f32 != nullptr) p.out_f32[off + tid] = o;
         }
 
+        ROWS_TS(6);
         // ---- G. chunk end: E' = E * GEND + dot3(KD, U) ----------------------------------------------
         if (pos == BT - 1) {
             if (tid < HEAD_K) S.gend[tid] = ex2_ftz(S.g2[tid]);
@@ -256,6 +274,12 @@ __global__ void __launch_bounds__(NTHREADS) rows_kernel(const Params p) {
             pos += 1;
         }
         __syncthreads();
+#ifdef CFBI_ROWS_PROFILE
+        ROWS_TS(7);
+        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && (i < 3 || pos % 16 == 4))
+            printf("rows pos=%d: prep %lld | akk/aqk %lld | UT/W %lld | P1/P2 %lld | U %lld | O %lld | chunk-end/sync %lld | total %lld\n", pos, tp[1] - tp[0], tp[2] - tp[1],
+                   tp[3] - tp[2], tp[4] - tp[3], tp[5] - tp[4], tp[6] - tp[5], tp[7] - tp[6], tp[7] - tp[0]);
+#endif
     }
 }
 

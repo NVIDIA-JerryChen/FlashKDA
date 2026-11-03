@@ -50,4 +50,11 @@ __device__ __forceinline__ void bulk_g2s(void* smem_dst, const void* gmem_src, u
         : "memory");
 }
 
+// Ampere-style 16-byte async copy global -> shared (bypasses L1), tracked with commit groups.
+__device__ __forceinline__ void cp_async_16(void* smem_dst, const void* gmem_src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem_u32(smem_dst)), "l"(gmem_src) : "memory");
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;" ::: "memory"); }
+
 }  // namespace cfbi
