@@ -469,6 +469,9 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
                 mbar_wait_bounded(&bar[BAR_AQ], lc & 1, 30);
                 mbar_wait_bounded(&bar[BAR_UREADY], lc & 1, 31);
                 KU_PS(80 + 8 * (warp - 9) + 1, lc);
+#ifdef CFBI_UMMA_RACE_DELAY_NS   // test hook: the slowest O warp lingers, which widens the window of the race above
+                if (s == 3) __nanosleep(CFBI_UMMA_RACE_DELAY_NS);
+#endif
                 const float* aqd = sAQ + 12 * 128 + s * 272;
 #pragma unroll
                 for (int pass = 0; pass < 2; ++pass) {   // two passes of 4 eight-column tiles (register budget)
@@ -529,6 +532,13 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
             }
             KU_PS(80 + 8 * (warp - 9) + 2, lc);
             __syncwarp();
+#ifndef CFBI_UMMA_NEG_ODONE_RACE
+            // A warp with no rows in this (tail) chunk gets here at once. Its arrival for chunk lc must not be counted into
+            // the phase of chunk lc - 1: that phase would complete while the slower O warps still read sU / sP2 / the U
+            // planes / sAQ of chunk lc - 1, and the epilogue warps (sU, sP2, U planes) and the Aqk bulk copy (sAQ) would then
+            // overwrite them. So wait for the phase of the previous chunk to complete first.
+            if (s >= nsb && lc > 0) mbar_wait_bounded(&bar[BAR_ODONE], (lc - 1) & 1, 33);
+#endif
             if (lane == 0) mbar_arrive(&bar[BAR_ODONE]);
             if (otid == 0 && lc + 1 < nch) {   // sAQ is free once every O thread has arrived: fetch the next chunk's Aqk
                 mbar_wait_bounded(&bar[BAR_ODONE], lc & 1, 32);

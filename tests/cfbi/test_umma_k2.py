@@ -130,3 +130,37 @@ def test_negative_control_wrong_umma_program(ext):
     # dropping the lo*hi cross term only changes the last bits of the fp32 results (8% of the outputs here), but any visible
     # fraction proves the bitwise comparison is sensitive to the UMMA program
     assert frac > 0.01, f"the harness is not sensitive to a wrong UMMA program (only {frac:.2%} of fp32 outputs differ)"
+
+
+def test_idle_o_warps_in_a_tail_chunk_do_not_race_the_previous_chunk(ext):
+    """Regression test of a real race found at integration. In a tail chunk with <= 32 rows two or more O warps have no
+    rows and used to arrive at ``BAR_ODONE`` at once, i.e. into the phase of the previous chunk: that phase completed
+    while the slowest O warp (sub-block 3) still read sU / sP2 / the U planes / sAQ of the previous chunk, and the next
+    chunk's epilogue and Aqk bulk copy overwrote them (wrong bits in 16 rows x 64 columns, intermittent).
+
+    Two variants of the extension make it deterministic: the slowest O warp sleeps 20 us (``CFBI_UMMA_RACE_DELAY_NS``);
+    the kernel as it is must still match the reference, the same kernel with the old arrival order
+    (``CFBI_UMMA_NEG_ODONE_RACE``) must not (otherwise this test would prove nothing)."""
+    from flash_kda.cfbi._ext import load_variant
+
+    try:
+        fixed = load_variant("umma_delay", ("CFBI_UMMA_RACE_DELAY_NS=20000",))
+        racy = load_variant("umma_delay_race", ("CFBI_UMMA_RACE_DELAY_NS=20000", "CFBI_UMMA_NEG_ODONE_RACE=1"))
+    except Exception as e:   # pragma: no cover - the variants need a JIT build
+        pytest.skip(f"cannot build the variants: {e}")
+    H = 3
+    lens = [100, 7, 64, 129, 200, 0, 70]   # tails of 36, 7, 0, 1, 8, -, 6 rows after 1, 0, 1, 2, 3, -, 1 full chunks
+    case = make_case(sum(lens), H, "authors", seed=50)
+    cu = torch.tensor([0] + list(__import__("itertools").accumulate(lens)), dtype=torch.int64, device="cuda")
+
+    def run(mod, impl):
+        o32 = torch.zeros(case["q"].shape, dtype=torch.float32, device="cuda")
+        o = torch.zeros_like(case["q"])
+        mod.forward(case["q"], case["k"], case["v"], case["g"], case["beta"], float(case["scale"]), o, case["A_log"],
+                    case["dt_bias"], float(case["lower_bound"]), None, None, None, cu, 0, o32, impl, None)
+        torch.cuda.synchronize()
+        return o32
+
+    ref = run(fixed, REF)
+    assert n_diff(run(fixed, UMMA), ref) == 0, "UMMA K2 differs from the reference when the slowest O warp is delayed"
+    assert n_diff(run(racy, UMMA), ref) > 1000, "the old arrival order should have produced wrong bits here (the test is vacuous)"
