@@ -429,6 +429,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
                    tp[1] - tp[0], tp[2] - tp[1], tp[3] - tp[2], tp[4] - tp[3], tp[5] - tp[4], tp[6] - tp[5], tp[7] - tp[6], tp[7] - tp[0]);
 #endif
     }
+    if (p.fuse_pos && tid == 0) p.pos[sp.slot] = (int)(((int64_t)sp.pos0 + sp.len) % BT);   // same value from every head CTA
 }
 
 }  // namespace cfbi

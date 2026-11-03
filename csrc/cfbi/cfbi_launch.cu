@@ -32,6 +32,7 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
     p.rows = a.rows;
     p.pos = a.pos;
     p.slot_ids = a.slot_ids;
+    p.fuse_pos = a.mode == 1 ? 1 : 0;
     p.plan = reinterpret_cast<SeqPlan*>(a.plan);
     p.ws = a.ws;
 
@@ -55,7 +56,7 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
             if (run_k2) k2_kernel<<<dim3(K2_NSLICE, a.N, a.H), NTHREADS, K2_SMEM_BYTES, stream>>>(p);
         }
     }
-    if (run_k2 && a.pos != nullptr) finalize_pos_kernel<<<(a.N + 255) / 256, 256, 0, stream>>>(p.plan, a.pos, a.N);
+    if (run_k2 && a.pos != nullptr && a.mode != 1) finalize_pos_kernel<<<(a.N + 255) / 256, 256, 0, stream>>>(p.plan, a.pos, a.N);
 }
 
 }  // namespace cfbi

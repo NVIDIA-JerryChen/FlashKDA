@@ -75,6 +75,7 @@ struct Params {
     float* rows;
     int* pos;
     const int* slot_ids;   // [N] state slot of each sequence of the call (nullptr: slot = sequence index)
+    int fuse_pos;          // 1: the row engine writes the new pos itself (mode 1), no finalize kernel
     SeqPlan* plan;
     float* ws;
 };

@@ -261,6 +261,7 @@ __global__ void __launch_bounds__(NTHREADS) rows_kernel(const Params p) {
         }
         __syncthreads();
     }
+    if (p.fuse_pos && tid == 0) p.pos[sp.slot] = (int)(((int64_t)sp.pos0 + sp.len) % BT);   // same value from every head CTA
 }
 
 }  // namespace ref

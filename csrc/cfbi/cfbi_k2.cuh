@@ -17,6 +17,8 @@
 //     SMALL/BIG dependency chains of the pinned dot3 order (20.7 cycles per mma) overlap.
 #pragma once
 
+#include <cstdio>
+
 #include "cfbi/cfbi_async.cuh"
 #include "cfbi/cfbi_common.cuh"
 
@@ -192,6 +194,12 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
 
     const bool isA = warp < 4;
     const int w = warp & 3;   // row tile (A: P1 / U, B: P2 / sub-block of O); P3 key tiles are w and w + 4
+#ifdef CFBI_K2_PROFILE
+    long long acc_wait = 0, acc_p12 = 0, acc_s1 = 0, acc_p3o = 0, acc_s2 = 0, tt;
+#define K2_TS() (threadIdx.x == 0 ? clock64() : 0)
+#else
+#define K2_TS() 0
+#endif
 
     for (int lc = 0; lc < nch; ++lc) {
         const bool full = lc < sp.nfull;
@@ -200,6 +208,9 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
         const int64_t tok0 = (int64_t)sp.tok0 + sp.hrows + (int64_t)BT * lc;
         const uint32_t par = lc & 1;
         float p2[K2_NT][4];
+#ifdef CFBI_K2_PROFILE
+        tt = K2_TS();
+#endif
 
         // ---- phase 1 ---------------------------------------------------------------------------------
         if (isA) {
@@ -232,8 +243,14 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
             k2_dot3_e(reinterpret_cast<const float4*>(sGQ) + w * 16 * 32 + lane, reinterpret_cast<const uint2*>(sEhi) + lane,
                       reinterpret_cast<const uint2*>(sElo) + lane, p2);
         }
+#ifdef CFBI_K2_PROFILE
+        if (tid == 0) { long long n2 = K2_TS(); acc_p12 += n2 - tt; tt = n2; }
+#endif
         __syncthreads();   // S1: U visible, P1 / P2 done with E, W / GQ / UT free
         if (tid == 0 && lc + 1 < nch) issue_front(lc + 1);
+#ifdef CFBI_K2_PROFILE
+        if (tid == 0) { long long n2 = K2_TS(); acc_s1 += n2 - tt; tt = n2; }
+#endif
 
         // ---- phase 3 ---------------------------------------------------------------------------------
         if (isA) {
@@ -348,8 +365,14 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
                 }
             }
         }
+#ifdef CFBI_K2_PROFILE
+        if (tid == 0) { long long n2 = K2_TS(); acc_p3o += n2 - tt; tt = n2; }
+#endif
         __syncthreads();   // S2: E' visible, O done, KD / Aqk free
         if (tid == 0 && lc + 1 < nch) issue_back(lc + 1);
+#ifdef CFBI_K2_PROFILE
+        if (tid == 0) { long long n2 = K2_TS(); acc_s2 += n2 - tt; tt = n2; }
+#endif
     }
 
     if (Eg != nullptr) {
@@ -358,6 +381,11 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
             Eg[v * HEAD_K + k] = sE[v * K2_SE + k];
         }
     }
+#ifdef CFBI_K2_PROFILE
+    if (tid == 0 && vs == 0 && n == 0 && h == 0 && nch >= 8)
+        printf("K2prof chunks=%d: per chunk cycles: phase1 (wait+P1/P2+U) %lld | S1 %lld | phase3 (P3/E-update | O) %lld | S2 %lld | total %lld\n", nch,
+               acc_p12 / nch, acc_s1 / nch, acc_p3o / nch, acc_s2 / nch, (acc_p12 + acc_s1 + acc_p3o + acc_s2) / nch);
+#endif
 }
 
 }  // namespace cfbi
