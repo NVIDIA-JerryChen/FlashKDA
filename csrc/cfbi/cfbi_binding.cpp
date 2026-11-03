@@ -96,6 +96,9 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     TORCH_CHECK(lower_bound >= -5.0 && lower_bound <= 0.0, "lower_bound must be in [-5, 0]");
     const int64_t T_total = B * T;
     TORCH_CHECK(T_total < (int64_t(1) << 31) && H < 65536, "problem too large for the int32 token index / grid");
+    // the kernels use 16-byte vector accesses on q/k (8 bf16) and on the fp32 state
+    auto aligned16 = [](const torch::Tensor& t) { return reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0; };
+    TORCH_CHECK(aligned16(q) && aligned16(k), "q and k must be 16-byte aligned");
 
     int64_t N = B;
     const int64_t* cu_ptr = nullptr;
@@ -122,6 +125,7 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
                         rows->size(3) == 64 && rows->size(4) == 128,
                     "rows must be [N, H, 5, 64, 128]");
         TORCH_CHECK(pos->dim() == 1 && pos->size(0) == N, "pos must be [N]");
+        TORCH_CHECK(aligned16(*E) && aligned16(*rows), "E and rows must be 16-byte aligned");
     } else {
         TORCH_CHECK(mode == 0, "decode (mode 1) needs a state");
     }

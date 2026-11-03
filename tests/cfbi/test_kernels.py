@@ -117,3 +117,38 @@ def test_bad_arguments_are_rejected(ext):
         prefill(case["q"], case["k"], case["v"], case["g"], case["beta"], 0.1, out, case["A_log"], case["dt_bias"], 1.0, st)
     with pytest.raises(RuntimeError, match="must be"):   # state tensors for the wrong number of sequences
         prefill(case["q"], case["k"], case["v"], case["g"], case["beta"], 0.1, out, case["A_log"], case["dt_bias"], -5.0, alloc_state(3, 2))
+
+
+def test_misaligned_inputs_are_rejected(ext):
+    """16-byte vector accesses: a bf16 view that starts 2 bytes off a 16-byte boundary must not run."""
+    H, T = 2, 64
+    case = make_case(T, H, "authors", seed=7)
+    buf = torch.zeros(T * H * 128 + 8, dtype=torch.bfloat16, device="cuda")
+    q = buf[1:1 + T * H * 128].view(1, T, H, 128)
+    q.copy_(case["q"])
+    out = torch.zeros_like(case["q"])
+    with pytest.raises(RuntimeError, match="16-byte aligned"):
+        prefill(q, case["k"], case["v"], case["g"], case["beta"], 0.1, out, case["A_log"], case["dt_bias"], -5.0,
+                alloc_state(1, H))
+
+
+@pytest.mark.parametrize("H", [33, 96])
+def test_many_heads(ext, H):
+    """Large head counts (grid.y / grid.z, per-head addressing): K1/K2 == row engine, batch == solo, head halves == whole."""
+    lens = [150, 70]
+    case = make_case(sum(lens), H, "authors", seed=8)
+    cu = torch.tensor([0, 150, 220], dtype=torch.int64, device="cuda")
+    sa, sb = alloc_state(2, H), alloc_state(2, H)
+    oa, fa = run(case, sa, mode=0, cu=cu)
+    ob, fb = run(case, sb, mode=1, cu=cu)
+    assert n_diff(oa, ob) == 0 and n_diff(fa, fb) == 0 and state_equal(sa, sb), "row engine != chunk kernels at large H"
+    half = H // 2
+    for lo, hi in ((0, half), (half, H)):
+        sub = dict(case)
+        for key in ("q", "k", "v", "g"):
+            sub[key] = case[key][:, :, lo:hi].contiguous()
+        sub["beta"], sub["A_log"], sub["dt_bias"] = case["beta"][:, :, lo:hi].contiguous(), case["A_log"][lo:hi], case["dt_bias"][lo:hi]
+        st = alloc_state(2, hi - lo)
+        o, o32 = run(sub, st, cu=cu)
+        assert n_diff(o32, fa[:, :, lo:hi]) == 0 and n_diff(o, oa[:, :, lo:hi]) == 0, f"heads {lo}:{hi} differ from the whole call"
+        assert state_equal(st, sa.select([0, 1], heads=slice(lo, hi)))
