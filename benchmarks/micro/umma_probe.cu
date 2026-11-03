@@ -78,6 +78,16 @@ __device__ __forceinline__ void umma_tf32(uint32_t d_tmem, uint64_t adesc, uint6
         : "r"(d_tmem), "l"(adesc), "l"(bdesc), "r"(idesc), "r"(accumulate), "r"(0), "r"(0), "r"(0), "r"(0)
         : "memory");
 }
+// same with A in tensor memory (a_tmem: lane 0, first K column of the 128 x 8 A slice; fp32/tf32 words, one per column)
+__device__ __forceinline__ void umma_tf32_ts(uint32_t d_tmem, uint32_t a_tmem, uint64_t bdesc, uint32_t idesc, uint32_t accumulate) {
+    asm volatile(
+        "{\n\t.reg .pred p;\n\t"
+        "setp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::1.kind::tf32 [%0], [%1], %2, %3, {%5, %6, %7, %8}, p;\n\t}\n"
+        :
+        : "r"(d_tmem), "r"(a_tmem), "l"(bdesc), "r"(idesc), "r"(accumulate), "r"(0), "r"(0), "r"(0), "r"(0)
+        : "memory");
+}
 // completion of all earlier tcgen05 async ops of this thread => mbarrier arrive (same thread that issued the MMAs)
 __device__ __forceinline__ void umma_commit(uint32_t bar) {
     asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::"r"(bar) : "memory");
@@ -253,6 +263,7 @@ struct KParams {
 __device__ __forceinline__ uint32_t smem_off(int layout_mode, int R, int KC, int r, int kk) {
     const uint32_t core = (uint32_t)((r & 7) * 16 + (kk & 3) * 4);
     if (layout_mode == 0) return (uint32_t)(r >> 3) * (uint32_t)(KC / 4 * 128) + (uint32_t)(kk >> 2) * 128u + core;
+    if (layout_mode == 2) return (uint32_t)(r >> 3) * (uint32_t)(KC / 4 * 144) + (uint32_t)(kk >> 2) * 144u + core;   // padded pitch
     return (uint32_t)(kk >> 2) * (uint32_t)(R / 8 * 128) + (uint32_t)(r >> 3) * 128u + core;
 }
 
@@ -265,10 +276,11 @@ __global__ void __launch_bounds__(128, 1) umma_kernel(KParams p) {
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, cta = blockIdx.x;
     const int K = p.K, nks = K / 8;
     const int KC = K < 64 ? K : 64, nch = K / KC, spc = KC / 8;
+    const int padw = p.layout_mode == 2 ? 9 : 8;   // plane words = R*KC*padw/8
     uint32_t* a_hi = reinterpret_cast<uint32_t*>(smem_raw);
-    uint32_t* a_lo = a_hi + M * KC;
-    uint32_t* b_hi = a_lo + M * KC;
-    uint32_t* b_lo = b_hi + N * KC;
+    uint32_t* a_lo = a_hi + M * KC * padw / 8;
+    uint32_t* b_hi = a_lo + M * KC * padw / 8;
+    uint32_t* b_lo = b_hi + N * KC * padw / 8;
 
     if (tid == 0) mbar_init(smem_u32(&mbar), 1);
     if (warp == 0) tmem_alloc(&tmem_slot, TMEM_COLS);
@@ -292,10 +304,10 @@ __global__ void __launch_bounds__(128, 1) umma_kernel(KParams p) {
     }
 
     const uint32_t idesc = make_idesc(M, N);
-    const int lbo_a = p.layout_mode == 0 ? 128 : M / 8 * 128, sbo_a = p.layout_mode == 0 ? KC / 4 * 128 : 128;
-    const int lbo_b = p.layout_mode == 0 ? 128 : N / 8 * 128, sbo_b = p.layout_mode == 0 ? KC / 4 * 128 : 128;
-    const uint32_t step_a = p.layout_mode == 0 ? 256u : (uint32_t)(2 * lbo_a);
-    const uint32_t step_b = p.layout_mode == 0 ? 256u : (uint32_t)(2 * lbo_b);
+    const int lbo_a = p.layout_mode == 0 ? 128 : (p.layout_mode == 2 ? 144 : M / 8 * 128), sbo_a = p.layout_mode == 0 ? KC / 4 * 128 : (p.layout_mode == 2 ? KC / 4 * 144 : 128);
+    const int lbo_b = p.layout_mode == 0 ? 128 : (p.layout_mode == 2 ? 144 : N / 8 * 128), sbo_b = p.layout_mode == 0 ? KC / 4 * 128 : (p.layout_mode == 2 ? KC / 4 * 144 : 128);
+    const uint32_t step_a = p.layout_mode == 0 ? 256u : (p.layout_mode == 2 ? 288u : (uint32_t)(2 * lbo_a));
+    const uint32_t step_b = p.layout_mode == 0 ? 256u : (p.layout_mode == 2 ? 288u : (uint32_t)(2 * lbo_b));
     uint32_t parity = 0;
 
     for (int c = 0; c < nch; ++c) {
@@ -453,6 +465,302 @@ __global__ void __launch_bounds__(128, 1) time_umma_kernel(long long* cyc, int i
 #endif
 }
 
+// layout study: dot3 K-step pattern (3 UMMAs per iteration, 2 accumulators) with runtime LBO/SBO of A and B and a
+// runtime step (bytes) between consecutive k-steps; planes are 40 KB each (data irrelevant)
+template <int M, int N>
+__global__ void __launch_bounds__(128, 1) time_layout_kernel(long long* cyc, int iters_a, int iters_b, int lbo_a, int sbo_a, int lbo_b, int sbo_b, int kstep_b, int* err) {
+#ifdef HAVE_TCGEN05
+    extern __shared__ __align__(1024) unsigned char smem_raw[];
+    __shared__ uint32_t tmem_slot;
+    __shared__ __align__(8) uint64_t mbar;
+    const int tid = threadIdx.x, warp = tid >> 5;
+    uint32_t* base = reinterpret_cast<uint32_t*>(smem_raw);   // 4 planes x 40 KB: a_hi, a_lo, b_hi, b_lo
+    for (int i = tid; i < 4 * 10240; i += 128) base[i] = 0x3F800000u + (hash32(i) & 0x7FE000u);
+    if (tid == 0) mbar_init(smem_u32(&mbar), 1);
+    if (warp == 0) tmem_alloc(&tmem_slot, 512);
+    fence_proxy_async_smem();
+    tc_fence_before();
+    __syncthreads();
+    tc_fence_after();
+    const uint32_t tmem = tmem_slot;
+    const uint32_t idesc = make_idesc(M, N);
+    const uint32_t a_hi = smem_u32(smem_raw), a_lo = a_hi + 40960, b_hi = a_lo + 40960, b_lo = b_hi + 40960;
+    uint32_t parity = 0;
+    long long t_done[3] = {0, 0, 0};
+    for (int rep = 0; rep < 3; ++rep) {
+        const int iters = rep == 2 ? iters_b : iters_a;
+        long long t0 = 0;
+        if (tid == 0) {
+            t0 = clock64();
+            for (int i = 0; i < iters; ++i) {
+                const uint32_t kb = (uint32_t)((i & 7) * kstep_b);   // walk over 8 k-steps like the kernels do
+                const uint64_t dah = make_smem_desc(a_hi, lbo_a, sbo_a), dal = make_smem_desc(a_lo, lbo_a, sbo_a);
+                const uint64_t dbh = make_smem_desc(b_hi + kb, lbo_b, sbo_b), dbl = make_smem_desc(b_lo + kb, lbo_b, sbo_b);
+                umma_tf32(tmem + 256, dal, dbh, idesc, 1u);
+                umma_tf32(tmem + 256, dah, dbl, idesc, 1u);
+                umma_tf32(tmem, dah, dbh, idesc, 1u);
+            }
+            umma_commit(smem_u32(&mbar));
+        }
+        uint32_t spins = 0;
+        while (!mbar_try_wait(smem_u32(&mbar), parity)) { if (++spins > (1u << 22)) { atomicAdd(err, 1); break; } }
+        parity ^= 1u;
+        if (tid == 0) t_done[rep] = clock64() - t0;
+    }
+    if (tid == 0) { cyc[0] = t_done[1]; cyc[1] = t_done[2]; }
+    tc_fence_before();
+    __syncthreads();
+    tc_fence_after();
+    if (warp == 0) tmem_dealloc(tmem, 512);
+#endif
+}
+static void time_layout_study() {
+    printf("== layout study: cycles per dot3 K-step (3 UMMAs, M=128 N=64) for descriptor strides (bytes) ==\n");
+    struct C { const char* name; int la, sa, lb, sb, kb; };
+    const C cs[] = {
+        {"A 128/256, B 128/256 (canonical)", 128, 256, 128, 256, 256},
+        {"A 160/320, B 128/256", 160, 320, 128, 256, 256},
+        {"A 128/256, B 144/4608 (E planes)", 128, 256, 144, 4608, 288},
+        {"A 160/320, B 144/4608 (kernel P1/P2)", 160, 320, 144, 4608, 288},
+        {"A 160/320, B 144/2304 (kernel P3)", 160, 320, 144, 2304, 288},
+        {"A 144/288, B 144/288", 144, 288, 144, 288, 288},
+    };
+    long long* d_cyc; int* d_err; CK(cudaMalloc(&d_cyc, 64)); CK(cudaMalloc(&d_err, 4)); CK(cudaMemset(d_err, 0, 4));
+    const size_t smem = 4 * 40960;
+    CK(cudaFuncSetAttribute(time_layout_kernel<128, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    for (const C& c : cs) {
+        time_layout_kernel<128, 64><<<1, 128, smem>>>(d_cyc, 256, 1024, c.la, c.sa, c.lb, c.sb, c.kb, d_err);
+        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        long long h[2]; CK(cudaMemcpy(h, d_cyc, 16, cudaMemcpyDeviceToHost));
+        printf("   %-40s : %7.1f cyc per K-step (%5.1f per UMMA)\n", c.name, (double)(h[1] - h[0]) / (1024 - 256), (double)(h[1] - h[0]) / (1024 - 256) / 3);
+    }
+    cudaFree(d_cyc); cudaFree(d_err);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Operand-swapped dot3 (the transposed orientation): the tensor-core A operand holds the Bt rows (the "y" operand of the
+// contract's dot3(x = A rows, y = Bt rows)), the B operand the A rows; D'[j][i] must equal the reference out[i][j].
+//   UMMA order of one K-step:  SMALL += (A'hi, B'lo) [= lo_x * hi_y];  SMALL += (A'lo, B'hi) [= hi_x * lo_y];  BIG += (A'hi, B'hi)
+// TS = 1: the A' planes live in TENSOR MEMORY (written with tcgen05.st, 128 K-columns per plane) and the UMMA reads them from
+// there; only B' goes through shared memory. Output: raw TMEM images [T][128 lanes = Bt row j][NB = A row i].
+// ------------------------------------------------------------------------------------------------
+template <int MA, int NB, int TS>
+__global__ void __launch_bounds__(128, 1) umma_swap_kernel(KParams p) {
+#ifdef HAVE_TCGEN05
+    extern __shared__ __align__(1024) unsigned char smem_raw[];
+    __shared__ uint32_t tmem_slot;
+    __shared__ __align__(8) uint64_t mbar;
+    const int tid = threadIdx.x, warp = tid >> 5, cta = blockIdx.x;
+    const int K = p.K, nks = K / 8;
+    const int KC = K < 64 ? K : 64, nch = K / KC, spc = KC / 8;
+    uint32_t* b_hi = reinterpret_cast<uint32_t*>(smem_raw);
+    uint32_t* b_lo = b_hi + NB * KC * 9 / 8;
+    uint32_t* a_hi = b_lo + NB * KC * 9 / 8;
+    uint32_t* a_lo = a_hi + MA * KC * 9 / 8;   // only when !TS
+    if (tid == 0) mbar_init(smem_u32(&mbar), 1);
+    if (warp == 0) tmem_alloc(&tmem_slot, 512);
+    tc_fence_before();
+    __syncthreads();
+    tc_fence_after();
+    const uint32_t tmem = tmem_slot;
+    const uint32_t lane_off = (uint32_t)((warp & 3) * 32) << 16;
+    constexpr uint32_t A_LO_COL = 128, BIG_COL = 256, SMALL_COL2 = 384;
+    if (TS) {   // A' (= Bt rows, 128 of them) -> TMEM: thread = lane = row; hi plane columns 0.., lo plane columns 128..
+        for (int c = 0; c < K / 8; ++c) {
+            uint32_t hv[8], lv[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) split_mode_fn(p.Bt[((size_t)cta * MA + tid) * K + 8 * c + e], 0, hv[e], lv[e]);
+            tmem_st<8>(tmem + lane_off + 8 * c, hv);
+            tmem_st<8>(tmem + lane_off + A_LO_COL + 8 * c, lv);
+        }
+        tmem_wait_st();
+        tc_fence_before();
+        __syncthreads();
+        tc_fence_after();
+    }
+    const uint32_t idesc = make_idesc(MA, NB);
+    uint32_t parity = 0;
+    for (int c = 0; c < nch; ++c) {
+        for (int which = 0; which < 2; ++which) {   // 0: B' = A rows (NB rows), 1: A' = Bt rows (MA rows), smem only if !TS
+            if (which == 1 && TS) continue;
+            const int R = which == 0 ? NB : MA;
+            uint32_t* hi = which == 0 ? b_hi : a_hi;
+            uint32_t* lo = which == 0 ? b_lo : a_lo;
+            for (int idx = tid; idx < R * KC; idx += 128) {
+                const int r = idx / KC, kk = idx % KC;
+                const int k = c * KC + kk;
+                const float x = which == 0 ? p.A[((size_t)cta * NB + r) * K + k] : p.Bt[((size_t)cta * MA + r) * K + k];
+                uint32_t h, l;
+                split_mode_fn(x, 0, h, l);
+                const uint32_t off = smem_off(2, R, KC, r, kk) >> 2;
+                hi[off] = h;
+                lo[off] = l;
+            }
+        }
+        fence_proxy_async_smem();
+        tc_fence_before();
+        __syncthreads();
+        tc_fence_after();
+        if (tid == 0) {
+            for (int sl = 0; sl < spc; ++sl) {
+                const int ks = c * spc + sl;
+                const uint32_t acc0 = ks > 0 ? 1u : 0u;
+                const uint64_t bh = make_smem_desc(smem_u32(b_hi) + sl * 288, 144, KC / 4 * 144), bl = make_smem_desc(smem_u32(b_lo) + sl * 288, 144, KC / 4 * 144);
+                if (TS) {
+                    umma_tf32_ts(tmem + SMALL_COL2, tmem + 8 * ks, bl, idesc, acc0);
+                    umma_tf32_ts(tmem + SMALL_COL2, tmem + A_LO_COL + 8 * ks, bh, idesc, 1u);
+                    umma_tf32_ts(tmem + BIG_COL, tmem + 8 * ks, bh, idesc, acc0);
+                } else {
+                    const uint64_t ah = make_smem_desc(smem_u32(a_hi) + sl * 288, 144, KC / 4 * 144), al = make_smem_desc(smem_u32(a_lo) + sl * 288, 144, KC / 4 * 144);
+                    umma_tf32(tmem + SMALL_COL2, ah, bl, idesc, acc0);
+                    umma_tf32(tmem + SMALL_COL2, al, bh, idesc, 1u);
+                    umma_tf32(tmem + BIG_COL, ah, bh, idesc, acc0);
+                }
+            }
+            umma_commit(smem_u32(&mbar));
+        }
+        uint32_t spins = 0;
+        while (!mbar_try_wait(smem_u32(&mbar), parity)) { if (++spins > (1u << 21)) { atomicAdd(p.err, 1); break; } }
+        parity ^= 1u;
+        tc_fence_after();
+        __syncthreads();
+    }
+    const int row = (warp & 3) * 32 + (tid & 31);
+    for (int c = 0; c < NB; c += 8) {
+        uint32_t b8[8], s8[8];
+        tmem_ld<8>(tmem + BIG_COL + lane_off + c, b8);
+        tmem_ld<8>(tmem + SMALL_COL2 + lane_off + c, s8);
+        tmem_wait_ld();
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const size_t o = ((size_t)cta * 128 + row) * NB + c + i;
+            p.big_o[o] = bits_f(b8[i]);
+            p.small_o[o] = bits_f(s8[i]);
+            p.out[o] = __fadd_rn(bits_f(b8[i]), bits_f(s8[i]));
+        }
+    }
+    tc_fence_before();
+    __syncthreads();
+    tc_fence_after();
+    if (warp == 0) tmem_dealloc(tmem, 512);
+#endif
+}
+
+// TS timing: back-to-back UMMAs with A from TMEM (dot3 K-step pattern: 3 UMMAs per iteration, 2 accumulators)
+template <int NB>
+__global__ void __launch_bounds__(128, 1) time_ts_kernel(long long* cyc, int iters_a, int iters_b, int ss, int* err) {
+#ifdef HAVE_TCGEN05
+    extern __shared__ __align__(1024) unsigned char smem_raw[];
+    __shared__ uint32_t tmem_slot;
+    __shared__ __align__(8) uint64_t mbar;
+    const int tid = threadIdx.x, warp = tid >> 5;
+    uint32_t* base = reinterpret_cast<uint32_t*>(smem_raw);   // b_hi, b_lo (and, for ss, a_hi, a_lo): 40 KB each
+    for (int i = tid; i < 4 * 10240; i += 128) base[i] = 0x3F800000u + (hash32(i) & 0x7FE000u);
+    if (tid == 0) mbar_init(smem_u32(&mbar), 1);
+    if (warp == 0) tmem_alloc(&tmem_slot, 512);
+    tc_fence_before();
+    __syncthreads();
+    tc_fence_after();
+    const uint32_t tmem = tmem_slot, lane_off = (uint32_t)((warp & 3) * 32) << 16;
+    {   // A' = 1.0-ish in TMEM (hi plane columns 0..63, lo plane 128..191)
+        uint32_t v8[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) v8[i] = 0x3F800000u + (hash32(tid * 8 + i) & 0x7FE000u);
+        for (int c = 0; c < 8; ++c) { tmem_st<8>(tmem + lane_off + 8 * c, v8); tmem_st<8>(tmem + lane_off + 128 + 8 * c, v8); }
+        tmem_wait_st();
+    }
+    tc_fence_before();
+    __syncthreads();
+    tc_fence_after();
+    const uint32_t idesc = make_idesc(128, NB);
+    const uint32_t b_hi = smem_u32(smem_raw), b_lo = b_hi + 40960, a_hi = b_lo + 40960, a_lo = a_hi + 40960;
+    uint32_t parity = 0;
+    long long t_done[3] = {0, 0, 0};
+    for (int rep = 0; rep < 3; ++rep) {
+        const int iters = rep == 2 ? iters_b : iters_a;
+        long long t0 = 0;
+        if (tid == 0) {
+            t0 = clock64();
+            for (int i = 0; i < iters; ++i) {
+                const uint32_t ks = (uint32_t)(i & 7);
+                const uint64_t bh = make_smem_desc(b_hi + ks * 288, 144, 2304), bl = make_smem_desc(b_lo + ks * 288, 144, 2304);
+                if (ss) {
+                    const uint64_t ah = make_smem_desc(a_hi + ks * 288, 144, 2304), al = make_smem_desc(a_lo + ks * 288, 144, 2304);
+                    umma_tf32(tmem + 384, ah, bl, idesc, 1u);
+                    umma_tf32(tmem + 384, al, bh, idesc, 1u);
+                    umma_tf32(tmem + 256, ah, bh, idesc, 1u);
+                } else {
+                    umma_tf32_ts(tmem + 384, tmem + 8 * ks, bl, idesc, 1u);
+                    umma_tf32_ts(tmem + 384, tmem + 128 + 8 * ks, bh, idesc, 1u);
+                    umma_tf32_ts(tmem + 256, tmem + 8 * ks, bh, idesc, 1u);
+                }
+            }
+            umma_commit(smem_u32(&mbar));
+        }
+        uint32_t spins = 0;
+        while (!mbar_try_wait(smem_u32(&mbar), parity)) { if (++spins > (1u << 22)) { atomicAdd(err, 1); break; } }
+        parity ^= 1u;
+        if (tid == 0) t_done[rep] = clock64() - t0;
+    }
+    if (tid == 0) { cyc[0] = t_done[1]; cyc[1] = t_done[2]; }
+    tc_fence_before();
+    __syncthreads();
+    tc_fence_after();
+    if (warp == 0) tmem_dealloc(tmem, 512);
+#endif
+}
+// issue-loop study: 3 UMMAs per iteration (dot3 K-step, M=128 N=NB, SS canonical layout) with a tcgen05.commit every `commit_every`
+// iterations (0 = only at the end) and a try_wait on an already-completed mbarrier every `wait_every` iterations (0 = never)
+template <int NB>
+__global__ void __launch_bounds__(128, 1) time_issue_kernel(long long* cyc, int iters_a, int iters_b, int commit_every, int wait_every, int* err) {
+#ifdef HAVE_TCGEN05
+    extern __shared__ __align__(1024) unsigned char smem_raw[];
+    __shared__ uint32_t tmem_slot;
+    __shared__ __align__(8) uint64_t mbar, mdone, mflag;
+    const int tid = threadIdx.x, warp = tid >> 5;
+    uint32_t* base = reinterpret_cast<uint32_t*>(smem_raw);
+    for (int i = tid; i < 4 * 10240; i += 128) base[i] = 0x3F800000u + (hash32(i) & 0x7FE000u);
+    if (tid == 0) { mbar_init(smem_u32(&mbar), 1); mbar_init(smem_u32(&mdone), 1); mbar_init(smem_u32(&mflag), 1);
+        asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(&mflag)) : "memory"); }   // mflag: phase 0 complete
+    if (warp == 0) tmem_alloc(&tmem_slot, 512);
+    fence_proxy_async_smem();
+    tc_fence_before();
+    __syncthreads();
+    tc_fence_after();
+    const uint32_t tmem = tmem_slot;
+    const uint32_t idesc = make_idesc(128, NB);
+    const uint32_t a_hi = smem_u32(smem_raw), a_lo = a_hi + 40960, b_hi = a_lo + 40960, b_lo = b_hi + 40960;
+    uint32_t parity = 0, mpar = 0;
+    long long t_done[3] = {0, 0, 0};
+    for (int rep = 0; rep < 3; ++rep) {
+        const int iters = rep == 2 ? iters_b : iters_a;
+        long long t0 = 0;
+        if (tid == 0) {
+            t0 = clock64();
+            for (int i = 0; i < iters; ++i) {
+                const uint32_t kb = (uint32_t)((i & 7) * 256);
+                if (wait_every && (i % wait_every) == 0) { uint32_t spins = 0; while (!mbar_try_wait(smem_u32(&mflag), 0)) { if (++spins > (1u << 20)) break; } }
+                const uint64_t dah = make_smem_desc(a_hi, 128, 256), dal = make_smem_desc(a_lo, 128, 256);
+                const uint64_t dbh = make_smem_desc(b_hi + kb, 128, 256), dbl = make_smem_desc(b_lo + kb, 128, 256);
+                umma_tf32(tmem + 256, dal, dbh, idesc, 1u);
+                umma_tf32(tmem + 256, dah, dbl, idesc, 1u);
+                umma_tf32(tmem, dah, dbh, idesc, 1u);
+                if (commit_every && (i % commit_every) == commit_every - 1) umma_commit(smem_u32(&mdone));
+            }
+            umma_commit(smem_u32(&mbar));
+        }
+        uint32_t spins = 0;
+        while (!mbar_try_wait(smem_u32(&mbar), parity)) { if (++spins > (1u << 22)) { atomicAdd(err, 1); break; } }
+        parity ^= 1u;
+        if (tid == 0) t_done[rep] = clock64() - t0;
+    }
+    if (tid == 0) { cyc[0] = t_done[1]; cyc[1] = t_done[2]; }
+    tc_fence_before();
+    __syncthreads();
+    tc_fence_after();
+    if (warp == 0) tmem_dealloc(tmem, 512);
+#endif
+}
 // two independent issuing threads (warp 0 and warp 1, own mbarrier, own accumulators): is the per-UMMA floor per issuer?
 // MODE 0: each issues plain UMMAs into its own accumulator; MODE 2: each issues the 3-UMMA dot3 K-step on its own BIG/SMALL pair
 template <int M, int N, int MODE>
@@ -689,7 +997,7 @@ static Out run_ref(const Tiles& t, int reverse_k = 0, int swap_small = 0) {
 template <int M, int N>
 static void launch_umma_t(const KParams& p, int ncta, int K) {
     const int KC = K < 64 ? K : 64;
-    const size_t smem = (size_t)(2 * M + 2 * N) * KC * 4;
+    const size_t smem = (size_t)(2 * M + 2 * N) * KC * 4 * 9 / 8;   // (padded layouts need 1/8 more)
     CK(cudaFuncSetAttribute(umma_kernel<M, N>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
     umma_kernel<M, N><<<ncta, 128, smem>>>(p);
 }
@@ -797,8 +1105,8 @@ static bool stage_layout() {
         Tiles t; t.T = 1; t.M = M; t.N = N; t.K = K; t.A.assign((size_t)M * K, 0.f); t.Bt.assign((size_t)N * K, 0.f);
         for (int r = 0; r < M; ++r) { t.A[(size_t)r * K + 0] = (float)(r + 1); t.A[(size_t)r * K + 1] = 1.f; }
         for (int n = 0; n < N; ++n) { t.Bt[(size_t)n * K + 0] = 1.f; t.Bt[(size_t)n * K + 1] = 1024.f * (n + 1); }
-        bool ok_mode[2] = {false, false};
-        for (int lm = 0; lm < 2; ++lm) {
+        bool ok_mode[3] = {false, false, false};
+        for (int lm = 0; lm < 3; ++lm) {
             UmmaOpts o; o.init_mode = 2; o.layout_mode = lm;
             Out raw; int nerr = 0;
             run_umma_raw(t, o, raw, &nerr);
@@ -834,6 +1142,7 @@ static bool stage_layout() {
             }
         }
         all_ok = all_ok && (ok_mode[0] || ok_mode[1]);
+        if (getenv("UMMA_FORCE_LAYOUT")) g_layout_mode = atoi(getenv("UMMA_FORCE_LAYOUT"));
     }
     LPRINTF("  selected layout_mode=%d\n", g_layout_mode);
     return all_ok;
@@ -1344,6 +1653,99 @@ static void stage_time(int clk_khz) {
     (void)clk_khz;
 }
 
+template <int NB> static void time_ts_row() {
+    long long* d_cyc; int* d_err; CK(cudaMalloc(&d_cyc, 64)); CK(cudaMalloc(&d_err, 4)); CK(cudaMemset(d_err, 0, 4));
+    CK(cudaFuncSetAttribute(time_ts_kernel<NB>, cudaFuncAttributeMaxDynamicSharedMemorySize, 4 * 40960));
+    double r[2];
+    for (int ss = 0; ss < 2; ++ss) {
+        time_ts_kernel<NB><<<1, 128, 4 * 40960>>>(d_cyc, 256, 1024, ss, d_err);
+        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        long long h[2]; CK(cudaMemcpy(h, d_cyc, 16, cudaMemcpyDeviceToHost));
+        r[ss] = (double)(h[1] - h[0]) / (1024 - 256);
+    }
+    printf("   M=128 N=%-3d | A from TMEM (TS): %6.1f cyc per dot3 K-step (%5.1f per UMMA, %5.0f MAC/clk) | A from smem (SS): %6.1f cyc per K-step (%5.1f per UMMA)\n", NB, r[0], r[0] / 3,
+           3.0 * 128 * NB * 8 / r[0], r[1], r[1] / 3);
+    cudaFree(d_cyc); cudaFree(d_err);
+}
+
+template <int MA, int NB, int TS>
+static void launch_swap_t(const KParams& p, int ncta, int K) {
+    const int KC = K < 64 ? K : 64;
+    const size_t smem = (size_t)(2 * NB + (TS ? 0 : 2 * MA)) * KC * 4 * 9 / 8 + 1024;
+    CK(cudaFuncSetAttribute(umma_swap_kernel<MA, NB, TS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    umma_swap_kernel<MA, NB, TS><<<ncta, 128, smem>>>(p);
+}
+// returns D' mapped back to the reference orientation [T][Mref = NB][Nref = MA]
+static Out run_swap(const Tiles& t, int ts) {
+    const int MA = t.N, NB = t.M;
+    DevBuf<float> dA, dB, dO, dBig, dSm; DevBuf<int> dErr;
+    dA.up(t.A); dB.up(t.Bt);
+    const size_t n = (size_t)t.T * 128 * NB;
+    dO.alloc(n); dBig.alloc(n); dSm.alloc(n); dErr.alloc(1);
+    CK(cudaMemset(dErr.p, 0, 4));
+    CK(cudaMemset(dO.p, 0xFF, n * 4)); CK(cudaMemset(dBig.p, 0xFF, n * 4)); CK(cudaMemset(dSm.p, 0xFF, n * 4));
+    KParams p; memset(&p, 0, sizeof(p));
+    p.K = t.K; p.A = dA.p; p.Bt = dB.p; p.out = dO.p; p.big_o = dBig.p; p.small_o = dSm.p; p.err = dErr.p;
+    if (MA == 128 && NB == 64) { if (ts) launch_swap_t<128, 64, 1>(p, t.T, t.K); else launch_swap_t<128, 64, 0>(p, t.T, t.K); }
+    else if (MA == 128 && NB == 128) { if (ts) launch_swap_t<128, 128, 1>(p, t.T, t.K); else launch_swap_t<128, 128, 0>(p, t.T, t.K); }
+    else if (MA == 64 && NB == 64) launch_swap_t<64, 64, 0>(p, t.T, t.K);
+    else if (MA == 64 && NB == 128) launch_swap_t<64, 128, 0>(p, t.T, t.K);
+    else { printf("unsupported swap shape\n"); exit(1); }
+    CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+    Out raw; dO.down(raw.out, n); dBig.down(raw.big, n); dSm.down(raw.small, n);
+    int e = 0; CK(cudaMemcpy(&e, dErr.p, 4, cudaMemcpyDeviceToHost));
+    if (e) printf("  [swap] TIMEOUT\n");
+    Out o; const size_t m = (size_t)t.T * NB * MA;
+    o.out.resize(m); o.big.resize(m); o.small.resize(m);
+    for (int ti = 0; ti < t.T; ++ti) for (int i = 0; i < NB; ++i) for (int j = 0; j < MA; ++j) {
+        const int lane = MA == 128 ? j : g_lane_of_row64[j];
+        const size_t src = ((size_t)ti * 128 + lane) * NB + i, dst = ((size_t)ti * NB + i) * MA + j;
+        o.out[dst] = raw.out[src]; o.big[dst] = raw.big[src]; o.small[dst] = raw.small[src];
+    }
+    cudaFree(dA.p); cudaFree(dB.p); cudaFree(dO.p); cudaFree(dBig.p); cudaFree(dSm.p); cudaFree(dErr.p);
+    return o;
+}
+static void stage_swap() {
+    printf("== swap: operand-swapped UMMA (A' = Bt rows, B' = A rows), D' transposed vs the mma.sync dot3 (reference orientation) ==\n");
+    printf("   cell = mismatching elements out/BIG/SMALL (T=8 tiles); TS = A' in tensor memory (tcgen05.st + UMMA [a_tmem])\n");
+    const int regs[] = {R_NORMAL, R_WIDE, R_CANCEL, R_USAGE_DECAY, R_ONES, R_EXACT0, R_SPARSE2, R_WIDE40, R_ZEROS, R_SMALLINT};
+    struct Cfg { int MA, NB, ts; };
+    const Cfg cfgs[] = {{128, 64, 0}, {128, 128, 0}, {64, 64, 0}, {64, 128, 0}, {128, 64, 1}, {128, 128, 1}};
+    size_t tot = 0, totn = 0;
+    for (int rg : regs) for (int K : {8, 16, 64, 128}) {
+        printf("%-12s K=%-3d", regime_name[rg], K);
+        for (const Cfg& c : cfgs) {
+            Tiles t = make_tiles(rg, 8, c.NB, c.MA, K, 7);   // M = NB rows of A, N = MA rows of Bt
+            Out ref = run_ref(t);
+            Out sw = run_swap(t, c.ts);
+            Cmp cm = compare(ref, sw, t.T, t.M, t.N);
+            printf(" | MA%-3d NB%-3d %s %zu/%zu/%zu", c.MA, c.NB, c.ts ? "TS" : "SS", cm.mo, cm.mb, cm.ms);
+            tot += cm.mo + cm.mb + cm.ms; totn += cm.n;
+            if ((cm.mo || cm.mb || cm.ms) && tot < 100000) print_first(cm, 2);
+        }
+        printf("\n");
+    }
+    printf("   TOTAL swapped-operand mismatches (out+BIG+SMALL): %zu over %zu elements per accumulator\n", tot, totn);
+}
+
+static void time_issue_study() {
+    printf("== issue-loop study: cycles per dot3 K-step (3 UMMAs, M=128, N=64 / 128) ==\n");
+    long long* d_cyc; int* d_err; CK(cudaMalloc(&d_cyc, 64)); CK(cudaMalloc(&d_err, 4)); CK(cudaMemset(d_err, 0, 4));
+    CK(cudaFuncSetAttribute(time_issue_kernel<64>, cudaFuncAttributeMaxDynamicSharedMemorySize, 4 * 40960));
+    CK(cudaFuncSetAttribute(time_issue_kernel<128>, cudaFuncAttributeMaxDynamicSharedMemorySize, 4 * 40960));
+    struct C { int commit, wait; };
+    const C cs[] = {{0, 0}, {1, 0}, {2, 0}, {4, 0}, {8, 0}, {0, 1}, {0, 2}, {1, 1}, {4, 4}};
+    for (int nb : {64, 128}) {
+        for (const C& c : cs) {
+            if (nb == 64) time_issue_kernel<64><<<1, 128, 4 * 40960>>>(d_cyc, 256, 1024, c.commit, c.wait, d_err);
+            else time_issue_kernel<128><<<1, 128, 4 * 40960>>>(d_cyc, 256, 1024, c.commit, c.wait, d_err);
+            CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+            long long h[2]; CK(cudaMemcpy(h, d_cyc, 16, cudaMemcpyDeviceToHost));
+            printf("   N=%-3d commit every %d iterations, try_wait(done barrier) every %d: %7.1f cyc per K-step\n", nb, c.commit, c.wait, (double)(h[1] - h[0]) / (1024 - 256));
+        }
+    }
+    cudaFree(d_cyc); cudaFree(d_err);
+}
 int main(int argc, char** argv) {
     std::vector<std::string> stages;
     for (int i = 1; i < argc; ++i) {
@@ -1365,6 +1767,10 @@ int main(int argc, char** argv) {
     if (want("neg")) stage_neg();
     if (want("tile")) stage_tile();
     if (want("char")) stage_char();
+    if (want("layoutstudy")) time_layout_study();
+    if (want("issuestudy")) time_issue_study();
+    if (want("swap")) stage_swap();
+    if (want("ts")) { printf("== ts timing ==\n"); time_ts_row<64>(); time_ts_row<128>(); }
     if (want("time")) stage_time(clk);
     if (want("deep")) stage_deep(24);
     if (want("m128n8")) {   // M=128 with N=8 is not a valid UMMA shape per the PTX tables (M=128: N=16..256 step 16); may fault -> run alone
