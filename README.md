@@ -114,7 +114,10 @@ flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
 sequence start, fp32 state, three-term TF32 tensor-core products). Prefill and the training forward evaluate many
 rows of it at once, decode evaluates one more row: the output and the continuation state have the **same bits**
 however the sequence is cut into calls, whatever else is in the batch, and whether it ran as prefill, decode or
-the training forward. Correctness-first v1 (no tcgen05/TMEM pipelining yet), validated on B300 (`sm_103a`) only.
+the training forward. Correctness-first v1 (no tcgen05/TMEM pipelining yet), validated on B300 (`sm_103a`) and, with the caveats of
+[docs/20261102-cfbi-design.md](docs/20261102-cfbi-design.md) section 7a, on B200, H100, A100, A10 and L40S (Ampere/Ada run the row
+engine only, and their bits differ from Hopper/Blackwell: bit equality holds within one architecture family). The first call on a
+device runs `flash_kda.cfbi.verify_hardware()`, an empirical check of the tensor-core premise.
 
 ```python
 from flash_kda.cfbi import alloc_state, prefill, decode, chunk_kda

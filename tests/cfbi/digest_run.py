@@ -2,6 +2,11 @@
 
 Run in two separate processes (tests/cfbi/test_bitwise_matrix.py::test_cross_process_digest does): the digests
 must be identical (no dependence on process state, allocator addresses, autotuning, stream timing).
+
+Digests are comparable on one GPU model only: the inputs come from ``torch.randn`` on the GPU, which is not
+bit-identical across GPU models (measured: the L40S and the H100, the A10 and the A100 produce different q/k/v/g from the
+same seed; A100 and L40S happen to agree). To compare architectures use arch_dump.py / arch_compare.py, which feed every
+machine the same CPU-generated inputs.
 """
 import hashlib
 import os

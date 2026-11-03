@@ -15,7 +15,7 @@ What is dumped (all CPU tensors, nothing is compared here):
     (the comparison is only meaningful if the inputs are bit-identical on both machines: the hashes say so).
 Primitive inputs come from numpy's PCG64 integer stream and exact float arithmetic (identical on every machine).
 The workload inputs are NOT regenerated per machine: ``torch.randn`` on the GPU is not bit-identical across GPU
-architectures (the L40S differs from the H100 in q/k/v/g), so the inputs are generated once on the CPU
+models (the L40S differs from the H100 in q/k/v/g), so the inputs are generated once on the CPU
 (``helpers.make_case(device="cpu")``) into a shared ``--inputs`` file that every machine loads; ``arch_compare.py`` still
 checks the input hashes.
 """
