@@ -143,11 +143,30 @@ recomputed forward, needs `flash-linear-attention`; `lower_bound` in `[-5, 0)` f
 [numerical contract](docs/20261102-cfbi-numerical-contract.md).
 
 ```bash
-FLASH_KDA_BUILD_EXTS=cfbi pip install -v --no-build-isolation .   # only the cfbi extension (no CUTLASS needed)
-python -m pytest tests/cfbi -q                                    # JIT-builds the extension if it is not installed
+FLASH_KDA_BUILD_EXTS=cfbi pip install -v --no-build-isolation .   # only the cfbi extensions (no CUTLASS needed)
+python -m pytest tests/cfbi -q                                    # JIT-builds the extensions if they are not installed
 CFBI_BIG=1 python -m pytest tests/cfbi -q                         # + 32K-token and N=512 runs
 python benchmarks/accuracy_cfbi.py && python benchmarks/bench_cfbi.py
 ```
+
+### The layers around the core: short conv and projections
+
+The same guarantee for the layers that feed the core (`flash_kda.cfbi.short_conv`, `flash_kda.cfbi.bi_linear`, extension
+`flash_kda_cfbi_conv_C`): the causal depthwise conv + SiLU on q/k/v is one fixed fp32 program (ascending-tap `fma` chain, SiLU from
+`ex2` / `rcp`, bf16 round-to-nearest-even; the conv state holds the last `W-1` inputs), and the projection GEMM is a fixed-K-order
+`mma.sync` kernel whose row `m` does not depend on `M` or on the other rows (cuBLAS's does). Output and state bits are identical for
+one prefill call = any cuts = `T = 1` decode = a varlen batch = the training forward.
+
+```python
+from flash_kda.cfbi import alloc_conv_state, bi_linear, short_conv
+
+q_pre = bi_linear(x, Wq)                                                  # bf16 [..., N], K % 16 == 0
+state = alloc_conv_state(N, D, W=4)                                       # bf16 [N, D, W-1], updated in place
+q = short_conv(q_pre.view(B, T, D), conv_weight, None, state, "silu")     # prefill / decode; state=None: differentiable training forward
+```
+
+Validated on B300 only. Specification, hardware-premise probes, controls (cuBLAS is not batch invariant), speed and limits:
+[docs/20261103-cfbi-conv-linear.md](docs/20261103-cfbi-conv-linear.md).
 
 ## Development
 
