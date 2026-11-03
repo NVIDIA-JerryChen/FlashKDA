@@ -52,38 +52,86 @@ def get_arch_flags():
     return flags
 
 
-ext_modules = [
-    CUDAExtension(
-        name='flash_kda_C',
-        sources=[
-            'csrc/flash_kda.cpp',
-            'csrc/smxx/fwd_launch.cu',
-        ],
-        include_dirs=[
-            os.path.join(this_dir, 'cutlass', 'include'),
-            os.path.join(this_dir, 'cutlass', 'examples', 'common'),
-            os.path.join(this_dir, 'cutlass', 'tools', 'util', 'include'),
-            os.path.join(this_dir, 'csrc'),
-        ],
-        extra_compile_args={
-            'cxx': ['-O3', '-Wno-psabi'],
-            'nvcc': [
-                '-O3',
-                '-U__CUDA_NO_HALF_OPERATORS__',
-                '-U__CUDA_NO_HALF_CONVERSIONS__',
-                '-U__CUDA_NO_HALF2_OPERATORS__',
-                '-U__CUDA_NO_BFLOAT16_CONVERSIONS__',
-                '--expt-relaxed-constexpr',
-                '--expt-extended-lambda',
-                '--use_fast_math',
-                '--ptxas-options=-v,--register-usage-level=10,--warn-on-spills',
-                '-lineinfo',
-                *get_nvcc_thread_args(),
-                *get_arch_flags(),
+# FLASH_KDA_BUILD_EXTS selects which extensions to build: "all" (default), or a
+# comma list of "master" (flash_kda_C, the CUTLASS chunk-16 kernel) and "cfbi"
+# (flash_kda_cfbi_C, the bitwise train/infer-consistent CF-BI kernels).
+_BUILD_EXTS = {
+    s.strip() for s in os.getenv("FLASH_KDA_BUILD_EXTS", "all").lower().split(",") if s.strip()
+}
+if "all" in _BUILD_EXTS:
+    _BUILD_EXTS = {"master", "cfbi"}
+_unknown = _BUILD_EXTS - {"master", "cfbi"}
+assert not _unknown, f"unknown FLASH_KDA_BUILD_EXTS entries: {sorted(_unknown)}"
+
+ext_modules = []
+
+if "master" in _BUILD_EXTS:
+    ext_modules.append(
+        CUDAExtension(
+            name='flash_kda_C',
+            sources=[
+                'csrc/flash_kda.cpp',
+                'csrc/smxx/fwd_launch.cu',
             ],
-        },
+            include_dirs=[
+                os.path.join(this_dir, 'cutlass', 'include'),
+                os.path.join(this_dir, 'cutlass', 'examples', 'common'),
+                os.path.join(this_dir, 'cutlass', 'tools', 'util', 'include'),
+                os.path.join(this_dir, 'csrc'),
+            ],
+            extra_compile_args={
+                'cxx': ['-O3', '-Wno-psabi'],
+                'nvcc': [
+                    '-O3',
+                    '-U__CUDA_NO_HALF_OPERATORS__',
+                    '-U__CUDA_NO_HALF_CONVERSIONS__',
+                    '-U__CUDA_NO_HALF2_OPERATORS__',
+                    '-U__CUDA_NO_BFLOAT16_CONVERSIONS__',
+                    '--expt-relaxed-constexpr',
+                    '--expt-extended-lambda',
+                    '--use_fast_math',
+                    '--ptxas-options=-v,--register-usage-level=10,--warn-on-spills',
+                    '-lineinfo',
+                    *get_nvcc_thread_args(),
+                    *get_arch_flags(),
+                ],
+            },
+        )
     )
-]
+
+if "cfbi" in _BUILD_EXTS:
+    # The CF-BI kernels fix the floating-point program bit for bit, so unlike
+    # flash_kda_C this extension must NOT be built with --use_fast_math (that
+    # enables FTZ, FMA contraction and approximate division/sqrt). All
+    # numerics-critical operations also use explicit intrinsics in the source;
+    # -fmad=false is a second line of defence. No CUTLASS is needed (pure PTX).
+    ext_modules.append(
+        CUDAExtension(
+            name='flash_kda_cfbi_C',
+            sources=[
+                'csrc/cfbi/cfbi_binding.cpp',
+                'csrc/cfbi/cfbi_launch.cu',
+                'csrc/cfbi/cfbi_probe.cu',
+            ],
+            include_dirs=[os.path.join(this_dir, 'csrc')],
+            extra_compile_args={
+                'cxx': ['-O3', '-Wno-psabi'],
+                'nvcc': [
+                    '-O3',
+                    '-fmad=false',
+                    '-ftz=false',
+                    '-prec-div=true',
+                    '-prec-sqrt=true',
+                    '--expt-relaxed-constexpr',
+                    '--ptxas-options=-v',
+                    '-lineinfo',
+                    *get_nvcc_thread_args(),
+                    *get_arch_flags(),
+                ],
+            },
+        )
+    )
+
 cmdclass = {"build_ext": BuildExtension}
 
 rev = os.getenv("FLASH_KDA_VERSION_SUFFIX", "")
@@ -99,7 +147,7 @@ setup(
     version='0.0.1' + rev,
     description='FlashKDA: Flash Kimi Delta Attention',
     ext_modules=ext_modules,
-    packages=['flash_kda'],
+    packages=['flash_kda', 'flash_kda.cfbi', 'flash_kda.cfbi._bwd'],
     cmdclass=cmdclass,
     zip_safe=False,
 )

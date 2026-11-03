@@ -1,5 +1,15 @@
 import torch
-from flash_kda_C import fwd as _fwd_raw, get_workspace_size
+
+# `flash_kda_C` (the CUTLASS chunk-16 kernel) is optional: the bitwise
+# train/infer-consistent kernels in `flash_kda.cfbi` live in a separate
+# extension (`flash_kda_cfbi_C`) and must stay importable without it.
+try:
+    from flash_kda_C import fwd as _fwd_raw, get_workspace_size
+    _FLASH_KDA_C_IMPORT_ERROR = None
+except ImportError as _e:  # pragma: no cover - depends on how the package was built
+    _fwd_raw = None
+    get_workspace_size = None
+    _FLASH_KDA_C_IMPORT_ERROR = _e
 
 
 def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state=None, final_state=None, cu_seqlens=None):
@@ -31,6 +41,12 @@ def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state
         * All input tensors must be CUDA, contiguous, and have the dtypes
           listed above.
     """
+    if _fwd_raw is None:
+        raise RuntimeError(
+            "flash_kda.fwd needs the `flash_kda_C` extension, which is not built/importable "
+            f"({_FLASH_KDA_C_IMPORT_ERROR}). Build it with FLASH_KDA_BUILD_EXTS=master (or all); "
+            "the bitwise-consistent kernels in `flash_kda.cfbi` do not need it."
+        )
     B, T_seq, H = q.shape[0], q.shape[1], q.shape[2]
     T_total = B * T_seq
     N = cu_seqlens.numel() - 1 if cu_seqlens is not None else B
