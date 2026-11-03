@@ -72,6 +72,9 @@ __device__ __forceinline__ void tmem_ld16(uint32_t taddr, uint32_t (&r)[16]) {
         : "r"(taddr));
 }
 
+template <int N>
+__device__ __forceinline__ void cp_async_wait_group() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
+
 // mbarrier helpers beyond cfbi_async.cuh --------------------------------------------------------------------
 __device__ __forceinline__ void mbar_arrive(uint64_t* bar) {
     asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(bar)) : "memory");

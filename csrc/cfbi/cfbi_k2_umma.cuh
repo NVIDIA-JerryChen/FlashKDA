@@ -56,10 +56,14 @@ constexpr int KU_OFF_A = KU_OFF_UL + KU_U_PLANE;
 constexpr int KU_OFF_SU = KU_OFF_A + KU_NS * KU_A_STAGE;
 constexpr int KU_OFF_SP2 = KU_OFF_SU + 64 * KU_SU * 4;
 constexpr int KU_OFF_AQ = KU_OFF_SP2 + 64 * KU_SU * 4;
-constexpr int KU_OFF_BAR = KU_OFF_AQ + KU_AQ_FLOATS * 4;
+constexpr int KU_UT_FLOATS = 4 * 1024;   // UT slice of one chunk (4 slices of 16 columns, fragment-native)
+constexpr int KU_OFF_UT = KU_OFF_AQ + KU_AQ_FLOATS * 4;
+constexpr int KU_PF = 4;                                  // prefetch depth (stages) of the transform warps
+constexpr int KU_OFF_STG = KU_OFF_UT + KU_UT_FLOATS * 4;   // fp32 fragment staging: [warp 4][slot KU_PF][frag 2][lane 32] float4
+constexpr int KU_OFF_BAR = KU_OFF_STG + 4 * KU_PF * 2 * 32 * 16;
 constexpr int KU_SMEM_BYTES = KU_OFF_BAR + 256;
 static_assert(KU_SMEM_BYTES <= 232448, "UMMA K2 shared memory");
-static_assert(KU_OFF_UH % 16 == 0 && KU_OFF_A % 16 == 0 && KU_OFF_SU % 16 == 0 && KU_OFF_AQ % 16 == 0 && KU_OFF_BAR % 8 == 0, "alignment");
+static_assert(KU_OFF_UH % 16 == 0 && KU_OFF_A % 16 == 0 && KU_OFF_SU % 16 == 0 && KU_OFF_AQ % 16 == 0 && KU_OFF_UT % 16 == 0 && KU_OFF_STG % 16 == 0 && KU_OFF_BAR % 8 == 0, "alignment");
 
 // mbarriers: BAR_FULL[s] / BAR_EMPTY[s] (A ring), then the per-chunk hand-offs
 constexpr int BAR_FULL = 0;
@@ -70,8 +74,23 @@ constexpr int BAR_P3 = BAR_EREADY + 2;      // P3 accumulators complete (tcgen05
 constexpr int BAR_UREADY = BAR_EREADY + 3;  // U (fp32 + planes) and P2 of the chunk are in smem                     -> MMA, O
 constexpr int BAR_ODONE = BAR_EREADY + 4;   // O is done reading U / P2 / U planes / AQ of the chunk                  -> epilogue
 constexpr int BAR_AQ = BAR_EREADY + 5;      // Aqk of the chunk copied into smem (bulk copy)                         -> O
-constexpr int KU_NBAR = BAR_EREADY + 6;
+constexpr int BAR_UT = BAR_EREADY + 6;      // UT slice of the chunk copied into smem (bulk copy)                    -> epilogue
+constexpr int KU_NBAR = BAR_EREADY + 7;
 static_assert(KU_NBAR * 8 <= 256, "barrier area");
+
+// Timeline instrumentation (benchmarks only): -DCFBI_UMMA_PROFILE records, for CTA (0,0,0) and chunk KU_PROF_CHUNK, the
+// clock64 cycle (relative to the start of the scan) at which each role passes the marked points into g_ku_prof; the
+// launcher prints the table after the kernel (a device printf would distort the timeline).
+#ifdef CFBI_UMMA_PROFILE
+#ifndef KU_PROF_CHUNK
+#define KU_PROF_CHUNK 6
+#endif
+// slots: MMA 0..9, T warp w: 16 + 8*w (+ event 0..5), E warp e: 48 + 8*e (+ event 0..5), O warp o: 80 + 8*o (+ event 0..2)
+__device__ long long g_ku_prof[128];
+#define KU_PS(slot, lcv) do { if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && (lcv) == KU_PROF_CHUNK && lane == 0) g_ku_prof[slot] = clock64() - prof_t0; } while (0)
+#else
+#define KU_PS(slot, lcv) do {} while (0)
+#endif
 
 // tensor-memory columns (allocation: 256)
 constexpr int TM_BIG12 = 0, TM_SMALL12 = 64, TM_BIG3 = 128, TM_SMALL3 = 192, TM_COLS = 256;
@@ -132,6 +151,7 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
     float* sU = reinterpret_cast<float*>(smem_raw + KU_OFF_SU);
     float* sP2 = reinterpret_cast<float*>(smem_raw + KU_OFF_SP2);
     float* sAQ = reinterpret_cast<float*>(smem_raw + KU_OFF_AQ);
+    float* sUT = reinterpret_cast<float*>(smem_raw + KU_OFF_UT);
     uint32_t* ehi = reinterpret_cast<uint32_t*>(smem_raw + KU_OFF_EH);
     uint32_t* elo = reinterpret_cast<uint32_t*>(smem_raw + KU_OFF_EL);
     uint32_t* uhi = reinterpret_cast<uint32_t*>(smem_raw + KU_OFF_UH);
@@ -140,15 +160,16 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
     if (tid == 0) {
 #pragma unroll
         for (int s = 0; s < KU_NS; ++s) {
-            mbar_init(&bar[BAR_FULL + s], 128);
+            mbar_init(&bar[BAR_FULL + s], 4);   // one arrival per transform warp
             mbar_init(&bar[BAR_EMPTY + s], 1);
         }
-        mbar_init(&bar[BAR_EREADY], 128);
+        mbar_init(&bar[BAR_EREADY], 4);     // one arrival per epilogue warp
         mbar_init(&bar[BAR_P12], 1);
         mbar_init(&bar[BAR_P3], 1);
-        mbar_init(&bar[BAR_UREADY], 128);
-        mbar_init(&bar[BAR_ODONE], 128);
+        mbar_init(&bar[BAR_UREADY], 4);
+        mbar_init(&bar[BAR_ODONE], 4);      // one arrival per O warp
         mbar_init(&bar[BAR_AQ], 1);
+        mbar_init(&bar[BAR_UT], 1);
         mbar_init_fence();
     }
     if (warp == 0) tmem_alloc(&tmem_slot, TM_COLS);
@@ -156,31 +177,48 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
     __syncthreads();
     tc_fence_after();
     const uint32_t tmem = tmem_slot;
+#ifdef CFBI_UMMA_PROFILE
+    const long long prof_t0 = clock64();
+#endif
 
     auto issue_aq = [&](int lc) {   // one thread: Aqk fragments + diagonal blocks of chunk lc -> sAQ
         fence_proxy_async_smem();
         mbar_arrive_expect_tx(&bar[BAR_AQ], KU_AQ_FLOATS * 4);
         bulk_g2s(sAQ, ws_chunk(lc) + WS2_AQF, KU_AQ_FLOATS * 4, &bar[BAR_AQ]);
     };
-    if (tid == 0) issue_aq(0);
+    auto issue_ut = [&](int lc) {   // one thread: the UT slice (4 x 1024 floats, contiguous in the workspace) of chunk lc -> sUT
+        fence_proxy_async_smem();
+        mbar_arrive_expect_tx(&bar[BAR_UT], KU_UT_FLOATS * 4);
+        bulk_g2s(sUT, ws_chunk(lc) + WS2_UT + vs * KU_UT_FLOATS, KU_UT_FLOATS * 4, &bar[BAR_UT]);
+    };
+    if (tid == 0) { issue_aq(0); issue_ut(0); }
 
     if (warp == 0) {
         // =============================== MMA issuer =====================================================
         if (lane == 0) {
             const uint32_t idesc = make_idesc(128, KU_BV);
+            // descriptor = (hi32 << 32) | ((start >> 4) + lo_const): LBO in bits 16.., SBO in bits 32.., version 1 in bit 46
+            constexpr uint32_t A_LO = (KU_A_LBO >> 4) << 16, A_HI = (KU_A_SBO >> 4) | (1u << 14);
+            constexpr uint32_t E_LO = (KU_EPITCH >> 4) << 16, E_HI = (KU_E_SBO >> 4) | (1u << 14), U_HI = (KU_U_SBO >> 4) | (1u << 14);
+            auto desc = [](uint32_t addr, uint32_t lo, uint32_t hi) { return ((uint64_t)hi << 32) | (uint64_t)((addr >> 4) + lo); };
+            const uint32_t a_base = smem_u32(smem_raw + KU_OFF_A), eh_base = smem_u32(smem_raw + KU_OFF_EH), el_base = smem_u32(smem_raw + KU_OFF_EL);
+            const uint32_t uh_base = smem_u32(smem_raw + KU_OFF_UH), ul_base = smem_u32(smem_raw + KU_OFF_UL);
             int i = 0;   // global A-stage counter (same sequence as the transform warps)
             for (int lc = 0; lc < nch; ++lc) {
                 const bool full = lc < nfull;
+                KU_PS(0, lc);
                 mbar_wait_bounded(&bar[BAR_EREADY], lc & 1, 1);
                 tc_fence_after();
+                KU_PS(1, lc);
                 for (int ks = 0; ks < 16; ++ks, ++i) {   // P1/P2: A = [W;GQ] stage (hi, lo), B = E planes k-step ks
                     const int s = i % KU_NS;
                     mbar_wait_bounded(&bar[BAR_FULL + s], (i / KU_NS) & 1, 2);
-                    tc_fence_after();
-                    const uint32_t ab = smem_u32(smem_raw + KU_OFF_A + s * KU_A_STAGE);
-                    const uint64_t ah = make_smem_desc(ab, KU_A_LBO, KU_A_SBO), al = make_smem_desc(ab + KU_A_PLANE, KU_A_LBO, KU_A_SBO);
-                    const uint64_t bh = make_smem_desc(smem_u32(smem_raw + KU_OFF_EH) + ks * 2 * KU_EPITCH, KU_EPITCH, KU_E_SBO);
-                    const uint64_t bl = make_smem_desc(smem_u32(smem_raw + KU_OFF_EL) + ks * 2 * KU_EPITCH, KU_EPITCH, KU_E_SBO);
+                    if (ks == 0) KU_PS(2, lc);
+                    if (ks == 5) KU_PS(7, lc);
+                    if (ks == 9) KU_PS(14, lc);
+                    const uint32_t ab = a_base + s * KU_A_STAGE;
+                    const uint64_t ah = desc(ab, A_LO, A_HI), al = desc(ab + KU_A_PLANE, A_LO, A_HI);
+                    const uint64_t bh = desc(eh_base + ks * 2 * KU_EPITCH, E_LO, E_HI), bl = desc(el_base + ks * 2 * KU_EPITCH, E_LO, E_HI);
                     const uint32_t acc0 = ks > 0 ? 1u : 0u;
 #ifdef CFBI_UMMA_NEG_NOLO   // negative control (tests only): a wrong program must be caught by the bitwise tests
                     umma_tf32(tmem + TM_SMALL12, ah, bl, idesc, acc0);
@@ -189,20 +227,24 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
                     umma_tf32(tmem + TM_SMALL12, ah, bl, idesc, 1u);
 #endif
                     umma_tf32(tmem + TM_BIG12, ah, bh, idesc, acc0);
+                    if (ks == 5) KU_PS(8, lc);
                     umma_commit(&bar[BAR_EMPTY + s]);
+                    if (ks == 5) KU_PS(9, lc);
+                    if (ks == 9) KU_PS(15, lc);
+                    if (ks == 15) KU_PS(3, lc);
                 }
                 umma_commit(&bar[BAR_P12]);
+                KU_PS(4, lc);
                 if (full) {
                     mbar_wait_bounded(&bar[BAR_UREADY], lc & 1, 3);
                     tc_fence_after();
+                    KU_PS(5, lc);
                     for (int ks = 0; ks < 8; ++ks, ++i) {   // P3: A = KD stage, B = U planes k-step ks
                         const int s = i % KU_NS;
                         mbar_wait_bounded(&bar[BAR_FULL + s], (i / KU_NS) & 1, 4);
-                        tc_fence_after();
-                        const uint32_t ab = smem_u32(smem_raw + KU_OFF_A + s * KU_A_STAGE);
-                        const uint64_t ah = make_smem_desc(ab, KU_A_LBO, KU_A_SBO), al = make_smem_desc(ab + KU_A_PLANE, KU_A_LBO, KU_A_SBO);
-                        const uint64_t bh = make_smem_desc(smem_u32(smem_raw + KU_OFF_UH) + ks * 2 * KU_EPITCH, KU_EPITCH, KU_U_SBO);
-                        const uint64_t bl = make_smem_desc(smem_u32(smem_raw + KU_OFF_UL) + ks * 2 * KU_EPITCH, KU_EPITCH, KU_U_SBO);
+                        const uint32_t ab = a_base + s * KU_A_STAGE;
+                        const uint64_t ah = desc(ab, A_LO, A_HI), al = desc(ab + KU_A_PLANE, A_LO, A_HI);
+                        const uint64_t bh = desc(uh_base + ks * 2 * KU_EPITCH, E_LO, U_HI), bl = desc(ul_base + ks * 2 * KU_EPITCH, E_LO, U_HI);
                         const uint32_t acc0 = ks > 0 ? 1u : 0u;
 #ifdef CFBI_UMMA_NEG_NOLO
                         umma_tf32(tmem + TM_SMALL3, ah, bl, idesc, acc0);
@@ -214,6 +256,7 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
                         umma_commit(&bar[BAR_EMPTY + s]);
                     }
                     umma_commit(&bar[BAR_P3]);
+                    KU_PS(6, lc);
                 }
             }
         }
@@ -222,66 +265,74 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
         // =============================== transform warps ================================================
         const int w = warp - 1;
         const int total = 24 * nfull + (sp.tail > 0 ? 16 : 0);   // A stages of the whole call: per full chunk 16 (W|GQ) + 8 (KD)
-        constexpr int PF = 4;
-        float4 pre[PF][2];
-        auto load_stage = [&](int i, float4 (&dst)[2]) {
-            const int lcs = (i < 24 * nfull) ? i / 24 : nfull;
-            const int j = i - 24 * lcs;
-            const float* wsb = ws_chunk(lcs);
-            const float* p0;
-            const float* p1;
-            if (j < 16) {
-                p0 = wsb + WS2_W + ((w * 16 + j) * 32 + lane) * 4;
-                p1 = wsb + WS2_GQ + ((w * 16 + j) * 32 + lane) * 4;
-            } else {
-                const int ks = j - 16;
-                p0 = wsb + WS2_KD + ((w * 8 + ks) * 32 + lane) * 4;
-                p1 = wsb + WS2_KD + (((w + 4) * 8 + ks) * 32 + lane) * 4;
+        // The fp32 fragments are fetched with cp.async into a lane-private smem staging slot (each lane reads back exactly
+        // what it copied): register prefetch loads would be waited for by the MEMBAR of every fence.proxy.async below.
+        float4* stg = reinterpret_cast<float4*>(smem_raw + KU_OFF_STG) + w * (KU_PF * 64);
+        auto issue_stage = [&](int i) {
+            if (i < total) {
+                const int lcs = (i < 24 * nfull) ? i / 24 : nfull;
+                const int j = i - 24 * lcs;
+                const float* wsb = ws_chunk(lcs);
+                const float* p0;
+                const float* p1;
+                if (j < 16) {
+                    p0 = wsb + WS2_W + ((w * 16 + j) * 32 + lane) * 4;
+                    p1 = wsb + WS2_GQ + ((w * 16 + j) * 32 + lane) * 4;
+                } else {
+                    const int ks = j - 16;
+                    p0 = wsb + WS2_KD + ((w * 8 + ks) * 32 + lane) * 4;
+                    p1 = wsb + WS2_KD + (((w + 4) * 8 + ks) * 32 + lane) * 4;
+                }
+                float4* d = stg + (i % KU_PF) * 64 + lane;
+                cp_async_16(d, p0);
+                cp_async_16(d + 32, p1);
             }
-            dst[0] = __ldcg(reinterpret_cast<const float4*>(p0));
-            dst[1] = __ldcg(reinterpret_cast<const float4*>(p1));
+            cp_async_commit();   // one (possibly empty) group per stage keeps the wait_group arithmetic uniform
         };
 #pragma unroll
-        for (int q = 0; q < PF; ++q)
-            if (q < total) load_stage(q, pre[q]);
-        for (int i0 = 0; i0 < total; i0 += PF) {
-#pragma unroll
-            for (int q = 0; q < PF; ++q) {
-                const int i = i0 + q;
-                if (i < total) {
-                    float4 f0 = pre[q][0], f1 = pre[q][1];
-                    if (i + PF < total) load_stage(i + PF, pre[q]);
-                    const int s = i % KU_NS;
-                    mbar_wait_bounded(&bar[BAR_EMPTY + s], ((i / KU_NS) & 1) ^ 1, 10);
-                    const int lcs = (i < 24 * nfull) ? i / 24 : nfull;
-                    const int j = i - 24 * lcs;
-                    if (j < 16 && lcs >= nfull && w >= (sp.tail + 15) / 16) {   // rows of sub-blocks past the tail: exact zeros
-                        f0 = make_float4(0.f, 0.f, 0.f, 0.f);
-                        f1 = f0;
-                    }
-                    uint32_t* hi = reinterpret_cast<uint32_t*>(smem_raw + KU_OFF_A + s * KU_A_STAGE);
-                    uint32_t* lo = hi + KU_A_PLANE / 4;
-                    // fragment (lane = 4g + t) of a 16x8 tile at row groups gi0, gi0+1: x = (g, k=t), y = (g+8, t), z = (g, t+4), w = (g+8, t+4);
-                    // every store instruction writes one whole 128-byte core matrix (lane = word)
-                    auto put = [&](float x, int word) {
-                        uint32_t hh, ll;
-                        split_tf32(x, hh, ll);
-                        hi[word + lane] = hh;
-                        lo[word + lane] = ll;
-                    };
-                    const int gA = 2 * w, gB = 8 + 2 * w;   // row groups of the first / second 16-row tile of this warp
-                    put(f0.x, gA * 80);
-                    put(f0.y, (gA + 1) * 80);
-                    put(f0.z, gA * 80 + 40);
-                    put(f0.w, (gA + 1) * 80 + 40);
-                    put(f1.x, gB * 80);
-                    put(f1.y, (gB + 1) * 80);
-                    put(f1.z, gB * 80 + 40);
-                    put(f1.w, (gB + 1) * 80 + 40);
-                    fence_proxy_async_smem();
-                    mbar_arrive(&bar[BAR_FULL + s]);
-                }
+        for (int q = 0; q < KU_PF; ++q) issue_stage(q);
+        for (int i = 0; i < total; ++i) {
+            cp_async_wait_group<KU_PF - 1>();   // the fragments of stage i are in the staging slot
+            const float4* sd = stg + (i % KU_PF) * 64 + lane;
+            float4 f0 = sd[0], f1 = sd[32];
+            asm volatile("" ::"f"(f0.x), "f"(f0.y), "f"(f0.z), "f"(f0.w), "f"(f1.x), "f"(f1.y), "f"(f1.z), "f"(f1.w) : "memory");
+            issue_stage(i + KU_PF);   // refill the slot just read
+            const int s = i % KU_NS;
+            mbar_wait_bounded(&bar[BAR_EMPTY + s], ((i / KU_NS) & 1) ^ 1, 10);
+            const int lcs = (i < 24 * nfull) ? i / 24 : nfull;
+            const int j = i - 24 * lcs;
+            if (j == 0) KU_PS(16 + 8 * w + 0, lcs);
+            if (j == 15) KU_PS(16 + 8 * w + 2, lcs);
+            if (j == 23) KU_PS(16 + 8 * w + 4, lcs);
+            if (j < 16 && lcs >= nfull && w >= (sp.tail + 15) / 16) {   // rows of sub-blocks past the tail: exact zeros
+                f0 = make_float4(0.f, 0.f, 0.f, 0.f);
+                f1 = f0;
             }
+            uint32_t* hi = reinterpret_cast<uint32_t*>(smem_raw + KU_OFF_A + s * KU_A_STAGE);
+            uint32_t* lo = hi + KU_A_PLANE / 4;
+            // fragment (lane = 4g + t) of a 16x8 tile at row groups gi0, gi0+1: x = (g, k=t), y = (g+8, t), z = (g, t+4), w = (g+8, t+4);
+            // every store instruction writes one whole 128-byte core matrix (lane = word)
+            auto put = [&](float x, int word) {
+                uint32_t hh, ll;
+                split_tf32(x, hh, ll);
+                hi[word + lane] = hh;
+                lo[word + lane] = ll;
+            };
+            const int gA = 2 * w, gB = 8 + 2 * w;   // row groups of the first / second 16-row tile of this warp
+            put(f0.x, gA * 80);
+            put(f0.y, (gA + 1) * 80);
+            put(f0.z, gA * 80 + 40);
+            put(f0.w, (gA + 1) * 80 + 40);
+            put(f1.x, gB * 80);
+            put(f1.y, (gB + 1) * 80);
+            put(f1.z, gB * 80 + 40);
+            put(f1.w, (gB + 1) * 80 + 40);
+            fence_proxy_async_smem();
+            __syncwarp();
+            if (lane == 0) mbar_arrive(&bar[BAR_FULL + s]);
+            if (j == 0) KU_PS(16 + 8 * w + 1, lcs);
+            if (j == 15) KU_PS(16 + 8 * w + 3, lcs);
+            if (j == 23) KU_PS(16 + 8 * w + 5, lcs);
         }
     } else if (warp <= 8) {
         // =============================== epilogue warps (thread = TMEM lane) ============================
@@ -300,7 +351,8 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
             elo[ku_eword(v, r)] = ll;
         }
         fence_proxy_async_smem();
-        mbar_arrive(&bar[BAR_EREADY]);
+        __syncwarp();
+        if (lane == 0) mbar_arrive(&bar[BAR_EREADY]);
 
         const int rt = r >> 4, gg = r & 7, hb = (r >> 3) & 1;
         const int ut_row = rt * 256 + gg * 16 + 2 * hb;   // offset of UT[r][v] inside the (slice-sliced) fragment-native UT block
@@ -308,11 +360,14 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
             const bool full = lc < nfull;
             const int valid = full ? BT : sp.tail;
             const float* wsb = ws_chunk(lc);
-            const float* utp = wsb + WS2_UT + vs * 4096 + ut_row;
             const float gend_k = full ? __ldcg(&wsb[WS2_GEND + r]) : 0.f;
+            KU_PS(48 + 8 * (warp - 5) + 0, lc);
             if (lc > 0) mbar_wait_bounded(&bar[BAR_ODONE], (lc - 1) & 1, 20);   // O of the previous chunk is done with sU / sP2 / U planes
+            KU_PS(48 + 8 * (warp - 5) + 1, lc);
+            if (r < 64) mbar_wait_bounded(&bar[BAR_UT], lc & 1, 23);
             mbar_wait_bounded(&bar[BAR_P12], lc & 1, 21);
             tc_fence_after();
+            KU_PS(48 + 8 * (warp - 5) + 2, lc);
             // ---- epilogue 1: P1 rows (lane < 64): U = UT - P1; P2 rows: keep P2 -------------------------------------
 #pragma unroll
             for (int c = 0; c < 4; ++c) {
@@ -321,7 +376,7 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
 #pragma unroll
                     for (int i = 0; i < 16; ++i) {
                         const int v = 16 * c + i;
-                        utv[i] = __ldcg(utp + (v >> 4) * 1024 + ((v >> 3) & 1) * 128 + ((v >> 1) & 3) * 4 + (v & 1));
+                        utv[i] = sUT[ut_row + (v >> 4) * 1024 + ((v >> 3) & 1) * 128 + ((v >> 1) & 3) * 4 + (v & 1)];
                     }
                 }
                 uint32_t bg[16], sm[16];
@@ -348,13 +403,20 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
                         sP2[(r - 64) * KU_SU + 16 * c + i] = fadd(__uint_as_float(bg[i]), __uint_as_float(sm[i]));
                 }
             }
+            if (r < 64) {   // both P1-row warps are done with sUT: fetch the next chunk's UT slice
+                asm volatile("bar.sync 1, 64;" ::: "memory");
+                if (r == 0 && lc + 1 < nch) issue_ut(lc + 1);
+            }
             fence_proxy_async_smem();
             tc_fence_before();
-            mbar_arrive(&bar[BAR_UREADY]);
+            __syncwarp();
+            if (lane == 0) mbar_arrive(&bar[BAR_UREADY]);
+            KU_PS(48 + 8 * (warp - 5) + 3, lc);
             // ---- epilogue 2 (full chunks): E' = E*GEND + P3, new B planes ----------------------------------------------
             if (full) {
                 mbar_wait_bounded(&bar[BAR_P3], lc & 1, 22);
                 tc_fence_after();
+                KU_PS(48 + 8 * (warp - 5) + 4, lc);
 #pragma unroll
                 for (int c = 0; c < 4; ++c) {
                     uint32_t bg[16], sm[16];
@@ -374,7 +436,9 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
                 }
                 fence_proxy_async_smem();
                 tc_fence_before();
-                mbar_arrive(&bar[BAR_EREADY]);
+                __syncwarp();
+                if (lane == 0) mbar_arrive(&bar[BAR_EREADY]);
+                KU_PS(48 + 8 * (warp - 5) + 5, lc);
             }
         }
         if (Eg != nullptr) {
@@ -392,8 +456,10 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
             const int nsb = (valid + SBR - 1) / SBR;
             const int64_t tok0 = (int64_t)sp.tok0 + sp.hrows + (int64_t)BT * lc;
             if (s < nsb) {
+                KU_PS(80 + 8 * (warp - 9) + 0, lc);
                 mbar_wait_bounded(&bar[BAR_AQ], lc & 1, 30);
                 mbar_wait_bounded(&bar[BAR_UREADY], lc & 1, 31);
+                KU_PS(80 + 8 * (warp - 9) + 1, lc);
                 const float* aqd = sAQ + 12 * 128 + s * 272;
 #pragma unroll
                 for (int pass = 0; pass < 2; ++pass) {   // two passes of 4 eight-column tiles (register budget)
@@ -452,7 +518,9 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
                     }
                 }
             }
-            mbar_arrive(&bar[BAR_ODONE]);
+            KU_PS(80 + 8 * (warp - 9) + 2, lc);
+            __syncwarp();
+            if (lane == 0) mbar_arrive(&bar[BAR_ODONE]);
             if (otid == 0 && lc + 1 < nch) {   // sAQ is free once every O thread has arrived: fetch the next chunk's Aqk
                 mbar_wait_bounded(&bar[BAR_ODONE], lc & 1, 32);
                 issue_aq(lc + 1);

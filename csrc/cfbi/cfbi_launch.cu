@@ -54,6 +54,22 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
             if (a.impl & IMPL_K2_UMMA) {
                 cudaFuncSetAttribute(k2u_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, KU_SMEM_BYTES);
                 k2u_kernel<<<dim3(KU_NSLICE, a.N, a.H), KU_THREADS, KU_SMEM_BYTES, stream>>>(p);
+#ifdef CFBI_UMMA_PROFILE
+                {
+                    cudaStreamSynchronize(stream);
+                    long long t[128];
+                    cudaMemcpyFromSymbol(t, g_ku_prof, sizeof(t));
+                    printf("PROF chunk %d (CTA 0,0,0), cycles since scan start\n", KU_PROF_CHUNK);
+                    printf("PROF mma : start %lld eready %lld full_k0 %lld full_k15 %lld p12_issued %lld uready %lld p3_issued %lld | k5: full_ok %lld umma3_issued %lld commit_done %lld | T0 j5: empty_ok %lld full %lld | T0 j9: empty_ok %lld full %lld | k9: full_ok %lld commit_done %lld\n", t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[12], t[13], t[10], t[11], t[14], t[15]);
+                    for (int w = 0; w < 4; ++w)
+                        printf("PROF T%d  : empty_j0 %lld full_j0 %lld empty_j15 %lld full_j15 %lld empty_j23 %lld full_j23 %lld\n", w, t[16 + 8 * w], t[17 + 8 * w], t[18 + 8 * w], t[19 + 8 * w], t[20 + 8 * w], t[21 + 8 * w]);
+                    for (int e = 0; e < 4; ++e)
+                        printf("PROF E%d  : start %lld odone_ok %lld p12_ok %lld epi1_done %lld p3_ok %lld epi2_done %lld\n", e, t[48 + 8 * e], t[49 + 8 * e], t[50 + 8 * e], t[51 + 8 * e], t[52 + 8 * e], t[53 + 8 * e]);
+                    for (int o = 0; o < 4; ++o)
+                        printf("PROF O%d  : start %lld ur_ok %lld end %lld\n", o, t[80 + 8 * o], t[81 + 8 * o], t[82 + 8 * o]);
+                    fflush(stdout);
+                }
+#endif
             } else {
                 cudaFuncSetAttribute(k2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, K2_SMEM_BYTES);
                 k2_kernel<<<dim3(K2_NSLICE, a.N, a.H), NTHREADS, K2_SMEM_BYTES, stream>>>(p);
