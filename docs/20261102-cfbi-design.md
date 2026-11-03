@@ -7,7 +7,9 @@ the kernels, how the pieces fit, what was verified and what it costs. Status: v1
 implementation (validated on B300, `sm_103a`); **the kernels were optimised afterwards without changing a bit of their
 results, see [20261103-cfbi-perf.md](20261103-cfbi-perf.md)** (sections 3 and 6-7 below describe the v1 structure and
 numbers; the v1 kernels live on as the bitwise reference in `csrc/cfbi/ref/`). Added since: `slot_ids` state pools,
-context-parallel prefill (`prefill_k1`/`prefill_k2`/`cp_prefill`).
+context-parallel prefill (`prefill_k1`/`prefill_k2`/`cp_prefill`). Section 7a lists what was measured on other
+architectures (H100, A100, A10, L40S, ...; read it before relying on them: Ampere/Ada run only the row engine, and
+Hopper's bits differ from Ampere's).
 
 ## 1. What you get
 
@@ -29,8 +31,11 @@ y = chunk_kda(q, k, v, g, beta, scale, A_log, dt_bias, lower_bound, cu_seqlens) 
 
 Argument names, dtypes and shapes follow `flash_kda.fwd` (`q,k,v,g` bf16 `[B,T,H,128]`, `beta` bf16 raw logits,
 `A_log` fp32 `[H]`, `dt_bias` fp32 `[H,128]`, `lower_bound` in `[-5,0]`, `cu_seqlens` int64 with `B == 1`; without
-`cu_seqlens` every batch entry is one sequence). K = V = 128. `FLASH_KDA_CFBI_ALLOW_UNVALIDATED_ARCH=1` is needed on
-devices below compute capability 10.0.
+`cu_seqlens` every batch entry is one sequence). K = V = 128. The first call on a device runs
+`flash_kda.cfbi.verify_hardware()` (about 0.3 s, cached per device and process): an empirical check of the tensor-core
+premise of section 2 on that very device; the entry points raise if it fails. `FLASH_KDA_CFBI_SKIP_VERIFY=1` skips the
+check, `FLASH_KDA_CFBI_ALLOW_UNVALIDATED_ARCH=1` runs it but only warns on failure. (It must not be the first cfbi call
+inside a CUDA graph capture: call it once beforehand.)
 
 ## 2. The idea in one page
 
@@ -185,21 +190,121 @@ ones (different hardware, so indicative only) that loss cannot be extrapolated f
   was the plan, but the symbol-level import closure measured ~10k lines in 28 files (CP code, `gla/chunk.py`,
   `fla.utils`/`fla.backends`), so the plan's fallback is used. Constraints: K=V=128, `lower_bound` in `[-5, 0)` for
   gradients, empty initial state (no `dh0`), no context parallelism.
-- **Scope**: validated on B300 only (the guard needs compute capability >= 10 unless overridden); no context parallelism,
+- **Scope**: validated on B300, and on the other architectures of section 7a to the extent stated there (the guard is
+  now the empirical `verify_hardware()`, not a capability test); no context parallelism,
   no conv/projection/gated-norm alignment (only the KDA core is covered); no `slot_ids` state-pool indirection (gather the
   active sequences' state yourself, as the scheduler test does); per-call workspace as in section 3; token count < 2^31,
   `N`, `H` < 65536.
 - **Unmeasured**: the effect on model quality, and the gate/beta distributions of real checkpoints (all data here is
   synthetic).
 - **Bit equality is relative to one GPU architecture and one compiler build**: nothing here promises equality across
-  architectures, nvcc versions or other KDA implementations.
+  architectures, nvcc versions or other KDA implementations. Measured, not assumed (section 7a): Hopper and
+  Ampere/Ada give different bits for the same inputs (the tensor-core product differs, the `ex2/rcp/rsqrt.approx`
+  instructions do not).
+
+## 7a. Other GPU architectures (measured 2026-11-03)
+
+v1 was written and validated on one B300. This section records what was measured on other GPUs afterwards and what had to
+change for it. Setup: cluster `sc`, one GPU per run, the same NGC `pytorch:26.08-py3` container on every machine (nvcc 13.4,
+torch 2.14, driver 615.71), JIT build of the extension for the device's own arch (`sm_90a`, `sm_100a`, ...). Raw logs, dumps and
+the node scripts are in `/home/scratch.jennym_gpu/consist-kda/arch-test/` (outside the repo); `tests/cfbi/arch_dump.py` /
+`arch_compare.py` are in it. The B300 ran on aws-pdx (driver 580.126.09, same image), all others on `sc`.
+
+**Build.** Before this change the extension did not compile for sm_80: ptxas rejects `cp.async.bulk`,
+`mbarrier.arrive.expect_tx`, `mbarrier.try_wait`, `fence.proxy.async` and the cluster-scope mbarrier fence below sm_90 (all of
+them live in `cfbi_async.cuh` and are used only by the optimised K2). They now compile to a trap for `__CUDA_ARCH__ < 900`
+and the launcher never selects such a kernel there. One nvcc run builds all of sm_80 / 86 / 89 / 90a / 100a / 103a / 120a
+(`FLASH_KDA_CFBI_ARCH="8.0;8.6;8.9;9.0a;10.0a;10.3a;12.0a"`, 51 s on a 32-core node; `FLASH_KDA_CUDA_ARCHS=all` of `setup.py`
+now includes 80/86/89 for this extension; flags unchanged: `-fmad=false`, no fast math). The arithmetic is untouched: `cuobjdump -sass` of all
+11 kernels (probes, plan, row engines, K1, K2, reference and optimised) is instruction-for-instruction identical to the base
+commit a7e66c2 for sm_90a, sm_100a and sm_103a (40,591 / 35,279 / 35,279 SASS lines); the H100 digest is the same before and
+after (7078397d...); sm_90 and sm_90a builds give the same bits. One binary
+built once for `8.0;8.6;8.9;9.0a;10.0a;10.3a` (a `;`-separated `FLASH_KDA_CFBI_ARCH`, or the `setup.py` build
+`FLASH_KDA_BUILD_EXTS=cfbi FLASH_KDA_CUDA_ARCHS=all`: 23 MB, SASS for 80/86/89/90a/100a/103a/120a) loads on the H100, A100, A10,
+L40S and B200 (the `setup.py` module: H100, A100, B200, B300), passes `test_arch` + `test_mma_probe` there (41 tests) and reproduces
+each device's own-build dump bit for bit; the launcher picks the kernels per device at run time.
+
+**Which kernels run where** (`resolve_impl` in `csrc/cfbi/cfbi_launch.cu`, reported by `verify_hardware()["kernels"]`; an
+explicit `_impl` is honoured where possible):
+
+| device class | shared memory opt-in per block | what runs |
+|---|---|---|
+| sm_90a, sm_100a, sm_103a | 227 KiB | optimised K1/K2/row engine (`_impl=0`), reference kernels (`_impl=3`), row engine only (`_impl=7`) |
+| sm_80 | 163 KiB | reference **row engine for every row** (no K1/K2) |
+| sm_86, sm_89 (and sm_120, not run) | 99 KiB | same |
+
+K1 needs 204 KiB (optimised) / 218 KiB (reference) of dynamic shared memory per CTA, so neither fits an Ampere/Ada SM: prefill
+and the training forward there run `mode 1` (every row through the row engine, `_impl` bit 2), which evaluates the same program
+row by row (bit-identical to K1/K2 on every device where both can run, see `test_vs_ref`, `test_row_engine_equals_chunk_kernels`,
+`test_arch.py::test_every_impl_value_is_accepted_and_same_bits`). The stateless training forward allocates a zeroed temporary
+state, N x H x 224 KiB. Cost, B=1 / T=4096 / H=6 prefill (event time; B300 chunk kernels: 3.7 ms at L=8192): H100 optimised kernels 0.34 ms, reference chunk kernels 1.90 ms,
+row engine only 115 ms (60x / 340x slower); B200 0.30 / 1.63 / 111 ms; B300 0.30 / 1.59 / 108 ms; row engine only on Ampere/Ada: A100 155 ms, A10 144 ms,
+L40S 106 ms (26-38 us per token, all heads in parallel). Decode, N=16 / H=12, one token: 34 us optimised and 49 us reference on
+the H100, 61 / 124 / 41 us on A100 / A10 / L40S (the row engine is the decode kernel anyway). This is a correctness fallback for
+prefill and the training forward, not a performance path.
+
+**Premise and schedule independence.** "Validated" below means: the premise probe and the schedule matrix pass on that device with
+their negative controls intact (`test_negative_control_k_order_matters` and the battery's own control: reversed K order differs in 91-96 % of the tiles;
+`test_negative_control_is_caught`: a sabotaged fma is caught). Counts are passed tests per file (default `FLASH_KDA_CFBI_IMPL=0`);
+every row except B300 also ran the BIG variant (`CFBI_BIG=1`: 32K tokens whole / random cuts / 32805 decode calls, N=512; 28 matrix tests).
+
+| GPU | sm | kernels | probe (`test_mma_probe` 27, `test_prep_probe` 13) | `verify_hardware()` | `test_kernels` 68 + `test_bitwise_matrix` 25 (+3 BIG) + `test_arch` 14 | `test_vs_ref` 71 |
+|---|---|---|---|---|---|---|
+| B300 SXM6 AC (aws-pdx, driver 580; also 147 tests on 2026-11-02) | 103a | optimised / reference / rows-only | 27 + 13 pass | ok, 0 / 12288, 0.26 s | pass (default = optimised; dumps with `_impl` 3 and 7 bit-identical to it) | 71 pass |
+| B200 | 100a | optimised / reference / rows-only | 27 + 13 pass | ok, 0 / 12288, 0.27 s | pass (default = optimised; dumps with `_impl` 3 and 7 bit-identical to it) | 71 pass |
+| H100 80GB HBM3 | 90a | optimised / reference / rows-only (all three run the full matrix) | 27 + 13 pass | ok, 0 / 12288, 0.18 s | pass x 3 implementations | 71 pass |
+| A100 80GB PCIe | 80 | reference row engine | 27 + 13 pass | ok, 0 / 12288, 0.26 s | pass (row engine only) | 71 skipped: the optimised kernels cannot run |
+| A10 | 86 | reference row engine | 27 + 13 pass | ok, 0 / 12288, 0.21 s | pass (row engine only) | 71 skipped |
+| L40S | 89 | reference row engine | 27 + 13 pass | ok, 0 / 12288, 0.19 s | pass (row engine only) | 71 skipped |
+
+`verify_hardware()`: 12288 placements (4 data regimes x K in {24, 128} x 16 row slots x 8 column slots x 3 neighbour patterns x 4
+pairs), 0 mismatches on every device, `dot3` within 2.3-2.7e-7 of `sum|a*b|`, about 0.2-0.3 s. The battery's negative control
+(reversed K) differs in 91-96 % of the tiles; the premise itself is checked on every device that was run, a fake probe that
+violates it makes `_guard` raise (`test_arch.py`).
+
+**Cross-architecture bits** (`arch_dump.py` + `arch_compare.py`; the same inputs on every machine - they are generated once on
+the CPU, because `torch.randn` on the GPU is *not* bit-identical across GPU models: the L40S and the H100 (and the A10 and the
+A100) produce different q/k/v/g from the same seed, so `digest_run.py` digests are comparable within one GPU model only; 3 data regimes, 6 sequences x
+4 heads, three prefill calls with cuts and the training forward, plus raw probes of `dot3`, `ex2`, `rcp`, `rsqrt`):
+
+- sm_80 (A100), sm_86 (A10), sm_89 (L40S): **bit-identical on all 31 dumped tensors** (SHA-256 over all results fba39291...).
+- sm_90a (H100) vs sm_80: `ex2.approx.ftz`, `rcp.approx.ftz`, `rsqrt.approx.ftz` are bit-identical (2^21 strided samples each);
+  the three-term `dot3` is not: 79 % of the products differ (max 2.6e-7 of `sum|a*b|`, i.e. a few fp32 ulp: the tensor-core
+  accumulation is not the same hardware behaviour). Propagated through the program, out of 1,039,872 outputs: **184 bf16 outputs
+  differ (0.018 %, at most 9 bf16 ulp), 880,424 fp32 outputs (84.7 %)**, 361,441 of 1,179,648 state entries `E` (30.6 %), 181,368 of 2,949,120
+  cache entries; the training forward the same (it equals prefill on every device).
+- H100: optimised == reference == row-engine-only, bit-identical on all dumped tensors; sm_90 (no `a`) == sm_90a.
+- Blackwell: sm_100a (B200) and sm_103a (B300) vs sm_90a (H100): **bit-identical on all 31 dumped tensors** (SHA-256 332f1fef...,
+  for `_impl` 0, 3 and 7 alike). Hopper and datacenter Blackwell agree.
+- `digest_run.py` (GPU-generated inputs): 7078397d... on B300 (2026-11-02 and again today with this branch), H100 and B200 (all `_impl`),
+  which can only happen if inputs and outputs of that workload are bit-identical on the three; 0b8ccdce... on A100 and L40S and
+  af13549c... on A10 (different inputs, so these do not compare architectures).
+
+So the contract's "one architecture + one build" is the right unit: Ampere/Ada agree among themselves, Hopper and Blackwell agree bit for bit (H100 == B200 == B300),
+and the two families differ in the last bits of every product. A model trained on one family and served on the other gets the same
+program but not the same bits (0.02 % of the bf16 outputs differ in this workload).
+
+**Not validated**
+- K1/K2 (the chunk kernels) on sm_80 / 86 / 89 - they cannot run there (shared memory), so "row engine == chunk kernels" and the
+  training-forward-vs-prefill equality are only tested on devices where K1/K2 run; on Ampere/Ada both sides are the row engine. What
+  carries the claim over is the premise probe (every row slot and neighbour pattern gives the same bits) - an inference, not a test of K1/K2.
+- The optimised kernels on sm < 90 (compiled as traps, never selected); sm_120 (compiles, no device); other drivers / CUDA
+  versions / compiler builds (one image everywhere); Turing and older (no TF32 mma: `verify_hardware()` rejects the device
+  without building anything); multi-GPU hosts with mixed architectures (one device at a time was used); the backward pass
+  anywhere but on the A100 (`test_backward.py`: 9 passed there after 10 min of Triton compile; row-engine-only forward, FLA's
+  backward).
+- Performance of anything but the fallback above (no tuning was done for Hopper or Ada: the optimised kernels are B300-tuned).
 
 ## 8. Reproduce
 
 ```bash
 FLASH_KDA_BUILD_EXTS=cfbi FLASH_KDA_CUDA_ARCHS=103a pip install -v --no-build-isolation .   # or let the tests JIT-build it
+                                                  # (one wheel for several archs: FLASH_KDA_CUDA_ARCHS=80,86,89,90a,100a,103a or =all)
 python -m pytest tests/cfbi -q                    # probes, accuracy, bitwise matrix, backward (needs flash-linear-attention)
 CFBI_BIG=1 python -m pytest tests/cfbi -q         # + 32K-token runs and N=512
 python benchmarks/accuracy_cfbi.py                # section 4
 python benchmarks/bench_cfbi.py                   # section 6 (needs flash_kda_C and FLA for the baselines)
+python benchmarks/bench_cfbi_arch.py              # what the Ampere/Ada row-engine fallback costs on this device
+FLASH_KDA_CFBI_IMPL=3 python -m pytest tests/cfbi -q   # the whole suite on the reference kernels (7: row engine only)
+python tests/cfbi/arch_dump.py OUT.pt && python tests/cfbi/arch_compare.py A.pt B.pt   # cross-architecture bit comparison (7a)
 ```

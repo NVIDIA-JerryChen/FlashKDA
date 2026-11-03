@@ -26,6 +26,29 @@ static void launch_chunk_kernels(const Params& p, const ForwardArgs& a, cudaStre
     }
 }
 
+DeviceCaps device_caps(int device) {
+    if (device < 0) cudaGetDevice(&device);
+    DeviceCaps c{0, 0, 0};
+    cudaDeviceGetAttribute(&c.major, cudaDevAttrComputeCapabilityMajor, device);
+    cudaDeviceGetAttribute(&c.minor, cudaDevAttrComputeCapabilityMinor, device);
+    cudaDeviceGetAttribute(&c.smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    return c;
+}
+
+size_t k1_smem_bytes(int impl) { return (impl & IMPL_REF_CHUNK) ? ref::K1_SMEM_BYTES : K1_SMEM_BYTES; }
+
+int resolve_impl(int requested, int device) {
+    const DeviceCaps c = device_caps(device);
+    int impl = requested & (IMPL_REF_ROWS | IMPL_REF_CHUNK | IMPL_ROWS_ONLY);
+    // The optimised kernels use sm_90+ instructions (cfbi_async.cuh); below that they are compiled as traps.
+    if (c.major < 9) impl |= IMPL_REF_ROWS | IMPL_REF_CHUNK;
+    // K1 needs 204 KiB (optimised) / 218 KiB (reference) of dynamic shared memory per CTA; where the device cannot
+    // provide it the row engine (which needs 7 KiB) evaluates every row - the same program, just row by row. That
+    // fallback uses the reference row engine, the one validated on such devices (sm_80 / 86 / 89).
+    if (!(impl & IMPL_ROWS_ONLY) && static_cast<size_t>(c.smem_optin) < k1_smem_bytes(impl)) impl |= IMPL_ROWS_ONLY | IMPL_REF_ROWS;
+    return impl;
+}
+
 void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
     Params p;
     p.q = static_cast<const __nv_bfloat16*>(a.q);
@@ -45,18 +68,19 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
     p.rows = a.rows;
     p.pos = a.pos;
     p.slot_ids = a.slot_ids;
-    p.fuse_pos = a.mode == 1 ? 1 : 0;
     p.plan = reinterpret_cast<SeqPlan*>(a.plan);
     p.ws = a.ws;
 
+    const int mode = resolve_mode(a.mode, a.impl);   // the binding has already done this and supplied a state if needed
+    p.fuse_pos = mode == 1 ? 1 : 0;
     const bool run_k1 = (a.phase & PHASE_K1) != 0, run_k2 = (a.phase & PHASE_K2) != 0;
-    if (run_k1) plan_kernel<<<1, PLAN_THREADS, 0, stream>>>(a.cu_seqlens, a.fixed_len, a.pos, a.slot_ids, a.N, a.mode == 1 ? 1 : 0, p.plan);
+    if (run_k1) plan_kernel<<<1, PLAN_THREADS, 0, stream>>>(a.cu_seqlens, a.fixed_len, a.pos, a.slot_ids, a.N, mode == 1 ? 1 : 0, p.plan);
     if (run_k1 && run_k2 && a.E != nullptr) {
         // head rows (finishing the open chunk) or, in mode 1, every row
         if (a.impl & IMPL_REF_ROWS) ref::rows_kernel<<<dim3(a.N, a.H), NTHREADS, 0, stream>>>(p);
         else rows_kernel<<<dim3(a.N, a.H), NTHREADS, 0, stream>>>(p);
     }
-    if (a.mode == 0) {
+    if (mode == 0) {
         const int64_t max_chunks = (a.T_total + BT - 1) / BT + a.N;   // upper bound; extra CTAs exit at once
         if (a.impl & IMPL_REF_CHUNK) {
             cudaFuncSetAttribute(ref::k1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ref::K1_SMEM_BYTES);
@@ -74,7 +98,7 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
             else launch_chunk_kernels<16>(p, a, stream, run_k1, run_k2, max_chunks);
         }
     }
-    if (run_k2 && a.pos != nullptr && a.mode != 1) finalize_pos_kernel<<<(a.N + 255) / 256, 256, 0, stream>>>(p.plan, a.pos, a.N);
+    if (run_k2 && a.pos != nullptr && mode != 1) finalize_pos_kernel<<<(a.N + 255) / 256, 256, 0, stream>>>(p.plan, a.pos, a.N);
 }
 
 }  // namespace cfbi

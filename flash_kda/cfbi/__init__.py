@@ -9,7 +9,9 @@ from .api import PrefillPhase1, decode, forward_train, prefill, prefill_k1, pref
 from .cp import cp_prefill
 from .autograd import chunk_kda
 from .state import CfbiState, alloc_state, state_equal, state_mismatch
+from .verify import verify_hardware
 
 __all__ = [
-    "load_ext", "prefill", "decode", "forward_train", "chunk_kda", "prefill_k1", "prefill_k2", "PrefillPhase1", "cp_prefill", "CfbiState", "alloc_state", "state_equal", "state_mismatch",
+    "load_ext", "prefill", "decode", "forward_train", "chunk_kda", "prefill_k1", "prefill_k2", "PrefillPhase1", "cp_prefill",
+    "CfbiState", "alloc_state", "state_equal", "state_mismatch", "verify_hardware",
 ]

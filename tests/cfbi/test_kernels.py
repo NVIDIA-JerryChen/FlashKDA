@@ -78,20 +78,6 @@ def test_training_forward_equals_prefill(ext):
     assert n_diff(oa, ot) == 0 and n_diff(fa, out32) == 0
 
 
-def test_arch_guard(monkeypatch):
-    """Premise validated on compute capability >= 10 only: older devices need an explicit opt-in."""
-    from flash_kda.cfbi import api
-
-    monkeypatch.setattr(api, "_ARCH_OK", {})
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
-    monkeypatch.delenv("FLASH_KDA_CFBI_ALLOW_UNVALIDATED_ARCH", raising=False)
-    with pytest.raises(RuntimeError, match="validated"):
-        api._guard(torch.device("cuda", 0))
-    monkeypatch.setenv("FLASH_KDA_CFBI_ALLOW_UNVALIDATED_ARCH", "1")
-    monkeypatch.setattr(api, "_ARCH_OK", {})
-    api._guard(torch.device("cuda", 0))
-
-
 def test_empty_call_leaves_state_alone(ext):
     H = 2
     case = make_case(70, H, "authors", seed=5)

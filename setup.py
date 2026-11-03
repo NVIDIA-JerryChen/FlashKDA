@@ -17,6 +17,9 @@ def get_nvcc_thread_args():
 
 
 SUPPORTED_CUDA_ARCHS = ["90a", "100a", "103a", "120a"]
+# The CF-BI extension additionally builds for Ampere / Ada (mma.sync TF32 needs sm_80+; the sm_90-only PTX of its
+# optimised kernels is guarded in csrc/cfbi/cfbi_async.cuh and the launcher runs the reference kernels there).
+CFBI_CUDA_ARCHS = ["80", "86", "89"] + SUPPORTED_CUDA_ARCHS
 
 
 def detect_cuda_arch():
@@ -26,10 +29,10 @@ def detect_cuda_arch():
         return None
 
     major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
-    return f"{major}{minor}a"
+    return f"{major}{minor}" + ("a" if major >= 9 else "")   # the "a" (arch-specific) variants start at sm_90
 
 
-def get_arch_flags():
+def get_arch_flags(supported=None):
     assert CUDA_HOME is not None, "PyTorch must be compiled with CUDA support"
 
     requested = os.getenv("FLASH_KDA_CUDA_ARCHS", "auto").lower()
@@ -42,7 +45,7 @@ def get_arch_flags():
             )
         archs = [arch]
     elif requested == "all":
-        archs = SUPPORTED_CUDA_ARCHS
+        archs = supported or SUPPORTED_CUDA_ARCHS
     else:
         archs = [arch.strip() for arch in requested.split(",") if arch.strip()]
 
@@ -126,7 +129,7 @@ if "cfbi" in _BUILD_EXTS:
                     '--ptxas-options=-v',
                     '-lineinfo',
                     *get_nvcc_thread_args(),
-                    *get_arch_flags(),
+                    *get_arch_flags(CFBI_CUDA_ARCHS),
                 ],
             },
         )
