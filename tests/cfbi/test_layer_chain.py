@@ -154,13 +154,13 @@ def single_sequence(layer, ops_whole, ops_serve, T=150, P=110, seed=1):
     return bad, st_bad
 
 
-@pytest.mark.parametrize("Dm,H", [(1024, 4), (4096, 16)])
-def test_whole_sequence_vs_prefill_then_decode(cx, Dm, H):
+@pytest.mark.parametrize("Dm,H,T,P", [(1024, 4, 150, 110), (4096, 16, 150, 110), (2048, 8, 1000, 905)])
+def test_whole_sequence_vs_prefill_then_decode(cx, Dm, H, T, P):
     layer = Layer(Dm, H, seed=Dm)
-    bad, st_bad = single_sequence(layer, Ops(), Ops())
+    bad, st_bad = single_sequence(layer, Ops(), Ops(), T=T, P=P)
     assert total(bad) == 0, {k: v for k, v in bad.items() if v}
     assert all(v == 0 for v in st_bad.values()), st_bad
-    print(f"\n[chain Dm={Dm} H={H}] whole call vs prefill(110) + 40 decode calls: 0 differing elements in "
+    print(f"\n[chain Dm={Dm} H={H}] whole call ({T} tokens) vs prefill({P}) + {T - P} decode calls: 0 differing elements in "
           f"{len(bad)} tensors (projections, conv, core; bf16 and fp32) and the final conv / core states")
 
 
@@ -272,3 +272,37 @@ def test_training_with_autograd_forward_equals_serving(cx):
         for t in params + convs + [layer.A_log, layer.dt_bias]:
             t.requires_grad_(False)
             t.grad = None
+
+
+def test_decode_step_of_the_whole_front_end_in_a_cuda_graph(cx):
+    """Serving runs decode under CUDA graphs: capture one decode step of the whole chain (6 projections, 3 convs, the core's
+    decode) and replay it over the remaining tokens; every replay equals the whole-sequence training-style call, bit for bit."""
+    Dm, H, T, P = 1024, 4, 150, 110
+    layer = Layer(Dm, H, seed=11)
+    g = torch.Generator(device="cuda")
+    g.manual_seed(12)
+    x = torch.randn(1, T, Dm, device="cuda", generator=g).to(torch.bfloat16)
+    whole = layer.forward(Ops(), x, None)
+    st = layer.alloc(1)
+    layer.forward(Ops(), x[:, :P].contiguous(), st)
+    static_x = x[:, P:P + 1].contiguous()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):   # warm-up on a scratch copy of the state (lazy initialisation off the capture)
+        scratch = dict(conv=[c.clone() for c in st["conv"]], core=st["core"].clone())
+        layer.forward(Ops(), static_x, scratch, mode="decode")
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        rec = layer.forward(Ops(), static_x, st, mode="decode")
+    bad = 0
+    for t in range(P, T):
+        static_x.copy_(x[:, t:t + 1])
+        graph.replay()
+        for key in KEYS:
+            for j in range(2):
+                ref = flat(whole[key][j])[t:t + 1]
+                got = flat(rec[key][j])
+                bad += n_diff(ref, got)
+    assert bad == 0, f"{bad} differing elements over {T - P} replays"

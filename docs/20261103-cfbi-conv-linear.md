@@ -214,7 +214,7 @@ Comparing only bf16 outputs is weak: both controls below change tens of thousand
 | row independent of M | `test_row_is_independent_of_M`: 5 (K, N) incl. 4096 x 4096, M = 1 .. 2048 (24 values), views at row offsets, permuted rows, single rows; `test_every_M_up_to_300` (M = 1..300, K = 1040) | identical bf16 and fp32 values |
 | configs agree, neighbours, N | `test_all_tile_configurations_agree` (5 configs), `test_neighbour_rows_do_not_matter` (zero / random / 2^60 / NaN / Inf rows next to the probe row), `test_columns_do_not_depend_on_N` | identical |
 | linear negative control | build with `-DCFBI_LIN_NEG_CONTROL=1`: the small-M (M <= 64) configuration walks K backwards | **caught**: rows computed with M = 1 / 16 vs inside M = 512 differ in 248 / 256 and 3968 / 4096 fp32 values (0 and 2 bf16 outputs); production 0 |
-| chain: layer front end | `test_layer_chain.py`: whole-sequence training-style call vs prefill(110) + 40 decode calls, hidden 1024 / 4 heads and 4096 / 16 heads; a varlen batch of 4 sequences + lock-step decode with compaction | 0 differing elements in 18 tensors (projection, conv, core outputs, bf16 and fp32) and in the final conv / core states |
+| chain: layer front end | `test_layer_chain.py`: whole-sequence training-style call vs prefill(110) + 40 decode calls, hidden 1024 / 4 heads and 4096 / 16 heads, and 1000 tokens (prefill 905 + 95 decode) at 2048 / 8 heads; a varlen batch of 4 sequences + lock-step decode with compaction; one decode step of the whole chain (6 projections, 3 convs, core decode) captured in a CUDA graph and replayed over 40 tokens | 0 differing elements in 18 tensors (projection, conv, core outputs, bf16 and fp32) and in the final conv / core states |
 | chain negative controls | sabotaged conv decode association, sabotaged small-M linear, cuBLAS projections (serving side only) | **all caught** (conv: 31169 / 31525 / 31270 fp32 values of q / k / v; linear: 81405 fp32 values of `q_pre` ...; cuBLAS: 3044 bf16 values of `g`, 7 of `beta`, 1481 bf16 core outputs) |
 | autograd forward | training step with weights requiring grad (`bi_linear`, `short_conv`, `chunk_kda` as autograd functions) | forward = serving bits; backward runs end to end (needs `flash-linear-attention`) |
 | random sweeps | `test_convlin_fuzz.py` (seeded): 24 random packed batches (D 1 .. 700 odd and even, W 2 .. 8, random bias / weight dtypes, random row stride, random initial state, lengths incl. 0 / 1 / 63 / 64 / 65) = every sequence alone cut at random points = the PyTorch emulation of section 2; 20 random `(M, N, K)` linears = the probe program, any row subset in any order, all 5 configs | identical (out, fp32, state) |
@@ -264,7 +264,8 @@ and in 85 outputs (fp32 weights), i.e. 5e-7 and 4e-5 of the outputs. Rare, nonze
 
 The chain `bi_linear` -> `short_conv` -> `prefill` / `decode` / `forward_train` is gated by `tests/cfbi/test_layer_chain.py`: the
 same layer evaluated as one training-style call over the whole sequence and as prefill(110) + 40 single-token decode calls (also
-a packed varlen batch of four sequences with lock-step decode and compaction of finished slots) gives bit-identical projection
+a packed varlen batch of four sequences with lock-step decode and compaction of finished slots, and decode steps replayed from a CUDA
+graph) gives bit-identical projection
 outputs, conv outputs and core outputs (bf16 and fp32) and final conv / core states, for hidden 1024 / 4 heads and hidden 4096 / 16
 heads. With the training step's autograd functions (weights requiring grad) the forward bits are the serving bits.
 
