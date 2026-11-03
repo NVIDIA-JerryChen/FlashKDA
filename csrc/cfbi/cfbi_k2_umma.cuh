@@ -28,7 +28,9 @@ namespace cfbi {
 constexpr int KU_BV = 64;                    // value columns per CTA
 constexpr int KU_NT = KU_BV / 8;             // 8-column tiles
 constexpr int KU_NSLICE = HEAD_V / KU_BV;    // CTAs per (sequence, head)
-constexpr int KU_NS = 4;                     // A-operand ring stages
+constexpr int KU_NS = 4;                     // A-operand ring stages (K = 8 each)
+constexpr int KU_G = 2;                      // stages per hand-off group: ONE full/empty barrier + ONE tcgen05.commit per group
+constexpr int KU_NG = KU_NS / KU_G;          // groups in the ring
 constexpr int KU_WARPS = 13;
 constexpr int KU_THREADS = KU_WARPS * 32;
 
@@ -159,9 +161,9 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
 
     if (tid == 0) {
 #pragma unroll
-        for (int s = 0; s < KU_NS; ++s) {
-            mbar_init(&bar[BAR_FULL + s], 4);   // one arrival per transform warp
-            mbar_init(&bar[BAR_EMPTY + s], 1);
+        for (int g = 0; g < KU_NG; ++g) {
+            mbar_init(&bar[BAR_FULL + g], 4);   // one arrival per transform warp (per group of KU_G stages)
+            mbar_init(&bar[BAR_EMPTY + g], 1);  // tcgen05.commit of the group
         }
         mbar_init(&bar[BAR_EREADY], 4);     // one arrival per epilogue warp
         mbar_init(&bar[BAR_P12], 1);
@@ -210,28 +212,27 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
                 mbar_wait_bounded(&bar[BAR_EREADY], lc & 1, 1);
                 tc_fence_after();
                 KU_PS(1, lc);
-                for (int ks = 0; ks < 16; ++ks, ++i) {   // P1/P2: A = [W;GQ] stage (hi, lo), B = E planes k-step ks
-                    const int s = i % KU_NS;
-                    mbar_wait_bounded(&bar[BAR_FULL + s], (i / KU_NS) & 1, 2);
-                    if (ks == 0) KU_PS(2, lc);
-                    if (ks == 5) KU_PS(7, lc);
-                    if (ks == 9) KU_PS(14, lc);
-                    const uint32_t ab = a_base + s * KU_A_STAGE;
-                    const uint64_t ah = desc(ab, A_LO, A_HI), al = desc(ab + KU_A_PLANE, A_LO, A_HI);
-                    const uint64_t bh = desc(eh_base + ks * 2 * KU_EPITCH, E_LO, E_HI), bl = desc(el_base + ks * 2 * KU_EPITCH, E_LO, E_HI);
-                    const uint32_t acc0 = ks > 0 ? 1u : 0u;
+                for (int ks0 = 0; ks0 < 16; ks0 += KU_G, i += KU_G) {   // P1/P2: A = [W;GQ] stages (hi, lo), B = E planes k-steps ks0, ks0+1
+                    const int gi = i / KU_G, gs = gi % KU_NG;
+                    mbar_wait_bounded(&bar[BAR_FULL + gs], (gi / KU_NG) & 1, 2);
+                    if (ks0 == 0) KU_PS(2, lc);
+                    if (ks0 == 14) KU_PS(3, lc);
+#pragma unroll
+                    for (int q = 0; q < KU_G; ++q) {
+                        const int ks = ks0 + q;
+                        const uint32_t ab = a_base + ((i + q) % KU_NS) * KU_A_STAGE;
+                        const uint64_t ah = desc(ab, A_LO, A_HI), al = desc(ab + KU_A_PLANE, A_LO, A_HI);
+                        const uint64_t bh = desc(eh_base + ks * 2 * KU_EPITCH, E_LO, E_HI), bl = desc(el_base + ks * 2 * KU_EPITCH, E_LO, E_HI);
+                        const uint32_t acc0 = ks > 0 ? 1u : 0u;
 #ifdef CFBI_UMMA_NEG_NOLO   // negative control (tests only): a wrong program must be caught by the bitwise tests
-                    umma_tf32(tmem + TM_SMALL12, ah, bl, idesc, acc0);
+                        umma_tf32(tmem + TM_SMALL12, ah, bl, idesc, acc0);
 #else
-                    umma_tf32(tmem + TM_SMALL12, al, bh, idesc, acc0);
-                    umma_tf32(tmem + TM_SMALL12, ah, bl, idesc, 1u);
+                        umma_tf32(tmem + TM_SMALL12, al, bh, idesc, acc0);
+                        umma_tf32(tmem + TM_SMALL12, ah, bl, idesc, 1u);
 #endif
-                    umma_tf32(tmem + TM_BIG12, ah, bh, idesc, acc0);
-                    if (ks == 5) KU_PS(8, lc);
-                    umma_commit(&bar[BAR_EMPTY + s]);
-                    if (ks == 5) KU_PS(9, lc);
-                    if (ks == 9) KU_PS(15, lc);
-                    if (ks == 15) KU_PS(3, lc);
+                        umma_tf32(tmem + TM_BIG12, ah, bh, idesc, acc0);
+                    }
+                    umma_commit(&bar[BAR_EMPTY + gs]);
                 }
                 umma_commit(&bar[BAR_P12]);
                 KU_PS(4, lc);
@@ -239,21 +240,25 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
                     mbar_wait_bounded(&bar[BAR_UREADY], lc & 1, 3);
                     tc_fence_after();
                     KU_PS(5, lc);
-                    for (int ks = 0; ks < 8; ++ks, ++i) {   // P3: A = KD stage, B = U planes k-step ks
-                        const int s = i % KU_NS;
-                        mbar_wait_bounded(&bar[BAR_FULL + s], (i / KU_NS) & 1, 4);
-                        const uint32_t ab = a_base + s * KU_A_STAGE;
-                        const uint64_t ah = desc(ab, A_LO, A_HI), al = desc(ab + KU_A_PLANE, A_LO, A_HI);
-                        const uint64_t bh = desc(uh_base + ks * 2 * KU_EPITCH, E_LO, U_HI), bl = desc(ul_base + ks * 2 * KU_EPITCH, E_LO, U_HI);
-                        const uint32_t acc0 = ks > 0 ? 1u : 0u;
+                    for (int ks0 = 0; ks0 < 8; ks0 += KU_G, i += KU_G) {   // P3: A = KD stages, B = U planes k-steps ks0, ks0+1
+                        const int gi = i / KU_G, gs = gi % KU_NG;
+                        mbar_wait_bounded(&bar[BAR_FULL + gs], (gi / KU_NG) & 1, 4);
+#pragma unroll
+                        for (int q = 0; q < KU_G; ++q) {
+                            const int ks = ks0 + q;
+                            const uint32_t ab = a_base + ((i + q) % KU_NS) * KU_A_STAGE;
+                            const uint64_t ah = desc(ab, A_LO, A_HI), al = desc(ab + KU_A_PLANE, A_LO, A_HI);
+                            const uint64_t bh = desc(uh_base + ks * 2 * KU_EPITCH, E_LO, U_HI), bl = desc(ul_base + ks * 2 * KU_EPITCH, E_LO, U_HI);
+                            const uint32_t acc0 = ks > 0 ? 1u : 0u;
 #ifdef CFBI_UMMA_NEG_NOLO
-                        umma_tf32(tmem + TM_SMALL3, ah, bl, idesc, acc0);
+                            umma_tf32(tmem + TM_SMALL3, ah, bl, idesc, acc0);
 #else
-                        umma_tf32(tmem + TM_SMALL3, al, bh, idesc, acc0);
-                        umma_tf32(tmem + TM_SMALL3, ah, bl, idesc, 1u);
+                            umma_tf32(tmem + TM_SMALL3, al, bh, idesc, acc0);
+                            umma_tf32(tmem + TM_SMALL3, ah, bl, idesc, 1u);
 #endif
-                        umma_tf32(tmem + TM_BIG3, ah, bh, idesc, acc0);
-                        umma_commit(&bar[BAR_EMPTY + s]);
+                            umma_tf32(tmem + TM_BIG3, ah, bh, idesc, acc0);
+                        }
+                        umma_commit(&bar[BAR_EMPTY + gs]);
                     }
                     umma_commit(&bar[BAR_P3]);
                     KU_PS(6, lc);
@@ -298,7 +303,7 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
             asm volatile("" ::"f"(f0.x), "f"(f0.y), "f"(f0.z), "f"(f0.w), "f"(f1.x), "f"(f1.y), "f"(f1.z), "f"(f1.w) : "memory");
             issue_stage(i + KU_PF);   // refill the slot just read
             const int s = i % KU_NS;
-            mbar_wait_bounded(&bar[BAR_EMPTY + s], ((i / KU_NS) & 1) ^ 1, 10);
+            if (i % KU_G == 0) mbar_wait_bounded(&bar[BAR_EMPTY + (i / KU_G) % KU_NG], (((i / KU_G) / KU_NG) & 1) ^ 1, 10);   // slot group free
             const int lcs = (i < 24 * nfull) ? i / 24 : nfull;
             const int j = i - 24 * lcs;
             if (j == 0) KU_PS(16 + 8 * w + 0, lcs);
@@ -327,9 +332,11 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
             put(f1.y, (gB + 1) * 80);
             put(f1.z, gB * 80 + 40);
             put(f1.w, (gB + 1) * 80 + 40);
-            fence_proxy_async_smem();
-            __syncwarp();
-            if (lane == 0) mbar_arrive(&bar[BAR_FULL + s]);
+            if (i % KU_G == KU_G - 1) {   // the group is complete: one proxy fence and one arrival per warp
+                fence_proxy_async_smem();
+                __syncwarp();
+                if (lane == 0) mbar_arrive(&bar[BAR_FULL + (i / KU_G) % KU_NG]);
+            }
             if (j == 0) KU_PS(16 + 8 * w + 1, lcs);
             if (j == 15) KU_PS(16 + 8 * w + 3, lcs);
             if (j == 23) KU_PS(16 + 8 * w + 5, lcs);
@@ -383,6 +390,7 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
                 tmem_ld16(tmem + TM_BIG12 + lane_off + 16 * c, bg);
                 tmem_ld16(tmem + TM_SMALL12 + lane_off + 16 * c, sm);
                 tmem_wait_ld();
+                if (c == 0) KU_PS(48 + 8 * (warp - 5) + 6, lc);
                 if (r < 64) {
 #pragma unroll
                     for (int i = 0; i < 16; ++i) {
@@ -402,6 +410,7 @@ __global__ void __launch_bounds__(KU_THREADS, 1) k2u_kernel(const Params p) {
                     for (int i = 0; i < 16; ++i)
                         sP2[(r - 64) * KU_SU + 16 * c + i] = fadd(__uint_as_float(bg[i]), __uint_as_float(sm[i]));
                 }
+                if (c == 0) KU_PS(48 + 8 * (warp - 5) + 7, lc);
             }
             if (r < 64) {   // both P1-row warps are done with sUT: fetch the next chunk's UT slice
                 asm volatile("bar.sync 1, 64;" ::: "memory");
