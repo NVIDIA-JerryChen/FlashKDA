@@ -169,6 +169,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
 
 #ifdef CFBI_K1_PROFILE
     long long tp[12];
+    long long t_job, t_help, t_z, t_stage0 = 0;
     K1_TS(0);
 #endif
     const int c = blockIdx.x, h = blockIdx.y, H = p.H;
@@ -333,20 +334,36 @@ __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
     const int early_units = full ? 4096 : 2048;
 
     // ---- 2. Akk / Aqk per sub-block -------------------------------------------------------------------
+#ifdef CFBI_K1_PROFILE
+    t_job = 0; t_help = 0;
+    if (tid == 0) t_z = clock64();
+#endif
     stage_fn(0, sStage0, tid, NTHREADS);
     __syncthreads();
+#ifdef CFBI_K1_PROFILE
+    if (tid == 0) t_stage0 = clock64() - t_z;
+#endif
     for (int s = 0; s < nsb; ++s) {
         const uint4* cur = (s & 1) ? sStage1 : sStage0;
         uint4* nxt = (s & 1) ? sStage0 : sStage1;
+#ifdef CFBI_K1_PROFILE
+        if (tid == 0 || tid == 128) t_z = clock64();
+#endif
         if (warp < 4) {   // MMA jobs: tiles nt = warp and warp + 4 of the 2s + 2 history tiles
             const uint4* stg = cur + L.lane;
             if (warp + 4 < 2 * s + 2) k1_akk_tiles<2>(stg, sKr, sG, sInvK, sBeta, sAkk, sAqk, s, warp, valid, L);
             else if (warp < 2 * s + 2) k1_akk_tiles<1>(stg, sKr, sG, sInvK, sBeta, sAkk, sAqk, s, warp, valid, L);
+#ifdef CFBI_K1_PROFILE
+            if (tid == 0) t_job += clock64() - t_z;
+#endif
         } else {          // helpers: stage the next sub-block, then this sub-block's share of the early workspace writes
             if (s + 1 < nsb) stage_fn(s + 1, nxt, tid - 128, 128);
             const int u0 = early_units * s / nsb, u1 = early_units * (s + 1) / nsb;
             for (int u = u0 + (tid - 128); u < u1; u += 128) early_unit(u);
             if (s == nsb - 1 && full && tid < 256 && tid >= 128) wsb[WS2_GEND + (tid - 128)] = ex2_ftz(sG[63 * K1_SG + (tid - 128)]);
+#ifdef CFBI_K1_PROFILE
+            if (tid == 128) t_help += clock64() - t_z;
+#endif
         }
         __syncthreads();
     }
@@ -464,8 +481,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
     __syncthreads();
     K1_TS(5);
     if (tid == 0 && blockIdx.y == 0 && (blockIdx.x == 0 || blockIdx.x == 37 || blockIdx.x == 300))
-        printf("K1prof c=%d: load %lld | prep %lld (a2 %lld, l2norm %lld, barrier %lld, cumsum %lld) | akk/aqk %lld | subst %lld (M %lld, chain %lld) | ws-write %lld | total %lld\n", c, tp[1] - tp[0],
-               tp[2] - tp[1], tp[6] - tp[1], tp[7] - tp[6], tp[8] - tp[7], tp[2] - tp[8], tp[3] - tp[2], tp[4] - tp[3], t_m, t_ch, tp[5] - tp[4], tp[5] - tp[0]);
+        printf("K1prof c=%d: load %lld | prep %lld (a2 %lld, l2norm %lld, barrier %lld, cumsum %lld) | akk/aqk %lld (stage0 %lld, jobs %lld, helpers %lld) | subst %lld (M %lld, chain %lld) | ws-write %lld | total %lld\n", c, tp[1] - tp[0],
+               tp[2] - tp[1], tp[6] - tp[1], tp[7] - tp[6], tp[8] - tp[7], tp[2] - tp[8], tp[3] - tp[2], t_stage0, t_job, t_help, tp[4] - tp[3], t_m, t_ch, tp[5] - tp[4], tp[5] - tp[0]);
 #endif
 }
 
