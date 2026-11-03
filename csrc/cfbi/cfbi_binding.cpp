@@ -95,12 +95,14 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     TORCH_CHECK(A_log.dim() == 1 && A_log.size(0) == H, "A_log must be [H]");
     TORCH_CHECK(dt_bias.dim() == 2 && dt_bias.size(0) == H && dt_bias.size(1) == 128, "dt_bias must be [H, 128]");
     TORCH_CHECK(mode == 0 || mode == 1, "mode must be 0 or 1");
-    TORCH_CHECK(impl >= 0 && impl <= 7,
-                "impl must be 0..7 (bit 0: reference row engine, bit 1: reference K1/K2, bit 2: row engine for every row)");
+    TORCH_CHECK(impl >= 0 && impl <= 15,
+                "impl must be 0..15 (bit 0: reference row engine, bit 1: reference K1/K2, bit 2: row engine for every row, "
+                "bit 3: UMMA K2)");
     TORCH_CHECK(phase >= 1 && phase <= 3, "phase must be 1 (K1), 2 (K2) or 3 (both)");
     TORCH_CHECK(k2_bv == 0 || k2_bv == 8 || k2_bv == 16, "k2_bv must be 0 (automatic), 8 or 16");
     TORCH_CHECK(phase == 3 || (mode == 0 && ws_in.has_value() && plan_in.has_value()),
                 "a split call (phase 1 or 2) is mode 0 and needs the workspace and plan buffers");
+    TORCH_CHECK(!(impl & IMPL_K2_UMMA) || k2_bv == 0 || k2_bv == 16, "the UMMA K2 works on 16-column value slices (k2_bv 0 or 16)");
     TORCH_CHECK(lower_bound >= -5.0 && lower_bound <= 0.0, "lower_bound must be in [-5, 0]");
     const int64_t T_total = B * T;
     TORCH_CHECK(T_total < (int64_t(1) << 31) && H < 65536, "problem too large for the int32 token index / grid");

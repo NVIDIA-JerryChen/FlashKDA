@@ -40,7 +40,7 @@ def _guard(device):
 
 def _impl_arg(_impl: Optional[int]) -> int:
     """``_impl`` (hidden, tests/diagnostics): bit 0 reference row engine, bit 1 reference K1/K2, bit 2 row engine for
-    every row; 0 = the optimised kernels where the device can run them (the launcher falls back to the reference
+    every row, bit 3 the tcgen05 (UMMA) K2 (Blackwell sm_100/103 only, dropped elsewhere); 0 = the optimised kernels where the device can run them (the launcher falls back to the reference
     kernels below sm_90 and to the row engine where K1 does not fit in shared memory, see csrc/cfbi/cfbi_launch.h).
     ``None`` reads ``FLASH_KDA_CFBI_IMPL`` (default 0), which lets a whole test run be pinned to e.g. the reference."""
     return int(os.environ.get("FLASH_KDA_CFBI_IMPL", "0")) if _impl is None else int(_impl)

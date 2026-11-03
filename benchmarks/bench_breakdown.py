@@ -1,7 +1,8 @@
 """Per-kernel GPU time of the CF-BI pipeline (plan / row engine / K1 / K2) for one implementation.
 
-usage: python benchmarks/bench_breakdown.py [--impl 0|3] [--prefill B L H ...] [--decode N H ...] [--warm POS]
-  --impl     0 = optimised kernels (default), 3 = the frozen v1 reference kernels
+usage: python benchmarks/bench_breakdown.py [--impl 0|3|8] [--prefill B L H ...] [--decode N H ...] [--warm POS]
+  --impl     0 = optimised kernels (default), 3 = the frozen v1 reference kernels,
+             8 = optimised row engine + K1 with the tcgen05 (UMMA) K2 (kernel k2u_kernel instead of k2_kernel)
   --prefill  one or more "B,L,H" shapes (default: the CF-BI report's H6/L8K shapes)
   --decode   one or more "N,H" shapes (decode averaged over 64 consecutive steps = every chunk phase)
   --warm     chunk phase (pos) the sequences start the prefill call at (exercises the row engine's head rows)

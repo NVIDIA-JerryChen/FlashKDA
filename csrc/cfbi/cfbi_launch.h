@@ -52,6 +52,7 @@ struct ForwardArgs {
 constexpr int IMPL_REF_ROWS = 1;    // row engine (decode, head rows)
 constexpr int IMPL_REF_CHUNK = 2;   // K1 + K2 (prefill / training forward)
 constexpr int IMPL_ROWS_ONLY = 4;   // no K1/K2: every row goes through the row engine (mode 1 semantics even for mode 0)
+constexpr int IMPL_K2_UMMA = 8;     // optimised K1<16> + the tcgen05 (UMMA) K2 (Blackwell sm_100/103 only; ignored with IMPL_REF_CHUNK)
 
 // What a device can run. The optimised kernels need sm_90+ (bulk copies, mbarrier transaction counts); K1 needs 204 KiB
 // (optimised) / 218 KiB (reference) of dynamic shared memory per CTA, while the opt-in limit is 227 KiB on sm_90 / 100 /

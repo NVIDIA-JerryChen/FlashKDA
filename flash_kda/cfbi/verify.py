@@ -42,6 +42,8 @@ def _impl_name(impl):
     if impl & 4:
         return f"{rows} row engine only (no K1/K2)"
     chunk = "reference" if impl & 2 else "optimised"
+    if impl & 8 and not impl & 2:
+        chunk = "optimised, tcgen05 (UMMA) K2"
     return rows if rows == chunk else f"{rows} row engine + {chunk} K1/K2"
 
 
