@@ -48,6 +48,7 @@ constexpr int K1_STAGE_UINT4 = 2 * 16 * 2 * 32;          // one A-operand stagin
 static_assert(2 * K1_STAGE_UINT4 * 16 <= 2 * 64 * K1_SX * 4, "two A-operand staging buffers must fit the UT/W area");
 static_assert(2 * 16 * K1_SM * 4 <= 64 * K1_RS * 2, "M must fit the raw-g area");
 static_assert(K1_SMEM_BYTES <= 232448, "K1 shared memory");
+static_assert(K1_OFF_AQK == K1_OFF_AKK + 64 * K1_SA * 4, "Akk and Aqk are zeroed as one array");
 
 #ifdef CFBI_K1_PROFILE
 #define K1_TS(i) do { if (threadIdx.x == 0) tp[i] = clock64(); } while (0)
@@ -125,11 +126,9 @@ __device__ __forceinline__ void k1_akk_tiles(const uint4* stg, const uint16_t* s
 #pragma unroll
             for (int ii = 0; ii < 2; ++ii) {
                 const int ch = 8 * ks + L.t + 4 * ii;
-                float v = 0.f;
-                if (jv[i])
-                    v = fmul(fmul(bf16raw_to_f32(sKr + jj[i] * K1_RS + ch), ikj[i]),
-                             ex2_ftz(fsub(sG[r0 * K1_SG + ch], sG[jj[i] * K1_SG + ch])));
-                split_tf32(v, bh[ii], bl[ii]);
+                const float kv = fmul(fmul(bf16raw_to_f32(sKr + jj[i] * K1_RS + ch), ikj[i]),
+                                      ex2_ftz(fsub(sG[r0 * K1_SG + ch], sG[jj[i] * K1_SG + ch])));
+                split_tf32(jv[i] ? kv : 0.f, bh[ii], bl[ii]);
             }
             mma_tf32_m16n8k8(sk[i], akl, bh);
             mma_tf32_m16n8k8(sq[i], aql, bh);
@@ -202,7 +201,10 @@ __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
     }
     cp_async_commit();
     if (tid < 64) sBetaLogit[tid] = tid < valid ? bf16_to_f32(p.beta[(tok0 + tid) * H + h]) : 0.f;   // strided 2-byte elements
-    for (int i = tid; i < 2 * 64 * K1_SA; i += NTHREADS) (i < 64 * K1_SA ? sAkk : sAqk)[i % (64 * K1_SA)] = 0.f;
+    {   // Akk and Aqk are contiguous: zero both with 16-byte stores
+        float4* z = reinterpret_cast<float4*>(sAkk);
+        for (int i = tid; i < 2 * 64 * K1_SA / 4; i += NTHREADS) z[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
     cp_async_wait_all();
     __syncthreads();
     K1_TS(1);
@@ -259,24 +261,27 @@ __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
     float* wsb = p.ws + ((int64_t)c * H + h) * WS2_FLOATS;
     const int rows_done = nsb * 16;
 
-    // A operands ks / qs of sub-block s for entries [e0, e1), split into TF32 hi/lo, fragment order
-    // [which][ks][hi,lo][lane]; `ltid` / `nthr` describe the helper threads that run it
+    // A operands ks / qs of sub-block s, split into TF32 hi/lo, fragment order [which][ks][hi,lo][lane]. One entry =
+    // (ks, lane): the k and the q operand share the exponent factor ex2(G2[row] - G2[r0]); `ltid` / `nthr` describe the
+    // helper threads that run it.
     auto stage_fn = [&](int s, uint4* stage, int ltid, int nthr) {
         const int r0 = 16 * s;
-        for (int e = ltid; e < 2 * 16 * 32; e += nthr) {
-            const int lane = e & 31, ks = (e >> 5) & 15, which = e >> 9;
+        for (int e = ltid; e < 16 * 32; e += nthr) {
+            const int lane = e & 31, ks = e >> 5;
             const int g = lane >> 2, t = lane & 3;
-            uint32_t hv[4], lv[4];
+            uint32_t hk[4], lk[4], hq[4], lq[4];
 #pragma unroll
             for (int ii = 0; ii < 4; ++ii) {
                 const int row = r0 + g + 8 * (ii & 1), ch = 8 * ks + t + 4 * (ii >> 1);
-                float v = 0.f;
-                if (row < valid)
-                    v = fmul(which ? qhat(row, ch) : khat(row, ch), ex2_ftz(fsub(sG[row * K1_SG + ch], sG[r0 * K1_SG + ch])));
-                split_tf32(v, hv[ii], lv[ii]);
+                const float f = ex2_ftz(fsub(sG[row * K1_SG + ch], sG[r0 * K1_SG + ch]));
+                const float kv = fmul(khat(row, ch), f), qv = fmul(qhat(row, ch), f);
+                split_tf32(row < valid ? kv : 0.f, hk[ii], lk[ii]);
+                split_tf32(row < valid ? qv : 0.f, hq[ii], lq[ii]);
             }
-            stage[((which * 16 + ks) * 2 + 0) * 32 + lane] = make_uint4(hv[0], hv[1], hv[2], hv[3]);
-            stage[((which * 16 + ks) * 2 + 1) * 32 + lane] = make_uint4(lv[0], lv[1], lv[2], lv[3]);
+            stage[((0 * 16 + ks) * 2 + 0) * 32 + lane] = make_uint4(hk[0], hk[1], hk[2], hk[3]);
+            stage[((0 * 16 + ks) * 2 + 1) * 32 + lane] = make_uint4(lk[0], lk[1], lk[2], lk[3]);
+            stage[((1 * 16 + ks) * 2 + 0) * 32 + lane] = make_uint4(hq[0], hq[1], hq[2], hq[3]);
+            stage[((1 * 16 + ks) * 2 + 1) * 32 + lane] = make_uint4(lq[0], lq[1], lq[2], lq[3]);
         }
     };
     // workspace entries that depend on prep only: GQ A-fragments (2048 float4) and, for full chunks, KD (2048); unit u
@@ -352,8 +357,15 @@ __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
             for (int tt = 0; tt < 16; ++tt) {
                 const int row = b + tt;
                 float x = (s > 0) ? fsub(rhs[tt], sM[(which * 16 + tt) * K1_SM + col]) : rhs[tt];
+                const float4* arow = reinterpret_cast<const float4*>(&sAkk[row * K1_SA + b]);   // 16-byte aligned
 #pragma unroll
-                for (int j = 0; j < tt; ++j) x = ffma(-sAkk[row * K1_SA + b + j], xr[j], x);
+                for (int j4 = 0; j4 < (tt + 3) / 4; ++j4) {
+                    const float4 av = arow[j4];
+                    const float a4[4] = {av.x, av.y, av.z, av.w};
+#pragma unroll
+                    for (int jl = 0; jl < 4; ++jl)
+                        if (4 * j4 + jl < tt) x = ffma(-a4[jl], xr[4 * j4 + jl], x);
+                }
                 xr[tt] = x;
                 X[row * K1_SX + col] = x;
             }

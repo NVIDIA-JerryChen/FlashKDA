@@ -26,7 +26,10 @@ static_assert((WS_FLOATS * 4) % 16 == 0, "workspace blocks must stay 16-byte ali
 // whole operand and every lane reads its mma.sync fragment as one 16-byte (A) / 8-byte (B) shared load.
 //   A fragment of a 16x8 tile at (row tile rt, k-step ks), lane = 4*g + t:  float4 {X[16rt+g][8ks+t], X[16rt+g+8][8ks+t],
 //   X[16rt+g][8ks+t+4], X[16rt+g+8][8ks+t+4]}  (registers a0..a3 of mma.m16n8k8).
-constexpr int K2_BV = 16;                  // value columns per K2 CTA
+#ifndef CFBI_K2_BV
+#define CFBI_K2_BV 16
+#endif
+constexpr int K2_BV = CFBI_K2_BV;                  // value columns per K2 CTA
 constexpr int K2_NT = K2_BV / 8;           // 8-column MMA tiles per CTA
 constexpr int K2_NSLICE = HEAD_V / K2_BV;  // CTAs per (sequence, head)
 constexpr int WS2_W = 0;                       // W  A-fragments   [rt 4][ks 16][lane 32][4]

@@ -129,6 +129,13 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
     long long tp[9];
 #endif
     int pos = sp.pos0;
+    // cached rows b..pos-1 of UT | W (role column) and of U (value column, tid < 128) of the current sub-block, and the
+    // reference row's G2: loaded from global for the first row of the call, afterwards carried in registers
+    // (a row's own result is appended to them), so consecutive head rows do not wait for their predecessor's stores.
+    float xpre[16], upre[16];
+    float gref_pre = 0.f;
+#pragma unroll
+    for (int jj = 0; jj < 16; ++jj) { xpre[jj] = 0.f; upre[jj] = 0.f; }
     for (int i = 0; i < nrows; ++i) {
         ROWS_TS(0);
         const int64_t tok = (int64_t)sp.tok0 + i;
@@ -138,26 +145,26 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
         const bool mine = g == (slot & 7);
 
         // ---- early loads: nothing here depends on this row's prep ------------------------------------
-        if (i == 0) {   // pull the whole state this CTA will touch towards L2 so later phases do not pay HBM latency
+        float gprev = 0.f, vraw = 0.f;
+        if (i == 0) {
+            // pull the whole state this CTA will touch towards L2 so later phases do not pay HBM latency
             const char* eb = reinterpret_cast<const char*>(Eg);
             prefetch_l2(eb + tid * 128);
             prefetch_l2(eb + (tid + NTHREADS) * 128);
             const int lines = pos * 4;   // 512 B per row = 4 lines of 128 B, five planes
             for (int l = tid; l < 5 * lines; l += NTHREADS) prefetch_l2(R + (l / lines) * ROW_PLANE_FLOATS + (l % lines) * 32);
+#pragma unroll
+            for (int jj = 0; jj < 16; ++jj) xpre[jj] = (b + jj < pos) ? Xg[(b + jj) * HEAD_K + col] : 0.f;
+            if (tid < HEAD_V) {
+#pragma unroll
+                for (int jj = 0; jj < 16; ++jj) upre[jj] = (b + jj < pos) ? Ru[(b + jj) * HEAD_V + tid] : 0.f;
+                if (pos > 0) gprev = Rg[(pos - 1) * HEAD_K + tid];
+                if (b < pos) gref_pre = Rg[b * HEAD_K + tid];
+            }
+        } else if (tid < HEAD_V) {
+            gprev = S.g2[tid];   // the previous row's G2 (written by this very thread last iteration)
         }
-        float xpre[16], upre[16];   // cached rows b..pos-1 of UT | W (role column) and of U (value column tid < 128)
-#pragma unroll
-        for (int jj = 0; jj < 16; ++jj) xpre[jj] = (b + jj < pos) ? Xg[(b + jj) * HEAD_K + col] : 0.f;
-        float gprev = 0.f, gref_pre = 0.f, vraw = 0.f;
-#pragma unroll
-        for (int jj = 0; jj < 16; ++jj) upre[jj] = 0.f;
-        if (tid < HEAD_V) {
-#pragma unroll
-            for (int jj = 0; jj < 16; ++jj) upre[jj] = (b + jj < pos) ? Ru[(b + jj) * HEAD_V + tid] : 0.f;
-            if (pos > 0) gprev = Rg[(pos - 1) * HEAD_K + tid];
-            if (b < pos) gref_pre = Rg[b * HEAD_K + tid];
-            vraw = bf16_to_f32(p.v[off + tid]);
-        }
+        if (tid < HEAD_V) vraw = bf16_to_f32(p.v[off + tid]);
 
         // ---- A. token-local prep -------------------------------------------------------------
         if (warp == 0) {   // lanes 0-15: k, lanes 16-31: q (channels 8*(lane&15) ..+7)
@@ -178,6 +185,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
             const float g2v = (pos == 0) ? a2 : fadd(gprev, a2);
             S.g2[tid] = g2v;
             S.gref[tid] = (b == pos) ? g2v : gref_pre;
+            gref_pre = (b == pos) ? g2v : gref_pre;
         }
         if (tid == HEAD_K) S.beta = beta_act(bf16_to_f32(p.beta[tok * H + h]));
         __syncthreads();
@@ -244,6 +252,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
             __syncthreads();
         }
         ROWS_TS(3);
+        float x_row = 0.f, u_row = 0.f;
         {   // right-hand side, cross-block subtraction, in-sub-block FMA chain over the cached rows; thread = (UT|W, column)
             float rhs;
             if (which == 0) rhs = fmul(S.beta, vraw);
@@ -262,6 +271,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
             }
             Xg[pos * HEAD_K + col] = x;
             S.x[which][col] = x;
+            x_row = x;
             if (which == 0) S.gq[col] = fmul(ex2_ftz(S.g2[col]), S.q[col]);
             if (tid < HEAD_K) {   // append khat / G2 of this row to the cache (later rows read them)
                 Rk[pos * HEAD_K + tid] = S.k[tid];
@@ -322,6 +332,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
         // ---- E, F. U = UT - P1, O = P2 (+ M2) then the FMA chain over j = b..t -------------------------------
         if (tid < HEAD_V) {
             const float u = fsub(S.x[0][tid], S.p1[tid]);
+            u_row = u;
             S.u[tid] = u;
             Ru[pos * HEAD_V + tid] = u;
             float o = S.p2[tid];
@@ -336,6 +347,14 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
             if (p.out_f32 != nullptr) p.out_f32[off + tid] = o;
         }
         ROWS_TS(6);
+        if (i + 1 < nrows) {   // append this row to the cached-row registers of the next row (same sub-block)
+            const int jprev = pos - b;
+#pragma unroll
+            for (int jj = 0; jj < 16; ++jj) {
+                xpre[jj] = (jj == jprev) ? x_row : xpre[jj];
+                upre[jj] = (jj == jprev) ? u_row : upre[jj];
+            }
+        }
 
         // ---- G. chunk end: E' = E * GEND + dot3(KD, U) ----------------------------------------------
         if (pos == BT - 1) {
