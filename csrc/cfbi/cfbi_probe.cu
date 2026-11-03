@@ -45,7 +45,7 @@ __global__ void probe_transc_kernel(const float* __restrict__ x, float* __restri
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float v = x[i];
-    y[i] = which == 0 ? ex2_ftz(v) : (which == 1 ? tanh_approx(v) : rsqrt_ftz(v));
+    y[i] = which == 0 ? ex2_ftz(v) : (which == 1 ? tanh_approx(v) : (which == 2 ? rsqrt_ftz(v) : rcp_ftz(v)));
 }
 
 void launch_probe_transc(const float* x, float* y, int64_t n, int which, cudaStream_t stream) {

@@ -2,16 +2,19 @@
 // engine and the probes all call these, so the per-token numbers are identical everywhere.
 //
 // Formulas follow master's tests/torch_ref.py (the bit-exact emulation of master's prep), except that
-// khat / qhat stay in fp32 (master rounds them to bf16).
+// khat / qhat stay in fp32 (master rounds them to bf16) and the sigmoid is computed with ex2 + rcp instead of
+// tanh.approx (see sigmoid_act).
 #pragma once
 
 #include "cfbi/cfbi_primitives.cuh"
 
 namespace cfbi {
 
-// sigmoid(x) = fma(tanh.approx(x * 0.5), 0.5, 0.5)
-__device__ __forceinline__ float sigmoid_tanh(float x) {
-    return __fmaf_rn(tanh_approx(__fmul_rn(x, 0.5f)), 0.5f, 0.5f);
+// sigmoid(x) = rcp(1 + ex2(-x * log2 e)). Master's gate uses fma(tanh.approx(x/2), .5, .5), but tanh.approx has a
+// max relative error of 1.1e-5 on B300 (absolute sigmoid error up to 3.9e-6), which dominated the error of the
+// whole program (2.4e-6 vs 0.7e-6 for the contract with exact transcendentals); ex2/rcp are ~1.4e-7 / 1.2e-7.
+__device__ __forceinline__ float sigmoid_act(float x) {
+    return rcp_ftz(__fadd_rn(1.0f, ex2_ftz(__fmul_rn(-x, LOG2E_F))));
 }
 
 // Per-head gate scalar: ex2(A_log * LOG2E)
@@ -20,11 +23,11 @@ __device__ __forceinline__ float gate_a_log_exp(float A_log) { return ex2_ftz(__
 // log2-decay of one (token, channel):  a2 = scale2 * sigmoid(a_log_exp * (g + dt_bias)),
 // scale2 = float(lower_bound * LOG2E) (computed in double on the host, like torch_ref / master).
 __device__ __forceinline__ float gate_a2(float g, float dt_bias, float a_log_exp, float scale2) {
-    return __fmul_rn(scale2, sigmoid_tanh(__fmul_rn(a_log_exp, __fadd_rn(g, dt_bias))));
+    return __fmul_rn(scale2, sigmoid_act(__fmul_rn(a_log_exp, __fadd_rn(g, dt_bias))));
 }
 
 // beta = sigmoid(logit)
-__device__ __forceinline__ float beta_act(float logit) { return sigmoid_tanh(logit); }
+__device__ __forceinline__ float beta_act(float logit) { return sigmoid_act(logit); }
 
 // L2 inverse norm of a 128-vector spread over a 16-lane group: lane j holds channels 8j .. 8j+7.
 //   partial_j = 8 sequential FMAs; butterfly add over xor offsets 8,4,2,1; rsqrt.approx.ftz(sum + 1e-6).

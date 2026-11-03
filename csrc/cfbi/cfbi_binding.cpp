@@ -30,7 +30,7 @@ torch::Tensor probe_dot3(torch::Tensor A, torch::Tensor B, bool reverse_k) {
 
 torch::Tensor probe_transc(torch::Tensor x, int64_t which) {
     check_f32_cuda(x, "x");
-    TORCH_CHECK(which >= 0 && which <= 2, "which must be 0 (ex2), 1 (tanh) or 2 (rsqrt)");
+    TORCH_CHECK(which >= 0 && which <= 3, "which must be 0 (ex2), 1 (tanh), 2 (rsqrt) or 3 (rcp)");
     c10::cuda::CUDAGuard guard(x.device());
     auto y = torch::empty_like(x);
     cfbi::launch_probe_transc(x.data_ptr<float>(), y.data_ptr<float>(), x.numel(), (int)which, cur_stream());

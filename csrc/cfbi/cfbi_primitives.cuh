@@ -4,8 +4,8 @@
 // training forward are the *same* arithmetic by construction:
 //   * elementwise ops only through explicit IEEE intrinsics (__fmul_rn / __fadd_rn / __fmaf_rn);
 //     there is no `a*b+c` in numerics-critical code (and the extension is built with -fmad=false);
-//   * three approximations, each through one PTX instruction: ex2.approx.ftz, tanh.approx,
-//     rsqrt.approx.ftz;
+//   * three approximations, each through one PTX instruction: ex2.approx.ftz, rcp.approx.ftz,
+//     rsqrt.approx.ftz (tanh.approx is only kept for the probe: on B300 its max relative error is 1.1e-5);
 //   * ONE dot3<> primitive (three-term TF32 MMA, fixed K order) for every tensor-core product.
 //
 // See docs/20261102-cfbi-numerical-contract.md for the contract these implement.
@@ -56,6 +56,11 @@ __device__ __forceinline__ float tanh_approx(float x) {
 __device__ __forceinline__ float rsqrt_ftz(float x) {
     float y;
     asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+__device__ __forceinline__ float rcp_ftz(float x) {
+    float y;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
 }
 

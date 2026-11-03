@@ -15,7 +15,8 @@ call. Any change to a formula below is a numerics change (new contract version),
 - fp32 everywhere except tensor-core operands. "round" = IEEE round-to-nearest-even. `fma` = one rounding.
   Every `*`, `+`, `-` below is its own rounding; nothing is contracted into an FMA unless written `fma`.
 - Approximations (each exactly one PTX instruction): `ex2` = `ex2.approx.ftz.f32` (flushes results below
-  2^-126 to 0 - intended), `tanh` = `tanh.approx.f32`, `rsqrt` = `rsqrt.approx.ftz.f32`.
+  2^-126 to 0 - intended), `rcp` = `rcp.approx.ftz.f32`, `rsqrt` = `rsqrt.approx.ftz.f32`. Measured max relative
+  error on B300: ex2 1.4e-7, rcp ~1.2e-7, rsqrt 1.2e-7 (`tanh.approx.f32`: 1.1e-5, not used).
 - Inputs mirror `flash_kda.fwd`: `q, k, v, g` bf16 `[B,T,H,128]`, `beta` bf16 raw logits `[B,T,H]`,
   `A_log` fp32 `[H]`, `dt_bias` fp32 `[H,128]`, `scale`, `lower_bound` in `[-5, 0]`, `cu_seqlens` int64.
 
@@ -28,7 +29,7 @@ khat = k * l2inv(k)                      (fp32, NOT rounded to bf16)
 qhat = (q * l2inv(q)) * scale            (scale rounded to fp32)
 gate scalar per head:  ale = ex2(A_log * LOG2E_f)         (LOG2E_f = fp32(log2 e))
 a2[c]  = scale2 * sig(ale * (g[c] + dt_bias[c])),  scale2 = fp32(lower_bound * log2 e) (double product)
-sig(x) = fma(tanh(x * 0.5), 0.5, 0.5)
+sig(x) = rcp(1 + ex2(-x * LOG2E_f))
 beta   = sig(beta_logit)
 ```
 `a2 <= 0` and `a2 >= scale2`, so the log2-decay of one row is in `[scale2, 0]` (>= -7.22 bits).
@@ -107,7 +108,11 @@ batch composition): the outputs, `E`, the valid cache rows and `pos`.
 
 - The report does not specify the elementwise approximations, the l2norm reduction order, the gate/beta
   forms or whether `khat/qhat` are rounded; section 1 above fixes them (taken from master's `torch_ref.py`,
-  except that `khat/qhat` stay fp32).
+  except that `khat/qhat` stay fp32 and **the sigmoid is `rcp(1 + ex2(-x log2 e))` instead of master's
+  `fma(tanh.approx(x/2), .5, .5)`**). Reason, measured on B300: `tanh.approx.f32` has a max relative error of
+  1.1e-5 (sigmoid abs error up to 3.9e-6) and made the program's fp32 error 2.4e-6 against 0.7e-6 for the same
+  program with exact transcendentals; with ex2+rcp the plan's accuracy target is met (see the design doc).
+  This is the one deliberate departure from the plan's text, which pinned master's tanh form.
 - For `b == 0` the report takes `R[t]` / `P2[t]` directly (as here); no `-0.0` subtract is executed.
 - Performance-only deviations (no effect on bits): `mma.sync` everywhere (no tcgen05/UMMA), global fp32
   workspace between K1 and K2, no warp specialisation, whole-head CTA for decode.

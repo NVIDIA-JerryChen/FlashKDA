@@ -33,7 +33,7 @@ def test_accuracy_vs_fp64_exact(ext, regime, T):
                                   case["dt_bias"], case["scale"], case["lower_bound"])
     err = rel_rms(out32.reshape(T, H, 128), ref)
     print(f"\n[accuracy] regime={regime:14s} T={T:4d}  rel RMS of fp32 O vs fp64 exact = {err:.3e}")
-    assert err < 8e-6, f"fp32 output too far from the exact recurrence: {err:.3e}"
+    assert err < 3e-6, f"fp32 output too far from the exact recurrence: {err:.3e}"
 
 
 @pytest.mark.parametrize("regime", ["authors", "heavy_tail", "long_memory", "saturated"])

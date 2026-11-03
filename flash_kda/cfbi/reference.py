@@ -123,7 +123,7 @@ def _prep_f32(q, k, g, beta, A_log, dt_bias, scale, lower_bound):
     khat = k.float() * l2inv(k)[:, None]
     qhat = (q.float() * l2inv(q)[:, None]) * _f32(scale)
     ale = torch.exp2(A_log * _f32(LOG2E))[:, None]
-    sig = lambda x: _fma(torch.tanh(x * _f32(0.5)), _f32(0.5), _f32(0.5))
+    sig = torch.sigmoid
     a2 = _f32(lower_bound * LOG2E) * sig(ale * (g.float() + dt_bias))
     return khat, qhat, a2, sig(beta.float())
 

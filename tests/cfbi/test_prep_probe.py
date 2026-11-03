@@ -38,14 +38,13 @@ def emu_prep(ext, q, k, g, beta, A_log, dt_bias, scale, lower_bound):
     inv_k, inv_q = emu_l2_inv(ext, k), emu_l2_inv(ext, q)
     khat = k.float() * inv_k[:, None]
     qhat = (q.float() * inv_q[:, None]) * f32(scale)
+    def sigmoid(x):   # rcp(1 + ex2(-x * log2 e))
+        e = ext.probe_transc(((-x) * f32(LOG2E)).contiguous(), 0)
+        return ext.probe_transc((f32(1.0) + e).contiguous(), 3)
+
     ale = ext.probe_transc((A_log * f32(LOG2E)).contiguous(), 0)
-    s = ale * (g.float() + dt_bias)
-    th = ext.probe_transc((s * f32(0.5)).contiguous(), 1)
-    sig = fma32(f32(0.5), th, f32(0.5))
-    a2 = f32(lower_bound * LOG2E) * sig
-    bth = ext.probe_transc((beta.float() * f32(0.5)).contiguous(), 1)
-    b = fma32(f32(0.5), bth, f32(0.5))
-    return khat, qhat, a2, b
+    a2 = f32(lower_bound * LOG2E) * sigmoid(ale * (g.float() + dt_bias))
+    return khat, qhat, a2, sigmoid(beta.float())
 
 
 def make_inputs(regime, rows, gen):

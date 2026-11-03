@@ -50,7 +50,7 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream);
 void launch_probe_dot3(const float* A, const float* B, float* D, int ntiles, int K, int reverse_k,
                        cudaStream_t stream);
 
-// y[i] = approx(x[i]); which: 0 = ex2.approx.ftz, 1 = tanh.approx, 2 = rsqrt.approx.ftz.
+// y[i] = approx(x[i]); which: 0 = ex2.approx.ftz, 1 = tanh.approx, 2 = rsqrt.approx.ftz, 3 = rcp.approx.ftz.
 void launch_probe_transc(const float* x, float* y, int64_t n, int which, cudaStream_t stream);
 
 // Per-token prep for `rows` tokens of one head (q,k,g: bf16 [rows,128]; beta: bf16 [rows]).
