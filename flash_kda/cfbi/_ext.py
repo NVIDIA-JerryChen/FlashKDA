@@ -31,6 +31,19 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _source_hash() -> str:
+    """Content hash of every file under csrc/cfbi. torch's JIT cache only hashes the listed .cpp/.cu files, so an edit
+    of a header (.cuh/.h) would silently reuse a stale build; the hash goes into the build flags to prevent that."""
+    import hashlib
+
+    h = hashlib.sha1()
+    for f in sorted((_repo_root() / "csrc" / "cfbi").rglob("*")):
+        if f.is_file():
+            h.update(f.name.encode())
+            h.update(f.read_bytes())
+    return h.hexdigest()[:16]
+
+
 def _jit_build(verbose: bool, name: str = "flash_kda_cfbi_C_jit", defines: tuple = ()):
     from torch.utils.cpp_extension import load
 
@@ -53,8 +66,8 @@ def _jit_build(verbose: bool, name: str = "flash_kda_cfbi_C_jit", defines: tuple
             name=name,
             sources=[str(csrc / "cfbi" / s) for s in _SOURCES],
             extra_include_paths=[str(csrc)],
-            extra_cflags=["-O3", "-Wno-psabi"],
-            extra_cuda_cflags=NVCC_FLAGS + [f"-D{d}" for d in defines],
+            extra_cflags=["-O3", "-Wno-psabi", f"-DCFBI_SRC_HASH=0x{_source_hash()}ull"],
+            extra_cuda_cflags=NVCC_FLAGS + [f"-D{d}" for d in defines] + [f"-DCFBI_SRC_HASH=0x{_source_hash()}ull"],
             build_directory=build_dir or None,
             verbose=verbose,
         )

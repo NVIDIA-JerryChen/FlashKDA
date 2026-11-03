@@ -1,145 +1,361 @@
-// CF-BI KDA K2: the E-dependent part, a serial scan over a sequence's chunks.
+// CF-BI KDA K2: the E-dependent part, a serial scan over a sequence's chunks (optimised).
 //
-// One CTA per (V-slice of 16 columns, sequence, head). It keeps its E slice [16][128] in shared memory and,
-// for every chunk: P1/P2 = dot3([W;GQ], E^T) -> U = UT - P1 -> O (cross-sub-block dot3 + FMA chain, bf16 out)
-// -> for a full chunk the state update E' = E*GEND + dot3(KD, U). A trailing partial chunk only produces O
-// and stores its U rows in the open-chunk row cache. All coefficients come from the K1 workspace.
+// Same arithmetic as csrc/cfbi/ref/ref_k2.cuh (every output element sees the identical sequence of roundings;
+// tests/cfbi/test_vs_ref.py compares bits), organised for the hardware:
+//   * K1 stores every operand "fragment native" (cfbi_common.cuh, WS2_*): one cp.async.bulk + mbarrier per
+//     operand moves it into shared memory and each lane reads its mma.sync fragment as one LDS.128 / LDS.64;
+//   * E lives in shared memory twice: fp32 (for E*GEND) and as pre-split TF32 hi/lo B-fragments, so the P1/P2
+//     loops do no ALU work on B; U is stored the same way for P3 and the cross-block part of O;
+//   * one CTA = (V slice of K2_BV columns, sequence, head), 8 compute warps in lock step per chunk:
+//         phase 1   warps 0-3: P1 = W.E^T (K=128) and U = UT - P1       | warps 4-7: P2 = GQ.E^T (K=128)
+//         S1        (CTA barrier; copies of the next chunk's W / GQ / UT are issued)
+//         phase 3   warps 0-3: P3 = KD.U (K=64) and E' = E*GEND + P3    | warps 4-7: O (cross-block dot3 + FMA chain)
+//         S2        (CTA barrier; copies of the next chunk's Aqk / KD are issued)
+//     Each operand buffer is single-buffered and refilled as soon as its last reader has passed a barrier, so the
+//     next chunk's operands stream in behind the current chunk's tensor-core work.
+//   * independent accumulator chains (all V tiles of a warp's row tile) are issued interleaved so that the
+//     SMALL/BIG dependency chains of the pinned dot3 order (20.7 cycles per mma) overlap.
 #pragma once
 
+#include "cfbi/cfbi_async.cuh"
 #include "cfbi/cfbi_common.cuh"
 
 namespace cfbi {
 
-constexpr int K2_BV = 16;   // value columns per CTA
-constexpr int K2_SE = 132;  // sE row stride
-constexpr int K2_SU = 24;   // sU / sP row stride (conflict-free B-fragment reads)
+constexpr int K2_SU = K2_BV + 8;   // fp32 U row stride (conflict-free float2 stores from the C fragments)
+constexpr int K2_SE = 132;         // fp32 E row stride (conflict-free scattered updates)
 
-__global__ void __launch_bounds__(NTHREADS) k2_kernel(const Params p) {
-    __shared__ __align__(16) float sE[K2_BV * K2_SE];
-    __shared__ __align__(16) float sU[64 * K2_SU];
-    __shared__ __align__(16) float sP[2 * 64 * K2_SU];   // [0] = P1, [1] = P2
+constexpr int K2_UT_FLOATS = 4 * K2_NT * 128;            // UT slice of one chunk
+constexpr int K2_AQ_FLOATS = 12 * 128 + 4 * 16 * 17;     // AQF + AQD
+constexpr int K2_KD_FLOATS = 8192 + 128;                 // KD fragments + GEND
+constexpr int K2_EHL_WORDS = K2_NT * 16 * 32 * 2;        // one plane (hi or lo) of E B-fragments
+constexpr int K2_UHL_WORDS = K2_NT * 8 * 32 * 2;         // one plane of U B-fragments
 
-    const int v0 = blockIdx.x * K2_BV, n = blockIdx.y, h = blockIdx.z, H = p.H;
+// byte offsets inside the dynamic shared memory block
+constexpr int K2_OFF_W = 0;
+constexpr int K2_OFF_GQ = K2_OFF_W + 8192 * 4;
+constexpr int K2_OFF_KD = K2_OFF_GQ + 8192 * 4;
+constexpr int K2_OFF_AQ = K2_OFF_KD + K2_KD_FLOATS * 4;
+constexpr int K2_OFF_UT = K2_OFF_AQ + K2_AQ_FLOATS * 4;
+constexpr int K2_OFF_E32 = K2_OFF_UT + K2_UT_FLOATS * 4;
+constexpr int K2_OFF_EHL = K2_OFF_E32 + K2_BV * K2_SE * 4;
+constexpr int K2_OFF_U32 = K2_OFF_EHL + 2 * K2_EHL_WORDS * 4;
+constexpr int K2_OFF_UHL = K2_OFF_U32 + 64 * K2_SU * 4;
+constexpr int K2_OFF_BAR = K2_OFF_UHL + 2 * K2_UHL_WORDS * 4;
+constexpr int K2_SMEM_BYTES = K2_OFF_BAR + 64;
+static_assert(K2_OFF_AQ % 16 == 0 && K2_OFF_UT % 16 == 0 && K2_OFF_E32 % 16 == 0 && K2_OFF_EHL % 16 == 0 &&
+              K2_OFF_U32 % 16 == 0 && K2_OFF_UHL % 16 == 0 && K2_OFF_BAR % 8 == 0, "shared memory alignment");
+
+// word index of E[v][k] (v = value column inside the slice, k = key channel) in a hi/lo plane of B-fragments
+// [nt][ks 16][lane 32][2]: the B fragment of the 8x8 (k-step, n-tile) block is b0 = (k = t, n = g), b1 = (k = t+4, n = g)
+__device__ __forceinline__ int efrag_word(int v, int k) {
+    return ((((v >> 3) * 16 + (k >> 3)) * 32 + ((v & 7) * 4 + (k & 3))) << 1) + ((k >> 2) & 1);
+}
+// same for U[j][v] (j = token row 0..63 is the K index): [nt][ks 8][lane 32][2]
+__device__ __forceinline__ int ufrag_word(int j, int v) {
+    return ((((v >> 3) * 8 + (j >> 3)) * 32 + ((v & 7) * 4 + (j & 3))) << 1) + ((j >> 2) & 1);
+}
+
+// P2 / P1 style product: rows of one 16-row tile (A fragments of K = 128, 16 k-steps) times the E fragments,
+// NT independent 16x8 tiles. Result = fadd_rn(BIG, SMALL) per element, C-fragment order.
+__device__ __forceinline__ void k2_dot3_e(const float4* a, const uint2* eh, const uint2* el, float (&res)[K2_NT][4]) {
+    float big[K2_NT][4], sml[K2_NT][4];
+#pragma unroll
+    for (int nt = 0; nt < K2_NT; ++nt)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { big[nt][i] = neg_zero(); sml[nt][i] = neg_zero(); }
+#pragma unroll
+    for (int ks = 0; ks < 16; ++ks) {
+        const float4 av = a[ks * 32];
+        uint32_t ah[4], al[4];
+        split_tf32(av.x, ah[0], al[0]);
+        split_tf32(av.y, ah[1], al[1]);
+        split_tf32(av.z, ah[2], al[2]);
+        split_tf32(av.w, ah[3], al[3]);
+#pragma unroll
+        for (int nt = 0; nt < K2_NT; ++nt) {
+            const uint2 bh = eh[(nt * 16 + ks) * 32], bl = el[(nt * 16 + ks) * 32];
+            const uint32_t bhv[2] = {bh.x, bh.y}, blv[2] = {bl.x, bl.y};
+            mma_tf32_m16n8k8(sml[nt], al, bhv);
+            mma_tf32_m16n8k8(sml[nt], ah, blv);
+            mma_tf32_m16n8k8(big[nt], ah, bhv);
+        }
+    }
+#pragma unroll
+    for (int nt = 0; nt < K2_NT; ++nt)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) res[nt][i] = fadd(big[nt][i], sml[nt][i]);
+}
+
+// cross-sub-block part of O: M = dot3(Aqk[16s.., 0:16s], U[0:16s]) for KS = 2s k-steps, A fragments `a`
+// (the sub-block's AQF fragments), B fragments from the U hi/lo planes.
+template <int KS>
+__device__ __forceinline__ void k2_cross_block(const float4* a, const uint2* uh, const uint2* ul, float (&res)[K2_NT][4]) {
+    float big[K2_NT][4], sml[K2_NT][4];
+#pragma unroll
+    for (int nt = 0; nt < K2_NT; ++nt)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { big[nt][i] = neg_zero(); sml[nt][i] = neg_zero(); }
+#pragma unroll
+    for (int ks = 0; ks < KS; ++ks) {
+        const float4 av = a[ks * 32];
+        uint32_t ah[4], al[4];
+        split_tf32(av.x, ah[0], al[0]);
+        split_tf32(av.y, ah[1], al[1]);
+        split_tf32(av.z, ah[2], al[2]);
+        split_tf32(av.w, ah[3], al[3]);
+#pragma unroll
+        for (int nt = 0; nt < K2_NT; ++nt) {
+            const uint2 bh = uh[(nt * 8 + ks) * 32], bl = ul[(nt * 8 + ks) * 32];
+            const uint32_t bhv[2] = {bh.x, bh.y}, blv[2] = {bl.x, bl.y};
+            mma_tf32_m16n8k8(sml[nt], al, bhv);
+            mma_tf32_m16n8k8(sml[nt], ah, blv);
+            mma_tf32_m16n8k8(big[nt], ah, bhv);
+        }
+    }
+#pragma unroll
+    for (int nt = 0; nt < K2_NT; ++nt)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) res[nt][i] = fadd(big[nt][i], sml[nt][i]);
+}
+
+__global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
+    extern __shared__ __align__(128) unsigned char smem_raw[];
+    float* sW = reinterpret_cast<float*>(smem_raw + K2_OFF_W);
+    float* sGQ = reinterpret_cast<float*>(smem_raw + K2_OFF_GQ);
+    float* sKD = reinterpret_cast<float*>(smem_raw + K2_OFF_KD);   // KD fragments, then GEND[128]
+    float* sAQ = reinterpret_cast<float*>(smem_raw + K2_OFF_AQ);   // AQF [12][32][4], then AQD [4][16][17]
+    float* sUT = reinterpret_cast<float*>(smem_raw + K2_OFF_UT);
+    float* sE = reinterpret_cast<float*>(smem_raw + K2_OFF_E32);
+    uint32_t* sEhi = reinterpret_cast<uint32_t*>(smem_raw + K2_OFF_EHL);
+    uint32_t* sElo = sEhi + K2_EHL_WORDS;
+    float* sU = reinterpret_cast<float*>(smem_raw + K2_OFF_U32);
+    uint32_t* sUhi = reinterpret_cast<uint32_t*>(smem_raw + K2_OFF_UHL);
+    uint32_t* sUlo = sUhi + K2_UHL_WORDS;
+    uint64_t* bar = reinterpret_cast<uint64_t*>(smem_raw + K2_OFF_BAR);   // 0 W, 1 GQ, 2 UT, 3 AQ, 4 KD
+
+    const int vs = blockIdx.x, n = blockIdx.y, h = blockIdx.z, H = p.H;
     const SeqPlan sp = p.plan[n];
     const int nch = sp.nfull + (sp.tail > 0 ? 1 : 0);
     if (nch == 0) return;
-    const int tid = threadIdx.x, warp = tid >> 5;
-    const LaneIdx L;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int v0 = vs * K2_BV;
 
-    float* Eg = p.E != nullptr ? p.E + ((int64_t)n * H + h) * E_FLOATS + (int64_t)v0 * HEAD_K : nullptr;
-    for (int idx = tid; idx < K2_BV * 32; idx += NTHREADS) {
-        const int v = idx >> 5, c4 = idx & 31;
-        *reinterpret_cast<float4*>(&sE[v * K2_SE + 4 * c4]) =
-            Eg != nullptr ? *reinterpret_cast<const float4*>(&Eg[v * HEAD_K + 4 * c4]) : make_float4(0.f, 0.f, 0.f, 0.f);
+    if (tid == 0) {
+#pragma unroll
+        for (int i = 0; i < 5; ++i) mbar_init(&bar[i], 1);
+        mbar_init_fence();
     }
     __syncthreads();
+
+    const float* ws_base = p.ws + ((int64_t)sp.cbase * H + h) * WS2_FLOATS;   // chunk lc: + lc * H * WS2_FLOATS
+    auto ws_chunk = [&](int lc) { return ws_base + (int64_t)lc * H * WS2_FLOATS; };
+    // copies of the operands that P1 / P2 / U consume (W, GQ, UT slice) and of those that O / P3 consume (Aqk, KD)
+    auto issue_front = [&](int lc) {
+        const float* wsb = ws_chunk(lc);
+        fence_proxy_async_smem();
+        mbar_arrive_expect_tx(&bar[0], 8192 * 4);
+        bulk_g2s(sW, wsb + WS2_W, 8192 * 4, &bar[0]);
+        mbar_arrive_expect_tx(&bar[1], 8192 * 4);
+        bulk_g2s(sGQ, wsb + WS2_GQ, 8192 * 4, &bar[1]);
+        mbar_arrive_expect_tx(&bar[2], K2_UT_FLOATS * 4);
+        bulk_g2s(sUT, wsb + WS2_UT + vs * K2_UT_FLOATS, K2_UT_FLOATS * 4, &bar[2]);
+    };
+    auto issue_back = [&](int lc) {
+        const float* wsb = ws_chunk(lc);
+        fence_proxy_async_smem();
+        mbar_arrive_expect_tx(&bar[3], K2_AQ_FLOATS * 4);
+        bulk_g2s(sAQ, wsb + WS2_AQF, K2_AQ_FLOATS * 4, &bar[3]);
+        if (lc < sp.nfull) {
+            mbar_arrive_expect_tx(&bar[4], K2_KD_FLOATS * 4);
+            bulk_g2s(sKD, wsb + WS2_KD, K2_KD_FLOATS * 4, &bar[4]);
+        }
+    };
+    if (tid == 0) {
+        issue_front(0);
+        issue_back(0);
+    }
+
+    // E slice [K2_BV][128]: fp32 copy and pre-split hi/lo B fragments
+    float* Eg = p.E != nullptr ? p.E + ((int64_t)n * H + h) * E_FLOATS + (int64_t)v0 * HEAD_K : nullptr;
+    for (int idx = tid; idx < K2_BV * HEAD_K; idx += NTHREADS) {
+        const int v = idx >> 7, k = idx & 127;
+        const float e = Eg != nullptr ? Eg[v * HEAD_K + k] : 0.f;
+        sE[v * K2_SE + k] = e;
+        uint32_t hi, lo;
+        split_tf32(e, hi, lo);
+        sEhi[efrag_word(v, k)] = hi;
+        sElo[efrag_word(v, k)] = lo;
+    }
+    __syncthreads();
+
+    const bool isA = warp < 4;
+    const int w = warp & 3;   // row tile (A: P1 / U, B: P2 / sub-block of O); P3 key tiles are w and w + 4
 
     for (int lc = 0; lc < nch; ++lc) {
         const bool full = lc < sp.nfull;
         const int valid = full ? BT : sp.tail;
         const int nsb = (valid + SBR - 1) / SBR;
         const int64_t tok0 = (int64_t)sp.tok0 + sp.hrows + (int64_t)BT * lc;
-        const float* wsb = p.ws + ((int64_t)(sp.cbase + lc) * H + h) * WS_FLOATS;
-        const float* wg = wsb + WS_WG;
-        const float* ut = wsb + WS_UT;
-        const float* aqk = wsb + WS_AQK;
-        const float* kd = wsb + WS_KD;
-        const float* gend = wsb + WS_GEND;
+        const uint32_t par = lc & 1;
+        float p2[K2_NT][4];
 
-        // ---- 1. P1 = dot3(W, E^T), P2 = dot3(GQ, E^T): (W|GQ) x row tile x 8-column tile ------------------
-        for (int jb = warp; jb < 16; jb += 8) {
-            const int nt = jb & 1, rt = (jb >> 1) & 3, which = jb >> 3;
-            if (rt >= nsb) continue;
-            const float* a_rows = wg + (int64_t)(which * 64 + 16 * rt) * 128;
-            auto load_a = [&](int ks, float (&a)[4]) {
+        // ---- phase 1 ---------------------------------------------------------------------------------
+        if (isA) {
+            if (w < nsb) {
+                mbar_wait(&bar[0], par);
+                float p1[K2_NT][4];
+                k2_dot3_e(reinterpret_cast<const float4*>(sW) + w * 16 * 32 + lane, reinterpret_cast<const uint2*>(sEhi) + lane,
+                          reinterpret_cast<const uint2*>(sElo) + lane, p1);
+                mbar_wait(&bar[2], par);   // UT slice
 #pragma unroll
-                for (int ii = 0; ii < 4; ++ii) a[ii] = a_rows[(L.g + 8 * (ii & 1)) * 128 + 8 * ks + L.t + 4 * (ii >> 1)];
-            };
-            auto load_e = [&](int ks, float (&bb)[2]) {
+                for (int nt = 0; nt < K2_NT; ++nt) {
+                    const float4 ut = reinterpret_cast<const float4*>(sUT)[(w * K2_NT + nt) * 32 + lane];
+                    const float utv[4] = {ut.x, ut.y, ut.z, ut.w};
 #pragma unroll
-                for (int ii = 0; ii < 2; ++ii) bb[ii] = sE[(8 * nt + L.g) * K2_SE + 8 * ks + L.t + 4 * ii];
-            };
-            float out[4];
-            dot3(HEAD_K / 8, load_a, load_e, out);
-#pragma unroll
-            for (int ii = 0; ii < 4; ++ii)
-                sP[which * 64 * K2_SU + (16 * rt + c_row(L, ii)) * K2_SU + 8 * nt + c_col(L, ii)] = out[ii];
+                    for (int i = 0; i < 4; ++i) {
+                        const float u = fsub(utv[i], p1[nt][i]);
+                        const int row = 16 * w + g + 8 * (i >> 1), col = 8 * nt + 2 * t + (i & 1);
+                        sU[row * K2_SU + col] = u;
+                        uint32_t hi, lo;
+                        split_tf32(u, hi, lo);
+                        sUhi[ufrag_word(row, col)] = hi;
+                        sUlo[ufrag_word(row, col)] = lo;
+                        if (!full && p.rows != nullptr && row < valid)
+                            p.rows[((int64_t)n * H + h) * ROWS_PER_HEAD_FLOATS + PLANE_U * ROW_PLANE_FLOATS + row * 128 + v0 + col] = u;
+                    }
+                }
+            }
+        } else if (w < nsb) {
+            mbar_wait(&bar[1], par);   // GQ
+            k2_dot3_e(reinterpret_cast<const float4*>(sGQ) + w * 16 * 32 + lane, reinterpret_cast<const uint2*>(sEhi) + lane,
+                      reinterpret_cast<const uint2*>(sElo) + lane, p2);
         }
-        __syncthreads();
+        __syncthreads();   // S1: U visible, P1 / P2 done with E, W / GQ / UT free
+        if (tid == 0 && lc + 1 < nch) issue_front(lc + 1);
 
-        // ---- 2. U = UT - P1 (and the open-chunk cache of a partial chunk) ---------------------------------
-        for (int idx = tid; idx < nsb * 16 * K2_BV; idx += NTHREADS) {
-            const int row = idx >> 4, col = idx & 15;
-            const float u = fsub(ut[row * 128 + v0 + col], sP[row * K2_SU + col]);
-            sU[row * K2_SU + col] = u;
-            if (!full && p.rows != nullptr && row < valid)
-                p.rows[((int64_t)n * H + h) * ROWS_PER_HEAD_FLOATS + PLANE_U * ROW_PLANE_FLOATS + row * 128 + v0 + col] = u;
-        }
-        __syncthreads();
-
-        // ---- 3. O = P2 + dot3(Aqk[b.., 0:b], U[0:b]) then FMA chain over j = b..t -----------------------
-        {
-            const int s = warp >> 1, nt = warp & 1;
-            if (s < nsb) {
-                const int b = 16 * s;
-                float m[4] = {0.f, 0.f, 0.f, 0.f};
-                if (s > 0) {
-                    auto load_a = [&](int ks, float (&a)[4]) {
+        // ---- phase 3 ---------------------------------------------------------------------------------
+        if (isA) {
+            if (full) {   // P3 = dot3(KD, U) over K = 64 for the key tiles w and w + 4, then E' = E*GEND + P3
+                mbar_wait(&bar[4], par);
+                float big[2][K2_NT][4], sml[2][K2_NT][4];
 #pragma unroll
-                        for (int ii = 0; ii < 4; ++ii)
-                            a[ii] = aqk[(b + L.g + 8 * (ii & 1)) * 64 + 8 * ks + L.t + 4 * (ii >> 1)];
-                    };
-                    auto load_u = [&](int ks, float (&bb)[2]) {
+                for (int mi = 0; mi < 2; ++mi)
 #pragma unroll
-                        for (int ii = 0; ii < 2; ++ii) bb[ii] = sU[(8 * ks + L.t + 4 * ii) * K2_SU + 8 * nt + L.g];
-                    };
-                    dot3(2 * s, load_a, load_u, m);
+                    for (int nt = 0; nt < K2_NT; ++nt)
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) { big[mi][nt][i] = neg_zero(); sml[mi][nt][i] = neg_zero(); }
+                const float4* kd = reinterpret_cast<const float4*>(sKD) + lane;
+                const uint2* uh = reinterpret_cast<const uint2*>(sUhi) + lane;
+                const uint2* ul = reinterpret_cast<const uint2*>(sUlo) + lane;
+#pragma unroll
+                for (int ks = 0; ks < 8; ++ks) {
+                    uint32_t ah[2][4], al[2][4];
+#pragma unroll
+                    for (int mi = 0; mi < 2; ++mi) {
+                        const float4 av = kd[((w + 4 * mi) * 8 + ks) * 32];
+                        split_tf32(av.x, ah[mi][0], al[mi][0]);
+                        split_tf32(av.y, ah[mi][1], al[mi][1]);
+                        split_tf32(av.z, ah[mi][2], al[mi][2]);
+                        split_tf32(av.w, ah[mi][3], al[mi][3]);
+                    }
+#pragma unroll
+                    for (int nt = 0; nt < K2_NT; ++nt) {
+                        const uint2 bh = uh[(nt * 8 + ks) * 32], bl = ul[(nt * 8 + ks) * 32];
+                        const uint32_t bhv[2] = {bh.x, bh.y}, blv[2] = {bl.x, bl.y};
+#pragma unroll
+                        for (int mi = 0; mi < 2; ++mi) {
+                            mma_tf32_m16n8k8(sml[mi][nt], al[mi], bhv);
+                            mma_tf32_m16n8k8(sml[mi][nt], ah[mi], blv);
+                            mma_tf32_m16n8k8(big[mi][nt], ah[mi], bhv);
+                        }
+                    }
+                }
+                const float* gend = sKD + 8192;
+#pragma unroll
+                for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+                    for (int nt = 0; nt < K2_NT; ++nt)
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const int k = 16 * (w + 4 * mi) + g + 8 * (i >> 1), v = 8 * nt + 2 * t + (i & 1);
+                            float* e = &sE[v * K2_SE + k];
+                            const float en = fadd(fmul(*e, gend[k]), fadd(big[mi][nt][i], sml[mi][nt][i]));
+                            *e = en;
+                            uint32_t hi, lo;
+                            split_tf32(en, hi, lo);
+                            sEhi[efrag_word(v, k)] = hi;
+                            sElo[efrag_word(v, k)] = lo;
+                        }
+            }
+        } else if (w < nsb) {   // O for sub-block s = w
+            const int s = w;
+            mbar_wait(&bar[3], par);
+            float o[K2_NT][4];
+            if (s == 0) {
+#pragma unroll
+                for (int nt = 0; nt < K2_NT; ++nt)
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) o[nt][i] = p2[nt][i];
+            } else {
+                float m[K2_NT][4];
+                const float4* a = reinterpret_cast<const float4*>(sAQ) + s * (s - 1) * 32 + lane;
+                const uint2* uh = reinterpret_cast<const uint2*>(sUhi) + lane;
+                const uint2* ul = reinterpret_cast<const uint2*>(sUlo) + lane;
+                if (s == 1) k2_cross_block<2>(a, uh, ul, m);
+                else if (s == 2) k2_cross_block<4>(a, uh, ul, m);
+                else k2_cross_block<6>(a, uh, ul, m);
+#pragma unroll
+                for (int nt = 0; nt < K2_NT; ++nt)
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) o[nt][i] = fadd(p2[nt][i], m[nt][i]);
+            }
+            const float* aqd = sAQ + 12 * 128 + s * 272;
+#pragma unroll
+            for (int jj = 0; jj < 16; ++jj) {   // O[t] = fma(Aqk[t][j], U[j], O[t]) for j = 16s .. t, ascending
+                float uj[K2_NT][2];
+#pragma unroll
+                for (int nt = 0; nt < K2_NT; ++nt) {
+                    const float2 u2 = *reinterpret_cast<const float2*>(&sU[(16 * s + jj) * K2_SU + 8 * nt + 2 * t]);
+                    uj[nt][0] = u2.x;
+                    uj[nt][1] = u2.y;
                 }
 #pragma unroll
-                for (int ii = 0; ii < 4; ++ii) {
-                    const int row = b + c_row(L, ii), col = 8 * nt + c_col(L, ii);
-                    float o = sP[64 * K2_SU + row * K2_SU + col];
-                    if (s > 0) o = fadd(o, m[ii]);
-                    for (int j = b; j <= row; ++j) o = ffma(aqk[row * 64 + j], sU[j * K2_SU + col], o);
-                    if (row < valid) {
-                        const int64_t oi = ((tok0 + row) * H + h) * HEAD_V + v0 + col;
-                        p.out[oi] = f32_to_bf16_rn(o);
-                        if (p.out_f32 != nullptr) p.out_f32[oi] = o;
+                for (int hi = 0; hi < 2; ++hi) {
+                    const int rr = g + 8 * hi;
+                    const float a = aqd[rr * 17 + jj];
+#pragma unroll
+                    for (int nt = 0; nt < K2_NT; ++nt)
+#pragma unroll
+                        for (int e = 0; e < 2; ++e) {
+                            const float nv = ffma(a, uj[nt][e], o[nt][2 * hi + e]);
+                            o[nt][2 * hi + e] = (jj <= rr) ? nv : o[nt][2 * hi + e];
+                        }
+                }
+            }
+#pragma unroll
+            for (int hi = 0; hi < 2; ++hi) {
+                const int row = 16 * s + g + 8 * hi;
+                if (row < valid) {
+#pragma unroll
+                    for (int nt = 0; nt < K2_NT; ++nt) {
+                        const int64_t oi = ((tok0 + row) * H + h) * HEAD_V + v0 + 8 * nt + 2 * t;
+                        *reinterpret_cast<__nv_bfloat162*>(&p.out[oi]) = __floats2bfloat162_rn(o[nt][2 * hi], o[nt][2 * hi + 1]);
+                        if (p.out_f32 != nullptr)
+                            *reinterpret_cast<float2*>(&p.out_f32[oi]) = make_float2(o[nt][2 * hi], o[nt][2 * hi + 1]);
                     }
                 }
             }
         }
-
-        // ---- 4. state update (full chunks): E' = E*GEND + dot3(KD, U) ---------------------------------------
-        if (full) {
-            for (int jb = warp; jb < 16; jb += 8) {   // 8 key tiles x 2 value tiles
-                const int mt = jb >> 1, nt = jb & 1;
-                auto load_kd = [&](int ks, float (&a)[4]) {
-#pragma unroll
-                    for (int ii = 0; ii < 4; ++ii)
-                        a[ii] = kd[(16 * mt + L.g + 8 * (ii & 1)) * 64 + 8 * ks + L.t + 4 * (ii >> 1)];
-                };
-                auto load_u = [&](int ks, float (&bb)[2]) {
-#pragma unroll
-                    for (int ii = 0; ii < 2; ++ii) bb[ii] = sU[(8 * ks + L.t + 4 * ii) * K2_SU + 8 * nt + L.g];
-                };
-                float out[4];
-                dot3(BT / 8, load_kd, load_u, out);
-#pragma unroll
-                for (int ii = 0; ii < 4; ++ii) {
-                    const int k = 16 * mt + c_row(L, ii), v = 8 * nt + c_col(L, ii);
-                    float* e = &sE[v * K2_SE + k];
-                    *e = fadd(fmul(*e, gend[k]), out[ii]);
-                }
-            }
-        }
-        __syncthreads();
+        __syncthreads();   // S2: E' visible, O done, KD / Aqk free
+        if (tid == 0 && lc + 1 < nch) issue_back(lc + 1);
     }
 
     if (Eg != nullptr) {
-        for (int idx = tid; idx < K2_BV * 32; idx += NTHREADS) {
-            const int v = idx >> 5, c4 = idx & 31;
-            *reinterpret_cast<float4*>(&Eg[v * HEAD_K + 4 * c4]) = *reinterpret_cast<const float4*>(&sE[v * K2_SE + 4 * c4]);
+        for (int idx = tid; idx < K2_BV * HEAD_K; idx += NTHREADS) {
+            const int v = idx >> 7, k = idx & 127;
+            Eg[v * HEAD_K + k] = sE[v * K2_SE + k];
         }
     }
 }

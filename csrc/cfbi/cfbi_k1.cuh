@@ -188,51 +188,62 @@ __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
         __syncthreads();
     }
 
-    // ---- 4. workspace for K2 (and the row cache of a trailing partial chunk) ----------------------
-    float* wsb = p.ws + ((int64_t)c * H + h) * WS_FLOATS;
+    // ---- 4. workspace for K2 (fragment-native layout, see cfbi_common.cuh) -------------------------
+    float* wsb = p.ws + ((int64_t)c * H + h) * WS2_FLOATS;
     const int rows_done = nsb * 16;
-    for (int idx = tid; idx < 128 * 32; idx += NTHREADS) {   // WG: rows 0..63 = W, 64..127 = GQ
-        const int row = idx >> 5, c4 = idx & 31;
+    for (int idx = tid; idx < 2 * 4 * 16 * 32; idx += NTHREADS) {   // W and GQ A-fragments: [which][rt][ks][lane]
+        const int lane = idx & 31, ks = (idx >> 5) & 15, rt = (idx >> 9) & 3, which = idx >> 11;
+        const int g = lane >> 2, t = lane & 3;
         float4 val;
-        if (row < 64) {
-            val = row < rows_done ? *reinterpret_cast<const float4*>(&sW[row * K1_SX + 4 * c4])
-                                  : make_float4(0.f, 0.f, 0.f, 0.f);
-        } else {
-            const int r = row - 64;
-            val.x = fmul(ex2_ftz(sG[r * K1_SKH + 4 * c4 + 0]), sQ[r * K1_SKH + 4 * c4 + 0]);
-            val.y = fmul(ex2_ftz(sG[r * K1_SKH + 4 * c4 + 1]), sQ[r * K1_SKH + 4 * c4 + 1]);
-            val.z = fmul(ex2_ftz(sG[r * K1_SKH + 4 * c4 + 2]), sQ[r * K1_SKH + 4 * c4 + 2]);
-            val.w = fmul(ex2_ftz(sG[r * K1_SKH + 4 * c4 + 3]), sQ[r * K1_SKH + 4 * c4 + 3]);
+        float* vv = &val.x;
+#pragma unroll
+        for (int ii = 0; ii < 4; ++ii) {
+            const int row = 16 * rt + g + 8 * (ii & 1), col = 8 * ks + t + 4 * (ii >> 1);
+            if (which == 0) vv[ii] = row < rows_done ? sW[row * K1_SX + col] : 0.f;
+            else vv[ii] = fmul(ex2_ftz(sG[row * K1_SKH + col]), sQ[row * K1_SKH + col]);
         }
-        *reinterpret_cast<float4*>(&wsb[WS_WG + row * 128 + 4 * c4]) = val;
+        *reinterpret_cast<float4*>(&wsb[(which ? WS2_GQ : WS2_W) + ((rt * 16 + ks) * 32 + lane) * 4]) = val;
     }
-    for (int idx = tid; idx < 64 * 32; idx += NTHREADS) {    // UT
-        const int row = idx >> 5, c4 = idx & 31;
-        *reinterpret_cast<float4*>(&wsb[WS_UT + row * 128 + 4 * c4]) =
-            row < rows_done ? *reinterpret_cast<const float4*>(&sUT[row * K1_SX + 4 * c4])
-                            : make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int idx = tid; idx < K2_NSLICE * 4 * K2_NT * 32; idx += NTHREADS) {   // UT in P1 C-fragment order: [slice][rt][nt][lane]
+        const int lane = idx & 31, nt = (idx >> 5) % K2_NT, rt = ((idx >> 5) / K2_NT) & 3, slice = idx / (32 * K2_NT * 4);
+        const int g = lane >> 2, t = lane & 3;
+        const int row = 16 * rt + g, col = slice * K2_BV + 8 * nt + 2 * t;
+        float4 val = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (row < rows_done) { val.x = sUT[row * K1_SX + col]; val.y = sUT[row * K1_SX + col + 1]; }
+        if (row + 8 < rows_done) { val.z = sUT[(row + 8) * K1_SX + col]; val.w = sUT[(row + 8) * K1_SX + col + 1]; }
+        *reinterpret_cast<float4*>(&wsb[WS2_UT + idx * 4]) = val;
     }
-    for (int idx = tid; idx < 64 * 16; idx += NTHREADS) {    // Aqk
-        const int row = idx >> 4, c4 = idx & 15;
-        *reinterpret_cast<float4*>(&wsb[WS_AQK + row * 64 + 4 * c4]) =
-            *reinterpret_cast<const float4*>(&sAqk[row * K1_SA + 4 * c4]);
+    for (int idx = tid; idx < AQ_NFRAG * 32; idx += NTHREADS) {   // Aqk cross-block A-fragments: f = s*(s-1) + ks
+        const int lane = idx & 31, f = idx >> 5;
+        const int s = f < 2 ? 1 : (f < 6 ? 2 : 3), ks = f - s * (s - 1);
+        const int g = lane >> 2, t = lane & 3;
+        float4 val;
+        float* vv = &val.x;
+#pragma unroll
+        for (int ii = 0; ii < 4; ++ii)
+            vv[ii] = sAqk[(16 * s + g + 8 * (ii & 1)) * K1_SA + 8 * ks + t + 4 * (ii >> 1)];
+        *reinterpret_cast<float4*>(&wsb[WS2_AQF + idx * 4]) = val;
+    }
+    for (int idx = tid; idx < 4 * 16 * 16; idx += NTHREADS) {   // Aqk diagonal blocks (row stride 17)
+        const int s = idx >> 8, r = (idx >> 4) & 15, cc = idx & 15;
+        wsb[WS2_AQD + s * 272 + r * 17 + cc] = sAqk[(16 * s + r) * K1_SA + 16 * s + cc];
     }
     if (full) {
-        {   // KD[k][j] = khat[j][k] * ex2(G2e[k] - G2[j][k]); thread = (k, half of the j range)
-            const int k = tid & 127, jh = tid >> 7;
-            const float g2e = sG[63 * K1_SKH + k];
-#pragma unroll
-            for (int j4 = 0; j4 < 8; ++j4) {
-                const int j = jh * 32 + 4 * j4;
+        {   // KD A-fragments [mt][ks][lane]: KD[k][j] = khat[j][k] * ex2(G2e[k] - G2[j][k])
+            for (int idx = tid; idx < 8 * 8 * 32; idx += NTHREADS) {
+                const int lane = idx & 31, ks = (idx >> 5) & 7, mt = idx >> 8;
+                const int g = lane >> 2, t = lane & 3;
                 float4 val;
-                val.x = fmul(sK[(j + 0) * K1_SKH + k], ex2_ftz(fsub(g2e, sG[(j + 0) * K1_SKH + k])));
-                val.y = fmul(sK[(j + 1) * K1_SKH + k], ex2_ftz(fsub(g2e, sG[(j + 1) * K1_SKH + k])));
-                val.z = fmul(sK[(j + 2) * K1_SKH + k], ex2_ftz(fsub(g2e, sG[(j + 2) * K1_SKH + k])));
-                val.w = fmul(sK[(j + 3) * K1_SKH + k], ex2_ftz(fsub(g2e, sG[(j + 3) * K1_SKH + k])));
-                *reinterpret_cast<float4*>(&wsb[WS_KD + k * 64 + j]) = val;
+                float* vv = &val.x;
+#pragma unroll
+                for (int ii = 0; ii < 4; ++ii) {
+                    const int k = 16 * mt + g + 8 * (ii & 1), j = 8 * ks + t + 4 * (ii >> 1);
+                    vv[ii] = fmul(sK[j * K1_SKH + k], ex2_ftz(fsub(sG[63 * K1_SKH + k], sG[j * K1_SKH + k])));
+                }
+                *reinterpret_cast<float4*>(&wsb[WS2_KD + idx * 4]) = val;
             }
         }
-        if (tid < 128) wsb[WS_GEND + tid] = ex2_ftz(sG[63 * K1_SKH + tid]);
+        if (tid < 128) wsb[WS2_GEND + tid] = ex2_ftz(sG[63 * K1_SKH + tid]);
     } else if (p.rows != nullptr) {
         float* R = p.rows + ((int64_t)n * H + h) * ROWS_PER_HEAD_FLOATS;
         for (int idx = tid; idx < valid * 32; idx += NTHREADS) {
