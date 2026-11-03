@@ -132,6 +132,33 @@ if "cfbi" in _BUILD_EXTS:
         )
     )
 
+    # The layers around the core (short causal conv + SiLU, batch-invariant bf16 linear): same flags, own extension.
+    ext_modules.append(
+        CUDAExtension(
+            name='flash_kda_cfbi_conv_C',
+            sources=[
+                'csrc/cfbi/cfbi_convlin_binding.cpp',
+                'csrc/cfbi/cfbi_convlin.cu',
+            ],
+            include_dirs=[os.path.join(this_dir, 'csrc')],
+            extra_compile_args={
+                'cxx': ['-O3', '-Wno-psabi'],
+                'nvcc': [
+                    '-O3',
+                    '-fmad=false',
+                    '-ftz=false',
+                    '-prec-div=true',
+                    '-prec-sqrt=true',
+                    '--expt-relaxed-constexpr',
+                    '--ptxas-options=-v',
+                    '-lineinfo',
+                    *get_nvcc_thread_args(),
+                    *get_arch_flags(),
+                ],
+            },
+        )
+    )
+
 cmdclass = {"build_ext": BuildExtension}
 
 rev = os.getenv("FLASH_KDA_VERSION_SUFFIX", "")
