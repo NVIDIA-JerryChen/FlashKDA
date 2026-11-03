@@ -356,31 +356,66 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
             }
         }
 
-        // ---- G. chunk end: E' = E * GEND + dot3(KD, U) ----------------------------------------------
+        // ---- G. chunk end: E' = E * GEND + dot3(KD, U), P3 over K = 64. Warp w owns the value tiles w and w + 8 for all
+        //         8 key tiles; the KD fragments of a key tile are shared by its two value tiles, operands are loaded in
+        //         two batches of four k-steps in front of the MMAs --------------------------------------------------
         if (pos == BT - 1) {
             if (tid < HEAD_K) S.gend[tid] = ex2_ftz(S.g2[tid]);
             __syncthreads();
-            for (int jb = warp; jb < 128; jb += 8) {   // 8 key tiles x 16 value tiles
-                const int mt = jb >> 4, nt = jb & 15;
-                auto load_kd = [&](int ks, float (&a)[4]) {
+            for (int mt = 0; mt < 8; ++mt) {
+                float big[2][4], sml[2][4], eold[2][4];
+#pragma unroll
+                for (int tl = 0; tl < 2; ++tl)
+#pragma unroll
+                    for (int i2 = 0; i2 < 4; ++i2) {
+                        big[tl][i2] = neg_zero();
+                        sml[tl][i2] = neg_zero();
+                        // this thread is the only owner of these E elements: read them now, use them after the MMAs
+                        eold[tl][i2] = Eg[(8 * (warp + 8 * tl) + c_col(L, i2)) * HEAD_K + 16 * mt + c_row(L, i2)];
+                    }
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    float rkA[4][4], rgA[4][4], ub[4][2][2];
+#pragma unroll
+                    for (int kl = 0; kl < 4; ++kl) {
+                        const int ks = 4 * half + kl;
+#pragma unroll
+                        for (int ii = 0; ii < 4; ++ii) {
+                            const int k = 16 * mt + g + 8 * (ii & 1), j = 8 * ks + t + 4 * (ii >> 1);
+                            rkA[kl][ii] = Rk[j * HEAD_K + k];
+                            rgA[kl][ii] = Rg[j * HEAD_K + k];
+                        }
+#pragma unroll
+                        for (int tl = 0; tl < 2; ++tl)
+#pragma unroll
+                            for (int ii = 0; ii < 2; ++ii) ub[kl][tl][ii] = Ru[(8 * ks + t + 4 * ii) * HEAD_V + 8 * (warp + 8 * tl) + g];
+                    }
+#pragma unroll
+                    for (int kl = 0; kl < 4; ++kl) {
+                        uint32_t ah[4], al[4];
+#pragma unroll
+                        for (int ii = 0; ii < 4; ++ii) {
+                            const int k = 16 * mt + g + 8 * (ii & 1);
+                            split_tf32(fmul(rkA[kl][ii], ex2_ftz(fsub(S.g2[k], rgA[kl][ii]))), ah[ii], al[ii]);
+                        }
+#pragma unroll
+                        for (int tl = 0; tl < 2; ++tl) {
+                            uint32_t bh[2], bl[2];
+#pragma unroll
+                            for (int ii = 0; ii < 2; ++ii) split_tf32(ub[kl][tl][ii], bh[ii], bl[ii]);
+                            mma_tf32_m16n8k8(sml[tl], al, bh);
+                            mma_tf32_m16n8k8(sml[tl], ah, bl);
+                            mma_tf32_m16n8k8(big[tl], ah, bh);
+                        }
+                    }
+                }
+#pragma unroll
+                for (int tl = 0; tl < 2; ++tl)
 #pragma unroll
                     for (int ii = 0; ii < 4; ++ii) {
-                        const int k = 16 * mt + L.g + 8 * (ii & 1), j = 8 * ks + L.t + 4 * (ii >> 1);
-                        a[ii] = fmul(Rk[j * HEAD_K + k], ex2_ftz(fsub(S.g2[k], Rg[j * HEAD_K + k])));
+                        const int k = 16 * mt + c_row(L, ii), v = 8 * (warp + 8 * tl) + c_col(L, ii);
+                        Eg[v * HEAD_K + k] = fadd(fmul(eold[tl][ii], S.gend[k]), fadd(big[tl][ii], sml[tl][ii]));
                     }
-                };
-                auto load_u = [&](int ks, float (&bb)[2]) {
-#pragma unroll
-                    for (int ii = 0; ii < 2; ++ii) bb[ii] = Ru[(8 * ks + L.t + 4 * ii) * HEAD_V + 8 * nt + L.g];
-                };
-                float out[4];
-                dot3(BT / 8, load_kd, load_u, out);
-#pragma unroll
-                for (int ii = 0; ii < 4; ++ii) {
-                    const int k = 16 * mt + c_row(L, ii), v = 8 * nt + c_col(L, ii);
-                    float* e = &Eg[v * HEAD_K + k];
-                    *e = fadd(fmul(*e, S.gend[k]), out[ii]);
-                }
             }
             pos = 0;
         } else {
@@ -389,7 +424,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
         __syncthreads();
 #ifdef CFBI_ROWS_PROFILE
         ROWS_TS(7);
-        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && (i < 3 || pos % 16 == 4))
+        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && (i < 3 || pos % 16 == 4 || pos == 0))
             printf("rows pos=%d: prep %lld | akk/aqk %lld | M tiles %lld | UT/W chain %lld | P1/P2 %lld | U,O %lld | chunk-end/sync %lld | total %lld\n", pos,
                    tp[1] - tp[0], tp[2] - tp[1], tp[3] - tp[2], tp[4] - tp[3], tp[5] - tp[4], tp[6] - tp[5], tp[7] - tp[6], tp[7] - tp[0]);
 #endif
