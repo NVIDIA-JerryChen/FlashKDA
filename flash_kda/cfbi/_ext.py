@@ -31,7 +31,7 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _jit_build(verbose: bool):
+def _jit_build(verbose: bool, name: str = "flash_kda_cfbi_C_jit", defines: tuple = ()):
     from torch.utils.cpp_extension import load
 
     root = _repo_root()
@@ -50,11 +50,11 @@ def _jit_build(verbose: bool):
         os.environ["TORCH_CUDA_ARCH_LIST"] = arch
     try:
         return load(
-            name="flash_kda_cfbi_C_jit",
+            name=name,
             sources=[str(csrc / "cfbi" / s) for s in _SOURCES],
             extra_include_paths=[str(csrc)],
             extra_cflags=["-O3", "-Wno-psabi"],
-            extra_cuda_cflags=NVCC_FLAGS,
+            extra_cuda_cflags=NVCC_FLAGS + [f"-D{d}" for d in defines],
             build_directory=build_dir or None,
             verbose=verbose,
         )
@@ -82,3 +82,10 @@ def load_ext(verbose: bool | None = None):
             pass
     _EXT = _jit_build(verbose)
     return _EXT
+
+
+def load_variant(name: str, defines: tuple):
+    """JIT-build a differently flagged copy of the extension under its own module name (tests only: the
+    negative-control kernels that the bitwise harness must catch)."""
+    return _jit_build(os.environ.get("FLASH_KDA_CFBI_VERBOSE", "0") == "1", name=f"flash_kda_cfbi_C_{name}",
+                      defines=tuple(defines))

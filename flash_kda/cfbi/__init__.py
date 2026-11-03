@@ -5,5 +5,9 @@ the training forward evaluate many rows at once, decode evaluates one more row o
 bits do not depend on call cuts, phase or batch composition. See docs/20261102-cfbi-numerical-contract.md.
 """
 from ._ext import load_ext
+from .api import decode, forward_train, prefill
+from .state import CfbiState, alloc_state, state_equal, state_mismatch
 
-__all__ = ["load_ext"]
+__all__ = [
+    "load_ext", "prefill", "decode", "forward_train", "CfbiState", "alloc_state", "state_equal", "state_mismatch",
+]
