@@ -171,6 +171,8 @@ def test_resolve_impl_policy(ext):
     for r in (r0, r3):
         need = k1_ref if r & 2 else k1_opt
         assert bool(r & ROWS_ONLY) == (smem < need), "row-engine-only exactly when K1's shared memory does not fit"
+        if smem < need:
+            assert r & 1, "the automatic row-engine-only fallback runs the reference row engine"
         assert ext.resolve_impl(r, -1) == r, "resolve_impl is idempotent"
     assert ext.resolve_impl(ROWS_ONLY, -1) & ROWS_ONLY, "an explicit row-engine-only request must be honoured"
 
