@@ -47,6 +47,7 @@ struct ForwardArgs {
 // optimised ones. K1 and K2 share one bit because their workspace layouts differ between the implementations.
 constexpr int IMPL_REF_ROWS = 1;    // row engine (decode, head rows)
 constexpr int IMPL_REF_CHUNK = 2;   // K1 + K2 (prefill / training forward)
+constexpr int IMPL_K2_UMMA = 4;     // optimised K1 + the tcgen05 (UMMA) K2 (ignored together with IMPL_REF_CHUNK)
 
 // Runs plan -> row engine -> K1 -> K2 -> pos update on `stream`.
 void launch_forward(const ForwardArgs& a, cudaStream_t stream);

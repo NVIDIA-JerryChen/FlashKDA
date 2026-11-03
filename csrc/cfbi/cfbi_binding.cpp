@@ -94,7 +94,7 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     TORCH_CHECK(A_log.dim() == 1 && A_log.size(0) == H, "A_log must be [H]");
     TORCH_CHECK(dt_bias.dim() == 2 && dt_bias.size(0) == H && dt_bias.size(1) == 128, "dt_bias must be [H, 128]");
     TORCH_CHECK(mode == 0 || mode == 1, "mode must be 0 or 1");
-    TORCH_CHECK(impl >= 0 && impl <= 3, "impl must be 0..3 (bit 0: reference row engine, bit 1: reference K1/K2)");
+    TORCH_CHECK(impl >= 0 && impl <= 7, "impl must be 0..7 (bit 0: reference row engine, bit 1: reference K1/K2, bit 2: UMMA K2)");
     TORCH_CHECK(lower_bound >= -5.0 && lower_bound <= 0.0, "lower_bound must be in [-5, 0]");
     const int64_t T_total = B * T;
     TORCH_CHECK(T_total < (int64_t(1) << 31) && H < 65536, "problem too large for the int32 token index / grid");

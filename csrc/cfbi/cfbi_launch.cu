@@ -2,6 +2,7 @@
 #include "cfbi/cfbi_common.cuh"
 #include "cfbi/cfbi_k1.cuh"
 #include "cfbi/cfbi_k2.cuh"
+#include "cfbi/cfbi_k2_umma.cuh"
 #include "cfbi/cfbi_launch.h"
 #include "cfbi/cfbi_plan.cuh"
 #include "cfbi/cfbi_rows.cuh"
@@ -49,9 +50,14 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
             ref::k2_kernel<<<dim3(HEAD_V / ref::K2_BV, a.N, a.H), NTHREADS, 0, stream>>>(p);
         } else {
             cudaFuncSetAttribute(k1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)K1_SMEM_BYTES);
-            cudaFuncSetAttribute(k2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, K2_SMEM_BYTES);
             k1_kernel<<<dim3((unsigned)max_chunks, a.H), NTHREADS, K1_SMEM_BYTES, stream>>>(p);
-            k2_kernel<<<dim3(K2_NSLICE, a.N, a.H), NTHREADS, K2_SMEM_BYTES, stream>>>(p);
+            if (a.impl & IMPL_K2_UMMA) {
+                cudaFuncSetAttribute(k2u_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, KU_SMEM_BYTES);
+                k2u_kernel<<<dim3(KU_NSLICE, a.N, a.H), KU_THREADS, KU_SMEM_BYTES, stream>>>(p);
+            } else {
+                cudaFuncSetAttribute(k2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, K2_SMEM_BYTES);
+                k2_kernel<<<dim3(K2_NSLICE, a.N, a.H), NTHREADS, K2_SMEM_BYTES, stream>>>(p);
+            }
         }
     }
     if (a.pos != nullptr) finalize_pos_kernel<<<(a.N + 255) / 256, 256, 0, stream>>>(p.plan, a.pos, a.N);
