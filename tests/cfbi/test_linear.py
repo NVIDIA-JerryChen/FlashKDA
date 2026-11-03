@@ -195,7 +195,7 @@ def test_leading_dims_strided_and_misaligned_inputs(cx):
 # controls: the invariance test must catch an M-dependent K order; cuBLAS shows the effect we guard against
 # ---------------------------------------------------------------------------------------------------------
 def test_negative_control_is_caught(cx, cx_neg):
-    """Build where the small-M configuration walks K backwards (an M-dependent program): the same check as above fails."""
+    """Build where the small-M (M <= 64) configuration walks K backwards (an M-dependent program): the same check as above fails."""
     K, N, M = 1024, 256, 512
     X, W = randbf((M, K), 26, 0.5), randbf((N, K), 27, 0.05)
 
@@ -212,8 +212,8 @@ def test_negative_control_is_caught(cx, cx_neg):
     bad = [(n_diff(lin(cx_neg, X[:m])[0], full_neg[0][:m]), n_diff(lin(cx_neg, X[:m])[1], full_neg[1][:m])) for m in ms]
     print(f"\n[negative control, linear] (bf16, fp32) outputs differing, M rows alone vs inside M=512, M = {ms}: {bad} "
           f"of {[m * N for m in ms]} (production build: all zero)")
-    assert bad[0][1] > 0 and bad[1][1] > 0, "the harness did not see an M-dependent K order in the fp32 values: it is vacuous"
-    assert all(b[1] == 0 for b in bad[2:])   # configs 1 / 2 are untouched
+    assert bad[0][1] > 0 and bad[1][1] > 0 and bad[2][1] > 0, "the harness did not see an M-dependent K order in the fp32 values: it is vacuous"
+    assert all(b[1] == 0 for b in bad[3:])   # M = 100, 128 run configuration 1: untouched
     assert n_diff(lin(cx_neg, X, 4)[1], lin(cx, X, 4)[1]) == 0   # the large-M configuration is untouched
 
 

@@ -57,3 +57,23 @@ def test_cross_process_digest(cx):
         r = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, check=True)
         digests.append([ln for ln in r.stdout.splitlines() if ln.startswith("DIGEST")][-1])
     assert digests[0] == digests[1], digests
+
+
+def test_too_small_max_seqlen_traps_instead_of_dropping_tokens(cx):
+    """max_seqlen only sizes the grid; a sequence longer than it must fail loudly (the trap poisons the CUDA context, so
+    the check runs in a subprocess), while a true bound works."""
+    root = Path(__file__).resolve().parents[2]
+    code = (
+        "import sys, torch\n"
+        "from flash_kda.cfbi import short_conv\n"
+        "x = torch.randn(1, 300, 64, device='cuda').to(torch.bfloat16)\n"
+        "w = torch.randn(64, 4, device='cuda')\n"
+        "cu = torch.tensor([0, 300], dtype=torch.int64, device='cuda')\n"
+        "y = short_conv(x, w, None, None, 'silu', cu, max_seqlen=int(sys.argv[1]))\n"
+        "torch.cuda.synchronize()\n"
+        "print('OK')\n"
+    )
+    ok = subprocess.run([sys.executable, "-c", code, "300"], capture_output=True, text=True, cwd=root)
+    assert ok.returncode == 0 and "OK" in ok.stdout, ok.stderr[-500:]
+    bad = subprocess.run([sys.executable, "-c", code, "64"], capture_output=True, text=True, cwd=root)
+    assert bad.returncode != 0 and "OK" not in bad.stdout, "a too-small max_seqlen did not fail"

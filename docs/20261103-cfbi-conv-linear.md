@@ -64,8 +64,8 @@ q = short_conv(q_pre.view(B, T, D), conv_weight, None, None, "silu")            
 * `state`: see section 2. A call with `state=None` writes no state and reads zero history (the training forward).
   Stateful calls are inference-only and raise if autograd would record them (`torch.no_grad()`).
 * `max_seqlen` (optional host int): upper bound of the sequence lengths; the grid is sized from it (default `T`, or `Ttot` for
-  packed input). Pass the true bound in packed decode (`max_seqlen=1`) to avoid launching idle blocks; a bound that is too small
-  silently drops tokens.
+  packed input). Pass the true bound in packed decode (`max_seqlen=1`) to avoid launching idle blocks; a sequence longer than the bound makes
+  the kernel trap (a loud device-side error instead of silently dropped tokens; it poisons the CUDA context).
 * `out_fp32=` (tests): receives the fp32 value before the bf16 rounding. Comparing only the bf16 outputs is a *weak* detector of
   arithmetic differences (a sabotaged association changes 15744 of 51200 fp32 values and 0 bf16 values in the control of
   section 6), so all equality tests compare both.
@@ -159,32 +159,33 @@ weights stream from HBM as in real decode, "hot" repeats one matrix):
 
 | M | tile config | bi_linear cold | cuBLAS cold | ratio | bi_linear hot | cuBLAS hot |
 |---|---|---|---|---|---|---|
-| 1 | 0 (16x32) | 12.1 | 9.2 | 1.3x | 11.4 | 6.5 |
-| 16 | 0 | 12.3 | 11.5 | 1.1x | 11.7 | 11.4 |
-| 64 | 1 (64x32) | 25.2 | 9.3 | 2.7x | 25.4 | 6.3 |
-| 128 | 2 (128x32) | 31.3 | 9.5 | 3.3x | 31.6 | 6.8 |
-| 8192 | 4 (128x128) | 731.7 (376 TFLOP/s) | 154.1 (1784 TFLOP/s) | 4.75x | 726.8 | 158.8 |
+| 1 | 0 (16x32) | 12.1 | 9.1 | 1.3x | 11.4 | 6.5 |
+| 16 | 0 | 12.2 | 11.4 | 1.07x | 11.7 | 11.4 |
+| 64 | 0 | 20.3 | 9.4 | 2.2x | 20.4 | 6.3 |
+| 128 | 1 (64x32) | 29.6 | 9.5 | 3.1x | 29.8 | 6.7 |
+| 8192 | 4 (128x128) | 731.7 (376 TFLOP/s) | 154.1 (1784 TFLOP/s) | 4.75x | 726.8 | 159.2 |
 
-Other projections of a KDA layer (hidden 4096, 16 heads, hot, us, `bi_linear / cuBLAS`): q/k/v `4096->2048` M=1 15.3 / 7.6, M=128 40.9 / 7.9,
-M=8192 375 / 85.7; `f_proj[0]` `4096->128` 11.2 / 4.5, 33.7 / 5.3, 47.1 / 9.8; `f_proj[1]` `128->2048` 2.2 / 2.4, 3.5 / 2.2, 25.2 / 8.3; `b_proj`
-`4096->16` 11.4 / 3.8, 31.6 / 4.2, 31.8 / 6.7; `o_proj` `2048->4096` 6.8 / 4.5, 17.3 / 4.7, 375 / 80.0.
+Other projections of a KDA layer (hidden 4096, 16 heads, hot, us, `bi_linear / cuBLAS`): q/k/v `4096->2048` M=1 15.9 / 7.9, M=128 35.3 / 8.4,
+M=8192 394.5 / 85.9; `f_proj[0]` `4096->128` 11.3 / 4.3, 25.2 / 5.0, 41.9 / 8.9; `f_proj[1]` `128->2048` 2.2 / 2.2, 3.2 / 2.2, 24.9 / 8.3; `b_proj`
+`4096->16` 11.4 / 3.8, 27.1 / 4.2, 31.7 / 6.8; `o_proj` `2048->4096` 6.8 / 4.3, 16.5 / 4.6, 374.9 / 80.0.
 
 Why it is slower than cuBLAS (reasoned, not profiled): the sum over K may not be split (no split-K), so the parallelism of a decode GEMM is the
-number of N tiles (128 CTAs at N = 4096); at M = 64 .. 128 the small warp tiles most likely cost more shared-memory bandwidth for `ldmatrix`
-than the MMA pipe needs (about 0.75 `ldmatrix.x4` per `mma.sync` in the 128x32 config); at M = 8192 `mma.sync` peaks well below
-tcgen05 (this kernel reaches 376 TFLOP/s, cuBLAS 1784). `M <= 16` is memory bound and within 1.1-1.3x of cuBLAS. Making it faster means a
-tcgen05 / UMMA kernel with the same chain per element, which has to be probed for bf16 like the core's tf32 UMMA was.
+number of N tiles (128 CTAs at N = 4096, or 16-row CTAs re-reading the weight tile from L2 for M <= 64, which is what the shape-to-config table
+uses because it measured fastest); at M = 8192 `mma.sync` peaks well below tcgen05 (this kernel reaches 376 TFLOP/s, cuBLAS 1784). `M <= 16` is
+memory bound and within 1.1-1.3x of cuBLAS. Tried without gain beyond that (`benchmarks/micro/linear_configs.py`, all nine variants gave the
+same bits): bigger warp tiles (fewer `ldmatrix` per MMA), pipelines of 6 and 8 stages, k-tiles of 256. Making it faster means a tcgen05 /
+UMMA kernel with the same chain per element, which has to be probed for bf16 like the core's tf32 UMMA was.
 
 **Conv, D = 4096, W = 4, SiLU, bf16** (us per call; FLA = its Triton `ShortConvolution`, torch = `F.conv1d` + `F.silu`):
 
 | case | short_conv | FLA Triton | torch |
 |---|---|---|---|
-| decode N = 1 / 16 / 64 / 128 (1 token, state in place) | 2.2 / 2.9 / 3.8 / 5.9 | 1.5 / 1.7 / 3.3 / 5.4 | |
-| prefill B = 1, T = 8192 (state in / out) | 45.5 | 42.4 | 468 |
-| prefill B = 8, T = 1024 | 45.6 | 42.1 | 468 |
-| varlen 8 x 1024 | 53.9 | 45.6 | |
+| decode N = 1 / 16 / 64 / 128 (1 token, state in place) | 2.2 / 2.9 / 3.8 / 6.0 | 1.5 / 1.7 / 3.3 / 5.4 | |
+| prefill B = 1, T = 8192 (state in / out) | 45.6 | 42.3 | 468 |
+| prefill B = 8, T = 1024 | 45.7 | 41.8 | 468 |
+| varlen 8 x 1024 | 54.5 | 45.7 | |
 
-`short_conv` is within 8% of FLA's kernel in prefill (2.9 TB/s effective) and within 15% at N = 64 .. 128 decode; the single-sequence decode
+`short_conv` is within 9% of FLA's kernel in prefill (2.9 TB/s effective) and within 15% at N = 64 .. 128 decode; the single-sequence decode
 call is latency bound (2.2 vs 1.5 us). The training forward (`state=None`) costs the same as the prefill. The launch geometry was tuned a
 little (`benchmarks/micro/conv_variants.py`: 128 threads, 4 tokens' loads in flight; larger unrolls are slower).
 
@@ -211,7 +212,7 @@ Comparing only bf16 outputs is weak: both controls below change tens of thousand
 | linear accuracy | `test_accuracy_vs_fp64`, K = 2048 | within 0.5 ulp + `2e-6 (sum|xw| + |b| + |ref|)` |
 | row independent of M | `test_row_is_independent_of_M`: 5 (K, N) incl. 4096 x 4096, M = 1 .. 2048 (24 values), views at row offsets, permuted rows, single rows; `test_every_M_up_to_300` (M = 1..300, K = 1040) | identical bf16 and fp32 values |
 | configs agree, neighbours, N | `test_all_tile_configurations_agree` (5 configs), `test_neighbour_rows_do_not_matter` (zero / random / 2^60 / NaN / Inf rows next to the probe row), `test_columns_do_not_depend_on_N` | identical |
-| linear negative control | build with `-DCFBI_LIN_NEG_CONTROL=1`: the M <= 16 configuration walks K backwards | **caught**: rows computed with M = 1 / 16 vs inside M = 512 differ in 248 / 256 and 3968 / 4096 fp32 values (0 and 2 bf16 outputs); production 0 |
+| linear negative control | build with `-DCFBI_LIN_NEG_CONTROL=1`: the small-M (M <= 64) configuration walks K backwards | **caught**: rows computed with M = 1 / 16 vs inside M = 512 differ in 248 / 256 and 3968 / 4096 fp32 values (0 and 2 bf16 outputs); production 0 |
 | chain: layer front end | `test_layer_chain.py`: whole-sequence training-style call vs prefill(110) + 40 decode calls, hidden 1024 / 4 heads and 4096 / 16 heads; a varlen batch of 4 sequences + lock-step decode with compaction | 0 differing elements in 18 tensors (projection, conv, core outputs, bf16 and fp32) and in the final conv / core states |
 | chain negative controls | sabotaged conv decode association, sabotaged small-M linear, cuBLAS projections (serving side only) | **all caught** (conv: 31169 / 31525 / 31270 fp32 values of q / k / v; linear: 81405 fp32 values of `q_pre` ...; cuBLAS: 3044 bf16 values of `g`, 7 of `beta`, 1481 bf16 core outputs) |
 | autograd forward | training step with weights requiring grad (`bi_linear`, `short_conv`, `chunk_kda` as autograd functions) | forward = serving bits; backward runs end to end (needs `flash-linear-attention`) |
@@ -279,12 +280,12 @@ Recipe for a model integration:
 * **Not covered**: the gated RMSNorm (`FusedRMSNormGated`), context parallelism, tensor-parallel collectives, fp16 / fp32 inputs, `K % 16 != 0`.
   Splitting a GEMM across TP ranks along K changes the program (it is a split-K by definition); splitting along N (column parallel)
   does not.
-* **Speed**: mma.sync only (no tcgen05 / TMA pipelines): `bi_linear` is 1.1-1.3x cuBLAS for `M <= 16` and 2.7-4.8x for larger `M` at
+* **Speed**: mma.sync only (no tcgen05 / TMA pipelines): `bi_linear` is 1.1-1.3x cuBLAS for `M <= 16` and 2.2-4.8x for larger `M` at
   4096 x 4096 (section 5). A faster batch-invariant kernel is an engineering item (UMMA, which the core's probes showed to be
   bit-identical for tf32, would have to be probed for bf16 too); the arithmetic per element is pinned by the contract.
 * **Backward**: plain PyTorch fp32 for the conv (it materialises a few `[tokens, D]` fp32 temporaries) and cuBLAS matmuls for the linear;
   not bit-pinned, gradients correct to the bf16 floor.
-* **`max_seqlen`** is trusted (see section 1).
+* **`max_seqlen`** must be a true bound (a too-small one traps, see section 1).
 
 ## 10. Reproduce
 

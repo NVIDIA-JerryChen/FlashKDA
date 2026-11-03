@@ -74,13 +74,15 @@ void run_linear(const lin::Args& a, cudaStream_t stream) {
 
 }  // namespace
 
+// Chosen from benchmarks/micro/linear_configs.py (B300, K = N = 4096, weights streaming from HBM): the 16-row tile is the best up
+// to M = 64 (the weight tile is re-read from L2 by every 16-row CTA, but the CTAs fill the machine); the choice only affects
+// speed - every configuration computes the same bits (tests/cfbi/test_linear.py::test_all_tile_configurations_agree).
 int linear_pick_cfg(int M, int N, int num_sms) {
-    if (M <= 16) return 0;
-    if (M <= 64) return 1;
-    if (M <= 128) return 2;
+    if (M <= 64) return 0;
+    if (M <= 128) return 1;
     auto tiles = [&](int bm, int bn) { return (int64_t)((M + bm - 1) / bm) * ((N + bn - 1) / bn); };
     if (tiles(128, 128) >= num_sms) return 4;
-    if (tiles(128, 64) >= num_sms) return 3;
+    if (tiles(128, 64) >= num_sms * 3 / 4) return 3;
     return 2;
 }
 

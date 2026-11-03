@@ -157,8 +157,8 @@ def short_conv(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tenso
         activation: ``"silu"`` (``"swish"``) or None.
         cu_seqlens: int64 ``[N+1]`` for packed varlen input (requires ``B == 1``).
         max_seqlen: optional upper bound of the sequence lengths (a host int). The grid is sized from it (default: ``T``
-            or, with ``cu_seqlens``, ``T_total``); a small bound avoids launching idle blocks, an incorrect (too small)
-            one silently drops tokens, so only pass a true bound.
+            or, with ``cu_seqlens``, ``T_total``); a small bound avoids launching idle blocks. It must be a true bound: a
+            sequence longer than it makes the kernel trap (a device-side error that poisons the CUDA context).
         out: optional bf16 output buffer (shape of x, contiguous, must not alias x).
         out_fp32: optional fp32 buffer (shape of x) that receives the value before the bf16 rounding (tests: comparing
             bf16 outputs only is a weak detector of arithmetic differences).

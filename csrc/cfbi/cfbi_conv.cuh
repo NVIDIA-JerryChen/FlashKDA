@@ -115,6 +115,8 @@ __global__ void __launch_bounds__(THREADS) conv_kernel(const Args a) {
     }
     const int64_t len = eos - bos;
     const int64_t t0 = (int64_t)j * TILE_T;
+    // max_seqlen (the grid bound) smaller than a real sequence would silently drop its tail: fail loudly instead
+    if (j == 0 && len > (int64_t)a.tiles * TILE_T) __trap();
     if (t0 >= len) return;   // also len == 0: nothing happens, the state stays as it is
     const int64_t t1 = min(t0 + (int64_t)TILE_T, len);
     const int d0 = (dt * THREADS + (int)threadIdx.x) * VEC;
