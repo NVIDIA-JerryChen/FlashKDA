@@ -161,6 +161,9 @@ CASES = [  # (D, W, weight dtype, bias dtype)
     (130, 4, torch.bfloat16, torch.float32),   # even, not a multiple of the block width
     (97, 3, torch.float32, torch.bfloat16),    # odd D: one channel per thread
     (512, 5, torch.bfloat16, None),
+    (64, 2, torch.float32, torch.float32),
+    (130, 8, torch.bfloat16, torch.bfloat16),
+    (3, 4, torch.float32, None),               # fewer channels than one thread block
 ]
 
 
@@ -444,15 +447,16 @@ def test_stateful_call_is_inference_only(cx):
 # context: FLA's own ShortConvolution (Triton). Informational: closeness of the two programs, and how consistent FLA's
 # conv is between its prefill and its single-token step (it uses a different reduction there).
 # ---------------------------------------------------------------------------------------------------------
-def test_against_fla_short_convolution(cx):
+@pytest.mark.parametrize("wdtype", [torch.bfloat16, torch.float32])
+def test_against_fla_short_convolution(cx, wdtype):
     try:
         from fla.modules import ShortConvolution
     except Exception as e:   # pragma: no cover
         pytest.skip(f"fla not importable: {e}")
-    D, W, T = 512, 4, 300
+    D, W, T = 2048, 4, 1024
     x = make_x(T, D, seed=31)
-    w, _ = make_weights(D, W, seed=32, wdtype=torch.bfloat16)
-    conv = ShortConvolution(D, W, bias=False, activation="silu", backend="triton", device="cuda", dtype=torch.bfloat16)
+    w, _ = make_weights(D, W, seed=32, wdtype=wdtype)
+    conv = ShortConvolution(D, W, bias=False, activation="silu", backend="triton", device="cuda", dtype=wdtype)
     with torch.no_grad():
         conv.weight.copy_(w.view(D, 1, W))
         y_fla, _ = conv(x)
@@ -466,6 +470,7 @@ def test_against_fla_short_convolution(cx):
     ulp = bf16_ulp_error(ours[0], y_fla[0].double())
     d_fla_vs_ours = n_diff(y_fla, ours) / ours.numel()
     d_fla_step = n_diff(y_step, y_fla) / ours.numel()
-    print(f"\n[FLA ShortConvolution] bf16 outputs differing from cfbi: {d_fla_vs_ours:.4%} "
-          f"(max distance {ulp:.2f} bf16 ulp); FLA step-by-step vs FLA full call: {d_fla_step:.4%} differing; cfbi: 0 by construction")
-    assert d_fla_vs_ours < 0.02   # different association / sigmoid implementation: a few 1e-4 of the values, never more than 1 ulp
+    print(f"\n[FLA ShortConvolution, {wdtype}] {ours.numel()} outputs. bf16 outputs differing from cfbi: {d_fla_vs_ours:.5%} "
+          f"(max distance {ulp:.2f} bf16 ulp); FLA single-token step vs FLA full call: {d_fla_step:.5%} differing; "
+          f"cfbi step vs full call: 0 by construction")
+    assert d_fla_vs_ours < 0.02   # a different program (association / sigmoid implementation): never more than ~1 ulp apart

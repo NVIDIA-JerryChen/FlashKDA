@@ -30,10 +30,17 @@
 namespace cfbi {
 namespace conv {
 
-constexpr int THREADS = 128;
+// Launch geometry (performance only; no effect on bits). The macros let benchmarks/micro/conv_variants.py build variants.
+#ifndef CFBI_CONV_THREADS
+#define CFBI_CONV_THREADS 128
+#endif
+#ifndef CFBI_CONV_UNROLL
+#define CFBI_CONV_UNROLL 4
+#endif
+constexpr int THREADS = CFBI_CONV_THREADS;
 constexpr int TILE_T = 64;   // tokens per block; must be >= the largest supported W - 1
 constexpr int MAX_W = 8;
-constexpr int UNROLL = 8;    // tokens whose loads are issued together
+constexpr int UNROLL = CFBI_CONV_UNROLL;    // tokens whose loads are issued together
 static_assert(TILE_T >= MAX_W - 1, "a non-first tile must never need the state");
 
 struct Args {

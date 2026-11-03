@@ -20,7 +20,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flash_kda.cfbi import (alloc_conv_state, alloc_state, bi_linear, decode, forward_train, prefill, short_conv,
+from flash_kda.cfbi import (alloc_conv_state, alloc_state, bi_linear, chunk_kda, decode, forward_train, prefill, short_conv,
                             state_equal)
 
 from convlin_helpers import cu_tensor, cx, cx_neg, n_diff  # noqa: F401
@@ -226,3 +226,49 @@ def test_negative_controls_are_caught(cx, cx_neg):
     assert any(k[0] in ("pq", "pk", "pv", "g", "beta") and k[1] == "fp32" for k in lin_bad), "linear K-order change not caught"
     if not out["projections through cuBLAS"]:
         print("  (cuBLAS happened to be batch invariant for these shapes: that control is inconclusive)")
+
+
+def test_training_with_autograd_forward_equals_serving(cx):
+    """The training step itself (autograd on: bi_linear / short_conv / chunk_kda as autograd functions, weights requiring
+    grad) produces the same forward bits as the serving path, and the backward runs end to end."""
+    Dm, H, T, P = 1024, 4, 150, 110
+    layer = Layer(Dm, H, seed=3)
+    g = torch.Generator(device="cuda")
+    g.manual_seed(5)
+    x = torch.randn(1, T, Dm, device="cuda", generator=g).to(torch.bfloat16)
+    # serving: prefill P + decode
+    st = layer.alloc(1)
+    parts = [(layer.forward(Ops(), x[:, :P].contiguous(), st), 0, P)]
+    for t in range(P, T):
+        parts.append((layer.forward(Ops(), x[:, t:t + 1].contiguous(), st, mode="decode"), 0, 1))
+    served = torch.cat([r["core"][0].reshape(r["core"][0].shape[0] * r["core"][0].shape[1], -1)[lo:hi] for r, lo, hi in parts])
+    # training step with autograd
+    params = [layer.wq, layer.wk, layer.wv, layer.f1, layer.f2, layer.bw]
+    convs = [layer.cq, layer.ck, layer.cv]
+    for t in params + convs:
+        t.requires_grad_(True)
+    layer.A_log.requires_grad_(True)
+    layer.dt_bias.requires_grad_(True)
+    try:
+        x2 = x.reshape(T, Dm)
+        kd = H * HD
+        q = short_conv(bi_linear(x2, layer.wq).view(1, T, kd), layer.cq, None, None, "silu")
+        k = short_conv(bi_linear(x2, layer.wk).view(1, T, kd), layer.ck, None, None, "silu")
+        v = short_conv(bi_linear(x2, layer.wv).view(1, T, kd), layer.cv, None, None, "silu")
+        gg = bi_linear(bi_linear(x2, layer.f1), layer.f2).view(1, T, H, HD)
+        beta = bi_linear(x2, layer.bw).view(1, T, H)
+        try:
+            out = chunk_kda(q.view(1, T, H, HD), k.view(1, T, H, HD), v.view(1, T, H, HD), gg, beta, layer.scale, layer.A_log,
+                            layer.dt_bias, LB)
+        except ImportError:
+            pytest.skip("fla not importable: the cfbi backward needs flash-linear-attention")
+        assert out.requires_grad
+        assert n_diff(out.detach().reshape(T, -1), served) == 0, "training forward (autograd on) != serving path"
+        out.float().pow(2).mean().backward()
+        for name, t in zip(("wq", "wk", "wv", "f1", "f2", "bw", "cq", "ck", "cv"), params + convs):
+            assert t.grad is not None and bool(torch.isfinite(t.grad.float()).all()), f"gradient of {name}"
+        assert float(layer.wq.grad.float().abs().sum()) > 0
+    finally:
+        for t in params + convs + [layer.A_log, layer.dt_bias]:
+            t.requires_grad_(False)
+            t.grad = None

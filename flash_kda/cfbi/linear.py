@@ -21,6 +21,7 @@ from typing import Optional
 import torch
 
 from ._ext import load_conv_ext
+from .api import _guard
 
 __all__ = ["bi_linear", "pick_config"]
 
@@ -39,6 +40,7 @@ def _aligned2d(t: torch.Tensor) -> torch.Tensor:
 def _bi_linear_fwd(x, weight, bias, out, cfg, out_fp32=None):
     if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
         raise TypeError(f"bi_linear needs bf16 x and weight, got {x.dtype} and {weight.dtype}")
+    _guard(x.device)   # the tile-slot independence of mma.sync was validated on B300 only
     if weight.dim() != 2 or x.shape[-1] != weight.shape[1]:
         raise ValueError(f"weight must be [N, K] with K == x.shape[-1] ({x.shape[-1]}), got {tuple(weight.shape)}")
     if bias is not None and bias.dtype not in (torch.float32, torch.bfloat16):
