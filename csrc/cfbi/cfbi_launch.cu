@@ -64,7 +64,7 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
                     for (int w = 0; w < 4; ++w)
                         printf("PROF T%d  : empty_j0 %lld full_j0 %lld empty_j15 %lld full_j15 %lld empty_j23 %lld full_j23 %lld\n", w, t[16 + 8 * w], t[17 + 8 * w], t[18 + 8 * w], t[19 + 8 * w], t[20 + 8 * w], t[21 + 8 * w]);
                     for (int e = 0; e < 4; ++e)
-                        printf("PROF E%d  : start %lld odone_ok %lld p12_ok %lld epi1_done %lld p3_ok %lld epi2_done %lld\n", e, t[48 + 8 * e], t[49 + 8 * e], t[50 + 8 * e], t[51 + 8 * e], t[52 + 8 * e], t[53 + 8 * e]);
+                        printf("PROF E%d  : start %lld odone_ok %lld p12_ok %lld epi1_done %lld p3_ok %lld epi2_done %lld | epi1 batch0: tmem_ld_done %lld batch_done %lld\n", e, t[48 + 8 * e], t[49 + 8 * e], t[50 + 8 * e], t[51 + 8 * e], t[52 + 8 * e], t[53 + 8 * e], t[54 + 8 * e], t[55 + 8 * e]);
                     for (int o = 0; o < 4; ++o)
                         printf("PROF O%d  : start %lld ur_ok %lld end %lld\n", o, t[80 + 8 * o], t[81 + 8 * o], t[82 + 8 * o]);
                     fflush(stdout);

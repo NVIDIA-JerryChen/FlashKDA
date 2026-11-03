@@ -712,7 +712,7 @@ __global__ void __launch_bounds__(128, 1) time_ts_kernel(long long* cyc, int ite
 // issue-loop study: 3 UMMAs per iteration (dot3 K-step, M=128 N=NB, SS canonical layout) with a tcgen05.commit every `commit_every`
 // iterations (0 = only at the end) and a try_wait on an already-completed mbarrier every `wait_every` iterations (0 = never)
 template <int NB>
-__global__ void __launch_bounds__(128, 1) time_issue_kernel(long long* cyc, int iters_a, int iters_b, int commit_every, int wait_every, int* err) {
+__global__ void __launch_bounds__(128, 1) time_issue_kernel(long long* cyc, int iters_a, int iters_b, int commit_every, int wait_every, int wait_mode, int* err) {
 #ifdef HAVE_TCGEN05
     extern __shared__ __align__(1024) unsigned char smem_raw[];
     __shared__ uint32_t tmem_slot;
@@ -739,7 +739,25 @@ __global__ void __launch_bounds__(128, 1) time_issue_kernel(long long* cyc, int 
             t0 = clock64();
             for (int i = 0; i < iters; ++i) {
                 const uint32_t kb = (uint32_t)((i & 7) * 256);
-                if (wait_every && (i % wait_every) == 0) { uint32_t spins = 0; while (!mbar_try_wait(smem_u32(&mflag), 0)) { if (++spins > (1u << 20)) break; } }
+                if (wait_every && (i % wait_every) == 0) {
+                    if (wait_mode == 0) { uint32_t spins = 0; while (!mbar_try_wait(smem_u32(&mflag), 0)) { if (++spins > (1u << 20)) break; } }
+                    else if (wait_mode == 1) {   // relaxed try_wait (no acquire)
+                        uint32_t spins = 0;
+                        while (true) {
+                            uint32_t ok;
+                            asm volatile("{\n\t.reg .pred p;\n\tmbarrier.try_wait.parity.relaxed.cta.shared::cta.b64 p, [%1], %2;\n\tselp.u32 %0, 1, 0, p;\n\t}\n" : "=r"(ok) : "r"(smem_u32(&mflag)), "r"(0) : "memory");
+                            if (ok || ++spins > (1u << 20)) break;
+                        }
+                    } else if (wait_mode == 2) {   // plain relaxed load of a flag word in smem
+                        uint32_t v;
+                        asm volatile("ld.relaxed.cta.shared::cta.u32 %0, [%1];" : "=r"(v) : "r"(smem_u32(&mflag)) : "memory");
+                        if (v == 0xdeadbeefu) atomicAdd(err, 1);
+                    } else {   // volatile load
+                        uint32_t v;
+                        asm volatile("ld.volatile.shared.u32 %0, [%1];" : "=r"(v) : "r"(smem_u32(&mflag)) : "memory");
+                        if (v == 0xdeadbeefu) atomicAdd(err, 1);
+                    }
+                }
                 const uint64_t dah = make_smem_desc(a_hi, 128, 256), dal = make_smem_desc(a_lo, 128, 256);
                 const uint64_t dbh = make_smem_desc(b_hi + kb, 128, 256), dbl = make_smem_desc(b_lo + kb, 128, 256);
                 umma_tf32(tmem + 256, dal, dbh, idesc, 1u);
@@ -1733,15 +1751,15 @@ static void time_issue_study() {
     long long* d_cyc; int* d_err; CK(cudaMalloc(&d_cyc, 64)); CK(cudaMalloc(&d_err, 4)); CK(cudaMemset(d_err, 0, 4));
     CK(cudaFuncSetAttribute(time_issue_kernel<64>, cudaFuncAttributeMaxDynamicSharedMemorySize, 4 * 40960));
     CK(cudaFuncSetAttribute(time_issue_kernel<128>, cudaFuncAttributeMaxDynamicSharedMemorySize, 4 * 40960));
-    struct C { int commit, wait; };
-    const C cs[] = {{0, 0}, {1, 0}, {2, 0}, {4, 0}, {8, 0}, {0, 1}, {0, 2}, {1, 1}, {4, 4}};
-    for (int nb : {64, 128}) {
+    struct C { int commit, wait, mode; };
+    const C cs[] = {{0, 0, 0}, {1, 0, 0}, {4, 0, 0}, {0, 1, 0}, {0, 1, 1}, {0, 1, 2}, {0, 1, 3}, {1, 1, 1}, {1, 1, 2}};
+    for (int nb : {64}) {
         for (const C& c : cs) {
-            if (nb == 64) time_issue_kernel<64><<<1, 128, 4 * 40960>>>(d_cyc, 256, 1024, c.commit, c.wait, d_err);
-            else time_issue_kernel<128><<<1, 128, 4 * 40960>>>(d_cyc, 256, 1024, c.commit, c.wait, d_err);
+            if (nb == 64) time_issue_kernel<64><<<1, 128, 4 * 40960>>>(d_cyc, 256, 1024, c.commit, c.wait, c.mode, d_err);
+            else time_issue_kernel<128><<<1, 128, 4 * 40960>>>(d_cyc, 256, 1024, c.commit, c.wait, c.mode, d_err);
             CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
             long long h[2]; CK(cudaMemcpy(h, d_cyc, 16, cudaMemcpyDeviceToHost));
-            printf("   N=%-3d commit every %d iterations, try_wait(done barrier) every %d: %7.1f cyc per K-step\n", nb, c.commit, c.wait, (double)(h[1] - h[0]) / (1024 - 256));
+            printf("   N=%-3d commit every %d iterations, wait every %d (mode %d: 0 try_wait acquire, 1 try_wait relaxed, 2 ld.relaxed, 3 ld.volatile): %7.1f cyc per K-step\n", nb, c.commit, c.wait, c.mode, (double)(h[1] - h[0]) / (1024 - 256));
         }
     }
     cudaFree(d_cyc); cudaFree(d_err);
