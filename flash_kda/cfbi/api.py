@@ -28,7 +28,7 @@ def _guard(device: torch.device):
 
 def prefill(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, state: CfbiState,
             cu_seqlens: Optional[torch.Tensor] = None, *, out_fp32: Optional[torch.Tensor] = None,
-            slot_ids: Optional[torch.Tensor] = None, _mode: int = 0, _impl: int = 0):
+            slot_ids: Optional[torch.Tensor] = None, _mode: int = 0, _impl: int = 0, _k2_bv: int = 0):
     """Append ``T`` tokens per sequence to the sequences' CF-BI state and write the outputs in place.
 
     Argument names/shapes follow ``flash_kda.fwd``: q, k, v, g bf16 ``[B, T, H, 128]``, beta bf16 raw logits
@@ -47,7 +47,7 @@ def prefill(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, state: Cf
     """
     _guard(q.device)
     load_ext().forward(q, k, v, g, beta, float(scale), out, A_log, dt_bias, float(lower_bound),
-                       state.E, state.rows, state.pos, cu_seqlens, _mode, out_fp32, _impl, slot_ids)
+                       state.E, state.rows, state.pos, cu_seqlens, _mode, out_fp32, _impl, slot_ids, k2_bv=_k2_bv)
 
 
 def decode(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, state: CfbiState, *,
@@ -66,13 +66,13 @@ def decode(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, state: Cfb
 
 def forward_train(q, k, v, g, beta, scale, A_log, dt_bias, lower_bound,
                   cu_seqlens: Optional[torch.Tensor] = None, *, out: Optional[torch.Tensor] = None,
-                  out_fp32: Optional[torch.Tensor] = None, _impl: int = 0) -> torch.Tensor:
+                  out_fp32: Optional[torch.Tensor] = None, _impl: int = 0, _k2_bv: int = 0) -> torch.Tensor:
     """Training-forward schedule of the same program, from the empty state; nothing is persisted."""
     _guard(q.device)
     if out is None:
         out = torch.empty_like(q)
     load_ext().forward(q, k, v, g, beta, float(scale), out, A_log, dt_bias, float(lower_bound),
-                       None, None, None, cu_seqlens, 0, out_fp32, _impl)
+                       None, None, None, cu_seqlens, 0, out_fp32, _impl, k2_bv=_k2_bv)
     return out
 
 

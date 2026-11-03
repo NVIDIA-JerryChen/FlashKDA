@@ -455,6 +455,78 @@ __global__ void __launch_bounds__(128, 1) time_umma_kernel(long long* cyc, int i
 #endif
 }
 
+// layout study: dot3 K-step pattern (3 UMMAs per iteration, 2 accumulators) with runtime LBO/SBO of A and B and a
+// runtime step (bytes) between consecutive k-steps; planes are 40 KB each (data irrelevant)
+template <int M, int N>
+__global__ void __launch_bounds__(128, 1) time_layout_kernel(long long* cyc, int iters_a, int iters_b, int lbo_a, int sbo_a, int lbo_b, int sbo_b, int kstep_b, int* err) {
+#ifdef HAVE_TCGEN05
+    extern __shared__ __align__(1024) unsigned char smem_raw[];
+    __shared__ uint32_t tmem_slot;
+    __shared__ __align__(8) uint64_t mbar;
+    const int tid = threadIdx.x, warp = tid >> 5;
+    uint32_t* base = reinterpret_cast<uint32_t*>(smem_raw);   // 4 planes x 40 KB: a_hi, a_lo, b_hi, b_lo
+    for (int i = tid; i < 4 * 10240; i += 128) base[i] = 0x3F800000u + (hash32(i) & 0x7FE000u);
+    if (tid == 0) mbar_init(smem_u32(&mbar), 1);
+    if (warp == 0) tmem_alloc(&tmem_slot, 512);
+    fence_proxy_async_smem();
+    tc_fence_before();
+    __syncthreads();
+    tc_fence_after();
+    const uint32_t tmem = tmem_slot;
+    const uint32_t idesc = make_idesc(M, N);
+    const uint32_t a_hi = smem_u32(smem_raw), a_lo = a_hi + 40960, b_hi = a_lo + 40960, b_lo = b_hi + 40960;
+    uint32_t parity = 0;
+    long long t_done[3] = {0, 0, 0};
+    for (int rep = 0; rep < 3; ++rep) {
+        const int iters = rep == 2 ? iters_b : iters_a;
+        long long t0 = 0;
+        if (tid == 0) {
+            t0 = clock64();
+            for (int i = 0; i < iters; ++i) {
+                const uint32_t kb = (uint32_t)((i & 7) * kstep_b);   // walk over 8 k-steps like the kernels do
+                const uint64_t dah = make_smem_desc(a_hi, lbo_a, sbo_a), dal = make_smem_desc(a_lo, lbo_a, sbo_a);
+                const uint64_t dbh = make_smem_desc(b_hi + kb, lbo_b, sbo_b), dbl = make_smem_desc(b_lo + kb, lbo_b, sbo_b);
+                umma_tf32(tmem + 256, dal, dbh, idesc, 1u);
+                umma_tf32(tmem + 256, dah, dbl, idesc, 1u);
+                umma_tf32(tmem, dah, dbh, idesc, 1u);
+            }
+            umma_commit(smem_u32(&mbar));
+        }
+        uint32_t spins = 0;
+        while (!mbar_try_wait(smem_u32(&mbar), parity)) { if (++spins > (1u << 22)) { atomicAdd(err, 1); break; } }
+        parity ^= 1u;
+        if (tid == 0) t_done[rep] = clock64() - t0;
+    }
+    if (tid == 0) { cyc[0] = t_done[1]; cyc[1] = t_done[2]; }
+    tc_fence_before();
+    __syncthreads();
+    tc_fence_after();
+    if (warp == 0) tmem_dealloc(tmem, 512);
+#endif
+}
+static void time_layout_study() {
+    printf("== layout study: cycles per dot3 K-step (3 UMMAs, M=128 N=64) for descriptor strides (bytes) ==\n");
+    struct C { const char* name; int la, sa, lb, sb, kb; };
+    const C cs[] = {
+        {"A 128/256, B 128/256 (canonical)", 128, 256, 128, 256, 256},
+        {"A 160/320, B 128/256", 160, 320, 128, 256, 256},
+        {"A 128/256, B 144/4608 (E planes)", 128, 256, 144, 4608, 288},
+        {"A 160/320, B 144/4608 (kernel P1/P2)", 160, 320, 144, 4608, 288},
+        {"A 160/320, B 144/2304 (kernel P3)", 160, 320, 144, 2304, 288},
+        {"A 144/288, B 144/288", 144, 288, 144, 288, 288},
+    };
+    long long* d_cyc; int* d_err; CK(cudaMalloc(&d_cyc, 64)); CK(cudaMalloc(&d_err, 4)); CK(cudaMemset(d_err, 0, 4));
+    const size_t smem = 4 * 40960;
+    CK(cudaFuncSetAttribute(time_layout_kernel<128, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    for (const C& c : cs) {
+        time_layout_kernel<128, 64><<<1, 128, smem>>>(d_cyc, 256, 1024, c.la, c.sa, c.lb, c.sb, c.kb, d_err);
+        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        long long h[2]; CK(cudaMemcpy(h, d_cyc, 16, cudaMemcpyDeviceToHost));
+        printf("   %-40s : %7.1f cyc per K-step (%5.1f per UMMA)\n", c.name, (double)(h[1] - h[0]) / (1024 - 256), (double)(h[1] - h[0]) / (1024 - 256) / 3);
+    }
+    cudaFree(d_cyc); cudaFree(d_err);
+}
+
 // two independent issuing threads (warp 0 and warp 1, own mbarrier, own accumulators): is the per-UMMA floor per issuer?
 // MODE 0: each issues plain UMMAs into its own accumulator; MODE 2: each issues the 3-UMMA dot3 K-step on its own BIG/SMALL pair
 template <int M, int N, int MODE>
@@ -1368,6 +1440,7 @@ int main(int argc, char** argv) {
     if (want("neg")) stage_neg();
     if (want("tile")) stage_tile();
     if (want("char")) stage_char();
+    if (want("layoutstudy")) time_layout_study();
     if (want("time")) stage_time(clk);
     if (want("deep")) stage_deep(24);
     if (want("m128n8")) {   // M=128 with N=8 is not a valid UMMA shape per the PTX tables (M=128: N=16..256 step 16); may fault -> run alone

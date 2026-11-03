@@ -81,7 +81,7 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
              std::optional<torch::Tensor> E, std::optional<torch::Tensor> rows, std::optional<torch::Tensor> pos,
              std::optional<torch::Tensor> cu_seqlens, int64_t mode, std::optional<torch::Tensor> out_f32,
              int64_t impl, std::optional<torch::Tensor> slot_ids, std::optional<torch::Tensor> ws_in,
-             std::optional<torch::Tensor> plan_in, int64_t phase) {
+             std::optional<torch::Tensor> plan_in, int64_t phase, int64_t k2_bv) {
     for (const auto* t : {&q, &k, &v, &g, &out}) check_bf16_cuda(*t, "q/k/v/g/out");
     check_bf16_cuda(beta, "beta");
     check_f32_cuda(A_log, "A_log");
@@ -97,6 +97,7 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     TORCH_CHECK(mode == 0 || mode == 1, "mode must be 0 or 1");
     TORCH_CHECK(impl >= 0 && impl <= 3, "impl must be 0..3 (bit 0: reference row engine, bit 1: reference K1/K2)");
     TORCH_CHECK(phase >= 1 && phase <= 3, "phase must be 1 (K1), 2 (K2) or 3 (both)");
+    TORCH_CHECK(k2_bv == 0 || k2_bv == 8 || k2_bv == 16, "k2_bv must be 0 (automatic), 8 or 16");
     TORCH_CHECK(phase == 3 || (mode == 0 && ws_in.has_value() && plan_in.has_value()),
                 "a split call (phase 1 or 2) is mode 0 and needs the workspace and plan buffers");
     TORCH_CHECK(lower_bound >= -5.0 && lower_bound <= 0.0, "lower_bound must be in [-5, 0]");
@@ -191,6 +192,7 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     a.mode = (int)mode;
     a.impl = (int)impl;
     a.phase = (int)phase;
+    a.k2_bv = (int)k2_bv;
     cfbi::launch_forward(a, cur_stream());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -204,7 +206,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("dt_bias"), py::arg("lower_bound"), py::arg("E") = py::none(), py::arg("rows") = py::none(),
           py::arg("pos") = py::none(), py::arg("cu_seqlens") = py::none(), py::arg("mode") = 0,
           py::arg("out_f32") = py::none(), py::arg("impl") = 0, py::arg("slot_ids") = py::none(), py::arg("ws") = py::none(), py::arg("plan") = py::none(),
-          py::arg("phase") = 3);
+          py::arg("phase") = 3, py::arg("k2_bv") = 0);
     m.def("workspace_sizes", [](int64_t T_total, int64_t N, int64_t H) {
         return std::make_pair(((T_total + 63) / 64 + N) * H * cfbi::WS_FLOATS_PER_CHUNK_HEAD, (N + 1) * cfbi::PLAN_INTS_PER_SEQ);
     }, "(workspace floats, plan ints) of a call", py::arg("T_total"), py::arg("N"), py::arg("H"));

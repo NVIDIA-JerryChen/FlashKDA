@@ -13,6 +13,19 @@ namespace cfbi {
 
 int version() { return 1; }
 
+template <int BV>
+static void launch_chunk_kernels(const Params& p, const ForwardArgs& a, cudaStream_t stream, bool run_k1, bool run_k2,
+                                 int64_t max_chunks) {
+    if (run_k1) {
+        cudaFuncSetAttribute(k1_kernel<BV>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)K1_SMEM_BYTES);
+        k1_kernel<BV><<<dim3((unsigned)max_chunks, a.H), NTHREADS, K1_SMEM_BYTES, stream>>>(p);
+    }
+    if (run_k2) {
+        cudaFuncSetAttribute(k2_kernel<BV>, cudaFuncAttributeMaxDynamicSharedMemorySize, K2Cfg<BV>::SMEM_BYTES);
+        k2_kernel<BV><<<dim3(K2Cfg<BV>::NSLICE, a.N, a.H), NTHREADS, K2Cfg<BV>::SMEM_BYTES, stream>>>(p);
+    }
+}
+
 void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
     Params p;
     p.q = static_cast<const __nv_bfloat16*>(a.q);
@@ -50,10 +63,15 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
             if (run_k1) ref::k1_kernel<<<dim3((unsigned)max_chunks, a.H), NTHREADS, ref::K1_SMEM_BYTES, stream>>>(p);
             if (run_k2) ref::k2_kernel<<<dim3(HEAD_V / ref::K2_BV, a.N, a.H), NTHREADS, 0, stream>>>(p);
         } else {
-            cudaFuncSetAttribute(k1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)K1_SMEM_BYTES);
-            cudaFuncSetAttribute(k2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, K2_SMEM_BYTES);
-            if (run_k1) k1_kernel<<<dim3((unsigned)max_chunks, a.H), NTHREADS, K1_SMEM_BYTES, stream>>>(p);
-            if (run_k2) k2_kernel<<<dim3(K2_NSLICE, a.N, a.H), NTHREADS, K2_SMEM_BYTES, stream>>>(p);
+            int bv = a.k2_bv;   // value columns per K2 CTA: 8 when the whole (N x H x 16 slices) grid fits in one wave of SMs
+            if (bv == 0) {
+                int dev = 0, sms = 148;
+                cudaGetDevice(&dev);
+                cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+                bv = ((int64_t)a.N * a.H * (HEAD_V / 8) <= sms) ? 8 : 16;
+            }
+            if (bv == 8) launch_chunk_kernels<8>(p, a, stream, run_k1, run_k2, max_chunks);
+            else launch_chunk_kernels<16>(p, a, stream, run_k1, run_k2, max_chunks);
         }
     }
     if (run_k2 && a.pos != nullptr && a.mode != 1) finalize_pos_kernel<<<(a.N + 255) / 256, 256, 0, stream>>>(p.plan, a.pos, a.N);

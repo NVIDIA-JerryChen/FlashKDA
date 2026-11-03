@@ -35,7 +35,7 @@ def _call_inputs(case, cu, done, take):
     return sub, torch.tensor(_cu(take), dtype=torch.int64, device="cuda")
 
 
-def run_chain(case, lens, takes, H, impl, mode=0):
+def run_chain(case, lens, takes, H, impl, mode=0, k2_bv=0):
     """``takes``: per call, per sequence number of tokens. Returns [(out, out32, state_snapshot)] per call."""
     N = len(lens)
     cu = _cu(lens)
@@ -47,7 +47,7 @@ def run_chain(case, lens, takes, H, impl, mode=0):
         out = torch.zeros_like(sub["q"])
         out32 = torch.zeros(sub["q"].shape, dtype=torch.float32, device="cuda")
         prefill(sub["q"], sub["k"], sub["v"], sub["g"], sub["beta"], case["scale"], out, case["A_log"], case["dt_bias"],
-                case["lower_bound"], st, cu_call, out_fp32=out32, _mode=mode, _impl=impl)
+                case["lower_bound"], st, cu_call, out_fp32=out32, _mode=mode, _impl=impl, _k2_bv=k2_bv)
         res.append((out, out32, st.clone()))
         done = [d + t for d, t in zip(done, take)]
     return res
@@ -169,3 +169,15 @@ def test_single_sequence_lengths(ext, T):
     case = make_case(T, H, "heavy_tail", seed=70)
     takes = [[T]]
     assert_same_results(run_chain(case, [T], takes, H, 0), run_chain(case, [T], takes, H, REF), f"T={T}")
+
+
+@pytest.mark.parametrize("bv", [8, 16])
+@pytest.mark.parametrize("regime", ["authors", "heavy_tail", "long_memory"])
+def test_k2_tile_widths(ext, bv, regime):
+    """K2 with 8 or 16 value columns per CTA (the launcher picks by grid size): same bits as the reference."""
+    H = 3
+    rng = random.Random(8)
+    lens = [rng.randint(1, 300) for _ in range(6)] + [64, 129]
+    case = make_case(sum(lens), H, regime, seed=90)
+    takes = random_takes(lens, 3, rng)
+    assert_same_results(run_chain(case, lens, takes, H, 0, k2_bv=bv), run_chain(case, lens, takes, H, REF), f"bv={bv}/{regime}")

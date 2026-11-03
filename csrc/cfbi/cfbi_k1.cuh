@@ -148,7 +148,9 @@ __device__ __forceinline__ void k1_akk_tiles(const uint4* stg, const uint16_t* s
         }
 }
 
+template <int BV>
 __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
+    constexpr int K2_BV = BV, K2_NT = BV / 8, K2_NSLICE = HEAD_V / BV;   // the UT workspace is stored per K2 slice
     extern __shared__ __align__(128) unsigned char smem_raw[];
     uint16_t* sKr = reinterpret_cast<uint16_t*>(smem_raw + K1_OFF_KR);
     uint16_t* sQr = reinterpret_cast<uint16_t*>(smem_raw + K1_OFF_QR);

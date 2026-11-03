@@ -24,29 +24,35 @@
 
 namespace cfbi {
 
-constexpr int K2_SU = K2_BV + 8;   // fp32 U row stride (conflict-free float2 stores from the C fragments)
-constexpr int K2_SE = 132;         // fp32 E row stride (conflict-free scattered updates)
-
-constexpr int K2_UT_FLOATS = 4 * K2_NT * 128;            // UT slice of one chunk
+constexpr int K2_SE = 132;                              // fp32 E row stride (conflict-free scattered updates)
 constexpr int K2_AQ_FLOATS = 12 * 128 + 4 * 16 * 17;     // AQF + AQD
 constexpr int K2_KD_FLOATS = 8192 + 128;                 // KD fragments + GEND
-constexpr int K2_EHL_WORDS = K2_NT * 16 * 32 * 2;        // one plane (hi or lo) of E B-fragments
-constexpr int K2_UHL_WORDS = K2_NT * 8 * 32 * 2;         // one plane of U B-fragments
 
-// byte offsets inside the dynamic shared memory block
-constexpr int K2_OFF_W = 0;
-constexpr int K2_OFF_GQ = K2_OFF_W + 8192 * 4;
-constexpr int K2_OFF_KD = K2_OFF_GQ + 8192 * 4;
-constexpr int K2_OFF_AQ = K2_OFF_KD + K2_KD_FLOATS * 4;
-constexpr int K2_OFF_UT = K2_OFF_AQ + K2_AQ_FLOATS * 4;
-constexpr int K2_OFF_E32 = K2_OFF_UT + K2_UT_FLOATS * 4;
-constexpr int K2_OFF_EHL = K2_OFF_E32 + K2_BV * K2_SE * 4;
-constexpr int K2_OFF_U32 = K2_OFF_EHL + 2 * K2_EHL_WORDS * 4;
-constexpr int K2_OFF_UHL = K2_OFF_U32 + 64 * K2_SU * 4;
-constexpr int K2_OFF_BAR = K2_OFF_UHL + 2 * K2_UHL_WORDS * 4;
-constexpr int K2_SMEM_BYTES = K2_OFF_BAR + 64;
-static_assert(K2_OFF_AQ % 16 == 0 && K2_OFF_UT % 16 == 0 && K2_OFF_E32 % 16 == 0 && K2_OFF_EHL % 16 == 0 &&
-              K2_OFF_U32 % 16 == 0 && K2_OFF_UHL % 16 == 0 && K2_OFF_BAR % 8 == 0, "shared memory alignment");
+// Tiling and shared-memory layout of a K2 CTA that owns BV value columns (BV = 8: more CTAs for a single short
+// sequence, BV = 16: fewer redundant operand copies for large batches).
+template <int BV>
+struct K2Cfg {
+    static constexpr int NT = BV / 8;                    // 8-column MMA tiles per CTA
+    static constexpr int NSLICE = HEAD_V / BV;           // CTAs per (sequence, head)
+    static constexpr int SU = BV + 8;                    // fp32 U row stride (conflict-free float2 stores from the C fragments)
+    static constexpr int UT_FLOATS = 4 * NT * 128;       // UT slice of one chunk
+    static constexpr int EHL_WORDS = NT * 16 * 32 * 2;   // one plane (hi or lo) of E B-fragments
+    static constexpr int UHL_WORDS = NT * 8 * 32 * 2;    // one plane of U B-fragments
+    // byte offsets inside the dynamic shared memory block
+    static constexpr int OFF_W = 0;
+    static constexpr int OFF_GQ = OFF_W + 8192 * 4;
+    static constexpr int OFF_KD = OFF_GQ + 8192 * 4;
+    static constexpr int OFF_AQ = OFF_KD + K2_KD_FLOATS * 4;
+    static constexpr int OFF_UT = OFF_AQ + K2_AQ_FLOATS * 4;
+    static constexpr int OFF_E32 = OFF_UT + UT_FLOATS * 4;
+    static constexpr int OFF_EHL = OFF_E32 + BV * K2_SE * 4;
+    static constexpr int OFF_U32 = OFF_EHL + 2 * EHL_WORDS * 4;
+    static constexpr int OFF_UHL = OFF_U32 + 64 * SU * 4;
+    static constexpr int OFF_BAR = OFF_UHL + 2 * UHL_WORDS * 4;
+    static constexpr int SMEM_BYTES = OFF_BAR + 64;
+    static_assert(OFF_AQ % 16 == 0 && OFF_UT % 16 == 0 && OFF_E32 % 16 == 0 && OFF_EHL % 16 == 0 && OFF_U32 % 16 == 0 &&
+                      OFF_UHL % 16 == 0 && OFF_BAR % 8 == 0, "shared memory alignment");
+};
 
 // word index of E[v][k] (v = value column inside the slice, k = key channel) in a hi/lo plane of B-fragments
 // [nt][ks 16][lane 32][2]: the B fragment of the 8x8 (k-step, n-tile) block is b0 = (k = t, n = g), b1 = (k = t+4, n = g)
@@ -60,6 +66,7 @@ __device__ __forceinline__ int ufrag_word(int j, int v) {
 
 // P2 / P1 style product: rows of one 16-row tile (A fragments of K = 128, 16 k-steps) times the E fragments,
 // NT independent 16x8 tiles. Result = fadd_rn(BIG, SMALL) per element, C-fragment order.
+template <int K2_NT>
 __device__ __forceinline__ void k2_dot3_e(const float4* a, const uint2* eh, const uint2* el, float (&res)[K2_NT][4]) {
     float big[K2_NT][4], sml[K2_NT][4];
 #pragma unroll
@@ -91,7 +98,7 @@ __device__ __forceinline__ void k2_dot3_e(const float4* a, const uint2* eh, cons
 
 // cross-sub-block part of O: M = dot3(Aqk[16s.., 0:16s], U[0:16s]) for KS = 2s k-steps, A fragments `a`
 // (the sub-block's AQF fragments), B fragments from the U hi/lo planes.
-template <int KS>
+template <int KS, int K2_NT>
 __device__ __forceinline__ void k2_cross_block(const float4* a, const uint2* uh, const uint2* ul, float (&res)[K2_NT][4]) {
     float big[K2_NT][4], sml[K2_NT][4];
 #pragma unroll
@@ -121,7 +128,13 @@ __device__ __forceinline__ void k2_cross_block(const float4* a, const uint2* uh,
         for (int i = 0; i < 4; ++i) res[nt][i] = fadd(big[nt][i], sml[nt][i]);
 }
 
+template <int BV>
 __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
+    using C = K2Cfg<BV>;
+    constexpr int K2_BV = BV, K2_NT = C::NT, K2_SU = C::SU, K2_UT_FLOATS = C::UT_FLOATS;
+    constexpr int K2_EHL_WORDS = C::EHL_WORDS, K2_UHL_WORDS = C::UHL_WORDS;
+    constexpr int K2_OFF_W = C::OFF_W, K2_OFF_GQ = C::OFF_GQ, K2_OFF_KD = C::OFF_KD, K2_OFF_AQ = C::OFF_AQ, K2_OFF_UT = C::OFF_UT;
+    constexpr int K2_OFF_E32 = C::OFF_E32, K2_OFF_EHL = C::OFF_EHL, K2_OFF_U32 = C::OFF_U32, K2_OFF_UHL = C::OFF_UHL, K2_OFF_BAR = C::OFF_BAR;
     extern __shared__ __align__(128) unsigned char smem_raw[];
     float* sW = reinterpret_cast<float*>(smem_raw + K2_OFF_W);
     float* sGQ = reinterpret_cast<float*>(smem_raw + K2_OFF_GQ);
@@ -217,7 +230,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
             if (w < nsb) {
                 mbar_wait(&bar[0], par);
                 float p1[K2_NT][4];
-                k2_dot3_e(reinterpret_cast<const float4*>(sW) + w * 16 * 32 + lane, reinterpret_cast<const uint2*>(sEhi) + lane,
+                k2_dot3_e<K2_NT>(reinterpret_cast<const float4*>(sW) + w * 16 * 32 + lane, reinterpret_cast<const uint2*>(sEhi) + lane,
                           reinterpret_cast<const uint2*>(sElo) + lane, p1);
                 mbar_wait(&bar[2], par);   // UT slice
 #pragma unroll
@@ -240,7 +253,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
             }
         } else if (w < nsb) {
             mbar_wait(&bar[1], par);   // GQ
-            k2_dot3_e(reinterpret_cast<const float4*>(sGQ) + w * 16 * 32 + lane, reinterpret_cast<const uint2*>(sEhi) + lane,
+            k2_dot3_e<K2_NT>(reinterpret_cast<const float4*>(sGQ) + w * 16 * 32 + lane, reinterpret_cast<const uint2*>(sEhi) + lane,
                       reinterpret_cast<const uint2*>(sElo) + lane, p2);
         }
 #ifdef CFBI_K2_PROFILE
@@ -320,9 +333,9 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
                 const float4* a = reinterpret_cast<const float4*>(sAQ) + s * (s - 1) * 32 + lane;
                 const uint2* uh = reinterpret_cast<const uint2*>(sUhi) + lane;
                 const uint2* ul = reinterpret_cast<const uint2*>(sUlo) + lane;
-                if (s == 1) k2_cross_block<2>(a, uh, ul, m);
-                else if (s == 2) k2_cross_block<4>(a, uh, ul, m);
-                else k2_cross_block<6>(a, uh, ul, m);
+                if (s == 1) k2_cross_block<2, K2_NT>(a, uh, ul, m);
+                else if (s == 2) k2_cross_block<4, K2_NT>(a, uh, ul, m);
+                else k2_cross_block<6, K2_NT>(a, uh, ul, m);
 #pragma unroll
                 for (int nt = 0; nt < K2_NT; ++nt)
 #pragma unroll

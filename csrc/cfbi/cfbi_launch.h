@@ -41,6 +41,7 @@ struct ForwardArgs {
     int mode;          // 0: prefill / training schedule (row engine for head rows, K1+K2 for the rest)
                        // 1: row engine for every row (decode; also a differential test of K1/K2)
     int phase;         // PHASE_* bits (3 = everything in one call)
+    int k2_bv;         // value columns per K2 CTA: 0 = choose by grid size, 8 or 16 = forced (tests)
     int impl;          // IMPL_* bits: which implementation of the row engine / chunk kernels runs (0 = optimised)
 };
 
