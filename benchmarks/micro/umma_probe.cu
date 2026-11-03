@@ -253,6 +253,7 @@ struct KParams {
 __device__ __forceinline__ uint32_t smem_off(int layout_mode, int R, int KC, int r, int kk) {
     const uint32_t core = (uint32_t)((r & 7) * 16 + (kk & 3) * 4);
     if (layout_mode == 0) return (uint32_t)(r >> 3) * (uint32_t)(KC / 4 * 128) + (uint32_t)(kk >> 2) * 128u + core;
+    if (layout_mode == 2) return (uint32_t)(r >> 3) * (uint32_t)(KC / 4 * 144) + (uint32_t)(kk >> 2) * 144u + core;   // padded pitch
     return (uint32_t)(kk >> 2) * (uint32_t)(R / 8 * 128) + (uint32_t)(r >> 3) * 128u + core;
 }
 
@@ -265,10 +266,11 @@ __global__ void __launch_bounds__(128, 1) umma_kernel(KParams p) {
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, cta = blockIdx.x;
     const int K = p.K, nks = K / 8;
     const int KC = K < 64 ? K : 64, nch = K / KC, spc = KC / 8;
+    const int padw = p.layout_mode == 2 ? 9 : 8;   // plane words = R*KC*padw/8
     uint32_t* a_hi = reinterpret_cast<uint32_t*>(smem_raw);
-    uint32_t* a_lo = a_hi + M * KC;
-    uint32_t* b_hi = a_lo + M * KC;
-    uint32_t* b_lo = b_hi + N * KC;
+    uint32_t* a_lo = a_hi + M * KC * padw / 8;
+    uint32_t* b_hi = a_lo + M * KC * padw / 8;
+    uint32_t* b_lo = b_hi + N * KC * padw / 8;
 
     if (tid == 0) mbar_init(smem_u32(&mbar), 1);
     if (warp == 0) tmem_alloc(&tmem_slot, TMEM_COLS);
@@ -292,10 +294,10 @@ __global__ void __launch_bounds__(128, 1) umma_kernel(KParams p) {
     }
 
     const uint32_t idesc = make_idesc(M, N);
-    const int lbo_a = p.layout_mode == 0 ? 128 : M / 8 * 128, sbo_a = p.layout_mode == 0 ? KC / 4 * 128 : 128;
-    const int lbo_b = p.layout_mode == 0 ? 128 : N / 8 * 128, sbo_b = p.layout_mode == 0 ? KC / 4 * 128 : 128;
-    const uint32_t step_a = p.layout_mode == 0 ? 256u : (uint32_t)(2 * lbo_a);
-    const uint32_t step_b = p.layout_mode == 0 ? 256u : (uint32_t)(2 * lbo_b);
+    const int lbo_a = p.layout_mode == 0 ? 128 : (p.layout_mode == 2 ? 144 : M / 8 * 128), sbo_a = p.layout_mode == 0 ? KC / 4 * 128 : (p.layout_mode == 2 ? KC / 4 * 144 : 128);
+    const int lbo_b = p.layout_mode == 0 ? 128 : (p.layout_mode == 2 ? 144 : N / 8 * 128), sbo_b = p.layout_mode == 0 ? KC / 4 * 128 : (p.layout_mode == 2 ? KC / 4 * 144 : 128);
+    const uint32_t step_a = p.layout_mode == 0 ? 256u : (p.layout_mode == 2 ? 288u : (uint32_t)(2 * lbo_a));
+    const uint32_t step_b = p.layout_mode == 0 ? 256u : (p.layout_mode == 2 ? 288u : (uint32_t)(2 * lbo_b));
     uint32_t parity = 0;
 
     for (int c = 0; c < nch; ++c) {
@@ -689,7 +691,7 @@ static Out run_ref(const Tiles& t, int reverse_k = 0, int swap_small = 0) {
 template <int M, int N>
 static void launch_umma_t(const KParams& p, int ncta, int K) {
     const int KC = K < 64 ? K : 64;
-    const size_t smem = (size_t)(2 * M + 2 * N) * KC * 4;
+    const size_t smem = (size_t)(2 * M + 2 * N) * KC * 4 * 9 / 8;   // (padded layouts need 1/8 more)
     CK(cudaFuncSetAttribute(umma_kernel<M, N>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
     umma_kernel<M, N><<<ncta, 128, smem>>>(p);
 }
@@ -797,8 +799,8 @@ static bool stage_layout() {
         Tiles t; t.T = 1; t.M = M; t.N = N; t.K = K; t.A.assign((size_t)M * K, 0.f); t.Bt.assign((size_t)N * K, 0.f);
         for (int r = 0; r < M; ++r) { t.A[(size_t)r * K + 0] = (float)(r + 1); t.A[(size_t)r * K + 1] = 1.f; }
         for (int n = 0; n < N; ++n) { t.Bt[(size_t)n * K + 0] = 1.f; t.Bt[(size_t)n * K + 1] = 1024.f * (n + 1); }
-        bool ok_mode[2] = {false, false};
-        for (int lm = 0; lm < 2; ++lm) {
+        bool ok_mode[3] = {false, false, false};
+        for (int lm = 0; lm < 3; ++lm) {
             UmmaOpts o; o.init_mode = 2; o.layout_mode = lm;
             Out raw; int nerr = 0;
             run_umma_raw(t, o, raw, &nerr);
@@ -834,6 +836,7 @@ static bool stage_layout() {
             }
         }
         all_ok = all_ok && (ok_mode[0] || ok_mode[1]);
+        if (getenv("UMMA_FORCE_LAYOUT")) g_layout_mode = atoi(getenv("UMMA_FORCE_LAYOUT"));
     }
     LPRINTF("  selected layout_mode=%d\n", g_layout_mode);
     return all_ok;

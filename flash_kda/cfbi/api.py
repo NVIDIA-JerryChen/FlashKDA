@@ -1,6 +1,7 @@
 """Python entry points of the CF-BI kernels (prefill, decode, training forward)."""
 import os
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import torch
 
@@ -73,3 +74,48 @@ def forward_train(q, k, v, g, beta, scale, A_log, dt_bias, lower_bound,
     load_ext().forward(q, k, v, g, beta, float(scale), out, A_log, dt_bias, float(lower_bound),
                        None, None, None, cu_seqlens, 0, out_fp32, _impl)
     return out
+
+
+@dataclass
+class PrefillPhase1:
+    """What ``prefill_k1`` hands to ``prefill_k2``: the K1 workspace (E-independent chunk coefficients, 139 KiB per
+    chunk and head), the call plan and the inputs of the call (kept alive until K2 has run)."""
+
+    ws: torch.Tensor
+    plan: torch.Tensor
+    inputs: Tuple
+    cu_seqlens: Optional[torch.Tensor]
+    slot_ids: Optional[torch.Tensor]
+    impl: int
+
+
+def prefill_k1(q, k, v, g, beta, scale, A_log, dt_bias, lower_bound, state: CfbiState,
+               cu_seqlens: Optional[torch.Tensor] = None, *, slot_ids: Optional[torch.Tensor] = None,
+               _impl: int = 0) -> PrefillPhase1:
+    """First half of ``prefill`` for context parallelism: the plan and K1, everything that does NOT need the entry state
+    ``E`` (more than half of the prefill work), so every context-parallel rank can run it at the same time.
+
+    Requirements: every sequence of the call starts on a 64-row grid line (``state.pos == 0``: shards of a long sequence
+    are cut at multiples of 64 tokens from the sequence start, only the last shard may end inside a chunk); nothing of
+    ``E`` is read or written here, a trailing partial chunk's rows go into ``state.rows``. Follow with
+    ``prefill_k2`` once the entry ``E`` (the previous shard's final ``E``) is in ``state.E``. The bits of the combination
+    are identical to one ``prefill`` call over the concatenated shards."""
+    _guard(q.device)
+    ext = load_ext()
+    B, T, H = q.shape[0], q.shape[1], q.shape[2]
+    N = (cu_seqlens.numel() - 1) if cu_seqlens is not None else B
+    ws_n, plan_n = ext.workspace_sizes(B * T, N, H)
+    ws = torch.empty(ws_n, dtype=torch.float32, device=q.device)
+    plan = torch.empty(plan_n, dtype=torch.int32, device=q.device)
+    ext.forward(q, k, v, g, beta, float(scale), q, A_log, dt_bias, float(lower_bound), state.E, state.rows, state.pos,
+                cu_seqlens, 0, None, _impl, slot_ids, ws, plan, 1)   # `out` (= q) is not written by K1
+    return PrefillPhase1(ws, plan, (q, k, v, g, beta, scale, A_log, dt_bias, lower_bound), cu_seqlens, slot_ids, _impl)
+
+
+def prefill_k2(h1: PrefillPhase1, out, state: CfbiState, *, out_fp32: Optional[torch.Tensor] = None):
+    """Second half of ``prefill`` (see ``prefill_k1``): the serial scan over the chunks from ``state.E``; writes ``out``,
+    updates ``state`` (E, row cache, pos) in place."""
+    q, k, v, g, beta, scale, A_log, dt_bias, lower_bound = h1.inputs
+    _guard(q.device)
+    load_ext().forward(q, k, v, g, beta, float(scale), out, A_log, dt_bias, float(lower_bound), state.E, state.rows,
+                       state.pos, h1.cu_seqlens, 0, out_fp32, h1.impl, h1.slot_ids, h1.ws, h1.plan, 2)

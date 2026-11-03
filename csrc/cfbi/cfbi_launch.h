@@ -40,6 +40,7 @@ struct ForwardArgs {
     float* ws;         // scratch [(ceil(T_total/64) + N) * H * WS_FLOATS_PER_CHUNK_HEAD] floats (mode 0 only)
     int mode;          // 0: prefill / training schedule (row engine for head rows, K1+K2 for the rest)
                        // 1: row engine for every row (decode; also a differential test of K1/K2)
+    int phase;         // PHASE_* bits (3 = everything in one call)
     int impl;          // IMPL_* bits: which implementation of the row engine / chunk kernels runs (0 = optimised)
 };
 
@@ -47,6 +48,12 @@ struct ForwardArgs {
 // optimised ones. K1 and K2 share one bit because their workspace layouts differ between the implementations.
 constexpr int IMPL_REF_ROWS = 1;    // row engine (decode, head rows)
 constexpr int IMPL_REF_CHUNK = 2;   // K1 + K2 (prefill / training forward)
+
+// Phases of a mode-0 call (context parallelism): K1 (plan + E-independent chunk coefficients) can run on every rank at
+// once, K2 (the serial scan that needs the entry state E) has to wait for the previous rank's E. PHASE_K1 skips the
+// row engine (shards must start on a 64-row grid line, i.e. pos == 0), PHASE_K2 reuses the plan and workspace.
+constexpr int PHASE_K1 = 1;
+constexpr int PHASE_K2 = 2;
 
 // Runs plan -> row engine -> K1 -> K2 -> pos update on `stream`.
 void launch_forward(const ForwardArgs& a, cudaStream_t stream);
