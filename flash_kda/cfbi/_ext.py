@@ -4,7 +4,9 @@ Order: (1) the module built by ``pip install`` / ``setup.py`` (``FLASH_KDA_BUILD
 ``FLASH_KDA_CFBI_JIT=1``; (2) a JIT build with ``torch.utils.cpp_extension.load`` from ``csrc/cfbi``
 (development loop; same flags as setup.py, no ``--use_fast_math``).
 
-Env knobs: FLASH_KDA_CFBI_JIT=1, FLASH_KDA_CFBI_VERBOSE=1, FLASH_KDA_CFBI_BUILD_DIR, TORCH_CUDA_ARCH_LIST.
+Env knobs: FLASH_KDA_CFBI_JIT=1, FLASH_KDA_CFBI_VERBOSE=1, FLASH_KDA_CFBI_BUILD_DIR, FLASH_KDA_CFBI_ARCH (default: the
+current device's arch, e.g. "8.0", "9.0a", "10.3a"; a ";"-separated list such as "8.0;8.6;8.9;9.0a;10.0a;10.3a" builds one
+binary for several architectures: the launcher picks the kernels per device at run time).
 """
 import os
 from pathlib import Path
