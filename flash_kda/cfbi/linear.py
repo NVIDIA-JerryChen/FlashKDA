@@ -16,6 +16,8 @@ control in ``tests/cfbi/test_linear.py`` measures it).
 Restrictions: bf16 ``x`` and ``W``, ``K % 16 == 0``. Differentiable (backward = plain torch matmuls, not bit-pinned).
 See docs/20261103-cfbi-conv-linear.md.
 """
+import os
+import warnings
 from typing import Optional
 
 import torch
@@ -24,6 +26,30 @@ from ._ext import load_conv_ext
 from .api import _guard
 
 __all__ = ["bi_linear", "pick_config"]
+
+
+_BF16_VALIDATED_MAJOR = 10     # the bf16 m16n8k16 tile-slot independence premise was probed on Blackwell (B300) only
+_BF16_GUARDED = {}
+
+
+def _guard_bf16(device) -> None:
+    """The core's ``_guard`` checks the tf32 premise (``verify_hardware``); ``bi_linear`` rests on the same property of the
+    bf16 ``m16n8k16`` MMA, which was validated on B300 only (docs/20261103-cfbi-conv-linear.md): refuse elsewhere unless
+    ``FLASH_KDA_CFBI_ALLOW_UNVALIDATED_ARCH=1`` (then warn)."""
+    _guard(device)
+    d = torch.device(device)
+    key = d.index if d.index is not None else torch.cuda.current_device()
+    if key in _BF16_GUARDED:
+        return
+    major, minor = torch.cuda.get_device_capability(key)
+    if major < _BF16_VALIDATED_MAJOR:
+        msg = (f"flash_kda.cfbi.bi_linear: the bf16 MMA premise was validated on Blackwell (compute capability >= "
+               f"{_BF16_VALIDATED_MAJOR}.0) only, this is cuda:{key} (compute capability {major}.{minor}); the bitwise "
+               "guarantee of the projection is not established there.")
+        if os.environ.get("FLASH_KDA_CFBI_ALLOW_UNVALIDATED_ARCH", "0") != "1":
+            raise RuntimeError(msg + " Set FLASH_KDA_CFBI_ALLOW_UNVALIDATED_ARCH=1 to run anyway.")
+        warnings.warn(msg + " Running anyway (FLASH_KDA_CFBI_ALLOW_UNVALIDATED_ARCH=1).", RuntimeWarning, stacklevel=3)
+    _BF16_GUARDED[key] = True
 
 
 def pick_config(M: int, N: int) -> int:
@@ -40,7 +66,7 @@ def _aligned2d(t: torch.Tensor) -> torch.Tensor:
 def _bi_linear_fwd(x, weight, bias, out, cfg, out_fp32=None):
     if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
         raise TypeError(f"bi_linear needs bf16 x and weight, got {x.dtype} and {weight.dtype}")
-    _guard(x.device)   # the tile-slot independence of mma.sync was validated on B300 only
+    _guard_bf16(x.device)   # the tile-slot independence of the bf16 mma.sync was validated on Blackwell (B300) only
     if weight.dim() != 2 or x.shape[-1] != weight.shape[1]:
         raise ValueError(f"weight must be [N, K] with K == x.shape[-1] ({x.shape[-1]}), got {tuple(weight.shape)}")
     if bias is not None and bias.dtype not in (torch.float32, torch.bfloat16):
