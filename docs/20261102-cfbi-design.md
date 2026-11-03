@@ -220,7 +220,7 @@ and the launcher never selects such a kernel there. One nvcc run builds all of s
 (`FLASH_KDA_CFBI_ARCH="8.0;8.6;8.9;9.0a;10.0a;10.3a;12.0a"`, 51 s on a 32-core node; `FLASH_KDA_CUDA_ARCHS=all` of `setup.py`
 now includes 80/86/89 for this extension; flags unchanged: `-fmad=false`, no fast math). The arithmetic is untouched: `cuobjdump -sass` of all
 11 kernels (probes, plan, row engines, K1, K2, reference and optimised) is instruction-for-instruction identical to the base
-commit a7e66c2 for sm_90a, sm_100a and sm_103a (40,591 / 35,279 / 35,279 SASS lines); the H100 digest is the same before and
+commit 3199764 for sm_90a, sm_100a and sm_103a (40,591 / 35,279 / 35,279 SASS lines); the H100 digest is the same before and
 after (7078397d...); sm_90 and sm_90a builds give the same bits. One binary
 built once for `8.0;8.6;8.9;9.0a;10.0a;10.3a` (a `;`-separated `FLASH_KDA_CFBI_ARCH`, or the `setup.py` build
 `FLASH_KDA_BUILD_EXTS=cfbi FLASH_KDA_CUDA_ARCHS=all`: 23 MB, SASS for 80/86/89/90a/100a/103a/120a) loads on the H100, A100, A10,
