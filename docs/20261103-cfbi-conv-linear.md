@@ -216,7 +216,9 @@ Comparing only bf16 outputs is weak: both controls below change tens of thousand
 | chain: layer front end | `test_layer_chain.py`: whole-sequence training-style call vs prefill(110) + 40 decode calls, hidden 1024 / 4 heads and 4096 / 16 heads; a varlen batch of 4 sequences + lock-step decode with compaction | 0 differing elements in 18 tensors (projection, conv, core outputs, bf16 and fp32) and in the final conv / core states |
 | chain negative controls | sabotaged conv decode association, sabotaged small-M linear, cuBLAS projections (serving side only) | **all caught** (conv: 31169 / 31525 / 31270 fp32 values of q / k / v; linear: 81405 fp32 values of `q_pre` ...; cuBLAS: 3044 bf16 values of `g`, 7 of `beta`, 1481 bf16 core outputs) |
 | autograd forward | training step with weights requiring grad (`bi_linear`, `short_conv`, `chunk_kda` as autograd functions) | forward = serving bits; backward runs end to end (needs `flash-linear-attention`) |
-| runtime | 150 repeated launches of a stateful varlen call (40-tile sequences), 50 repeated linear calls, two processes (SHA-256), JIT build vs `setup.py` build (`FLASH_KDA_BUILD_EXTS=cfbi_conv`, `-gencode arch=compute_103a`) | identical; the two builds give the same digest `b093a85f...` |
+| random sweeps | `test_convlin_fuzz.py` (seeded): 24 random packed batches (D 1 .. 700 odd and even, W 2 .. 8, random bias / weight dtypes, random row stride, random initial state, lengths incl. 0 / 1 / 63 / 64 / 65) = every sequence alone cut at random points = the PyTorch emulation of section 2; 20 random `(M, N, K)` linears = the probe program, any row subset in any order, all 5 configs | identical (out, fp32, state) |
+| memory / races | `compute-sanitizer` memcheck (with `PYTORCH_NO_CUDA_MEMORY_CACHING=1` so that over-reads of a tensor are detectable) over the conv and linear tests, racecheck and synccheck over the linear tests (all configs) | 0 errors, 0 hazards |
+| runtime | 150 repeated launches of a stateful varlen call (sequences of up to 41 tiles), 50 repeated linear calls, a side CUDA stream, a too-small `max_seqlen` traps (subprocess), two processes (SHA-256), JIT build vs `setup.py` build (`FLASH_KDA_BUILD_EXTS=cfbi_conv`, `-gencode arch=compute_103a`) | identical; the two builds give the same digest `b093a85f...` |
 
 
 ## 7. Control: cuBLAS is not batch invariant
@@ -247,6 +249,10 @@ regime - differs in 0.1-0.8% of the bf16 outputs** (a different split of the K s
 size of the error that would make a decode step disagree with the prefill row, and the reason the projection of a CF-BI layer cannot go
 through cuBLAS. In the layer chain of section 6 (hidden 4096) cuBLAS projections change 3044 bf16 values of `g` (the first `f_proj` linear is
 `4096 -> 128`), 7 of `beta` and, through the core's state, 1481 bf16 core outputs of a 150-token sequence.
+
+Accuracy is the same as cuBLAS's (`benchmarks/micro/linear_accuracy.py`): rel. RMS error against fp64 1.65e-3 for both at (256, 4096, 4096), (64, 4096, 2048),
+(128, 11008, 4096), i.e. the bf16 rounding floor; where cuBLAS does not split K (e.g. M = 256, K = N = 4096) its bf16 outputs are bit-identical to `bi_linear`'s (0 of
+1M differ), elsewhere 0.18% (M = 64, 4096 -> 2048) to 0.50% (K = 11008) differ because it adds the K terms in another order.
 
 For orientation, FLA's own conv (`test_against_fla_short_convolution`): on 2,097,152 outputs (D = 2048, T = 1024, no bias) FLA's Triton full-call kernel gives exactly
 the same bf16 bits as `short_conv` (0 differ, bf16 and fp32 weights); its single-token `step` kernel differs from its own full-call kernel in 1 output (bf16 weights)
