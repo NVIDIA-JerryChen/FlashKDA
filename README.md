@@ -114,7 +114,9 @@ flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
 sequence start, fp32 state, three-term TF32 tensor-core products). Prefill and the training forward evaluate many
 rows of it at once, decode evaluates one more row: the output and the continuation state have the **same bits**
 however the sequence is cut into calls, whatever else is in the batch, and whether it ran as prefill, decode or
-the training forward. Correctness-first v1 (no tcgen05/TMEM pipelining yet), validated on B300 (`sm_103a`) only.
+the training forward. Optimised kernels (bulk-copy/mbarrier pipelines, fragment-native workspace, packed decode tiles;
+see [perf doc](docs/20261103-cfbi-perf.md)) that are checked bit for bit against the frozen v1 reference kernels
+(`_impl=3`); validated on B300 (`sm_103a`) unless the perf doc says otherwise.
 
 ```python
 from flash_kda.cfbi import alloc_state, prefill, decode, chunk_kda
@@ -123,6 +125,13 @@ state = alloc_state(N, H)                       # E fp32 [N,H,128,128], open-chu
 prefill(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, state, cu_seqlens)   # any cut, in place
 decode(q1, k1, v1, g1, beta1, scale, out1, A_log, dt_bias, lower_bound, state)          # one token per sequence
 y = chunk_kda(q, k, v, g, beta, scale, A_log, dt_bias, lower_bound)                      # training: autograd
+
+# one state POOL for a serving engine: sequence n of the call uses slot slot_ids[n] (-1 = padding entry)
+pool = alloc_state(num_slots, H)
+decode(q1, k1, v1, g1, beta1, scale, out1, A_log, dt_bias, lower_bound, pool, slot_ids=slots)   # int32 [N]
+
+# context parallelism: K1 (no E needed) on every rank at once, K2 chained through E; same bits as one prefill call
+from flash_kda.cfbi import cp_prefill       # shards cut at multiples of 64 tokens from the sequence start
 ```
 
 Same argument names/shapes as `flash_kda.fwd`; extra constraints and the backward (FLA's chunk backward on a

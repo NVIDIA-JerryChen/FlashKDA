@@ -3,9 +3,11 @@
 `flash_kda.cfbi` (extension `flash_kda_cfbi_C`, sources in `csrc/cfbi/`) implements the "CF-BI" idea: ONE fixed-order,
 chunk-form floating-point program that prefill, the training forward and decode all evaluate. The program itself
 is specified in [20261102-cfbi-numerical-contract.md](20261102-cfbi-numerical-contract.md); this document describes
-the kernels, how the pieces fit, what was verified and what it costs. Status: v1, validated on B300 (`sm_103a`)
-only, performance engineering (tcgen05/UMMA, TMEM, bulk-copy pipelines, decode double-CTA residency) is explicitly
-not part of it.
+the kernels, how the pieces fit, what was verified and what it costs. Status: v1 was the correctness-first
+implementation (validated on B300, `sm_103a`); **the kernels were optimised afterwards without changing a bit of their
+results, see [20261103-cfbi-perf.md](20261103-cfbi-perf.md)** (sections 3 and 6-7 below describe the v1 structure and
+numbers; the v1 kernels live on as the bitwise reference in `csrc/cfbi/ref/`). Added since: `slot_ids` state pools,
+context-parallel prefill (`prefill_k1`/`prefill_k2`/`cp_prefill`).
 
 ## 1. What you get
 

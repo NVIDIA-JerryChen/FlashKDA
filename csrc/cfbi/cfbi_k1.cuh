@@ -168,7 +168,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
     float* sBetaLogit = sBeta + 64;
 
 #ifdef CFBI_K1_PROFILE
-    long long tp[8];
+    long long tp[12];
     K1_TS(0);
 #endif
     const int c = blockIdx.x, h = blockIdx.y, H = p.H;
@@ -200,6 +200,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
         else *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
     }
     cp_async_commit();
+    const float a_log_h = p.A_log[h];                                  // loaded now, used after the raw rows have arrived
+    const float dtb_c = p.dt_bias[h * HEAD_K + (tid & 127)];
     if (tid < 64) sBetaLogit[tid] = tid < valid ? bf16_to_f32(p.beta[(tok0 + tid) * H + h]) : 0.f;   // strided 2-byte elements
     {   // Akk and Aqk are contiguous: zero both with 16-byte stores
         float4* z = reinterpret_cast<float4*>(sAkk);
@@ -210,11 +212,31 @@ __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
     K1_TS(1);
 
     // ---- 1. prep ---------------------------------------------------------------------------------------
-    if (tid >= 128) {   // l2norm inverse of the 64 k rows and 64 q rows: 16-lane groups, 8 channels per lane
-        const int t2 = tid - 128, grp = t2 >> 4, lj = t2 & 15;
-#pragma unroll 4
-        for (int r = 0; r < 16; ++r) {
-            const int vec = grp + 8 * r;
+    // 1a. all threads: gate a2 of one channel for half of the rows (independent), l2norm inverse of 8 of the 128 k / q
+    //     rows (16-lane groups, 8 channels per lane, all 32 lanes take part in the shuffles), beta
+    {
+        const float ale = gate_a_log_exp(a_log_h);
+        const int c = tid & 127, half = tid >> 7;
+        const float dtb = dtb_c;
+#pragma unroll
+        for (int r4 = 0; r4 < 4; ++r4) {
+            float a2v[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {   // 8 independent rows in flight; unconditional work + select (no divergent branch)
+                const int row = 2 * (8 * r4 + i) + half;
+                a2v[i] = gate_a2(__uint_as_float(static_cast<uint32_t>(sGr[row * K1_RS + c]) << 16), dtb, ale, p.scale2);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int row = 2 * (8 * r4 + i) + half;
+                sG[row * K1_SG + c] = row < valid ? a2v[i] : 0.f;
+            }
+        }
+        K1_TS(6);
+        const int grp = tid >> 4, lj = tid & 15;
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int vec = grp + 16 * r;
             const bool isq = vec >= 64;
             const int row = isq ? vec - 64 : vec;
             const uint4 u = *reinterpret_cast<const uint4*>((isq ? sQr : sKr) + row * K1_RS + 8 * lj);
@@ -225,31 +247,28 @@ __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
                 x[2 * i] = __uint_as_float(wv[i] << 16);
                 x[2 * i + 1] = __uint_as_float(wv[i] & 0xFFFF0000u);
             }
-            const float inv = l2norm_inv(x);   // all lanes take part in the shuffles
+            const float inv = l2norm_inv(x);
             if (lj == 0) (isq ? sInvQ : sInvK)[row] = inv;
         }
-    } else {   // gate a2 and the sequential cumsum over rows for channel `tid`, beta
-        const float ale = gate_a_log_exp(p.A_log[h]);
-        const float dtb = p.dt_bias[h * HEAD_K + tid];
+        K1_TS(7);
+        if (tid < 64) sBeta[tid] = tid < valid ? beta_act(sBetaLogit[tid]) : 0.f;
+    }
+    __syncthreads();
+    K1_TS(8);
+    // 1b. sequential cumsum over the rows for every channel, in place: G2[0] = a2[0], G2[t] = G2[t-1] + a2[t]
+    if (tid < 128) {
         float acc = 0.f;
 #pragma unroll
         for (int r8 = 0; r8 < 8; ++r8) {
-            float a2[8];
+            float a[8];
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {   // independent: the sequential dependency is only the fadd chain below
-                const int row = 8 * r8 + i;
-                a2[i] = 0.f;
-                if (row < valid)
-                    a2[i] = gate_a2(__uint_as_float(static_cast<uint32_t>(sGr[row * K1_RS + tid]) << 16), dtb, ale, p.scale2);
-            }
+            for (int i = 0; i < 8; ++i) a[i] = sG[(8 * r8 + i) * K1_SG + tid];
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                const int row = 8 * r8 + i;
-                acc = (row == 0) ? a2[i] : fadd(acc, a2[i]);
-                sG[row * K1_SG + tid] = acc;
+                acc = (r8 == 0 && i == 0) ? a[i] : fadd(acc, a[i]);
+                sG[(8 * r8 + i) * K1_SG + tid] = acc;
             }
         }
-        if (tid < 64) sBeta[tid] = tid < valid ? beta_act(sBetaLogit[tid]) : 0.f;
     }
     __syncthreads();
     K1_TS(2);
@@ -334,14 +353,23 @@ __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
     K1_TS(3);
 
     // ---- 3. block forward substitution for UT and W ---------------------------------------------------
+#ifdef CFBI_K1_PROFILE
+    long long t_m = 0, t_ch = 0, t_y;
+#endif
     for (int s = 0; s < nsb; ++s) {
         const int b = 16 * s;
+#ifdef CFBI_K1_PROFILE
+        if (tid == 0) t_y = clock64();
+#endif
         if (s > 0) {
             if (s == 1) k1_m_phase<2>(sAkk, sUT, sW, sM, b, warp, L);
             else if (s == 2) k1_m_phase<4>(sAkk, sUT, sW, sM, b, warp, L);
             else k1_m_phase<6>(sAkk, sUT, sW, sM, b, warp, L);
             __syncthreads();
         }
+#ifdef CFBI_K1_PROFILE
+        if (tid == 0) { long long tn = clock64(); t_m += tn - t_y; t_y = tn; }
+#endif
         {   // thread = (UT | W, column): right-hand sides, subtract M, FMA chain over the sub-block's earlier rows
             const int which = tid >> 7, col = tid & 127;
             float rhs[16];
@@ -371,6 +399,9 @@ __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
             }
         }
         __syncthreads();
+#ifdef CFBI_K1_PROFILE
+        if (tid == 0) t_ch += clock64() - t_y;
+#endif
     }
     K1_TS(4);
 
@@ -433,8 +464,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
     __syncthreads();
     K1_TS(5);
     if (tid == 0 && blockIdx.y == 0 && (blockIdx.x == 0 || blockIdx.x == 37 || blockIdx.x == 300))
-        printf("K1prof c=%d: load %lld | prep %lld | akk/aqk %lld | subst %lld | ws-write %lld | total %lld\n", c, tp[1] - tp[0],
-               tp[2] - tp[1], tp[3] - tp[2], tp[4] - tp[3], tp[5] - tp[4], tp[5] - tp[0]);
+        printf("K1prof c=%d: load %lld | prep %lld (a2 %lld, l2norm %lld, barrier %lld, cumsum %lld) | akk/aqk %lld | subst %lld (M %lld, chain %lld) | ws-write %lld | total %lld\n", c, tp[1] - tp[0],
+               tp[2] - tp[1], tp[6] - tp[1], tp[7] - tp[6], tp[8] - tp[7], tp[2] - tp[8], tp[3] - tp[2], tp[4] - tp[3], t_m, t_ch, tp[5] - tp[4], tp[5] - tp[0]);
 #endif
 }
 
