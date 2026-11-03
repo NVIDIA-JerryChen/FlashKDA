@@ -6,8 +6,9 @@ bits do not depend on call cuts, phase or batch composition. See docs/20261102-c
 """
 from ._ext import load_ext
 from .api import decode, forward_train, prefill
+from .autograd import chunk_kda
 from .state import CfbiState, alloc_state, state_equal, state_mismatch
 
 __all__ = [
-    "load_ext", "prefill", "decode", "forward_train", "CfbiState", "alloc_state", "state_equal", "state_mismatch",
+    "load_ext", "prefill", "decode", "forward_train", "chunk_kda", "CfbiState", "alloc_state", "state_equal", "state_mismatch",
 ]
