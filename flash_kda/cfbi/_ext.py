@@ -1,0 +1,137 @@
+"""Loader for the ``flash_kda_cfbi_C`` extension.
+
+Order: (1) the module built by ``pip install`` / ``setup.py`` (``FLASH_KDA_BUILD_EXTS=cfbi``), unless
+``FLASH_KDA_CFBI_JIT=1``; (2) a JIT build with ``torch.utils.cpp_extension.load`` from ``csrc/cfbi``
+(development loop; same flags as setup.py, no ``--use_fast_math``).
+
+The conv / linear kernels (``flash_kda.cfbi.conv`` / ``.linear``) live in a second extension,
+``flash_kda_cfbi_conv_C`` (``load_conv_ext``), built the same way from ``csrc/cfbi/cfbi_convlin*``.
+
+Env knobs: FLASH_KDA_CFBI_JIT=1, FLASH_KDA_CFBI_VERBOSE=1, FLASH_KDA_CFBI_BUILD_DIR, FLASH_KDA_CFBI_ARCH (default: the
+current device's arch, e.g. "8.0", "9.0a", "10.3a"; a ";"-separated list such as "8.0;8.6;8.9;9.0a;10.0a;10.3a" builds one
+binary for several architectures: the launcher picks the kernels per device at run time).
+"""
+import os
+from pathlib import Path
+
+import torch
+
+_EXT = None
+_CONV_EXT = None
+
+NVCC_FLAGS = [
+    "-O3",
+    "-fmad=false",       # no FMA contraction (numerics-critical code also uses explicit intrinsics)
+    "-ftz=false",
+    "-prec-div=true",
+    "-prec-sqrt=true",
+    "--expt-relaxed-constexpr",
+    "-lineinfo",
+    "--ptxas-options=-v",
+]
+
+_SOURCES = ("cfbi_binding.cpp", "cfbi_launch.cu", "cfbi_probe.cu")
+_CONV_SOURCES = ("cfbi_convlin_binding.cpp", "cfbi_convlin.cu")
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _source_hash() -> str:
+    """Content hash of every file under csrc/cfbi. torch's JIT cache only hashes the listed .cpp/.cu files, so an edit
+    of a header (.cuh/.h) would silently reuse a stale build; the hash goes into the build flags to prevent that."""
+    import hashlib
+
+    h = hashlib.sha1()
+    for f in sorted((_repo_root() / "csrc" / "cfbi").rglob("*")):
+        if f.is_file():
+            h.update(f.name.encode())
+            h.update(f.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def _jit_build(verbose: bool, name: str = "flash_kda_cfbi_C_jit", defines: tuple = (), sources: tuple = _SOURCES):
+    from torch.utils.cpp_extension import load
+
+    root = _repo_root()
+    csrc = root / "csrc"
+    # The extension uses tf32 mma.sync (sm_80+). Container images often preset TORCH_CUDA_ARCH_LIST with
+    # old archs (e.g. 7.5), so build for the current device unless FLASH_KDA_CFBI_ARCH says otherwise.
+    arch = os.environ.get("FLASH_KDA_CFBI_ARCH")
+    if arch is None and torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        arch = f"{major}.{minor}" + ("a" if major >= 9 else "")
+    build_dir = os.environ.get("FLASH_KDA_CFBI_BUILD_DIR")
+    if build_dir:
+        os.makedirs(build_dir, exist_ok=True)
+    saved = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    if arch is not None:
+        os.environ["TORCH_CUDA_ARCH_LIST"] = arch
+    try:
+        return load(
+            name=name,
+            sources=[str(csrc / "cfbi" / s) for s in sources],
+            extra_include_paths=[str(csrc)],
+            extra_cflags=["-O3", "-Wno-psabi", f"-DCFBI_SRC_HASH=0x{_source_hash()}ull"],
+            extra_cuda_cflags=NVCC_FLAGS + [f"-D{d}" for d in defines] + [f"-DCFBI_SRC_HASH=0x{_source_hash()}ull"],
+            build_directory=build_dir or None,
+            verbose=verbose,
+        )
+    finally:
+        if saved is None:
+            os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
+        else:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = saved
+
+
+def load_ext(verbose: bool | None = None):
+    """Return the CF-BI extension module (building it just in time if it was not installed)."""
+    global _EXT
+    if _EXT is not None:
+        return _EXT
+    if verbose is None:
+        verbose = os.environ.get("FLASH_KDA_CFBI_VERBOSE", "0") == "1"
+    if os.environ.get("FLASH_KDA_CFBI_JIT", "0") != "1":
+        try:
+            import flash_kda_cfbi_C
+
+            _EXT = flash_kda_cfbi_C
+            return _EXT
+        except ImportError:
+            pass
+    _EXT = _jit_build(verbose)
+    return _EXT
+
+
+def load_variant(name: str, defines: tuple):
+    """JIT-build a differently flagged copy of the extension under its own module name (tests only: the
+    negative-control kernels that the bitwise harness must catch)."""
+    return _jit_build(os.environ.get("FLASH_KDA_CFBI_VERBOSE", "0") == "1", name=f"flash_kda_cfbi_C_{name}",
+                      defines=tuple(defines))
+
+
+def load_conv_ext(verbose: bool | None = None):
+    """Return the conv / linear extension ``flash_kda_cfbi_conv_C`` (JIT-built if it was not installed)."""
+    global _CONV_EXT
+    if _CONV_EXT is not None:
+        return _CONV_EXT
+    if verbose is None:
+        verbose = os.environ.get("FLASH_KDA_CFBI_VERBOSE", "0") == "1"
+    if os.environ.get("FLASH_KDA_CFBI_JIT", "0") != "1":
+        try:
+            import flash_kda_cfbi_conv_C
+
+            _CONV_EXT = flash_kda_cfbi_conv_C
+            return _CONV_EXT
+        except ImportError:
+            pass
+    _CONV_EXT = _jit_build(verbose, name="flash_kda_cfbi_conv_C_jit", sources=_CONV_SOURCES)
+    return _CONV_EXT
+
+
+def load_conv_variant(name: str, defines: tuple):
+    """Differently flagged copy of the conv / linear extension (tests only: the negative-control kernels, e.g.
+    CFBI_CONV_NEG_CONTROL=1 and CFBI_LIN_NEG_CONTROL=1, that the bitwise harness must catch)."""
+    return _jit_build(os.environ.get("FLASH_KDA_CFBI_VERBOSE", "0") == "1", name=f"flash_kda_cfbi_conv_C_{name}",
+                      defines=tuple(defines), sources=_CONV_SOURCES)
