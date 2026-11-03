@@ -26,7 +26,8 @@ def _guard(device: torch.device):
 
 
 def prefill(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, state: CfbiState,
-            cu_seqlens: Optional[torch.Tensor] = None, *, out_fp32: Optional[torch.Tensor] = None, _mode: int = 0):
+            cu_seqlens: Optional[torch.Tensor] = None, *, out_fp32: Optional[torch.Tensor] = None, _mode: int = 0,
+            _impl: int = 0):
     """Append ``T`` tokens per sequence to the sequences' CF-BI state and write the outputs in place.
 
     Argument names/shapes follow ``flash_kda.fwd``: q, k, v, g bf16 ``[B, T, H, 128]``, beta bf16 raw logits
@@ -38,11 +39,11 @@ def prefill(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, state: Cf
     """
     _guard(q.device)
     load_ext().forward(q, k, v, g, beta, float(scale), out, A_log, dt_bias, float(lower_bound),
-                       state.E, state.rows, state.pos, cu_seqlens, _mode, out_fp32)
+                       state.E, state.rows, state.pos, cu_seqlens, _mode, out_fp32, _impl)
 
 
 def decode(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, state: CfbiState, *,
-           out_fp32: Optional[torch.Tensor] = None):
+           out_fp32: Optional[torch.Tensor] = None, _impl: int = 0):
     """One token per sequence (``q`` bf16 ``[N, 1, H, 128]`` or ``[N, H, 128]``); same arithmetic as ``prefill``."""
     if q.dim() == 3:
         q, k, v, g, out = (x.unsqueeze(1) for x in (q, k, v, g, out))
@@ -51,16 +52,16 @@ def decode(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, state: Cfb
             out_fp32 = out_fp32.unsqueeze(1)
     _guard(q.device)
     load_ext().forward(q, k, v, g, beta, float(scale), out, A_log, dt_bias, float(lower_bound),
-                       state.E, state.rows, state.pos, None, 1, out_fp32)
+                       state.E, state.rows, state.pos, None, 1, out_fp32, _impl)
 
 
 def forward_train(q, k, v, g, beta, scale, A_log, dt_bias, lower_bound,
                   cu_seqlens: Optional[torch.Tensor] = None, *, out: Optional[torch.Tensor] = None,
-                  out_fp32: Optional[torch.Tensor] = None) -> torch.Tensor:
+                  out_fp32: Optional[torch.Tensor] = None, _impl: int = 0) -> torch.Tensor:
     """Training-forward schedule of the same program, from the empty state; nothing is persisted."""
     _guard(q.device)
     if out is None:
         out = torch.empty_like(q)
     load_ext().forward(q, k, v, g, beta, float(scale), out, A_log, dt_bias, float(lower_bound),
-                       None, None, None, cu_seqlens, 0, out_fp32)
+                       None, None, None, cu_seqlens, 0, out_fp32, _impl)
     return out

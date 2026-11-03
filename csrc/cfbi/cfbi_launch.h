@@ -39,7 +39,13 @@ struct ForwardArgs {
     float* ws;         // scratch [(ceil(T_total/64) + N) * H * WS_FLOATS_PER_CHUNK_HEAD] floats (mode 0 only)
     int mode;          // 0: prefill / training schedule (row engine for head rows, K1+K2 for the rest)
                        // 1: row engine for every row (decode; also a differential test of K1/K2)
+    int impl;          // IMPL_* bits: which implementation of the row engine / chunk kernels runs (0 = optimised)
 };
+
+// Implementation selector (tests only): the frozen v1 kernels in csrc/cfbi/ref/ are the bitwise oracle of the
+// optimised ones. K1 and K2 share one bit because their workspace layouts differ between the implementations.
+constexpr int IMPL_REF_ROWS = 1;    // row engine (decode, head rows)
+constexpr int IMPL_REF_CHUNK = 2;   // K1 + K2 (prefill / training forward)
 
 // Runs plan -> row engine -> K1 -> K2 -> pos update on `stream`.
 void launch_forward(const ForwardArgs& a, cudaStream_t stream);

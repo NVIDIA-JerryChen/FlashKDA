@@ -79,7 +79,8 @@ void check_bf16_cuda(const torch::Tensor& t, const char* name) {
 void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g, torch::Tensor beta, double scale,
              torch::Tensor out, torch::Tensor A_log, torch::Tensor dt_bias, double lower_bound,
              std::optional<torch::Tensor> E, std::optional<torch::Tensor> rows, std::optional<torch::Tensor> pos,
-             std::optional<torch::Tensor> cu_seqlens, int64_t mode, std::optional<torch::Tensor> out_f32) {
+             std::optional<torch::Tensor> cu_seqlens, int64_t mode, std::optional<torch::Tensor> out_f32,
+             int64_t impl) {
     for (const auto* t : {&q, &k, &v, &g, &out}) check_bf16_cuda(*t, "q/k/v/g/out");
     check_bf16_cuda(beta, "beta");
     check_f32_cuda(A_log, "A_log");
@@ -93,6 +94,7 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     TORCH_CHECK(A_log.dim() == 1 && A_log.size(0) == H, "A_log must be [H]");
     TORCH_CHECK(dt_bias.dim() == 2 && dt_bias.size(0) == H && dt_bias.size(1) == 128, "dt_bias must be [H, 128]");
     TORCH_CHECK(mode == 0 || mode == 1, "mode must be 0 or 1");
+    TORCH_CHECK(impl >= 0 && impl <= 3, "impl must be 0..3 (bit 0: reference row engine, bit 1: reference K1/K2)");
     TORCH_CHECK(lower_bound >= -5.0 && lower_bound <= 0.0, "lower_bound must be in [-5, 0]");
     const int64_t T_total = B * T;
     TORCH_CHECK(T_total < (int64_t(1) << 31) && H < 65536, "problem too large for the int32 token index / grid");
@@ -162,6 +164,7 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     a.plan = plan.data_ptr<int>();
     a.ws = mode == 0 ? ws.data_ptr<float>() : nullptr;
     a.mode = (int)mode;
+    a.impl = (int)impl;
     cfbi::launch_forward(a, cur_stream());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -174,7 +177,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("v"), py::arg("g"), py::arg("beta"), py::arg("scale"), py::arg("out"), py::arg("A_log"),
           py::arg("dt_bias"), py::arg("lower_bound"), py::arg("E") = py::none(), py::arg("rows") = py::none(),
           py::arg("pos") = py::none(), py::arg("cu_seqlens") = py::none(), py::arg("mode") = 0,
-          py::arg("out_f32") = py::none());
+          py::arg("out_f32") = py::none(), py::arg("impl") = 0);
     m.def("probe_dot3", &probe_dot3, "dot3 tile probe", py::arg("A"), py::arg("B"), py::arg("reverse_k") = false);
     m.def("probe_transc", &probe_transc, "ex2/tanh/rsqrt approximations", py::arg("x"), py::arg("which"));
     m.def("probe_prep", &probe_prep, "per-token prep probe", py::arg("q"), py::arg("k"), py::arg("g"),
