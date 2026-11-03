@@ -32,9 +32,10 @@ struct ForwardArgs {
     int fixed_len;     // tokens per sequence when cu_seqlens == null
     int64_t T_total;
     const int64_t* cu_seqlens;  // [N+1] or null
-    float* E;          // [N,H,128,128] fp32 state, or null (training: zero initial state, no write-back)
-    float* rows;       // [N,H,5,64,128] fp32 open-chunk row cache, or null
-    int* pos;          // [N] int32 fill of the open chunk, or null
+    float* E;          // [S,H,128,128] fp32 state pool, or null (training: zero initial state, no write-back)
+    float* rows;       // [S,H,5,64,128] fp32 open-chunk row cache, or null
+    int* pos;          // [S] int32 fill of the open chunk per state slot, or null
+    const int* slot_ids;   // [N] int32 state slot of each sequence of the call (-1: skip the entry), or null (slot = n)
     int* plan;         // scratch [(N+1) * PLAN_INTS_PER_SEQ] ints
     float* ws;         // scratch [(ceil(T_total/64) + N) * H * WS_FLOATS_PER_CHUNK_HEAD] floats (mode 0 only)
     int mode;          // 0: prefill / training schedule (row engine for head rows, K1+K2 for the rest)

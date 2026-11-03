@@ -80,7 +80,7 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
              torch::Tensor out, torch::Tensor A_log, torch::Tensor dt_bias, double lower_bound,
              std::optional<torch::Tensor> E, std::optional<torch::Tensor> rows, std::optional<torch::Tensor> pos,
              std::optional<torch::Tensor> cu_seqlens, int64_t mode, std::optional<torch::Tensor> out_f32,
-             int64_t impl) {
+             int64_t impl, std::optional<torch::Tensor> slot_ids) {
     for (const auto* t : {&q, &k, &v, &g, &out}) check_bf16_cuda(*t, "q/k/v/g/out");
     check_bf16_cuda(beta, "beta");
     check_f32_cuda(A_log, "A_log");
@@ -117,16 +117,27 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     const bool has_state = E.has_value();
     TORCH_CHECK(has_state == rows.has_value() && has_state == pos.has_value(),
                 "E, rows and pos must be given together");
+    // The state is a pool of S slots; sequence n of the call uses slot slot_ids[n] (slot_ids absent: slot n, S == N).
+    int64_t S = N;
+    const int* slot_ptr = nullptr;
+    if (slot_ids.has_value()) {
+        TORCH_CHECK(has_state, "slot_ids needs a state (E, rows, pos)");
+        TORCH_CHECK(slot_ids->is_cuda() && slot_ids->dtype() == torch::kInt32 && slot_ids->dim() == 1 &&
+                        slot_ids->numel() == N && slot_ids->is_contiguous(),
+                    "slot_ids must be a contiguous int32 CUDA vector with one entry per sequence");
+        slot_ptr = slot_ids->data_ptr<int>();
+    }
     if (has_state) {
         check_f32_cuda(*E, "E");
         check_f32_cuda(*rows, "rows");
         TORCH_CHECK(pos->is_cuda() && pos->dtype() == torch::kInt32 && pos->is_contiguous(), "pos must be int32 CUDA");
-        TORCH_CHECK(E->dim() == 4 && E->size(0) == N && E->size(1) == H && E->size(2) == 128 && E->size(3) == 128,
-                    "E must be [N, H, 128, 128]");
-        TORCH_CHECK(rows->dim() == 5 && rows->size(0) == N && rows->size(1) == H && rows->size(2) == 5 &&
+        if (slot_ids.has_value()) S = E->size(0);
+        TORCH_CHECK(E->dim() == 4 && E->size(0) == S && E->size(1) == H && E->size(2) == 128 && E->size(3) == 128,
+                    "E must be [N, H, 128, 128] (a pool [S, H, 128, 128] with slot_ids)");
+        TORCH_CHECK(rows->dim() == 5 && rows->size(0) == S && rows->size(1) == H && rows->size(2) == 5 &&
                         rows->size(3) == 64 && rows->size(4) == 128,
-                    "rows must be [N, H, 5, 64, 128]");
-        TORCH_CHECK(pos->dim() == 1 && pos->size(0) == N, "pos must be [N]");
+                    "rows must be [N, H, 5, 64, 128] (a pool [S, ...] with slot_ids)");
+        TORCH_CHECK(pos->dim() == 1 && pos->size(0) == S, "pos must be [N] (a pool [S] with slot_ids)");
         TORCH_CHECK(aligned16(*E) && aligned16(*rows), "E and rows must be 16-byte aligned");
     } else {
         TORCH_CHECK(mode == 0, "decode (mode 1) needs a state");
@@ -161,6 +172,7 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     a.E = has_state ? E->data_ptr<float>() : nullptr;
     a.rows = has_state ? rows->data_ptr<float>() : nullptr;
     a.pos = has_state ? pos->data_ptr<int>() : nullptr;
+    a.slot_ids = slot_ptr;
     a.plan = plan.data_ptr<int>();
     a.ws = mode == 0 ? ws.data_ptr<float>() : nullptr;
     a.mode = (int)mode;
@@ -177,7 +189,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("v"), py::arg("g"), py::arg("beta"), py::arg("scale"), py::arg("out"), py::arg("A_log"),
           py::arg("dt_bias"), py::arg("lower_bound"), py::arg("E") = py::none(), py::arg("rows") = py::none(),
           py::arg("pos") = py::none(), py::arg("cu_seqlens") = py::none(), py::arg("mode") = 0,
-          py::arg("out_f32") = py::none(), py::arg("impl") = 0);
+          py::arg("out_f32") = py::none(), py::arg("impl") = 0, py::arg("slot_ids") = py::none());
     m.def("probe_dot3", &probe_dot3, "dot3 tile probe", py::arg("A"), py::arg("B"), py::arg("reverse_k") = false);
     m.def("probe_transc", &probe_transc, "ex2/tanh/rsqrt approximations", py::arg("x"), py::arg("which"));
     m.def("probe_prep", &probe_prep, "per-token prep probe", py::arg("q"), py::arg("k"), py::arg("g"),

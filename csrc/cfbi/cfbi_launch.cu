@@ -31,10 +31,11 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
     p.E = a.E;
     p.rows = a.rows;
     p.pos = a.pos;
+    p.slot_ids = a.slot_ids;
     p.plan = reinterpret_cast<SeqPlan*>(a.plan);
     p.ws = a.ws;
 
-    plan_kernel<<<1, PLAN_THREADS, 0, stream>>>(a.cu_seqlens, a.fixed_len, a.pos, a.N, a.mode == 1 ? 1 : 0, p.plan);
+    plan_kernel<<<1, PLAN_THREADS, 0, stream>>>(a.cu_seqlens, a.fixed_len, a.pos, a.slot_ids, a.N, a.mode == 1 ? 1 : 0, p.plan);
     if (a.E != nullptr) {
         // head rows (finishing the open chunk) or, in mode 1, every row
         if (a.impl & IMPL_REF_ROWS) ref::rows_kernel<<<dim3(a.N, a.H), NTHREADS, 0, stream>>>(p);

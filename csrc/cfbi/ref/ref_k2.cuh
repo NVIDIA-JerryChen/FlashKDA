@@ -30,7 +30,7 @@ __global__ void __launch_bounds__(NTHREADS) k2_kernel(const Params p) {
     const int tid = threadIdx.x, warp = tid >> 5;
     const LaneIdx L;
 
-    float* Eg = p.E != nullptr ? p.E + ((int64_t)n * H + h) * E_FLOATS + (int64_t)v0 * HEAD_K : nullptr;
+    float* Eg = p.E != nullptr ? p.E + ((int64_t)sp.slot * H + h) * E_FLOATS + (int64_t)v0 * HEAD_K : nullptr;
     for (int idx = tid; idx < K2_BV * 32; idx += NTHREADS) {
         const int v = idx >> 5, c4 = idx & 31;
         *reinterpret_cast<float4*>(&sE[v * K2_SE + 4 * c4]) =
@@ -77,7 +77,7 @@ __global__ void __launch_bounds__(NTHREADS) k2_kernel(const Params p) {
             const float u = fsub(ut[row * 128 + v0 + col], sP[row * K2_SU + col]);
             sU[row * K2_SU + col] = u;
             if (!full && p.rows != nullptr && row < valid)
-                p.rows[((int64_t)n * H + h) * ROWS_PER_HEAD_FLOATS + PLANE_U * ROW_PLANE_FLOATS + row * 128 + v0 + col] = u;
+                p.rows[((int64_t)sp.slot * H + h) * ROWS_PER_HEAD_FLOATS + PLANE_U * ROW_PLANE_FLOATS + row * 128 + v0 + col] = u;
         }
         __syncthreads();
 

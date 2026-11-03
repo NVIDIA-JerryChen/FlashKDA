@@ -18,7 +18,7 @@ namespace cfbi {
 constexpr int PLAN_THREADS = 1024;
 
 __global__ void __launch_bounds__(PLAN_THREADS)
-plan_kernel(const int64_t* cu, int fixed_len, const int* pos_state, int N, int all_rows, SeqPlan* plan) {
+plan_kernel(const int64_t* cu, int fixed_len, const int* pos_state, const int* slot_ids, int N, int all_rows, SeqPlan* plan) {
     using Scan = cub::BlockScan<int, PLAN_THREADS>;
     __shared__ typename Scan::TempStorage tmp;
     __shared__ int carry;
@@ -26,7 +26,7 @@ plan_kernel(const int64_t* cu, int fixed_len, const int* pos_state, int N, int a
     __syncthreads();
     for (int base = 0; base < N; base += PLAN_THREADS) {
         const int n = base + threadIdx.x;
-        SeqPlan sp = {0, 0, 0, 0, 0, 0, 0, 0};
+        SeqPlan sp = {0, 0, 0, 0, 0, 0, 0, -1};
         int nch = 0;
         if (n < N) {
             int tok0, len;
@@ -37,7 +37,9 @@ plan_kernel(const int64_t* cu, int fixed_len, const int* pos_state, int N, int a
                 tok0 = n * fixed_len;
                 len = fixed_len;
             }
-            const int pos0 = pos_state != nullptr ? pos_state[n] : 0;
+            const int slot = slot_ids != nullptr ? slot_ids[n] : n;
+            if (slot < 0) len = 0;   // padding entry of a fixed-shape batch: no tokens, no state access
+            const int pos0 = (pos_state != nullptr && slot >= 0) ? pos_state[slot] : 0;
             int hrows, nfull, tail;
             if (all_rows) {
                 hrows = len; nfull = 0; tail = 0;
@@ -48,7 +50,7 @@ plan_kernel(const int64_t* cu, int fixed_len, const int* pos_state, int N, int a
                 tail = rest % BT;
             }
             nch = nfull + (tail > 0 ? 1 : 0);
-            sp.tok0 = tok0; sp.len = len; sp.pos0 = pos0; sp.hrows = hrows; sp.nfull = nfull; sp.tail = tail;
+            sp.tok0 = tok0; sp.len = len; sp.pos0 = pos0; sp.hrows = hrows; sp.nfull = nfull; sp.tail = tail; sp.slot = slot;
         }
         int excl, total;
         Scan(tmp).ExclusiveSum(nch, excl, total);
@@ -61,7 +63,7 @@ plan_kernel(const int64_t* cu, int fixed_len, const int* pos_state, int N, int a
         __syncthreads();
     }
     if (threadIdx.x == 0) {
-        SeqPlan last = {0, 0, 0, 0, 0, 0, carry, 0};
+        SeqPlan last = {0, 0, 0, 0, 0, 0, carry, -1};
         plan[N] = last;
     }
 }
@@ -71,7 +73,7 @@ __global__ void finalize_pos_kernel(const SeqPlan* plan, int* pos, int N) {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
     if (n < N) {
         const SeqPlan sp = plan[n];
-        pos[n] = (int)(((int64_t)sp.pos0 + sp.len) % BT);
+        if (sp.slot >= 0) pos[sp.slot] = (int)(((int64_t)sp.pos0 + sp.len) % BT);
     }
 }
 

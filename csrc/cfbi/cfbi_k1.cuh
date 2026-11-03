@@ -400,7 +400,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
         wsb[WS2_AQD + s * 272 + r * 17 + cc] = sAqk[(16 * s + r) * K1_SA + 16 * s + cc];
     }
     if (!full && p.rows != nullptr) {
-        float* R = p.rows + ((int64_t)n * H + h) * ROWS_PER_HEAD_FLOATS;
+        float* R = p.rows + ((int64_t)sp.slot * H + h) * ROWS_PER_HEAD_FLOATS;
         for (int idx = tid; idx < valid * 32; idx += NTHREADS) {
             const int row = idx >> 5, c4 = idx & 31;
             float4 kv;

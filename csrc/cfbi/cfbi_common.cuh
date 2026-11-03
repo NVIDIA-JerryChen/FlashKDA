@@ -50,7 +50,7 @@ struct SeqPlan {
     int nfull;  // full 64-row chunks handled by K1/K2
     int tail;   // trailing rows (< 64) handled by K1/K2; they stay in the open chunk afterwards
     int cbase;  // index of this sequence's first K1/K2 chunk (exclusive prefix sum); plan[N].cbase = total
-    int pad_;
+    int slot;   // state slot of the sequence (index into E / rows / pos), -1 = skipped (padding entry)
 };
 static_assert(sizeof(SeqPlan) == PLAN_INTS_PER_SEQ * sizeof(int), "SeqPlan size");
 
@@ -71,6 +71,7 @@ struct Params {
     float* E;     // NOT const/__restrict__: written and re-read inside kernels (no .nc loads)
     float* rows;
     int* pos;
+    const int* slot_ids;   // [N] state slot of each sequence of the call (nullptr: slot = sequence index)
     SeqPlan* plan;
     float* ws;
 };

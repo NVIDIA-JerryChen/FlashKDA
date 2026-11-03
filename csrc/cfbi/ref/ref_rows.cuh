@@ -39,13 +39,13 @@ __global__ void __launch_bounds__(NTHREADS) rows_kernel(const Params p) {
     const int tid = threadIdx.x, warp = tid >> 5;
     const LaneIdx L;
 
-    float* R = p.rows + ((int64_t)n * H + h) * ROWS_PER_HEAD_FLOATS;
+    float* R = p.rows + ((int64_t)sp.slot * H + h) * ROWS_PER_HEAD_FLOATS;
     float* Rk = R + PLANE_KHAT * ROW_PLANE_FLOATS;
     float* Rg = R + PLANE_G2 * ROW_PLANE_FLOATS;
     float* Rut = R + PLANE_UT * ROW_PLANE_FLOATS;
     float* Rw = R + PLANE_W * ROW_PLANE_FLOATS;
     float* Ru = R + PLANE_U * ROW_PLANE_FLOATS;
-    float* Eg = p.E + ((int64_t)n * H + h) * E_FLOATS;
+    float* Eg = p.E + ((int64_t)sp.slot * H + h) * E_FLOATS;
     const float ale = gate_a_log_exp(p.A_log[h]);
 
     int pos = sp.pos0;

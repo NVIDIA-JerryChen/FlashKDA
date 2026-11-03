@@ -178,7 +178,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
     }
 
     // E slice [K2_BV][128]: fp32 copy and pre-split hi/lo B fragments
-    float* Eg = p.E != nullptr ? p.E + ((int64_t)n * H + h) * E_FLOATS + (int64_t)v0 * HEAD_K : nullptr;
+    float* Eg = p.E != nullptr ? p.E + ((int64_t)sp.slot * H + h) * E_FLOATS + (int64_t)v0 * HEAD_K : nullptr;
     for (int idx = tid; idx < K2_BV * HEAD_K; idx += NTHREADS) {
         const int v = idx >> 7, k = idx & 127;
         const float e = Eg != nullptr ? Eg[v * HEAD_K + k] : 0.f;
@@ -223,7 +223,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
                         sUhi[ufrag_word(row, col)] = hi;
                         sUlo[ufrag_word(row, col)] = lo;
                         if (!full && p.rows != nullptr && row < valid)
-                            p.rows[((int64_t)n * H + h) * ROWS_PER_HEAD_FLOATS + PLANE_U * ROW_PLANE_FLOATS + row * 128 + v0 + col] = u;
+                            p.rows[((int64_t)sp.slot * H + h) * ROWS_PER_HEAD_FLOATS + PLANE_U * ROW_PLANE_FLOATS + row * 128 + v0 + col] = u;
                     }
                 }
             }

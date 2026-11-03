@@ -238,7 +238,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k1_kernel(const Params p) {
         }
         if (tid < 128) wsb[WS_GEND + tid] = ex2_ftz(sG[63 * K1_SKH + tid]);
     } else if (p.rows != nullptr) {
-        float* R = p.rows + ((int64_t)n * H + h) * ROWS_PER_HEAD_FLOATS;
+        float* R = p.rows + ((int64_t)sp.slot * H + h) * ROWS_PER_HEAD_FLOATS;
         for (int idx = tid; idx < valid * 32; idx += NTHREADS) {
             const int row = idx >> 5, c4 = idx & 31;
             *reinterpret_cast<float4*>(&R[PLANE_KHAT * ROW_PLANE_FLOATS + row * 128 + 4 * c4]) =
