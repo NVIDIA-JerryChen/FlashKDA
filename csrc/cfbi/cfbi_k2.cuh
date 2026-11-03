@@ -44,13 +44,12 @@ struct K2Cfg {
     static constexpr int OFF_KD = OFF_GQ + 8192 * 4;
     static constexpr int OFF_AQ = OFF_KD + K2_KD_FLOATS * 4;
     static constexpr int OFF_UT = OFF_AQ + K2_AQ_FLOATS * 4;
-    static constexpr int OFF_E32 = OFF_UT + UT_FLOATS * 4;
-    static constexpr int OFF_EHL = OFF_E32 + BV * K2_SE * 4;
+    static constexpr int OFF_EHL = OFF_UT + UT_FLOATS * 4;
     static constexpr int OFF_U32 = OFF_EHL + 2 * EHL_WORDS * 4;
     static constexpr int OFF_UHL = OFF_U32 + 64 * SU * 4;
     static constexpr int OFF_BAR = OFF_UHL + 2 * UHL_WORDS * 4;
     static constexpr int SMEM_BYTES = OFF_BAR + 64;
-    static_assert(OFF_AQ % 16 == 0 && OFF_UT % 16 == 0 && OFF_E32 % 16 == 0 && OFF_EHL % 16 == 0 && OFF_U32 % 16 == 0 &&
+    static_assert(OFF_AQ % 16 == 0 && OFF_UT % 16 == 0 && OFF_EHL % 16 == 0 && OFF_U32 % 16 == 0 &&
                       OFF_UHL % 16 == 0 && OFF_BAR % 8 == 0, "shared memory alignment");
 };
 
@@ -134,14 +133,13 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
     constexpr int K2_BV = BV, K2_NT = C::NT, K2_SU = C::SU, K2_UT_FLOATS = C::UT_FLOATS;
     constexpr int K2_EHL_WORDS = C::EHL_WORDS, K2_UHL_WORDS = C::UHL_WORDS;
     constexpr int K2_OFF_W = C::OFF_W, K2_OFF_GQ = C::OFF_GQ, K2_OFF_KD = C::OFF_KD, K2_OFF_AQ = C::OFF_AQ, K2_OFF_UT = C::OFF_UT;
-    constexpr int K2_OFF_E32 = C::OFF_E32, K2_OFF_EHL = C::OFF_EHL, K2_OFF_U32 = C::OFF_U32, K2_OFF_UHL = C::OFF_UHL, K2_OFF_BAR = C::OFF_BAR;
+    constexpr int K2_OFF_EHL = C::OFF_EHL, K2_OFF_U32 = C::OFF_U32, K2_OFF_UHL = C::OFF_UHL, K2_OFF_BAR = C::OFF_BAR;
     extern __shared__ __align__(128) unsigned char smem_raw[];
     float* sW = reinterpret_cast<float*>(smem_raw + K2_OFF_W);
     float* sGQ = reinterpret_cast<float*>(smem_raw + K2_OFF_GQ);
     float* sKD = reinterpret_cast<float*>(smem_raw + K2_OFF_KD);   // KD fragments, then GEND[128]
     float* sAQ = reinterpret_cast<float*>(smem_raw + K2_OFF_AQ);   // AQF [12][32][4], then AQD [4][16][17]
     float* sUT = reinterpret_cast<float*>(smem_raw + K2_OFF_UT);
-    float* sE = reinterpret_cast<float*>(smem_raw + K2_OFF_E32);
     uint32_t* sEhi = reinterpret_cast<uint32_t*>(smem_raw + K2_OFF_EHL);
     uint32_t* sElo = sEhi + K2_EHL_WORDS;
     float* sU = reinterpret_cast<float*>(smem_raw + K2_OFF_U32);
@@ -192,12 +190,12 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
         issue_back(0);
     }
 
-    // E slice [K2_BV][128]: fp32 copy and pre-split hi/lo B fragments
+    // E slice [K2_BV][128]: pre-split hi/lo B fragments in shared memory; the fp32 values live in the registers of the
+    // warps that update them (a thread owns the same E elements for the whole scan)
     float* Eg = p.E != nullptr ? p.E + ((int64_t)sp.slot * H + h) * E_FLOATS + (int64_t)v0 * HEAD_K : nullptr;
     for (int idx = tid; idx < K2_BV * HEAD_K; idx += NTHREADS) {
         const int v = idx >> 7, k = idx & 127;
         const float e = Eg != nullptr ? Eg[v * HEAD_K + k] : 0.f;
-        sE[v * K2_SE + k] = e;
         uint32_t hi, lo;
         split_tf32(e, hi, lo);
         sEhi[efrag_word(v, k)] = hi;
@@ -206,7 +204,17 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
     __syncthreads();
 
     const bool isA = warp < 4;
-    const int w = warp & 3;   // row tile (A: P1 / U, B: P2 / sub-block of O); P3 key tiles are w and w + 4
+    const int w = warp & 3;
+    float ereg[2][K2_NT][4];   // fp32 E elements of this thread (A warps): key tiles w, w + 4, value tiles 0..NT-1
+#pragma unroll
+    for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+        for (int nt = 0; nt < K2_NT; ++nt)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int k = 16 * (w + 4 * mi) + g + 8 * (i >> 1), v = 8 * nt + 2 * t + (i & 1);
+                ereg[mi][nt][i] = (isA && Eg != nullptr) ? Eg[v * HEAD_K + k] : 0.f;
+            }   // row tile (A: P1 / U, B: P2 / sub-block of O); P3 key tiles are w and w + 4
 #ifdef CFBI_K2_PROFILE
     long long acc_wait = 0, acc_p12 = 0, acc_s1 = 0, acc_p3o = 0, acc_s2 = 0, tt;
 #define K2_TS() (threadIdx.x == 0 ? clock64() : 0)
@@ -310,9 +318,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
 #pragma unroll
                         for (int i = 0; i < 4; ++i) {
                             const int k = 16 * (w + 4 * mi) + g + 8 * (i >> 1), v = 8 * nt + 2 * t + (i & 1);
-                            float* e = &sE[v * K2_SE + k];
-                            const float en = fadd(fmul(*e, gend[k]), fadd(big[mi][nt][i], sml[mi][nt][i]));
-                            *e = en;
+                            const float en = fadd(fmul(ereg[mi][nt][i], gend[k]), fadd(big[mi][nt][i], sml[mi][nt][i]));
+                            ereg[mi][nt][i] = en;
                             uint32_t hi, lo;
                             split_tf32(en, hi, lo);
                             sEhi[efrag_word(v, k)] = hi;
@@ -388,11 +395,16 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
 #endif
     }
 
-    if (Eg != nullptr) {
-        for (int idx = tid; idx < K2_BV * HEAD_K; idx += NTHREADS) {
-            const int v = idx >> 7, k = idx & 127;
-            Eg[v * HEAD_K + k] = sE[v * K2_SE + k];
-        }
+    if (Eg != nullptr && isA) {
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+            for (int nt = 0; nt < K2_NT; ++nt)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int k = 16 * (w + 4 * mi) + g + 8 * (i >> 1), v = 8 * nt + 2 * t + (i & 1);
+                    Eg[v * HEAD_K + k] = ereg[mi][nt][i];
+                }
     }
 #ifdef CFBI_K2_PROFILE
     if (tid == 0 && vs == 0 && n == 0 && h == 0 && nch >= 8)
