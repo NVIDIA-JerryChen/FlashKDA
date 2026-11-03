@@ -53,14 +53,16 @@ def get_arch_flags():
 
 
 # FLASH_KDA_BUILD_EXTS selects which extensions to build: "all" (default), or a
-# comma list of "master" (flash_kda_C, the CUTLASS chunk-16 kernel) and "cfbi"
-# (flash_kda_cfbi_C, the bitwise train/infer-consistent CF-BI kernels).
+# comma list of "master" (flash_kda_C, the CUTLASS chunk-16 kernel), "cfbi"
+# (flash_kda_cfbi_C, the bitwise train/infer-consistent CF-BI kernels, plus
+# flash_kda_cfbi_conv_C) and "cfbi_conv" (only flash_kda_cfbi_conv_C: the pinned
+# short causal conv and the batch-invariant bf16 linear).
 _BUILD_EXTS = {
     s.strip() for s in os.getenv("FLASH_KDA_BUILD_EXTS", "all").lower().split(",") if s.strip()
 }
 if "all" in _BUILD_EXTS:
     _BUILD_EXTS = {"master", "cfbi"}
-_unknown = _BUILD_EXTS - {"master", "cfbi"}
+_unknown = _BUILD_EXTS - {"master", "cfbi", "cfbi_conv"}
 assert not _unknown, f"unknown FLASH_KDA_BUILD_EXTS entries: {sorted(_unknown)}"
 
 ext_modules = []
@@ -132,6 +134,7 @@ if "cfbi" in _BUILD_EXTS:
         )
     )
 
+if {"cfbi", "cfbi_conv"} & _BUILD_EXTS:
     # The layers around the core (short causal conv + SiLU, batch-invariant bf16 linear): same flags, own extension.
     ext_modules.append(
         CUDAExtension(

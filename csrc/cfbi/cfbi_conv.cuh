@@ -83,10 +83,10 @@ __device__ __forceinline__ float conv_finish(float acc, bool has_bias, float bia
 __device__ __forceinline__ float ld_param(const void* p, bool bf16, int64_t i) {
     return bf16 ? bf16_to_f32(static_cast<const __nv_bfloat16*>(p)[i]) : static_cast<const float*>(p)[i];
 }
-__device__ __forceinline__ uint16_t ld_raw16(const __nv_bfloat16* p) {
-    return *reinterpret_cast<const uint16_t*>(p);
-}
+__device__ __forceinline__ uint16_t ld_raw16(const __nv_bfloat16* p) { return *reinterpret_cast<const uint16_t*>(p); }
 __device__ __forceinline__ void st_raw16(__nv_bfloat16* p, uint16_t v) { *reinterpret_cast<uint16_t*>(p) = v; }
+// raw bf16 bits -> fp32 (exact)
+__device__ __forceinline__ float raw_to_f32(uint16_t r) { return __uint_as_float((uint32_t)r << 16); }
 
 template <int W, int VEC>
 __global__ void __launch_bounds__(THREADS) conv_kernel(const Args a) {
@@ -129,62 +129,73 @@ __global__ void __launch_bounds__(THREADS) conv_kernel(const Args a) {
     // state entry m (0 .. W-2) of channel d0 + c holds the input of sequence position m - (W-1)
     const __nv_bfloat16* st = a.state != nullptr ? a.state + ((int64_t)n * a.D + d0) * (W - 1) : nullptr;
 
-    // history window: inputs of positions t0-(W-1) .. t0-1
-    float win[VEC][W - 1];
+    // register window = raw bf16 bits of the inputs of positions t-(W-1) .. t-1 (the state of the program at token t)
+    uint16_t win[VEC][W - 1];
 #pragma unroll
     for (int m = 0; m < W - 1; ++m) {
         const int64_t p = t0 - (W - 1) + m;
 #pragma unroll
         for (int c = 0; c < VEC; ++c) {
-            if (p >= 0) win[c][m] = bf16_to_f32(xs[p * a.x_stride + c]);
-            else win[c][m] = st != nullptr ? bf16_to_f32(st[(int64_t)c * (W - 1) + (W - 1) + p]) : 0.0f;
+            if (p >= 0) win[c][m] = ld_raw16(xs + p * a.x_stride + c);
+            else win[c][m] = st != nullptr ? ld_raw16(st + (int64_t)c * (W - 1) + (W - 1) + p) : (uint16_t)0;
         }
     }
 
     const bool single = (t1 - t0) == 1;
     (void)single;
     for (int64_t tb = t0; tb < t1; tb += UNROLL) {
-        float xv[UNROLL][VEC];
+        uint32_t xr[UNROLL];   // the VEC raw inputs of each token (VEC == 2: one 32-bit load)
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) {
-#pragma unroll
-            for (int c = 0; c < VEC; ++c) xv[u][c] = (tb + u < t1) ? bf16_to_f32(xs[(tb + u) * a.x_stride + c]) : 0.0f;
+            xr[u] = 0;
+            if (tb + u < t1) {
+                const __nv_bfloat16* px = xs + (tb + u) * a.x_stride;
+                if constexpr (VEC == 2) xr[u] = *reinterpret_cast<const uint32_t*>(px);
+                else xr[u] = ld_raw16(px);
+            }
         }
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) {
             if (tb + u < t1) {
+                uint32_t yr = 0;
 #pragma unroll
                 for (int c = 0; c < VEC; ++c) {
+                    const uint16_t cur = (VEC == 2) ? (uint16_t)(c == 0 ? (xr[u] & 0xFFFFu) : (xr[u] >> 16)) : (uint16_t)xr[u];
                     float xin[W];
 #pragma unroll
-                    for (int m = 0; m < W - 1; ++m) xin[m] = win[c][m];
-                    xin[W - 1] = xv[u][c];
+                    for (int m = 0; m < W - 1; ++m) xin[m] = raw_to_f32(win[c][m]);
+                    xin[W - 1] = raw_to_f32(cur);
 #ifdef CFBI_CONV_NEG_CONTROL
                     const float acc = single ? conv_acc_two_chains<W>(w[c], xin) : conv_acc<W>(w[c], xin);
 #else
                     const float acc = conv_acc<W>(w[c], xin);
 #endif
                     const float yv = conv_finish(acc, has_bias, bias[c], silu);
-                    ys[(tb + u) * a.y_stride + c] = f32_to_bf16_rn(yv);
+                    yr |= (uint32_t)__bfloat16_as_ushort(f32_to_bf16_rn(yv)) << (16 * c);
                     if (y32 != nullptr) y32[(tb + u) * a.y_stride + c] = yv;
 #pragma unroll
                     for (int m = 0; m < W - 2; ++m) win[c][m] = win[c][m + 1];
-                    win[c][W - 2] = xin[W - 1];
+                    win[c][W - 2] = cur;
                 }
+                __nv_bfloat16* py = ys + (tb + u) * a.y_stride;
+                if constexpr (VEC == 2) *reinterpret_cast<uint32_t*>(py) = yr;
+                else *reinterpret_cast<uint16_t*>(py) = (uint16_t)yr;
             }
         }
     }
 
-    // new state (first tile only): the last W-1 inputs of (old state ++ x); all reads of the old state of this
-    // thread's channels happen before any of its writes
+    // new state (first tile only). If this tile ends the sequence the register window IS the new state (the last W-1
+    // inputs of old state ++ x); otherwise the sequence is longer than a tile and the last W-1 inputs are plain x rows.
+    // All reads of the old state of this thread's channels happened before the loop; only this thread writes them.
     if (j == 0 && a.state != nullptr) {
         uint16_t nv[VEC][W - 1];
 #pragma unroll
         for (int m = 0; m < W - 1; ++m) {
-            const int64_t p = len - (W - 1) + m;
 #pragma unroll
-            for (int c = 0; c < VEC; ++c)
-                nv[c][m] = p >= 0 ? ld_raw16(xs + p * a.x_stride + c) : ld_raw16(st + (int64_t)c * (W - 1) + (W - 1) + p);
+            for (int c = 0; c < VEC; ++c) {
+                if (t1 == len) nv[c][m] = win[c][m];
+                else nv[c][m] = ld_raw16(xs + (len - (W - 1) + m) * a.x_stride + c);   // position >= TILE_T - (W-1) > 0
+            }
         }
         __nv_bfloat16* stw = a.state + ((int64_t)n * a.D + d0) * (W - 1);
 #pragma unroll
