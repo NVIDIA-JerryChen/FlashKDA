@@ -180,7 +180,9 @@ ones (different hardware, so indicative only) that loss cannot be extrapolated f
 
 ## 7. Limits, and what v1 does not do
 
-- **Performance**: mma.sync TF32 only, no tcgen05/UMMA/TMEM, no bulk-copy pipelines, no warp specialisation. K2 is a
+- **Performance** (this is the v1 state; the v2 kernels, with bulk-copy + mbarrier pipelines, rewritten K1 / K2 / row engine,
+  a tcgen05 K2 experiment and the measured numbers, are in `docs/20261103-cfbi-perf.md`): mma.sync TF32 only, no
+  tcgen05/UMMA/TMEM, no bulk-copy pipelines, no warp specialisation. K2 is a
   latency-bound serial scan (one CTA per (V-slice, sequence, head), ~25 us per chunk) which dominates small batches; K1
   runs one CTA per SM (218 KiB smem) with dependent phases; the row engine takes ~100 us at N=64 / H=12 (the report's
   Decode A/B: 67 / 52 us) because each row walks ~10 dependent phases with barriers. These are engineering, not
@@ -191,10 +193,11 @@ ones (different hardware, so indicative only) that loss cannot be extrapolated f
   `fla.utils`/`fla.backends`), so the plan's fallback is used. Constraints: K=V=128, `lower_bound` in `[-5, 0)` for
   gradients, empty initial state (no `dh0`), no context parallelism.
 - **Scope**: validated on B300, and on the other architectures of section 7a to the extent stated there (the guard is
-  now the empirical `verify_hardware()`, not a capability test); no context parallelism,
-  no conv/projection/gated-norm alignment (only the KDA core is covered); no `slot_ids` state-pool indirection (gather the
-  active sequences' state yourself, as the scheduler test does); per-call workspace as in section 3; token count < 2^31,
-  `N`, `H` < 65536.
+  now the empirical `verify_hardware()`, not a capability test). Context parallelism (`prefill_k1` / `prefill_k2` /
+  `cp_prefill`) and the `slot_ids` state-pool indirection exist now (`docs/20261103-cfbi-perf.md`). The layers around the core
+  are aligned in a separate extension: the pinned short causal conv + SiLU and the batch-invariant bf16 projection
+  (`flash_kda.cfbi.short_conv` / `bi_linear`, `docs/20261103-cfbi-conv-linear.md`; validated on B300 only); the gated RMSNorm
+  and communication are not covered. Per-call workspace as in section 3; token count < 2^31, `N`, `H` < 65536.
 - **Unmeasured**: the effect on model quality, and the gate/beta distributions of real checkpoints (all data here is
   synthetic).
 - **Bit equality is relative to one GPU architecture and one compiler build**: nothing here promises equality across
