@@ -209,9 +209,10 @@ ones (different hardware, so indicative only) that loss cannot be extrapolated f
 
 v1 was written and validated on one B300. This section records what was measured on other GPUs afterwards and what had to
 change for it. Setup: cluster `sc`, one GPU per run, the same NGC `pytorch:26.08-py3` container on every machine (nvcc 13.4,
-torch 2.14, driver 615.71), JIT build of the extension for the device's own arch (`sm_90a`, `sm_100a`, ...). Raw logs, dumps and
+torch 2.14, driver 615.71), JIT build of the extension for the device's own arch (`sm_90a`, `sm_100a`, ...). Raw logs and
 the node scripts are in `/home/scratch.jennym_gpu/consist-kda/arch-test/` (outside the repo); `tests/cfbi/arch_dump.py` /
-`arch_compare.py` are in it. The B300 ran on aws-pdx (driver 580.126.09, same image), all others on `sc`.
+`arch_compare.py` are in it. The per-GPU `.pt` dumps were deleted after the comparison (the SHA-256 that every run printed is
+kept in those logs; `arch_dump.py` regenerates a dump). The B300 ran on aws-pdx (driver 580.126.09, same image), all others on `sc`.
 
 **Build.** Before this change the extension did not compile for sm_80: ptxas rejects `cp.async.bulk`,
 `mbarrier.arrive.expect_tx`, `mbarrier.try_wait`, `fence.proxy.async` and the cluster-scope mbarrier fence below sm_90 (all of
