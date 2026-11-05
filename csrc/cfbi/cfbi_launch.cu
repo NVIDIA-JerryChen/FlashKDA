@@ -39,7 +39,14 @@ static void launch_chunk_kernels(const Params& p, const ForwardArgs& a, cudaStre
                                  int64_t max_chunks) {
     if (run_k1) {
         cudaFuncSetAttribute(k1_kernel<BV>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)K1_SMEM_BYTES);
-        k1_kernel<BV><<<dim3((unsigned)max_chunks, a.H), NTHREADS, K1_SMEM_BYTES, stream>>>(p);
+        // persistent: one CTA per SM works through the (chunk, head) items; the kernel reads the exact item count from the plan
+        // (max_chunks * H is only an upper bound known on the host)
+        int dev = 0, sms = 148;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        const int64_t items = max_chunks * a.H;
+        const unsigned grid = (unsigned)(items < sms ? items : sms);
+        k1_kernel<BV><<<grid, K1_THREADS, K1_SMEM_BYTES, stream>>>(p);
     }
     if (run_k2) {
         if (BV == 16 && (a.impl & IMPL_K2_UMMA)) {
