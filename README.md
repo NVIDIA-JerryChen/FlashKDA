@@ -35,6 +35,14 @@ handoff helpers. See [installation, API and limitations](docs/consistency.en.md)
 ([中文](docs/consistency.md)) and the [validation record](docs/consistency-validation.md).
 The existing `fwd` interface remains available.
 
+For dense single-token decode, `prepare_consistent_decode(...).run()` binds validated
+buffers and shares the recurrent numerical contract. See the [decode API](docs/consistent-decode.en.md)
+([中文](docs/consistent-decode.md)) and [example](examples/consistent_decode.py).
+
+For dense multi-token prefill, `prepare_consistent_prefill(...).run()` processes
+sequences with the same BF16 continuation state. See the [prefill API](docs/consistent-prefill.en.md)
+([中文](docs/consistent-prefill.md)) and [example](examples/consistent_prefill.py).
+
 ## Using FlashKDA as an FLA backend
 
 Once installed, FlashKDA is auto-dispatched from `flash-linear-attention`'s `chunk_kda`. See [fla-org/flash-linear-attention#852](https://github.com/fla-org/flash-linear-attention/pull/852) for integration details.

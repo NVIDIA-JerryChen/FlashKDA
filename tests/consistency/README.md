@@ -41,3 +41,10 @@ communication outside capture. For two nodes with four allocated GPUs each, run
 --store /shared/unique-new.store` on each node, replacing R with 0 or 1. The same
 initially absent shared path must support file locking. Use a new path each run;
 this launcher does not probe and release a TCP port before use.
+
+Dense single-token prepared decode tests are in `test_decode.py`; see the
+[decode contract](../../docs/consistent-decode.en.md).
+
+融合 dense prefill 检查：`python -m pytest -q tests/consistency/test_prefill.py`。
+覆盖 direct/staged、每步参考状态、工作区边界、PD、两 GPU head 分片和 Graph 内容更新。
+独立数学诊断：`python -m tests.consistency.accuracy --prefill`。
