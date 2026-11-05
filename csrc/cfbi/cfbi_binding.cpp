@@ -99,7 +99,9 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
                 "impl must be 0..15 (bit 0: reference row engine, bit 1: reference K1/K2, bit 2: row engine for every row, "
                 "bit 3: UMMA K2)");
     TORCH_CHECK(phase >= 1 && phase <= 3, "phase must be 1 (K1), 2 (K2) or 3 (both)");
-    TORCH_CHECK(k2_bv == 0 || k2_bv == 8 || k2_bv == 16, "k2_bv must be 0 (automatic), 8 or 16");
+    TORCH_CHECK(k2_bv == 0 || k2_bv == 8 || k2_bv == 16 || k2_bv == 32 || (k2_bv >= 1000 && k2_bv <= 1000 + 65536),
+                "k2_bv must be 0 (automatic), 8, 16, 32, or 1000 + x (testing: the first x (sequence, head) pairs use 32-column tiles, "
+                "the others 16-column tiles)");
     TORCH_CHECK(phase == 3 || (mode == 0 && ws_in.has_value() && plan_in.has_value()),
                 "a split call (phase 1 or 2) is mode 0 and needs the workspace and plan buffers");
     TORCH_CHECK(!(impl & cfbi::IMPL_K2_UMMA) || k2_bv == 0 || k2_bv == 16, "the UMMA K2 works on 16-column value slices (k2_bv 0 or 16)");

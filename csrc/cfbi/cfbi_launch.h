@@ -42,7 +42,8 @@ struct ForwardArgs {
                        // 1: row engine for every row (decode; also a differential test of K1/K2); the caller maps
                        //    mode 0 + IMPL_ROWS_ONLY to 1 (resolve_mode) and supplies a state (E, rows, pos) then
     int phase;         // PHASE_* bits (3 = everything in one call)
-    int k2_bv;         // value columns per K2 CTA: 0 = choose by grid size, 8 or 16 = forced (tests)
+    int k2_bv;         // value columns per K2 CTA: 0 = choose from the grid size (a homogeneous width or a 32/16 mix), 8, 16 or 32 = forced
+                       // (tests); 1000 + x = the first x (sequence, head) pairs with 32-column tiles, the rest with 16 (tests)
     int impl;          // IMPL_* bits as returned by resolve_impl (the launcher does not re-resolve)
 };
 

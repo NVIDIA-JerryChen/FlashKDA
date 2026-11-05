@@ -1,6 +1,6 @@
 """Per-kernel GPU time of the CF-BI pipeline (plan / row engine / K1 / K2) for one implementation.
 
-usage: python benchmarks/bench_breakdown.py [--impl 0|3|8] [--prefill B L H ...] [--decode N H ...] [--warm POS]
+usage: python benchmarks/bench_breakdown.py [--impl 0|3|8] [--prefill B L H ...] [--decode N H ...] [--warm POS] [--k2bv 0|8|16|32]
   --impl     0 = optimised kernels (default), 3 = the frozen v1 reference kernels,
              8 = optimised row engine + K1 with the tcgen05 (UMMA) K2 (kernel k2u_kernel instead of k2_kernel)
   --prefill  one or more "B,L,H" shapes (default: the CF-BI report's H6/L8K shapes)
@@ -59,7 +59,7 @@ def report(label, times, counts):
     print(f"{label:34s} total {total:10.1f} us   {parts}", flush=True)
 
 
-def bench_prefill(B, L, H, impl, warm_pos):
+def bench_prefill(B, L, H, impl, warm_pos, k2_bv=0):
     case = make_case(B * L, H, "authors", seed=0)
     q = case["q"].reshape(B, L, H, 128).contiguous()
     k = case["k"].reshape(B, L, H, 128).contiguous()
@@ -74,7 +74,7 @@ def bench_prefill(B, L, H, impl, warm_pos):
     def f():
         if warm_pos:
             st.pos.fill_(warm_pos)
-        prefill(q, k, v, g, beta, case["scale"], out, case["A_log"], case["dt_bias"], LB, st, _impl=impl)
+        prefill(q, k, v, g, beta, case["scale"], out, case["A_log"], case["dt_bias"], LB, st, _impl=impl, _k2_bv=k2_bv)
 
     t, c = kernel_times(f, iters=3)
     report(f"prefill B={B} L={L} H={H} pos0={warm_pos}", t, c)
@@ -122,13 +122,14 @@ def main():
     ap.add_argument("--decode", nargs="*", default=None)
     ap.add_argument("--train", nargs="*", default=None)
     ap.add_argument("--warm", type=int, default=0)
+    ap.add_argument("--k2bv", type=int, default=int(os.environ.get("CFBI_BENCH_K2BV", "0")), help="force the K2 value-tile width (8, 16 or 32); 0 = automatic")
     a = ap.parse_args()
     print(f"device {torch.cuda.get_device_name()}  impl={a.impl}")
     pre = a.prefill if a.prefill is not None else (["1,8192,6", "8,8192,6", "64,8192,6", "1,32768,32"] if a.decode is None and a.train is None else [])
     dec = a.decode if a.decode is not None else (["1,12", "16,12", "64,12", "128,12"] if a.prefill is None and a.train is None else [])
     for s in pre:
         B, L, H = (int(x) for x in s.split(","))
-        bench_prefill(B, L, H, a.impl, a.warm)
+        bench_prefill(B, L, H, a.impl, a.warm, a.k2bv)
     for s in a.train or []:
         B, L, H = (int(x) for x in s.split(","))
         bench_train(B, L, H, a.impl)

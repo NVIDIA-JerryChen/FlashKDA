@@ -57,7 +57,7 @@ def _check(guards, what):
 
 
 @pytest.mark.parametrize("impl", [0, 3])
-@pytest.mark.parametrize("bv", [8, 16])
+@pytest.mark.parametrize("bv", [8, 16, 32, 1005])   # 1000 + x: a mix, the first x (sequence, head) pairs with 32-column tiles
 def test_prefill_varlen_warm_and_decode_stay_inside_their_buffers(ext, impl, bv):
     H = 3
     rng = random.Random(1)
@@ -103,7 +103,7 @@ def test_prefill_varlen_warm_and_decode_stay_inside_their_buffers(ext, impl, bv)
         assert v.content_unchanged(), f"decode modified its input '{k}'"
 
 
-@pytest.mark.parametrize("bv", [8, 16])
+@pytest.mark.parametrize("bv", [8, 16, 32, 1001])
 def test_training_forward_and_split_phases_stay_inside_their_buffers(ext, bv):
     H = 2
     case = make_case(64 * 3 + 21, H, "authors", seed=3)

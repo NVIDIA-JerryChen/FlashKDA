@@ -26,11 +26,12 @@ static_assert((WS_FLOATS * 4) % 16 == 0, "workspace blocks must stay 16-byte ali
 // whole operand and every lane reads its mma.sync fragment as one 16-byte (A) / 8-byte (B) shared load.
 //   A fragment of a 16x8 tile at (row tile rt, k-step ks), lane = 4*g + t:  float4 {X[16rt+g][8ks+t], X[16rt+g+8][8ks+t],
 //   X[16rt+g][8ks+t+4], X[16rt+g+8][8ks+t+4]}  (registers a0..a3 of mma.m16n8k8).
-// K2 splits the 128 value columns of a head over CTAs of BV columns (8 or 16, chosen per call, see K2Cfg in cfbi_k2.cuh); the
-// UT part of the workspace is stored per BV-slice, so K1 and K2 of one call must use the same BV.
+// K2 splits the 128 value columns of a head over CTAs of 8, 16 or 32 columns (chosen per call and per (sequence, head), see K2Cfg in
+// cfbi_k2.cuh); the UT part of the workspace is stored in slices of 16 columns whatever the K2 tile is: a K2 CTA reads the slice(s) that
+// hold its columns, so K1 does not depend on the K2 tiling.
 constexpr int WS2_W = 0;                       // W  A-fragments   [rt 4][ks 16][lane 32][4]
 constexpr int WS2_GQ = WS2_W + 8192;           // GQ A-fragments   [rt 4][ks 16][lane 32][4]
-constexpr int WS2_UT = WS2_GQ + 8192;          // UT, C-fragment order of the P1 tiles: [slice][rt 4][nt NT][lane 32][4]
+constexpr int WS2_UT = WS2_GQ + 8192;          // UT, C-fragment order of the P1 tiles: [16-column slice 8][rt 4][nt 2][lane 32][4]
 constexpr int WS2_AQF = WS2_UT + 8192;         // Aqk cross-block A-fragments of sub-blocks 1..3: [12][lane 32][4]
 constexpr int WS2_AQD = WS2_AQF + 12 * 128;    // Aqk diagonal 16x16 blocks, row stride 17: [4][16][17]
 constexpr int WS2_KD = WS2_AQD + 4 * 16 * 17;  // KD A-fragments   [mt 8][ks 8][lane 32][4]
@@ -74,6 +75,11 @@ struct Params {
     int fuse_pos;          // 1: the row engine writes the new pos itself (mode 1), no finalize kernel
     SeqPlan* plan;
     float* ws;
+    // K2 value-tile widths (chosen by the launcher from N, H and the SM count): the (sequence, head) pairs p = h * N + n with p < tile_x32
+    // use 32-column tiles (4 CTAs each), the other pairs tile_bvb-column tiles (8, 16 or 32; 128 / tile_bvb CTAs each). Only K2 reads them:
+    // K1 stores the UT part of the workspace in 16-column slices whatever the tiles are.
+    int tile_x32;
+    int tile_bvb;
 };
 
 // 8 consecutive bf16 (16-byte aligned) -> 8 fp32 (exact).

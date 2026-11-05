@@ -28,14 +28,17 @@ constexpr int K2_SE = 132;                              // fp32 E row stride (co
 constexpr int K2_AQ_FLOATS = 12 * 128 + 4 * 16 * 17;     // AQF + AQD
 constexpr int K2_KD_FLOATS = 8192 + 128;                 // KD fragments + GEND
 
-// Tiling and shared-memory layout of a K2 CTA that owns BV value columns (BV = 8: more CTAs for a single short
-// sequence, BV = 16: fewer redundant operand copies for large batches).
+// Tiling and shared-memory layout of a K2 CTA that owns BV value columns (BV = 8: more CTAs for a single short sequence, BV = 16 / 32:
+// fewer redundant operand copies for larger grids; the launcher picks the widths, see choose_k2_tiles in cfbi_launch.cu).
 template <int BV>
 struct K2Cfg {
     static constexpr int NT = BV / 8;                    // 8-column MMA tiles per CTA
     static constexpr int NSLICE = HEAD_V / BV;           // CTAs per (sequence, head)
     static constexpr int SU = BV + 8;                    // fp32 U row stride (conflict-free float2 stores from the C fragments)
-    static constexpr int UT_FLOATS = 4 * NT * 128;       // UT slice of one chunk
+    // UT of one chunk: K1 always stores it in slices of 16 value columns ([slice][rt 4][nt 2][lane 32][4], 1024 floats). A CTA copies the
+    // slice(s) that hold its columns: BV = 8 the one slice that contains its 8 columns (it reads half of it), BV = 16 its own slice,
+    // BV = 32 two consecutive slices. K1 therefore does not depend on the K2 tile width.
+    static constexpr int UT_FLOATS = (NT >= 2 ? NT / 2 : 1) * 1024;
     static constexpr int EHL_WORDS = NT * 16 * 32 * 2;   // one plane (hi or lo) of E B-fragments
     static constexpr int UHL_WORDS = NT * 8 * 32 * 2;    // one plane of U B-fragments
     // byte offsets inside the dynamic shared memory block
@@ -127,8 +130,9 @@ __device__ __forceinline__ void k2_cross_block(const float4* a, const uint2* uh,
         for (int i = 0; i < 4; ++i) res[nt][i] = fadd(big[nt][i], sml[nt][i]);
 }
 
+// One K2 tile: the CTA owns the BV value columns of slice `vs` of the (sequence n, head h) pair (the grid is decoded by k2_kernel / k2_kernel_mixed).
 template <int BV>
-__global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
+__device__ __forceinline__ void k2_tile(const Params& p, const int vs, const int n, const int h) {
     using C = K2Cfg<BV>;
     constexpr int K2_BV = BV, K2_NT = C::NT, K2_SU = C::SU, K2_UT_FLOATS = C::UT_FLOATS;
     constexpr int K2_EHL_WORDS = C::EHL_WORDS, K2_UHL_WORDS = C::UHL_WORDS;
@@ -147,7 +151,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
     uint32_t* sUlo = sUhi + K2_UHL_WORDS;
     uint64_t* bar = reinterpret_cast<uint64_t*>(smem_raw + K2_OFF_BAR);   // 0 W, 1 GQ, 2 UT, 3 AQ, 4 KD
 
-    const int vs = blockIdx.x, n = blockIdx.y, h = blockIdx.z, H = p.H;
+    const int H = p.H;
     const SeqPlan sp = p.plan[n];
     const int nch = sp.nfull + (sp.tail > 0 ? 1 : 0);
     if (nch == 0) return;
@@ -173,7 +177,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
         mbar_arrive_expect_tx(&bar[1], 8192 * 4);
         bulk_g2s(sGQ, wsb + WS2_GQ, 8192 * 4, &bar[1]);
         mbar_arrive_expect_tx(&bar[2], K2_UT_FLOATS * 4);
-        bulk_g2s(sUT, wsb + WS2_UT + vs * K2_UT_FLOATS, K2_UT_FLOATS * 4, &bar[2]);
+        bulk_g2s(sUT, wsb + WS2_UT + ((vs * K2_NT) >> 1) * 1024, K2_UT_FLOATS * 4, &bar[2]);   // K1 writes 16-column slices of 1024 floats
     };
     auto issue_back = [&](int lc) {
         const float* wsb = ws_chunk(lc);
@@ -243,7 +247,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
                 mbar_wait(&bar[2], par);   // UT slice
 #pragma unroll
                 for (int nt = 0; nt < K2_NT; ++nt) {
-                    const float4 ut = reinterpret_cast<const float4*>(sUT)[(w * K2_NT + nt) * 32 + lane];
+                    // 8-column tile T = vs * NT + nt of the head = half (T & 1) of the 16-column slice T >> 1; sUT starts at slice (vs * NT) >> 1
+                    const float4 ut = reinterpret_cast<const float4*>(sUT)[(((nt >> 1) * 4 + w) * 2 + ((vs * K2_NT + nt) & 1)) * 32 + lane];
                     const float utv[4] = {ut.x, ut.y, ut.z, ut.w};
 #pragma unroll
                     for (int i = 0; i < 4; ++i) {
@@ -411,6 +416,36 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
         printf("K2prof chunks=%d: per chunk cycles: phase1 (wait+P1/P2+U) %lld | S1 %lld | phase3 (P3/E-update | O) %lld | S2 %lld | total %lld\n", nch,
                acc_p12 / nch, acc_s1 / nch, acc_p3o / nch, acc_s2 / nch, (acc_p12 + acc_s1 + acc_p3o + acc_s2) / nch);
 #endif
+}
+
+// K2 grid of one tile width (every (sequence, head) pair at BV columns): CTA (value slice, sequence, head).
+template <int BV>
+__global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
+    k2_tile<BV>(p, static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y), static_cast<int>(blockIdx.z));
+}
+
+// K2 grid that mixes two tile widths, one 1-D kernel. CTA b decodes into (width, (sequence, head) pair, value slice): the first
+// tile_x32 pairs p = h * N + n use 32-column tiles (4 CTAs each, first in the grid: the longest CTAs go first), the others
+// tile_bvb-column tiles (128 / tile_bvb CTAs each). All CTAs get the shared memory of the widest tile; a CTA runs only the body of its own
+// width. (The launcher uses it only when 0 < tile_x32 < N * H; grids of one width run k2_kernel<BV>: the same body measured 0.2 - 1.7 %
+// faster there than inside this merged kernel, probably from its different register allocation.)
+__global__ void __launch_bounds__(NTHREADS, 1) k2_kernel_mixed(const Params p) {
+    const int b = static_cast<int>(blockIdx.x), nA = 4 * p.tile_x32;
+    int pair, slice, width;
+    if (b < nA) {
+        pair = b >> 2;
+        slice = b & 3;
+        width = 32;
+    } else {
+        const int per_pair = HEAD_V / p.tile_bvb, q = b - nA;
+        pair = p.tile_x32 + q / per_pair;
+        slice = q % per_pair;
+        width = p.tile_bvb;
+    }
+    const int n = pair % p.N, h = pair / p.N;
+    if (width == 8) k2_tile<8>(p, slice, n, h);
+    else if (width == 16) k2_tile<16>(p, slice, n, h);
+    else k2_tile<32>(p, slice, n, h);
 }
 
 }  // namespace cfbi

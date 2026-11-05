@@ -179,13 +179,41 @@ def test_single_sequence_lengths(ext, T):
     assert_same_results(run_chain(case, [T], takes, H, 0), run_chain(case, [T], takes, H, REF), f"T={T}")
 
 
-@pytest.mark.parametrize("bv", [8, 16])
+@pytest.mark.parametrize("bv", [8, 16, 32])
 @pytest.mark.parametrize("regime", ["authors", "heavy_tail", "long_memory"])
 def test_k2_tile_widths(ext, bv, regime):
-    """K2 with 8 or 16 value columns per CTA (the launcher picks by grid size): same bits as the reference."""
+    """K2 with 8, 16 or 32 value columns per CTA (the launcher picks by grid size): same bits as the reference."""
     H = 3
     rng = random.Random(8)
     lens = [rng.randint(1, 300) for _ in range(6)] + [64, 129]
     case = make_case(sum(lens), H, regime, seed=90)
     takes = random_takes(lens, 3, rng)
     assert_same_results(run_chain(case, lens, takes, H, 0, k2_bv=bv), run_chain(case, lens, takes, H, REF), f"bv={bv}/{regime}")
+
+
+@pytest.mark.parametrize("B, T, H", [(8, 192, 6), (13, 130, 6), (3, 70, 40)])
+def test_fixed_length_calls_pick_wide_and_mixed_tiles(ext, B, T, H):
+    """A fixed-length call (no cu_seqlens: all sequences have the same length, known to the host) lets the launcher choose K2 tile widths by
+    the grid size: N*H = 48, 78 and 120 pairs are a 32/16 mix on a 132..148-SM device. Same bits as the reference."""
+    case = make_case(B * T, H, "heavy_tail", seed=95)
+    ins = {k: case[k].reshape((B, T) + tuple(case[k].shape[2:])).contiguous() for k in ("q", "k", "v", "g", "beta")}
+    res = []
+    for impl in (0, REF):
+        st = alloc_state(B, H)
+        out = torch.zeros_like(ins["q"])
+        out32 = torch.zeros(ins["q"].shape, dtype=torch.float32, device="cuda")
+        prefill(ins["q"], ins["k"], ins["v"], ins["g"], ins["beta"], case["scale"], out, case["A_log"], case["dt_bias"],
+                case["lower_bound"], st, out_fp32=out32, _impl=impl)
+        res.append((out, out32, st.clone()))
+    assert_same_results([res[0]], [res[1]], f"fixed-length B={B} T={T} H={H}")
+
+
+@pytest.mark.parametrize("H, x32", [(3, 1), (3, 7), (3, 13), (3, 23), (6, 30)])
+def test_k2_mixed_tile_widths(ext, H, x32):
+    """K2 grid mixing tile widths: 32-column tiles for the first x32 (sequence, head) pairs p = h * N + n, 16-column tiles for the
+    others (the launcher picks such a mix for grids that fill the last round of SMs badly): same bits as the reference."""
+    rng = random.Random(11)
+    lens = [rng.randint(1, 300) for _ in range(6)] + [64, 129]
+    case = make_case(sum(lens), H, "heavy_tail", seed=91)
+    takes = random_takes(lens, 3, rng)
+    assert_same_results(run_chain(case, lens, takes, H, 0, k2_bv=1000 + x32), run_chain(case, lens, takes, H, REF), f"H={H}/x32={x32}")

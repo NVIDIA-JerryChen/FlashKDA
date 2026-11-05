@@ -34,11 +34,79 @@ static void launch_k2_umma(const Params& p, const ForwardArgs& a, cudaStream_t s
 #endif
 }
 
+// K2 value-tile widths of a call (see Params::tile_x32): the first x32 (sequence, head) pairs use 32-column tiles, the others bvb-column
+// tiles. K2 is a serial scan over a sequence's chunks and one CTA fills an SM (shared memory), so the kernel takes about
+// chunks * (time of the busiest SM), and one CTA needs T(BV) per chunk: measured on B200 / B300 (grids of one round and saturated grids
+// agree) T(8) : T(16) : T(32) = 3.4 : 4.7 : 7.8 K cycles. A wider tile is cheaper per value column (the A operands W / GQ / KD / Aqk are
+// loaded once per CTA and chunk) but quantises the grid more coarsely, and a mix of 32- and 16-column pairs fills the last round of an
+// awkwardly sized grid. cost = the busiest SM's time per chunk (units of 0.1 K cycles) with CTAs dispatched in grid order (32-column
+// tiles first) to the SM that frees first.
+static int64_t k2_grid_cost(int64_t nh, int64_t x32, int bvb, int64_t sms) {
+    const int64_t tl = 78, ts = bvb == 8 ? 34 : (bvb == 16 ? 47 : 78);
+    const int64_t nl = 4 * x32, ns = (nh - x32) * (HEAD_V / bvb);
+    const int64_t a = nl / sms, r = nl % sms;                // r SMs run a + 1 long CTAs (free at f1), the other sms - r run a (free at f0)
+    const int64_t f0 = a * tl, f1 = (a + 1) * tl;
+    const int64_t busy_long = r > 0 ? f1 : f0;
+    if (ns == 0) return busy_long;
+    auto slots = [&](int64_t t) {                            // CTA start slots that are free at or before time t
+        return (sms - r) * (t >= f0 ? (t - f0) / ts + 1 : 0) + r * (t >= f1 ? (t - f1) / ts + 1 : 0);
+    };
+    int64_t lo = f0, hi = f1 + ns * ts;                      // earliest t with slots(t) >= ns: the start of the last short CTA
+    while (lo < hi) {
+        const int64_t mid = (lo + hi) / 2;
+        if (slots(mid) >= ns) hi = mid; else lo = mid + 1;
+    }
+    const int64_t last_end = lo + ts;
+    return last_end > busy_long ? last_end : busy_long;
+}
+
+static void choose_k2_tiles(int k2_bv, int64_t nh, int sms, bool equal_len, int* x32, int* bvb) {
+    if (k2_bv >= 1000) {   // testing hook: a mixed grid with exactly k2_bv - 1000 pairs of 32-column tiles, the rest 16-column tiles
+        *x32 = static_cast<int>(std::min<int64_t>(k2_bv - 1000, nh));
+        *bvb = 16;
+        return;
+    }
+    if (k2_bv == 8 || k2_bv == 16) { *x32 = 0; *bvb = k2_bv; return; }
+    if (k2_bv == 32) { *x32 = static_cast<int>(nh); *bvb = 16; return; }
+    // The cost model below assumes sequences of equal length, which the host knows only for a fixed-length call (no cu_seqlens). With
+    // cu_seqlens the lengths live on the device (no host sync): a wide tile lengthens the critical path of the longest sequence (the CTA of
+    // a 32-column tile needs 1.66x the time per chunk of a 16-column one), so such calls keep the rule of the original launcher.
+    if (!equal_len) {
+        *x32 = 0;
+        *bvb = nh * (HEAD_V / 8) <= sms ? 8 : 16;
+        return;
+    }
+    // automatic: the cheapest homogeneous width (ties: the narrower tile) ...
+    int64_t best = k2_grid_cost(nh, 0, 8, sms);
+    int bx = 0, bw = 8;
+    const int64_t c16 = k2_grid_cost(nh, 0, 16, sms), c32 = k2_grid_cost(nh, nh, 16, sms);
+    if (c16 < best) { best = c16; bx = 0; bw = 16; }
+    if (c32 < best) { best = c32; bx = static_cast<int>(nh); bw = 16; }
+    // ... or 32-column tiles for the first x pairs and 16-column tiles for the rest, with x filling whole rounds of the SMs (4 CTAs per pair);
+    // taken only if it is predicted to be at least 3 % faster than the best homogeneous grid (the model is not exact)
+    int64_t mixed = best;
+    int mx = -1;
+    for (int64_t k = 1; 4 * nh > k * sms; ++k) {
+        const int64_t x = std::min<int64_t>(nh - 1, k * sms / 4);
+        if (x < 1) continue;
+        const int64_t c = k2_grid_cost(nh, x, 16, sms);
+        if (c < mixed) { mixed = c; mx = static_cast<int>(x); }
+    }
+    if (mx > 0 && mixed * 100 <= best * 97) { bx = mx; bw = 16; }
+    *x32 = bx;
+    *bvb = bw;
+}
+
 template <int BV>
+static void launch_k2_homogeneous(const Params& p, const ForwardArgs& a, cudaStream_t stream) {
+    cudaFuncSetAttribute(k2_kernel<BV>, cudaFuncAttributeMaxDynamicSharedMemorySize, K2Cfg<BV>::SMEM_BYTES);
+    k2_kernel<BV><<<dim3(K2Cfg<BV>::NSLICE, a.N, a.H), NTHREADS, K2Cfg<BV>::SMEM_BYTES, stream>>>(p);
+}
+
 static void launch_chunk_kernels(const Params& p, const ForwardArgs& a, cudaStream_t stream, bool run_k1, bool run_k2,
                                  int64_t max_chunks) {
     if (run_k1) {
-        cudaFuncSetAttribute(k1_kernel<BV>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)K1_SMEM_BYTES);
+        cudaFuncSetAttribute(k1_kernel<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)K1_SMEM_BYTES);
         // persistent: one CTA per SM works through the (chunk, head) items; the kernel reads the exact item count from the plan
         // (max_chunks * H is only an upper bound known on the host)
         int dev = 0, sms = 148;
@@ -46,14 +114,23 @@ static void launch_chunk_kernels(const Params& p, const ForwardArgs& a, cudaStre
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         const int64_t items = max_chunks * a.H;
         const unsigned grid = (unsigned)(items < sms ? items : sms);
-        k1_kernel<BV><<<grid, K1_THREADS, K1_SMEM_BYTES, stream>>>(p);
+        k1_kernel<16><<<grid, K1_THREADS, K1_SMEM_BYTES, stream>>>(p);   // stores the UT part in 16-column slices whatever K2 tiles are used
     }
     if (run_k2) {
-        if (BV == 16 && (a.impl & IMPL_K2_UMMA)) {
+        if (a.impl & IMPL_K2_UMMA) {
             launch_k2_umma(p, a, stream);
         } else {
-            cudaFuncSetAttribute(k2_kernel<BV>, cudaFuncAttributeMaxDynamicSharedMemorySize, K2Cfg<BV>::SMEM_BYTES);
-            k2_kernel<BV><<<dim3(K2Cfg<BV>::NSLICE, a.N, a.H), NTHREADS, K2Cfg<BV>::SMEM_BYTES, stream>>>(p);
+            const int64_t nh = static_cast<int64_t>(a.N) * a.H;
+            if (p.tile_x32 > 0 && p.tile_x32 < nh) {   // two tile widths in one grid
+                const int64_t ctas = 4 * static_cast<int64_t>(p.tile_x32) + (nh - p.tile_x32) * (HEAD_V / p.tile_bvb);
+                cudaFuncSetAttribute(k2_kernel_mixed, cudaFuncAttributeMaxDynamicSharedMemorySize, K2Cfg<32>::SMEM_BYTES);
+                k2_kernel_mixed<<<static_cast<unsigned>(ctas), NTHREADS, K2Cfg<32>::SMEM_BYTES, stream>>>(p);
+            } else {                                   // one tile width: CTA (value slice, sequence, head)
+                const int bv = p.tile_x32 > 0 ? 32 : p.tile_bvb;
+                if (bv == 8) launch_k2_homogeneous<8>(p, a, stream);
+                else if (bv == 32) launch_k2_homogeneous<32>(p, a, stream);
+                else launch_k2_homogeneous<16>(p, a, stream);
+            }
         }
     }
 }
@@ -105,6 +182,8 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
     p.slot_ids = a.slot_ids;
     p.plan = reinterpret_cast<SeqPlan*>(a.plan);
     p.ws = a.ws;
+    p.tile_x32 = 0;
+    p.tile_bvb = 16;
 
     const int mode = resolve_mode(a.mode, a.impl);   // the binding has already done this and supplied a state if needed
     p.fuse_pos = mode == 1 ? 1 : 0;
@@ -122,16 +201,15 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
             if (run_k1) ref::k1_kernel<<<dim3((unsigned)max_chunks, a.H), NTHREADS, ref::K1_SMEM_BYTES, stream>>>(p);
             if (run_k2) ref::k2_kernel<<<dim3(HEAD_V / ref::K2_BV, a.N, a.H), NTHREADS, 0, stream>>>(p);
         } else {
-            int bv = a.k2_bv;   // value columns per K2 CTA: 8 when the whole (N x H x 16 slices) grid fits in one wave of SMs
-            if (a.impl & IMPL_K2_UMMA) bv = 16;   // the UMMA K2 consumes the 16-column UT slices of K1<16> (checked by the binding)
-            if (bv == 0) {
-                int dev = 0, sms = 148;
-                cudaGetDevice(&dev);
-                cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-                bv = ((int64_t)a.N * a.H * (HEAD_V / 8) <= sms) ? 8 : 16;
-            }
-            if (bv == 8) launch_chunk_kernels<8>(p, a, stream, run_k1, run_k2, max_chunks);
-            else launch_chunk_kernels<16>(p, a, stream, run_k1, run_k2, max_chunks);
+            // K2 value tiles: chosen from N, H and the SM count unless forced by a.k2_bv (K1 does not depend on them: it always stores the
+            // UT part of the workspace in 16-column slices, which the UMMA K2 consumes as well).
+            int dev = 0, sms = 148;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+            const int64_t nh = static_cast<int64_t>(a.N) * a.H;
+            if (a.impl & IMPL_K2_UMMA) { p.tile_x32 = 0; p.tile_bvb = 16; }
+            else choose_k2_tiles(a.k2_bv, nh, sms, a.cu_seqlens == nullptr, &p.tile_x32, &p.tile_bvb);
+            launch_chunk_kernels(p, a, stream, run_k1, run_k2, max_chunks);
         }
     }
     if (run_k2 && a.pos != nullptr && mode != 1) finalize_pos_kernel<<<(a.N + 255) / 256, 256, 0, stream>>>(p.plan, a.pos, a.N);
