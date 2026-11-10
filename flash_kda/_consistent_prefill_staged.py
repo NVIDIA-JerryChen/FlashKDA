@@ -140,6 +140,10 @@ def _scan_kernel(
     start: cutlass.Int32,
     count: cutlass.Int32,
     V_TILE: cutlass.Constexpr[int],
+    checkpoints: cute.Tensor,
+    checkpoint_indices: cute.Tensor,
+    CHECKPOINTS: cutlass.Constexpr[bool],
+    WRITE_FINAL: cutlass.Constexpr[bool],
 ):
     """One warp owns a [V_TILE V, 128 K] tile in registers.
 
@@ -167,6 +171,13 @@ def _scan_kernel(
     h_read = cute.make_tensor(
         (gInitialStateSource.iterator + state_offset).align(32), state_layout
     )
+    if cutlass.const_expr(CHECKPOINTS):
+        if start > 0:
+            slot = checkpoint_indices[batch_idx, start - 1]
+            checkpoint_offset = (cutlass.Int64(slot) * HV + value_head_idx) * 128 * 128
+            h_read = cute.make_tensor(
+                (checkpoints.iterator + checkpoint_offset).align(32), state_layout
+            )
     h_layout = cute.make_layout((V_TILE // V_LANES, 8), stride=(8, 1))
     vec8_layout = cute.make_layout((8,), stride=(1,))
     h_reg = cute.make_rmem_tensor(h_layout, cutlass.Float32)
@@ -226,13 +237,29 @@ def _scan_kernel(
         for j in cutlass.range_constexpr(V_TILE // V_LANES):
             for i in cutlass.range_constexpr(8):
                 h_reg[j, i] = h_reg[j, i].to(cutlass.BFloat16).to(cutlass.Float32)
-    h_out = cute.make_tensor((gH.iterator + state_offset).align(32), state_layout)
-    for j in cutlass.range_constexpr(V_TILE // V_LANES):
-        v_idx = v_offset + v_lane + V_LANES * j
-        for i in cutlass.range_constexpr(8):
-            h_bf16[i] = h_reg[j, i].to(cutlass.BFloat16)
-        h_tile = cute.local_tile(h_out, (1, 8), (v_idx, k_lane))
-        cute.autovec_copy(h_bf16, h_tile)
+        if cutlass.const_expr(CHECKPOINTS):
+            slot = checkpoint_indices[batch_idx, token]
+            checkpoint_offset = (cutlass.Int64(slot) * HV + value_head_idx) * 128 * 128
+            checkpoint = cute.make_tensor(
+                (checkpoints.iterator + checkpoint_offset).align(32), state_layout
+            )
+            for j in cutlass.range_constexpr(V_TILE // V_LANES):
+                v_idx = v_offset + v_lane + V_LANES * j
+                for i in cutlass.range_constexpr(8):
+                    h_bf16[i] = h_reg[j, i].to(cutlass.BFloat16)
+                h_tile = cute.local_tile(checkpoint, (1, 8), (v_idx, k_lane))
+                cute.autovec_copy(h_bf16, h_tile)
+    if cutlass.const_expr(WRITE_FINAL):
+        if not CHECKPOINTS or start + count == length:
+            h_out = cute.make_tensor(
+                (gH.iterator + state_offset).align(32), state_layout
+            )
+            for j in cutlass.range_constexpr(V_TILE // V_LANES):
+                v_idx = v_offset + v_lane + V_LANES * j
+                for i in cutlass.range_constexpr(8):
+                    h_bf16[i] = h_reg[j, i].to(cutlass.BFloat16)
+                h_tile = cute.local_tile(h_out, (1, 8), (v_idx, k_lane))
+                cute.autovec_copy(h_bf16, h_tile)
 
 
 @cute.jit
@@ -272,7 +299,20 @@ def _launch_scan(
     V_TILE: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
-    _scan_kernel(v, coeff, state_out, state_in, out, start, count, V_TILE).launch(
+    _scan_kernel(
+        v,
+        coeff,
+        state_out,
+        state_in,
+        out,
+        start,
+        count,
+        V_TILE,
+        state_out,
+        coeff,
+        False,
+        True,
+    ).launch(
         grid=[v.shape[0] * v.shape[2] * (128 // V_TILE), 1, 1],
         block=[32, 1, 1],
         stream=stream,
@@ -287,14 +327,14 @@ def _fake(shape, dtype=cute.BFloat16):
 
 @functools.cache
 def compiled_coeff_kernel(device_index, capability):
-    b, l, h, n = (cute.sym_int() for _ in range(4))
-    x = _fake((b, l, h, 128))
+    b, length, h, n = (cute.sym_int() for _ in range(4))
+    x = _fake((b, length, h, 128))
     return cute.compile(
         _launch_coeff,
         x,
         x,
         x,
-        _fake((b, l, h)),
+        _fake((b, length, h)),
         _fake((h,), cute.Float32),
         _fake((h * 128,), cute.Float32),
         _fake((n,), cute.Float32),
@@ -310,8 +350,8 @@ def compiled_coeff_kernel(device_index, capability):
 
 @functools.cache
 def compiled_scan_kernel(device_index, capability, v_tile):
-    b, l, h, n = (cute.sym_int() for _ in range(4))
-    x = _fake((b, l, h, 128))
+    b, length, h, n = (cute.sym_int() for _ in range(4))
+    x = _fake((b, length, h, 128))
     state = _fake((b, h, 128, 128))
     return cute.compile(
         _launch_scan,
@@ -323,6 +363,64 @@ def compiled_scan_kernel(device_index, capability, v_tile):
         cutlass.Int32(0),
         cutlass.Int32(0),
         v_tile,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi --generate-line-info",
+    )
+
+
+@cute.jit
+def _launch_scan_checkpoints(
+    v: cute.Tensor,
+    coeff: cute.Tensor,
+    state_out: cute.Tensor,
+    state_in: cute.Tensor,
+    out: cute.Tensor,
+    checkpoints: cute.Tensor,
+    checkpoint_indices: cute.Tensor,
+    start: cutlass.Int32,
+    count: cutlass.Int32,
+    V_TILE: cutlass.Constexpr[int],
+    WRITE_FINAL: cutlass.Constexpr[bool],
+    stream: cuda.CUstream,
+):
+    _scan_kernel(
+        v,
+        coeff,
+        state_out,
+        state_in,
+        out,
+        start,
+        count,
+        V_TILE,
+        checkpoints,
+        checkpoint_indices,
+        True,
+        WRITE_FINAL,
+    ).launch(
+        grid=[v.shape[0] * v.shape[2] * (128 // V_TILE), 1, 1],
+        block=[32, 1, 1],
+        stream=stream,
+    )
+
+
+@functools.cache
+def compiled_scan_checkpoints(device_index, capability, v_tile, write_final):
+    b, length, h, n = (cute.sym_int() for _ in range(4))
+    x = _fake((b, length, h, 128))
+    state = _fake((b, h, 128, 128))
+    return cute.compile(
+        _launch_scan_checkpoints,
+        x,
+        _fake((n,), cute.Float32),
+        state,
+        state,
+        x,
+        _fake((cute.sym_int(), h, 128, 128)),
+        _fake((b, length), cute.Int32),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        v_tile,
+        write_final,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi --generate-line-info",
     )

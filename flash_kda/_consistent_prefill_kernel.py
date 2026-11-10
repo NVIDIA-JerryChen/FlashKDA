@@ -44,6 +44,10 @@ def _prefill_kernel(
     eps: cutlass.Float32,
     lower_bound: cutlass.Float32,
     V_TILE: cutlass.Constexpr[int],
+    checkpoints: cute.Tensor,
+    checkpoint_indices: cute.Tensor,
+    CHECKPOINTS: cutlass.Constexpr[bool],
+    WRITE_FINAL: cutlass.Constexpr[bool],
 ):
     """One warp owns a [V_TILE V, 128 K] tile in registers.
 
@@ -197,13 +201,26 @@ def _prefill_kernel(
         for j in cutlass.range_constexpr(V_TILE // V_LANES):
             for i in cutlass.range_constexpr(8):
                 h_reg[j, i] = h_reg[j, i].to(cutlass.BFloat16).to(cutlass.Float32)
-    h_out = cute.make_tensor((gH.iterator + state_offset).align(32), state_layout)
-    for j in cutlass.range_constexpr(V_TILE // V_LANES):
-        v_idx = v_offset + v_lane + V_LANES * j
-        for i in cutlass.range_constexpr(8):
-            h_bf16[i] = h_reg[j, i].to(cutlass.BFloat16)
-        h_tile = cute.local_tile(h_out, (1, 8), (v_idx, k_lane))
-        cute.autovec_copy(h_bf16, h_tile)
+        if cutlass.const_expr(CHECKPOINTS):
+            slot = checkpoint_indices[batch_idx, token]
+            checkpoint_offset = (cutlass.Int64(slot) * HV + value_head_idx) * 128 * 128
+            checkpoint = cute.make_tensor(
+                (checkpoints.iterator + checkpoint_offset).align(32), state_layout
+            )
+            for j in cutlass.range_constexpr(V_TILE // V_LANES):
+                v_idx = v_offset + v_lane + V_LANES * j
+                for i in cutlass.range_constexpr(8):
+                    h_bf16[i] = h_reg[j, i].to(cutlass.BFloat16)
+                h_tile = cute.local_tile(checkpoint, (1, 8), (v_idx, k_lane))
+                cute.autovec_copy(h_bf16, h_tile)
+    if cutlass.const_expr(WRITE_FINAL):
+        h_out = cute.make_tensor((gH.iterator + state_offset).align(32), state_layout)
+        for j in cutlass.range_constexpr(V_TILE // V_LANES):
+            v_idx = v_offset + v_lane + V_LANES * j
+            for i in cutlass.range_constexpr(8):
+                h_bf16[i] = h_reg[j, i].to(cutlass.BFloat16)
+            h_tile = cute.local_tile(h_out, (1, 8), (v_idx, k_lane))
+            cute.autovec_copy(h_bf16, h_tile)
 
 
 @cute.jit
@@ -239,6 +256,10 @@ def _launch(
         eps,
         lower_bound,
         V_TILE,
+        state_out,
+        beta,
+        False,
+        True,
     ).launch(
         grid=[q.shape[0] * q.shape[2] * (128 // V_TILE), 1, 1],
         block=[32, 1, 1],
@@ -280,6 +301,95 @@ def compiled_prefill_kernel(device_index, capability, v_tile=4):
         cutlass.Float32(0.0),
         cutlass.Float32(0.0),
         v_tile,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi --generate-line-info",
+    )
+
+
+@cute.jit
+def _launch_checkpoints(
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    g: cute.Tensor,
+    beta: cute.Tensor,
+    state_out: cute.Tensor,
+    state_in: cute.Tensor,
+    out: cute.Tensor,
+    a_log: cute.Tensor,
+    dt_bias: cute.Tensor,
+    checkpoints: cute.Tensor,
+    checkpoint_indices: cute.Tensor,
+    scale: cutlass.Float32,
+    eps: cutlass.Float32,
+    lower_bound: cutlass.Float32,
+    V_TILE: cutlass.Constexpr[int],
+    WRITE_FINAL: cutlass.Constexpr[bool],
+    stream: cuda.CUstream,
+):
+    _prefill_kernel(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state_out,
+        state_in,
+        out,
+        a_log,
+        dt_bias,
+        scale,
+        eps,
+        lower_bound,
+        V_TILE,
+        checkpoints,
+        checkpoint_indices,
+        True,
+        WRITE_FINAL,
+    ).launch(
+        grid=[q.shape[0] * q.shape[2] * (128 // V_TILE), 1, 1],
+        block=[32, 1, 1],
+        stream=stream,
+    )
+
+
+@functools.cache
+def compiled_prefill_checkpoints(device_index, capability, v_tile, write_final):
+    import torch
+
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("prepare consistent_prefill_fwd before CUDA Graph capture")
+    b, length, h = (cute.sym_int(), cute.sym_int(), cute.sym_int())
+
+    def fake(shape, dtype=cute.BFloat16):
+        return cute.runtime.make_fake_compact_tensor(
+            dtype,
+            shape,
+            assumed_align=32,
+            stride_order=tuple(reversed(range(len(shape)))),
+        )
+
+    x = fake((b, length, h, 128))
+    state = fake((b, h, 128, 128))
+    return cute.compile(
+        _launch_checkpoints,
+        x,
+        x,
+        x,
+        x,
+        fake((b, length, h)),
+        state,
+        state,
+        x,
+        fake((h,), cute.Float32),
+        fake((h * 128,), cute.Float32),
+        fake((cute.sym_int(), h, 128, 128)),
+        fake((b, length), cute.Int32),
+        cutlass.Float32(0.0),
+        cutlass.Float32(0.0),
+        cutlass.Float32(0.0),
+        v_tile,
+        write_final,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi --generate-line-info",
     )

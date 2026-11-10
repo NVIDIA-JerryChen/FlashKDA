@@ -39,9 +39,12 @@ For dense single-token decode, `prepare_consistent_decode(...).run()` binds vali
 buffers and shares the recurrent numerical contract. See the [decode API](docs/consistent-decode.en.md)
 ([中文](docs/consistent-decode.md)) and [example](examples/consistent_decode.py).
 
-For dense multi-token prefill, `prepare_consistent_prefill(...).run()` processes
-sequences with the same BF16 continuation state. See the [prefill API](docs/consistent-prefill.en.md)
-([中文](docs/consistent-prefill.md)) and [example](examples/consistent_prefill.py).
+For dense or packed variable-length prefill, `prepare_unified_prefill(...).run()`
+uses the same continuation contract. See the [unified prefill API](docs/unified-prefill.en.md)
+([中文](docs/unified-prefill.md)) and [runnable example](examples/unified_prefill.py).
+Dense multi-token checkpoint output is available through `prepare_consistent_prefill`;
+see the [checkpoint API](docs/consistent-prefill.en.md) ([中文](docs/consistent-prefill.md)).
+These optional Python APIs have their own validated dependencies and platform scope.
 
 ## Using FlashKDA as an FLA backend
 
