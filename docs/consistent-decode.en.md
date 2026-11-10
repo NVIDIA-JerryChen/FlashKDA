@@ -11,11 +11,8 @@ path without requiring the FlashInfer package.
 
 Follow the [consistent forward installation instructions](consistency.en.md) for
 `.[consistency,test]`; the original FlashKDA C++ extension is not required.
-Dependencies include CuTe DSL 4.6.2, TVM FFI 0.1.x and cuda-python. Successful installation
-on another version does not establish support. Validated with two NVLink-connected B300 GPUs,
-Python 3.12.3, PyTorch 2.13.0a0+9186a08b2c.nv26.07, CUDA 13.3, driver 615.71.10, and
-CuTe DSL 4.6.2. The full regression suite passed 154 tests; see the
-[validation and performance record](consistent-decode-validation.en.md).
+See [unified prefill installation](unified-prefill.en.md) for current dependencies and the validated stack.
+The [historical validation record](consistent-decode-validation.en.md) retains its original versions and timings.
 
 ```bash
 FLASH_KDA_SKIP_CUDA_BUILD=1 python -m pip install --no-build-isolation '.[consistency,test]'

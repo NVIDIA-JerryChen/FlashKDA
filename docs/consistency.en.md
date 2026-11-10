@@ -16,7 +16,7 @@ target is B300/GB300; see the [validation record](consistency-validation.md) for
 actual coverage. Other architectures/stacks require fresh acceptance testing.
 
 ```bash
-python -m pip install 'nvidia-cutlass-dsl==4.6.2' 'apache-tvm-ffi>=0.1.11,<0.2' 'cuda-python>=12.8' pytest
+python -m pip install 'nvidia-cutlass-dsl==4.7.0' 'apache-tvm-ffi==0.1.10' 'cuda-python>=12.8' pytest
 FLASH_KDA_SKIP_CUDA_BUILD=1 python -m pip install --no-build-isolation '.[consistency,test]'
 python examples/consistent_fwd.py
 ```
@@ -26,14 +26,7 @@ building the C++ extension using the root installation instructions. Install the
 `consistency` extra as well when using both interfaces. CuTe imports/compiles on
 first use. Production does not depend on FlashInfer or a local reference checkout.
 
-Reproduce the tested environment with this fixed public image digest, from the checkout root:
-
-```bash
-docker run --rm --gpus all --ipc=host -e PYTHONPATH=/work -e PYTHONNOUSERSITE=1 \
-  -e PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 -v "$PWD:/work:ro" -w /work \
-  nvcr.io/nvidia/pytorch@sha256:3becd068f49bd2ad38f90db5f9a4803019a76933a24e63d821376c44e7a9200a \
-  bash -c 'python -m pip install pytest && FLASH_KDA_LONG_TESTS=1 python -m pytest -q -p no:cacheprovider tests/consistency'
-```
+See [unified prefill](unified-prefill.en.md) for the current software stack and installation.
 
 ## API and data contract
 

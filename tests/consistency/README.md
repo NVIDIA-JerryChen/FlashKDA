@@ -48,3 +48,10 @@ Dense single-token prepared decode tests are in `test_decode.py`; see the
 融合 dense prefill 检查：`python -m pytest -q tests/consistency/test_prefill.py`。
 覆盖 direct/staged、每步参考状态、工作区边界、PD、两 GPU head 分片和 Graph 内容更新。
 独立数学诊断：`python -m tests.consistency.accuracy --prefill`。
+
+Unified dense/varlen prefill: `python -m pytest -q tests/consistency/test_unified_prefill.py`.
+This covers split execution, dynamic device metadata during Graph replay, capacity
+tails, compile-cache reuse, empty inputs and checkpoint-prefix continuation.
+Per-token checkpoint pool tests are in `test_checkpoints.py`.
+The older `accuracy` helper measures a BF16-state numerical-contract reference;
+it is not a full-precision state-recurrence oracle.

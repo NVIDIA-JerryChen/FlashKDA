@@ -9,9 +9,8 @@
 ## 安装与验证平台
 
 按[一致性接口安装说明](consistency.md)安装 `.[consistency,test]`，不需要编译原 FlashKDA C++ 扩展。
-依赖 CuTe DSL 4.6.2、TVM FFI 0.1.x、cuda-python；其他版本不能仅凭安装成功认定已验证。
-已在两张 NVLink 互联的 B300 上验证，软件栈为 Python 3.12.3、PyTorch 2.13.0a0+9186a08b2c.nv26.07、
-CUDA 13.3、驱动 615.71.10、CuTe DSL 4.6.2。完整回归 154 项通过；详见[验证与性能记录](consistent-decode-validation.md)。
+当前依赖和已测软件组合见[统一 prefill 安装说明](unified-prefill.md)。
+[早期验证与性能记录](consistent-decode-validation.md) 保留其原始软件版本，不代表当前版本的计时。
 
 ```bash
 FLASH_KDA_SKIP_CUDA_BUILD=1 python -m pip install --no-build-isolation '.[consistency,test]'

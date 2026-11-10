@@ -14,7 +14,7 @@ Backward、CPR、Ulysses、并行前缀树、卷积层状态及完整模型集�
 其他架构或软件组合需要重新验收，不承诺跨版本逐位一致。
 
 ```bash
-python -m pip install 'nvidia-cutlass-dsl==4.6.2' 'apache-tvm-ffi>=0.1.11,<0.2' 'cuda-python>=12.8' pytest
+python -m pip install 'nvidia-cutlass-dsl==4.7.0' 'apache-tvm-ffi==0.1.10' 'cuda-python>=12.8' pytest
 FLASH_KDA_SKIP_CUDA_BUILD=1 python -m pip install --no-build-isolation '.[consistency,test]'
 python examples/consistent_fwd.py
 ```
@@ -23,14 +23,7 @@ python examples/consistent_fwd.py
 如需同时使用 `fwd`，按首页构建步骤安装，并安装 `consistency` extra。
 CuTe DSL 在第一次调用时导入和编译；运行时无需 FlashInfer 或外部参考仓。
 
-已测环境可用固定的公开镜像摘要复现（从仓库根目录执行）：
-
-```bash
-docker run --rm --gpus all --ipc=host -e PYTHONPATH=/work -e PYTHONNOUSERSITE=1 \
-  -e PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 -v "$PWD:/work:ro" -w /work \
-  nvcr.io/nvidia/pytorch@sha256:3becd068f49bd2ad38f90db5f9a4803019a76933a24e63d821376c44e7a9200a \
-  bash -c 'python -m pip install pytest && FLASH_KDA_LONG_TESTS=1 python -m pytest -q -p no:cacheprovider tests/consistency'
-```
+当前统一 prefill 的软件组合与安装说明见[统一 prefill](unified-prefill.md)。
 
 ## API 与数据契约
 

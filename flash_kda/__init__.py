@@ -1,10 +1,19 @@
 import torch
+from .unified_prefill import UnifiedPrefillPlan, prepare_unified_prefill
 from .consistent import consistent_fwd, NUMERICAL_CONTRACT
 from .consistent_decode import consistent_decode_fwd, prepare_consistent_decode, ConsistentDecodePlan
 
 from .consistent_prefill import (
     ConsistentPrefillPlan, prepare_consistent_prefill, consistent_prefill_fwd,
 )
+
+
+__all__ = [
+    "fwd", "get_workspace_size", "consistent_fwd", "NUMERICAL_CONTRACT",
+    "consistent_decode_fwd", "prepare_consistent_decode", "ConsistentDecodePlan",
+    "ConsistentPrefillPlan", "prepare_consistent_prefill", "consistent_prefill_fwd",
+    "UnifiedPrefillPlan", "prepare_unified_prefill",
+]
 
 
 def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state=None, final_state=None, cu_seqlens=None):
