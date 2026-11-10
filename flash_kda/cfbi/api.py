@@ -41,10 +41,20 @@ def _guard(device):
 def _impl_arg(_impl: Optional[int]) -> int:
     """``_impl`` (hidden, tests/diagnostics): bit 0 reference row engine, bit 1 reference K1/K2, bit 2 row engine for
     every row, bit 3 the tcgen05 (UMMA) K2 (Blackwell sm_100/103 only, dropped elsewhere; bit-identical but slower, see
-    docs/20261103-cfbi-perf.md section 4); 0 = the optimised kernels where the device can run them (the launcher falls
+    docs/20261103-cfbi-perf.md section 4), bit 4 (value 16) a K2 whose CTA order and value-tile widths are decided on the
+    device from the sequence lengths (the host cannot see them): the schedule builder writes a table into the plan buffer
+    (``workspace_sizes`` reports its size), the K2 kernel runs it; bit-identical to the other K2 kernels. The bit is dropped
+    (the other K2 runs) with bits 1 and 2, below sm_90 and when bit 3 is requested too (the UMMA K2 wins), it is ignored by
+    decode (no K2) and by calls with more sequences than the builder takes (``sched_capacity(H)`` of the extension).
+    ``_k2_bv`` 8 / 16 / 32 forces that tile width for every pair under bit 4 (the device ordering stays), 0 = the device
+    policy; ``1000 + x`` is rejected. Bit 5 (value 32) keeps the old K2 kernels where the default would run the
+    device-scheduled one (it excludes bit 4). 0 = the optimised kernels where the device can run them (the launcher falls
     back to the reference kernels below sm_90 and to the row engine where K1 does not fit in shared memory, see
-    csrc/cfbi/cfbi_launch.h). ``None`` reads ``FLASH_KDA_CFBI_IMPL`` (default 0), which lets a whole test run be pinned
-    to e.g. the reference."""
+    csrc/cfbi/cfbi_launch.h); on a Blackwell device a ``cu_seqlens`` prefill call with ``_impl=0`` and no forced tile
+    width that is predicted to gain from it also runs the device-scheduled K2 (the rule is ``k2_dyn_default_route`` in that header and section 7
+    of the performance document; ``ext.k2_route(N, H, T_total)`` answers it for a call). Distinct ``slot_ids`` and a
+    monotonic ``cu_seqlens`` stay unchecked preconditions (checking them would need a device synchronisation). ``None`` reads
+    ``FLASH_KDA_CFBI_IMPL`` (default 0), which lets a whole test run be pinned to e.g. the reference."""
     return int(os.environ.get("FLASH_KDA_CFBI_IMPL", "0")) if _impl is None else int(_impl)
 
 

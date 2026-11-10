@@ -2,6 +2,7 @@
 #include "cfbi/cfbi_common.cuh"
 #include "cfbi/cfbi_k1.cuh"
 #include "cfbi/cfbi_k2.cuh"
+#include "cfbi/cfbi_k2_dyn.h"
 #include "cfbi/cfbi_k2_umma.cuh"
 #include "cfbi/cfbi_launch.h"
 #include "cfbi/cfbi_plan.cuh"
@@ -104,7 +105,7 @@ static void launch_k2_homogeneous(const Params& p, const ForwardArgs& a, cudaStr
 }
 
 static void launch_chunk_kernels(const Params& p, const ForwardArgs& a, cudaStream_t stream, bool run_k1, bool run_k2,
-                                 int64_t max_chunks) {
+                                 int64_t max_chunks, bool k2_dyn, int sms_k2) {
     if (run_k1) {
         cudaFuncSetAttribute(k1_kernel<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)K1_SMEM_BYTES);
         // persistent: one CTA per SM works through the (chunk, head) items; the kernel reads the exact item count from the plan
@@ -117,7 +118,9 @@ static void launch_chunk_kernels(const Params& p, const ForwardArgs& a, cudaStre
         k1_kernel<16><<<grid, K1_THREADS, K1_SMEM_BYTES, stream>>>(p);   // stores the UT part in 16-column slices whatever K2 tiles are used
     }
     if (run_k2) {
-        if (a.impl & IMPL_K2_UMMA) {
+        if (k2_dyn) {
+            launch_k2_dyn(p, a, sms_k2, stream);
+        } else if (a.impl & IMPL_K2_UMMA) {
             launch_k2_umma(p, a, stream);
         } else {
             const int64_t nh = static_cast<int64_t>(a.N) * a.H;
@@ -148,7 +151,7 @@ size_t k1_smem_bytes(int impl) { return (impl & IMPL_REF_CHUNK) ? ref::K1_SMEM_B
 
 int resolve_impl(int requested, int device) {
     const DeviceCaps c = device_caps(device);
-    int impl = requested & (IMPL_REF_ROWS | IMPL_REF_CHUNK | IMPL_ROWS_ONLY | IMPL_K2_UMMA);
+    int impl = requested & (IMPL_REF_ROWS | IMPL_REF_CHUNK | IMPL_ROWS_ONLY | IMPL_K2_UMMA | IMPL_K2_DYN);
     // The tcgen05 K2 only exists in the sm_100a / sm_103a code (cfbi_tcgen05.cuh): drop the request everywhere else
     // (the mma.sync K2 computes the same bits).
     if (c.major != 10) impl &= ~IMPL_K2_UMMA;
@@ -158,7 +161,36 @@ int resolve_impl(int requested, int device) {
     // provide it the row engine (which needs 7 KiB) evaluates every row - the same program, just row by row. That
     // fallback uses the reference row engine, the one validated on such devices (sm_80 / 86 / 89).
     if (!(impl & IMPL_ROWS_ONLY) && static_cast<size_t>(c.smem_optin) < k1_smem_bytes(impl)) impl |= IMPL_ROWS_ONLY | IMPL_REF_ROWS;
+    // The dynamic-schedule K2 runs on top of the optimised K1: the reference chunk kernels (also what sm < 90 gets) and the row-engine-only schedule
+    // have no K2 stage of this kind, and when the UMMA K2 is requested as well it wins (also where it is dropped: the request alone clears the bit).
+    if ((impl & (IMPL_REF_CHUNK | IMPL_ROWS_ONLY)) || (requested & IMPL_K2_UMMA)) impl &= ~IMPL_K2_DYN;
     return impl;
+}
+
+// Duration of the schedule builder (units of 0.1 ns) for N sequences and `pairs` = N * H pairs: an upper envelope of the medians measured on B200 / B300, the larger of
+// an estimate by N and one by the number of pairs (k2_policy.route_builder_x10ns).
+static int64_t k2_route_builder_x10ns(int64_t N, int64_t pairs) {
+    const int64_t by_sequences = N <= 4 ? 55000 : N <= 16 ? 70000 : N <= 32 ? 95000 : N <= 128 ? 120000 : N <= 256 ? 160000 : 300000;
+    const int64_t by_pairs = pairs <= 24 ? 55000 : pairs <= 128 ? 75000 : pairs <= 192 ? 95000 : pairs <= 768 ? 120000 : pairs <= 1536 ? 160000 : 300000;
+    return std::max(by_sequences, by_pairs);
+}
+
+// The routing rule of cfbi_launch.h in integer arithmetic; tests/cfbi/k2_policy.py (route_default) is the specification of every line.
+bool k2_dyn_default_route(int64_t N, int64_t H, int64_t T_total, int device) {
+    if (device < 0) cudaGetDevice(&device);
+    if (device_caps(device).major != 10) return false;   // the schedule policy is calibrated on B200 / B300 only
+    int sms = 0;
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+    if (N < 1 || H < 1 || N > K2_ROUTE_MAX_SEQUENCES || N > k2_sched_capacity(H) || T_total < K2_ROUTE_MIN_TOKENS_PER_SEQ * N) return false;
+    const int64_t nh = N * H;
+    if (nh * K2_SCHED_ITEMS_PER_PAIR <= sms) return false;            // one wave at 8 columns: the old schedule is decoded, no builder runs
+    int x32 = 0, bvb = 0;
+    choose_k2_tiles(0, nh, sms, true, &x32, &bvb);                    // the device policy for equal lengths: the closed form of the fixed-length launcher
+    if (x32 == 0 && bvb == 16) return false;                          // the old rule's grid (16-column tiles): nothing to gain
+    const int64_t co = k2_grid_cost(nh, 0, 16, sms), cd = k2_grid_cost(nh, x32, bvb, sms);
+    const int64_t tokens_per_seq = std::min<int64_t>(T_total / N, K2_ROUTE_MAX_TOKENS_PER_SEQ);
+    const int64_t stage = co * (K2_ROUTE_UNIT_X10NS * tokens_per_seq / 64 + K2_ROUTE_CTA_X10NS);
+    return (100 * (co - cd) - K2_ROUTE_OVERHEAD_PCT * co) * stage >= 100 * co * k2_route_builder_x10ns(N, nh);
 }
 
 void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
@@ -207,12 +239,27 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
             cudaGetDevice(&dev);
             cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
             const int64_t nh = static_cast<int64_t>(a.N) * a.H;
-            if (a.impl & IMPL_K2_UMMA) { p.tile_x32 = 0; p.tile_bvb = 16; }
+            // beyond the capacity of the schedule builder (host-known N and H) the old K2 kernels run
+            const bool k2_dyn = (a.impl & IMPL_K2_DYN) != 0 && !(a.impl & IMPL_K2_UMMA) && a.N <= k2_sched_capacity(a.H);
+            if (k2_dyn || (a.impl & IMPL_K2_UMMA)) { p.tile_x32 = 0; p.tile_bvb = 16; }
             else choose_k2_tiles(a.k2_bv, nh, sms, a.cu_seqlens == nullptr, &p.tile_x32, &p.tile_bvb);
-            launch_chunk_kernels(p, a, stream, run_k1, run_k2, max_chunks);
+            launch_chunk_kernels(p, a, stream, run_k1, run_k2, max_chunks, k2_dyn, sms);
         }
     }
     if (run_k2 && a.pos != nullptr && mode != 1) finalize_pos_kernel<<<(a.N + 255) / 256, 256, 0, stream>>>(p.plan, a.pos, a.N);
+}
+
+// The dynamic K2 schedule of a call (tests only, see cfbi_launch.h).
+void launch_probe_k2_schedule(const K2SchedProbeArgs& a, cudaStream_t stream) {
+    int sms = a.sms;
+    if (sms <= 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    }
+    SeqPlan* plan = reinterpret_cast<SeqPlan*>(a.plan);
+    plan_kernel<<<1, PLAN_THREADS, 0, stream>>>(a.cu_seqlens, a.fixed_len, a.pos, a.slot_ids, a.N, 0, plan);
+    k2_sched_build(plan, a.N, a.H, sms, a.k2_bv, a.cu_seqlens == nullptr, stream);
 }
 
 }  // namespace cfbi

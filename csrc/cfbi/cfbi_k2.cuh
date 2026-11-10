@@ -177,7 +177,11 @@ __device__ __forceinline__ void k2_tile(const Params& p, const int vs, const int
         mbar_arrive_expect_tx(&bar[1], 8192 * 4);
         bulk_g2s(sGQ, wsb + WS2_GQ, 8192 * 4, &bar[1]);
         mbar_arrive_expect_tx(&bar[2], K2_UT_FLOATS * 4);
+#ifdef CFBI_K2_TEST_WRONG_UT_SLICE   // negative control (tests only): the CTA reads the next 16-column slice of the UT part: a wrong item must be caught by the bitwise tests
+        bulk_g2s(sUT, wsb + WS2_UT + ((((vs * K2_NT) >> 1) + 1) & 7) * 1024, K2_UT_FLOATS * 4, &bar[2]);
+#else
         bulk_g2s(sUT, wsb + WS2_UT + ((vs * K2_NT) >> 1) * 1024, K2_UT_FLOATS * 4, &bar[2]);   // K1 writes 16-column slices of 1024 floats
+#endif
     };
     auto issue_back = [&](int lc) {
         const float* wsb = ws_chunk(lc);
@@ -424,6 +428,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel(const Params p) {
     k2_tile<BV>(p, static_cast<int>(blockIdx.x), static_cast<int>(blockIdx.y), static_cast<int>(blockIdx.z));
 }
 
+#ifndef CFBI_K2_TILE_ONLY   // the dynamic-schedule translation unit (cfbi_k2_dyn.cu) uses k2_tile only; this kernel is defined once, in cfbi_launch.cu
 // K2 grid that mixes two tile widths, one 1-D kernel. CTA b decodes into (width, (sequence, head) pair, value slice): the first
 // tile_x32 pairs p = h * N + n use 32-column tiles (4 CTAs each, first in the grid: the longest CTAs go first), the others
 // tile_bvb-column tiles (128 / tile_bvb CTAs each). All CTAs get the shared memory of the widest tile; a CTA runs only the body of its own
@@ -447,5 +452,6 @@ __global__ void __launch_bounds__(NTHREADS, 1) k2_kernel_mixed(const Params p) {
     else if (width == 16) k2_tile<16>(p, slice, n, h);
     else k2_tile<32>(p, slice, n, h);
 }
+#endif  // CFBI_K2_TILE_ONLY
 
 }  // namespace cfbi

@@ -11,7 +11,7 @@ import torch
 
 from flash_kda.cfbi import alloc_state, decode, prefill, state_equal, state_mismatch
 
-from helpers import make_case, n_diff
+from helpers import make_case, n_diff, require_impl
 
 
 def _cu(lens):
@@ -36,9 +36,10 @@ def _run(case, sub, cu_call, state, slot_ids, impl):
     return out, out32
 
 
-@pytest.mark.parametrize("impl", [0, 3])
+@pytest.mark.parametrize("impl", [0, 3, 16])
 @pytest.mark.parametrize("seed", [0, 1])
 def test_pool_equals_gather_scatter(ext, impl, seed):
+    require_impl(ext, impl)
     H, S = 3, 11
     rng = random.Random(40 + seed)
     N = 5
@@ -73,8 +74,9 @@ def test_pool_equals_gather_scatter(ext, impl, seed):
             assert state_equal(pool.select(torch.tensor([s], device="cuda")), before.select(torch.tensor([s], device="cuda")))
 
 
-@pytest.mark.parametrize("impl", [0, 3])
+@pytest.mark.parametrize("impl", [0, 3, 16])
 def test_negative_slot_is_skipped(ext, impl):
+    require_impl(ext, impl)
     H, S = 2, 6
     lens = [150, 40, 90, 64]
     case = make_case(sum(lens), H, "authors", seed=70)

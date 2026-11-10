@@ -30,7 +30,7 @@ NVCC_FLAGS = [
     "--ptxas-options=-v",
 ]
 
-_SOURCES = ("cfbi_binding.cpp", "cfbi_launch.cu", "cfbi_probe.cu")
+_SOURCES = ("cfbi_binding.cpp", "cfbi_launch.cu", "cfbi_k2_dyn.cu", "cfbi_probe.cu")
 _CONV_SOURCES = ("cfbi_convlin_binding.cpp", "cfbi_convlin.cu")
 
 

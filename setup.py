@@ -116,6 +116,7 @@ if "cfbi" in _BUILD_EXTS:
             sources=[
                 'csrc/cfbi/cfbi_binding.cpp',
                 'csrc/cfbi/cfbi_launch.cu',
+                'csrc/cfbi/cfbi_k2_dyn.cu',
                 'csrc/cfbi/cfbi_probe.cu',
             ],
             include_dirs=[os.path.join(this_dir, 'csrc')],

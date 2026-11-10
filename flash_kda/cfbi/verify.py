@@ -44,6 +44,8 @@ def _impl_name(impl):
     chunk = "reference" if impl & 2 else "optimised"
     if impl & 8 and not impl & 2:
         chunk = "optimised, tcgen05 (UMMA) K2"
+    elif impl & 16 and not impl & 2:
+        chunk = "optimised, K2 from a device-built schedule"
     return rows if rows == chunk else f"{rows} row engine + {chunk} K1/K2"
 
 

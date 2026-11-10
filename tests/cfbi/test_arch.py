@@ -178,8 +178,11 @@ def test_resolve_impl_policy(ext):
 
 
 def test_every_impl_value_is_accepted_and_same_bits(ext):
-    """All eight ``impl`` values (resolved per device) give the same bits for a call with state and for the training
-    forward: optimised / reference / row-engine-only are one program. On Ampere they all resolve to impl 7."""
+    """All 64 ``impl`` values (resolved per device) are accepted, except the ones that ask for the device-scheduled K2 (bit 4,
+    value 16) and for the old K2 kernels (bit 5, value 32) together, which are rejected; the accepted ones give the same bits for
+    a call with state and for the training forward: optimised / reference / row-engine-only / UMMA K2 / device-scheduled K2 /
+    old K2 kernels are one program, including the combinations of bits 4 and 5 with the others. On Ampere they all resolve to
+    impl 7."""
     H = 3
     lens = [150, 1, 64, 129, 33, 0, 70]
     case = make_case(sum(lens), H, "heavy_tail", seed=13)
@@ -188,11 +191,17 @@ def test_every_impl_value_is_accepted_and_same_bits(ext):
         cu.append(cu[-1] + L)
     cu_t = torch.tensor(cu, dtype=torch.int64, device="cuda")
     seen, results = set(), []
-    for impl in range(8):
-        eff = ext.resolve_impl(impl, -1)
-        if eff in seen:
+    for impl in range(64):
+        if impl & 16 and impl & 32:                       # the two K2 choices exclude each other
+            with pytest.raises((RuntimeError, ValueError)):
+                prefill(case["q"], case["k"], case["v"], case["g"], case["beta"], case["scale"], torch.zeros_like(case["q"]), case["A_log"], case["dt_bias"],
+                        case["lower_bound"], alloc_state(len(lens), H), cu_t, _impl=impl)
             continue
-        seen.add(eff)
+        key = (ext.resolve_impl(impl, -1), bool(impl & 32))   # bit 5 does not change what resolve_impl returns, but it is a request of its own
+        if key in seen:
+            continue
+        seen.add(key)
+        eff = key[0]
         st = alloc_state(len(lens), H)
         out = torch.zeros_like(case["q"])
         out32 = torch.zeros(case["q"].shape, dtype=torch.float32, device="cuda")
@@ -201,8 +210,8 @@ def test_every_impl_value_is_accepted_and_same_bits(ext):
         ot32 = torch.zeros(case["q"].shape, dtype=torch.float32, device="cuda")
         ot = forward_train(case["q"], case["k"], case["v"], case["g"], case["beta"], case["scale"], case["A_log"],
                            case["dt_bias"], case["lower_bound"], cu_t, out_fp32=ot32, _impl=impl)
-        results.append((eff, out, out32, st, ot, ot32))
-    print(f"\n[impl matrix] distinct effective implementations on this device: {sorted(seen)}")
+        results.append(("%d%s" % (eff, " + bit 5" if key[1] else ""), out, out32, st, ot, ot32))
+    print(f"\n[impl matrix] distinct effective implementations on this device (without / with bit 5): {sorted(seen)}")
     e0, o0, f0, s0, t0, tf0 = results[0]
     for eff, o, f, s, t, tf in results[1:]:
         what = f"impl {eff} vs {e0}"

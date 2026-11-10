@@ -3,6 +3,7 @@ sentinel (NaN bit pattern); after the call the margins must be untouched (no wri
 an output or the state) and the inputs unchanged. Catches the classic partial-chunk / last-row / empty-sequence overruns
 that comparing results alone cannot see when the overrun lands outside the compared tensor."""
 import math
+import os
 import random
 
 import pytest
@@ -10,7 +11,7 @@ import torch
 
 from flash_kda.cfbi import CfbiState, decode, forward_train, prefill, prefill_k1, prefill_k2
 
-from helpers import make_case
+from helpers import make_case, require_impl
 
 PAD = 4096   # elements of margin on each side (a multiple of 8 -> every view stays 16-byte aligned)
 FILL = {torch.bfloat16: 0x7FC1, torch.float32: 0x7FC00001, torch.int32: 0x7FFFFFF1, torch.int64: 0x7FFFFFFFFFFFFFF1}
@@ -56,9 +57,12 @@ def _check(guards, what):
         assert gd.margins_intact(), f"{what}: write outside the buffer of '{name}'"
 
 
-@pytest.mark.parametrize("impl", [0, 3])
-@pytest.mark.parametrize("bv", [8, 16, 32, 1005])   # 1000 + x: a mix, the first x (sequence, head) pairs with 32-column tiles
+@pytest.mark.parametrize("impl", [0, 3, 16])
+@pytest.mark.parametrize("bv", [8, 16, 32, 1005])   # 1000 + x: a mix, the first x (sequence, head) pairs with 32-column tiles (a test hook of the old kernels)
 def test_prefill_varlen_warm_and_decode_stay_inside_their_buffers(ext, impl, bv):
+    require_impl(ext, impl)
+    if impl == 16 and bv >= 1000:
+        pytest.skip("the 1000 + x hook belongs to the old kernels; the device-scheduled K2 rejects it")
     H = 3
     rng = random.Random(1)
     lens = [1, 63, 64, 65, 130, 0, 7]
@@ -103,8 +107,32 @@ def test_prefill_varlen_warm_and_decode_stay_inside_their_buffers(ext, impl, bv)
         assert v.content_unchanged(), f"decode modified its input '{k}'"
 
 
+def test_default_impl_varlen_call_big_enough_to_be_routed_stays_inside_its_buffers(ext):
+    """On a Blackwell device the default implementation runs the device-scheduled K2 for a call like this one (``ext.k2_route``): the schedule table lives in the
+    plan buffer the call allocates itself and the K2 grid has 16 CTAs per (sequence, head) pair of which most exit at once; every guarded buffer keeps its margins."""
+    H = 6
+    lens = [384, 640, 256, 1024, 320, 512, 448, 700, 300, 260, 384, 512]
+    N, T = len(lens), sum(lens)
+    case = make_case(T, H, "authors", seed=21)
+    gi = _inputs(case)
+    cu_list = [0]
+    for L in lens:
+        cu_list.append(cu_list[-1] + L)
+    gcu = Guarded(torch.tensor(cu_list, dtype=torch.int64, device="cuda"))
+    state, sg = _state(N, H)
+    go, go32 = _zeros_guarded(case["q"].shape, torch.bfloat16), _zeros_guarded(case["q"].shape, torch.float32)
+    prefill(gi["q"].t, gi["k"].t, gi["v"].t, gi["g"].t, gi["beta"].t, case["scale"], go.t, case["A_log"], case["dt_bias"], case["lower_bound"], state, gcu.t,
+            out_fp32=go32.t)
+    torch.cuda.synchronize()
+    _check({**gi, "cu": gcu, "out": go, "out32": go32, "E": sg[0], "rows": sg[1], "pos": sg[2]}, "default prefill (routed: %s)" % ext.k2_route(N, H, T))
+    for k, v in gi.items():
+        assert v.content_unchanged(), f"prefill modified its input '{k}'"
+
+
 @pytest.mark.parametrize("bv", [8, 16, 32, 1001])
 def test_training_forward_and_split_phases_stay_inside_their_buffers(ext, bv):
+    if bv >= 1000 and int(os.environ.get("FLASH_KDA_CFBI_IMPL", "0")) & 16:
+        pytest.skip("the 1000 + x hook belongs to the old kernels; a default pinned to the device-scheduled K2 (FLASH_KDA_CFBI_IMPL=16) rejects it")
     H = 2
     case = make_case(64 * 3 + 21, H, "authors", seed=3)
     gi = _inputs(case)

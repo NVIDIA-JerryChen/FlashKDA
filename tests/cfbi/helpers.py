@@ -74,3 +74,10 @@ def n_diff(a, b):
 def rel_rms(x, ref):
     x, ref = x.double(), ref.double()
     return float(((x - ref) ** 2).mean().sqrt() / (ref ** 2).mean().sqrt())
+
+
+def require_impl(ext, impl):
+    """Skip a scenario that asks for the device-scheduled K2 (impl bit 16) on a device that drops the bit: the comparison would run another K2."""
+    if impl & 16 and not ext.resolve_impl(impl, -1) & 16:
+        import pytest
+        pytest.skip("the device-scheduled K2 does not run on this device (impl bit 16 is dropped)")

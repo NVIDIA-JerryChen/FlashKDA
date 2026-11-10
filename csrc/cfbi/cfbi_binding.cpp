@@ -69,6 +69,51 @@ void check_bf16_cuda(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
 }
 
+// Tests: the K2 schedule of a call. plan: int32 CUDA [plan_ints(N, H)]; cu_seqlens (int64 [N + 1]) or fixed_len tokens per sequence for N sequences;
+// pos (int32, one per state slot) and slot_ids (int32 [N]) as in forward. Fills `plan` with the SeqPlan entries and, behind them, the schedule.
+void probe_k2_schedule(torch::Tensor plan, int64_t H, int64_t N, int64_t fixed_len, std::optional<torch::Tensor> cu_seqlens,
+                       std::optional<torch::Tensor> pos, std::optional<torch::Tensor> slot_ids, int64_t sms, int64_t k2_bv) {
+    TORCH_CHECK(plan.is_cuda() && plan.dtype() == torch::kInt32 && plan.is_contiguous(), "plan must be a contiguous int32 CUDA tensor");
+    TORCH_CHECK(H >= 1 && N >= 1 && N <= cfbi::k2_sched_capacity(H), "N must be in 1 .. the capacity of the schedule builder for H heads");
+    TORCH_CHECK(plan.numel() >= cfbi::plan_ints(N, H), "plan too small: need plan_ints(N, H) ints");
+    TORCH_CHECK(k2_bv == 0 || k2_bv == 8 || k2_bv == 16 || k2_bv == 32, "k2_bv must be 0, 8, 16 or 32");
+    TORCH_CHECK(sms >= 0 && sms < 65536, "sms out of range");
+    c10::cuda::CUDAGuard guard(plan.device());
+    cfbi::K2SchedProbeArgs a{};
+    if (cu_seqlens.has_value()) {
+        TORCH_CHECK(cu_seqlens->is_cuda() && cu_seqlens->dtype() == torch::kInt64 && cu_seqlens->numel() == N + 1 && cu_seqlens->is_contiguous(),
+                    "cu_seqlens must be a contiguous int64 CUDA vector with N + 1 entries");
+        a.cu_seqlens = cu_seqlens->data_ptr<int64_t>();
+    }
+    if (pos.has_value()) {
+        TORCH_CHECK(pos->is_cuda() && pos->dtype() == torch::kInt32 && pos->is_contiguous(), "pos must be a contiguous int32 CUDA tensor");
+        a.pos = pos->data_ptr<int>();
+    }
+    if (slot_ids.has_value()) {
+        TORCH_CHECK(slot_ids->is_cuda() && slot_ids->dtype() == torch::kInt32 && slot_ids->numel() == N && slot_ids->is_contiguous(),
+                    "slot_ids must be a contiguous int32 CUDA vector with N entries");
+        a.slot_ids = slot_ids->data_ptr<int>();
+    }
+    a.fixed_len = static_cast<int>(fixed_len);
+    a.N = static_cast<int>(N);
+    a.H = static_cast<int>(H);
+    a.plan = plan.data_ptr<int>();
+    a.sms = static_cast<int>(sms);
+    a.k2_bv = static_cast<int>(k2_bv);
+    cfbi::launch_probe_k2_schedule(a, cur_stream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Tests: the start time (ns) and SM of the first n CTAs of the last device-scheduled K2 launch; only an extension built with CFBI_DYN_TEST_START_LOG has a
+// log (the others return a zero count).
+std::vector<torch::Tensor> dyn_start_log(int64_t n) {
+    TORCH_CHECK(n >= 0 && n <= (1 << 19), "n out of range");
+    auto t = torch::zeros({n}, torch::dtype(torch::kInt64));
+    auto s = torch::zeros({n}, torch::dtype(torch::kInt32));
+    const int got = cfbi::k2_dyn_test_log(reinterpret_cast<unsigned long long*>(t.data_ptr<int64_t>()), reinterpret_cast<unsigned*>(s.data_ptr<int>()), static_cast<int>(n));
+    return {t, s, torch::tensor({static_cast<int64_t>(got)}, torch::dtype(torch::kInt64))};
+}
+
 // One entry point for prefill, the training forward and decode.
 //   q,k,v,g: bf16 [B,T,H,128]; beta: bf16 [B,T,H] (raw logits); out: bf16 [B,T,H,128] (written in place).
 //   State (E fp32 [N,H,128,128], rows fp32 [N,H,5,64,128], pos int32 [N]) is all-or-none: given => prefill/decode
@@ -95,9 +140,11 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     TORCH_CHECK(A_log.dim() == 1 && A_log.size(0) == H, "A_log must be [H]");
     TORCH_CHECK(dt_bias.dim() == 2 && dt_bias.size(0) == H && dt_bias.size(1) == 128, "dt_bias must be [H, 128]");
     TORCH_CHECK(mode == 0 || mode == 1, "mode must be 0 or 1");
-    TORCH_CHECK(impl >= 0 && impl <= 15,
-                "impl must be 0..15 (bit 0: reference row engine, bit 1: reference K1/K2, bit 2: row engine for every row, "
-                "bit 3: UMMA K2)");
+    TORCH_CHECK(impl >= 0 && impl <= cfbi::IMPL_MAX,
+                "impl must be 0..63 (bit 0: reference row engine, bit 1: reference K1/K2, bit 2: row engine for every row, "
+                "bit 3: UMMA K2, bit 4: K2 driven by a schedule built on the device, bit 5: the old K2 kernels also where the default routing "
+                "would choose the device-scheduled one)");
+    TORCH_CHECK(!((impl & cfbi::IMPL_K2_DYN) && (impl & cfbi::IMPL_K2_OLD)), "impl bits 4 (device-scheduled K2) and 5 (old K2 kernels) exclude each other");
     TORCH_CHECK(phase >= 1 && phase <= 3, "phase must be 1 (K1), 2 (K2) or 3 (both)");
     TORCH_CHECK(k2_bv == 0 || k2_bv == 8 || k2_bv == 16 || k2_bv == 32 || (k2_bv >= 1000 && k2_bv <= 1000 + 65536),
                 "k2_bv must be 0 (automatic), 8, 16, 32, or 1000 + x (testing: the first x (sequence, head) pairs use 32-column tiles, "
@@ -105,6 +152,8 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     TORCH_CHECK(phase == 3 || (mode == 0 && ws_in.has_value() && plan_in.has_value()),
                 "a split call (phase 1 or 2) is mode 0 and needs the workspace and plan buffers");
     TORCH_CHECK(!(impl & cfbi::IMPL_K2_UMMA) || k2_bv == 0 || k2_bv == 16, "the UMMA K2 works on 16-column value slices (k2_bv 0 or 16)");
+    TORCH_CHECK(!(impl & cfbi::IMPL_K2_DYN) || k2_bv < 1000,
+                "the K2 driven by a device-built schedule (impl bit 4) takes k2_bv 0 (device policy), 8, 16 or 32 (forced width of every pair), not 1000 + x");
     TORCH_CHECK(lower_bound >= -5.0 && lower_bound <= 0.0, "lower_bound must be in [-5, 0]");
     const int64_t T_total = B * T;
     TORCH_CHECK(T_total < (int64_t(1) << 31) && H < 65536, "problem too large for the int32 token index / grid");
@@ -140,8 +189,14 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     // Which kernels run on this device (sm < 90: the reference kernels; no room for K1's shared memory: the row
     // engine for every row). Bits do not depend on it, see cfbi_launch.h.
     c10::cuda::CUDAGuard guard(q.device());
-    const int eff_impl = cfbi::resolve_impl((int)impl);
+    int eff_impl = cfbi::resolve_impl((int)impl);
     const int eff_mode = cfbi::resolve_mode((int)mode, eff_impl);
+    // Default routing (see cfbi_launch.h): only a call that asks for nothing (impl 0, no forced tile width) and that the optimised kernels run as they are.
+    // A plan buffer supplied by the caller that is too small for the schedule keeps the old kernels (an explicit impl 16 is an error instead, below).
+    if (impl == 0 && k2_bv == 0 && eff_impl == 0 && eff_mode == 0 && cu_seqlens.has_value() &&
+        (!plan_in.has_value() || plan_in->numel() >= cfbi::plan_ints(N, H)) && cfbi::k2_dyn_default_route(N, H, T_total, q.get_device())) {
+        eff_impl |= cfbi::IMPL_K2_DYN;
+    }
     if (has_state) {
         check_f32_cuda(*E, "E");
         check_f32_cuda(*rows, "rows");
@@ -175,9 +230,13 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
                                              "implementation cannot run (row-engine-only schedule)");
 
     const int64_t max_chunks_alloc = (T_total + 63) / 64 + N;
-    torch::Tensor plan = plan_in.has_value() ? *plan_in : torch::empty({(N + 1) * cfbi::PLAN_INTS_PER_SEQ}, q.options().dtype(torch::kInt32));
-    TORCH_CHECK(plan.is_cuda() && plan.dtype() == torch::kInt32 && plan.is_contiguous() &&
-                    plan.numel() >= (N + 1) * cfbi::PLAN_INTS_PER_SEQ, "plan buffer: contiguous int32 CUDA, (N + 1) * 8 entries");
+    // the plan buffer also holds the schedule of the dynamic-schedule K2 when that K2 runs (cfbi::plan_ints, what workspace_sizes reports); a call beyond
+    // the capacity of the schedule builder runs the old K2 kernels and needs the plan entries only
+    const bool dyn_runs = eff_mode == 0 && (eff_impl & cfbi::IMPL_K2_DYN) && N <= cfbi::k2_sched_capacity(H);
+    const int64_t plan_need = (N + 1) * cfbi::PLAN_INTS_PER_SEQ + (dyn_runs ? cfbi::k2_sched_ints(N, H) : 0);
+    torch::Tensor plan = plan_in.has_value() ? *plan_in : torch::empty({plan_need}, q.options().dtype(torch::kInt32));
+    TORCH_CHECK(plan.is_cuda() && plan.dtype() == torch::kInt32 && plan.is_contiguous() && plan.numel() >= plan_need,
+                "plan buffer: contiguous int32 CUDA, workspace_sizes(...)[1] entries ((N + 1) * 8 plan entries, plus the schedule of the device-scheduled K2)");
     torch::Tensor ws;
     if (eff_mode == 0) {
         if (ws_in.has_value()) {
@@ -219,7 +278,7 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
 
 // Implementation bits that run for `impl` on `device` (< 0: the current one), see cfbi_launch.h.
 int64_t resolve_impl_py(int64_t impl, int64_t device) {
-    TORCH_CHECK(impl >= 0 && impl <= 15, "impl must be 0..15");
+    TORCH_CHECK(impl >= 0 && impl <= cfbi::IMPL_MAX, "impl must be 0..63");
     return cfbi::resolve_impl((int)impl, (int)device);
 }
 
@@ -246,8 +305,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("out_f32") = py::none(), py::arg("impl") = 0, py::arg("slot_ids") = py::none(), py::arg("ws") = py::none(), py::arg("plan") = py::none(),
           py::arg("phase") = 3, py::arg("k2_bv") = 0);
     m.def("workspace_sizes", [](int64_t T_total, int64_t N, int64_t H) {
-        return std::make_pair(((T_total + 63) / 64 + N) * H * cfbi::WS_FLOATS_PER_CHUNK_HEAD, (N + 1) * cfbi::PLAN_INTS_PER_SEQ);
-    }, "(workspace floats, plan ints) of a call", py::arg("T_total"), py::arg("N"), py::arg("H"));
+        return std::make_pair(((T_total + 63) / 64 + N) * H * cfbi::WS_FLOATS_PER_CHUNK_HEAD, cfbi::plan_ints(N, H));
+    }, "(workspace floats, plan ints) of a call; the plan buffer also holds the schedule of the device-scheduled K2", py::arg("T_total"), py::arg("N"), py::arg("H"));
+    m.def("probe_k2_schedule", &probe_k2_schedule,
+          "run the plan kernel and the K2 schedule builder (tests): fills `plan` (workspace_sizes(...)[1] ints); sms 0 = this device's SM count",
+          py::arg("plan"), py::arg("H"), py::arg("N"), py::arg("fixed_len"), py::arg("cu_seqlens") = py::none(), py::arg("pos") = py::none(),
+          py::arg("slot_ids") = py::none(), py::arg("sms") = 0, py::arg("k2_bv") = 0);
+    m.def("dyn_start_log", &dyn_start_log, "(start ns, SM, [count]) of the first n CTAs of the last device-scheduled K2 (start-order probe build only)", py::arg("n"));
+    m.def("sched_capacity", [](int64_t H) { return cfbi::k2_sched_capacity(H); }, "most sequences the K2 schedule builder takes for H heads", py::arg("H"));
+    m.def("k2_route", &cfbi::k2_dyn_default_route, "whether the default implementation (impl 0) runs the device-scheduled K2 for a cu_seqlens call of N sequences, "
+          "H heads and T_total tokens on a device (< 0: the current one)", py::arg("N"), py::arg("H"), py::arg("T_total"), py::arg("device") = -1);
     m.def("probe_dot3", &probe_dot3, "dot3 tile probe", py::arg("A"), py::arg("B"), py::arg("reverse_k") = false);
     m.def("probe_transc", &probe_transc, "ex2/tanh/rsqrt approximations", py::arg("x"), py::arg("which"));
     m.def("probe_prep", &probe_prep, "per-token prep probe", py::arg("q"), py::arg("k"), py::arg("g"),

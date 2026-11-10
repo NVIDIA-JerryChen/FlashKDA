@@ -237,6 +237,11 @@ explicit `_impl` is honoured where possible):
 | sm_80 | 163 KiB | reference **row engine for every row** (no K1/K2) |
 | sm_86, sm_89 (and sm_120, not run) | 99 KiB | same |
 
+On sm_100a / sm_103a the default implementation also chooses between two K2 launches for a variable-length prefill (`cu_seqlens`): the
+old K2 kernels, or one driven by a schedule that a builder kernel makes on the device from the sequence lengths (`_impl` bit 4). Calls
+that are predicted to gain get the second one (`k2_dyn_default_route` in `csrc/cfbi/cfbi_launch.cu`, rule and measurements in section 7 of the
+performance document); both compute the same bits, and `_impl=32` keeps the old kernels where the default would route.
+
 K1 needs 204 KiB (optimised) / 218 KiB (reference) of dynamic shared memory per CTA, so neither fits an Ampere/Ada SM: prefill
 and the training forward there run `mode 1` (every row through the row engine, `_impl` bit 2), which evaluates the same program
 row by row (bit-identical to K1/K2 on every device where both can run, see `test_vs_ref`, `test_row_engine_equals_chunk_kernels`,

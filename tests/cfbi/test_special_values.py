@@ -44,8 +44,10 @@ def _poison(case, kind, rng_seed=0):
 def test_poisoned_inputs_match_reference(ext, kind):
     H, T = 2, 200
     case = _poison(make_case(T, H, "authors", seed=5), kind)
-    res = []
-    for impl in (0, 3):
+    res = {}
+    for impl in (0, 3, 16):                       # 16: the K2 driven by a schedule built on the device
+        if impl == 16 and not ext.resolve_impl(16, -1) & 16:
+            continue
         st = alloc_state(1, H)
         out = torch.zeros_like(case["q"])
         o32 = torch.zeros(case["q"].shape, dtype=torch.float32, device="cuda")
@@ -58,7 +60,10 @@ def test_poisoned_inputs_match_reference(ext, kind):
             decode(q1["q"], q1["k"], q1["v"], q1["g"], q1["beta"], case["scale"], o1, case["A_log"], case["dt_bias"],
                    case["lower_bound"], st, _impl=impl)
             out = torch.cat([out, o1], dim=1)
-        res.append((out, o32, st))
-    assert n_diff(res[0][0], res[1][0]) == 0, f"{kind}: bf16 outputs differ"
-    assert n_diff(res[0][1], res[1][1]) == 0, f"{kind}: fp32 outputs differ"
-    assert state_equal(res[0][2], res[1][2]), f"{kind}: {state_mismatch(res[0][2], res[1][2])}"
+        res[impl] = (out, o32, st)
+    for impl in res:
+        if impl == 3:
+            continue
+        assert n_diff(res[impl][0], res[3][0]) == 0, f"{kind}/{impl}: bf16 outputs differ"
+        assert n_diff(res[impl][1], res[3][1]) == 0, f"{kind}/{impl}: fp32 outputs differ"
+        assert state_equal(res[impl][2], res[3][2]), f"{kind}/{impl}: {state_mismatch(res[impl][2], res[3][2])}"
