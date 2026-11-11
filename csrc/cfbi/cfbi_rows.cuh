@@ -197,29 +197,35 @@ __device__ __forceinline__ void st_relaxed_gpu(int* ptr, int v) {
 // word and stores the new value at the end of its row loop, the plan-less version of the two-launch scheme without its snapshot) and CFBI_DECODE_TEST_FIRST_ARRIVER (the
 // first CTA to arrive, not the last, stores).
 template <bool DECODE>
-__device__ __forceinline__ SeqPlan rows_entry(const Params& p, int n, int& pos_smem) {
-    if (!DECODE) return p.plan[n];
-    const SeqWindow w = seq_window(p.cu_seqlens, p.fixed_len, p.slot_ids, n);
-    if (w.len == 0) return SeqPlan{0, 0, 0, 0, 0, 0, 0, w.slot};   // padding entry or empty sequence (uniform over the CTA): no state access, the caller returns
-    if (threadIdx.x == 0) {
+using RowsParams = std::conditional_t<DECODE, DecodeParams, Params>;   // DecodeParams: the call's Params and its token windows (cfbi_common.cuh)
+
+template <bool DECODE>
+__device__ __forceinline__ SeqPlan rows_entry(const RowsParams<DECODE>& p, int n, int& pos_smem) {
+    if constexpr (!DECODE) {
+        return p.plan[n];
+    } else {
+        const SeqWindow w = seq_window(p.cu_seqlens, p.fixed_len, p.slot_ids, n);
+        if (w.len == 0) return SeqPlan{0, 0, 0, 0, 0, 0, 0, w.slot};   // padding entry or empty sequence (uniform over the CTA): no state access, the caller returns
+        if (threadIdx.x == 0) {
 #ifdef CFBI_DECODE_TEST_DELAY_NS
-        __nanosleep(static_cast<unsigned>(CFBI_DECODE_TEST_DELAY_NS) * ((blockIdx.x + blockIdx.y) & 3u));
+            __nanosleep(static_cast<unsigned>(CFBI_DECODE_TEST_DELAY_NS) * ((blockIdx.x + blockIdx.y) & 3u));
 #endif
 #ifdef CFBI_DECODE_TEST_EVERY_CTA_WRITES
-        const int old = atomicAdd(p.pos + w.slot, 0);   // a plain read of the word (an add of zero): no counting
-        pos_smem = old & POS_MASK;
+            const int old = atomicAdd(p.pos + w.slot, 0);   // a plain read of the word (an add of zero): no counting
+            pos_smem = old & POS_MASK;
 #else
-        const int old = atomicAdd(p.pos + w.slot, 1 << POS_COUNT_SHIFT);
-        pos_smem = old & POS_MASK;
+            const int old = atomicAdd(p.pos + w.slot, 1 << POS_COUNT_SHIFT);
+            pos_smem = old & POS_MASK;
 #ifdef CFBI_DECODE_TEST_FIRST_ARRIVER
-        if ((old >> POS_COUNT_SHIFT) == 0) st_relaxed_gpu(p.pos + w.slot, (int)(((int64_t)(old & POS_MASK) + w.len) % BT));
+            if ((old >> POS_COUNT_SHIFT) == 0) st_relaxed_gpu(p.pos + w.slot, (int)(((int64_t)(old & POS_MASK) + w.len) % BT));
 #else
-        if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(p.pos + w.slot, (int)(((int64_t)(old & POS_MASK) + w.len) % BT));
+            if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(p.pos + w.slot, (int)(((int64_t)(old & POS_MASK) + w.len) % BT));
 #endif
 #endif
+        }
+        __syncthreads();
+        return SeqPlan{w.tok0, w.len, pos_smem, w.len, 0, 0, 0, w.slot};
     }
-    __syncthreads();
-    return SeqPlan{w.tok0, w.len, pos_smem, w.len, 0, 0, 0, w.slot};
 }
 
 #ifndef CFBI_ROWS_MINB
@@ -227,7 +233,7 @@ __device__ __forceinline__ SeqPlan rows_entry(const Params& p, int n, int& pos_s
 #endif
 // DECODE = false: the head rows / decode rows of a call whose plan kernel has run. DECODE = true: the single-launch decode, see rows_entry; same body, same arithmetic.
 template <bool DECODE>
-__global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Params p) {
+__global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const RowsParams<DECODE> p) {
 #ifdef CFBI_ROWS_PROFILE
     const long long prof_entry = clock64();   // the profile starts at kernel entry: before the plan load and the rest of the prologue
 #endif

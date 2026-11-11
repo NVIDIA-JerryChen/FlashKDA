@@ -31,7 +31,7 @@ TESTS = ROOT / "tests" / "cfbi"
 
 # the macros of the variant builds, by prefix (the first three are the hooks of the row engine), and the build-time tunables that are no test macros
 TEST_PREFIXES = ("CFBI_ROWS_PROFILE", "CFBI_ROWS_DELAY_NS", "CFBI_ROWS_TEST_", "CFBI_NEG_CONTROL", "CFBI_K1_PROFILE", "CFBI_K2_PROFILE", "CFBI_UMMA_PROFILE", "CFBI_DYN_TEST_",
-                 "CFBI_K2_TEST_", "CFBI_UMMA_NEG_", "CFBI_UMMA_RACE_", "CFBI_CONV_NEG_", "CFBI_LIN_NEG_")
+                 "CFBI_K2_TEST_", "CFBI_UMMA_NEG_", "CFBI_UMMA_RACE_", "CFBI_CONV_NEG_", "CFBI_LIN_NEG_", "CFBI_DECODE_TEST_")
 TUNABLES = ("CFBI_ROWS_MINB", "CFBI_ROWS_PF_L1", "CFBI_K2_TILE_ONLY", "CFBI_HAVE_TCGEN05", "CFBI_CONV_UNROLL", "CFBI_CONV_THREADS", "CFBI_SRC_HASH")
 GPU_MODULES = ("test_rows_occupancy.py", "test_rows_decode_families.py", "test_rows_delay.py", "test_rows_sanitizer.py", "test_rows_graph.py", "test_rows_profile_gpu.py", "test_k2_dyn_variants.py", "rows_workload.py", "rows_bounded.py")
 
@@ -55,6 +55,7 @@ def launch_text():
 
 
 # ---- sites ------------------------------------------------------------------------------------------------------------------------------------------------------
+ENTRY_CALL = "rows_entry<DECODE>("          # the plan load of rows_kernel<false> and the derived entry of rows_kernel<true>: one call, so one site before it
 RAW_BARRIER = re.compile(r"\b__syncthreads\b")
 BARRIER_MACRO = re.compile(r"\bROWS_SYNC(?:_END)?\(")
 DELAY_CALL = re.compile(r"\bROWS_DELAY\((\d+)\)")
@@ -76,9 +77,9 @@ def site_problems(text):
         return probs + ["the delay sites called directly in rows_kernel are %s, expected [0, 8] (the others are inside the barrier macros)" % [s for k, s in sites]]
     code = trp.code_lines(body)
     entry, chunk = sites[0][0], sites[1][0]
-    plan = [k for k, l in code if "p.plan[" in l]
+    plan = [k for k, l in code if ENTRY_CALL in l]
     if not plan or entry > plan[0]:
-        probs.append("site 0 does not come before the plan load")
+        probs.append("site 0 does not come before the plan load (the sequence entry of the kernel)")
     stamp = [k for k, l in code if "prof_entry = clock64()" in l]
     if stamp and stamp[0] > entry:
         probs.append("site 0 comes before the profile entry stamp")
@@ -107,7 +108,7 @@ def test_a_missing_or_misplaced_delay_site_is_caught(rows_text, name, old, new, 
 
 def test_site_0_after_the_plan_load_is_caught(rows_text):
     moved = mutate(rows_text, "    ROWS_DELAY(0);   // test hook: kernel entry, before the plan load and the first loads\n", "")
-    moved = mutate(moved, "    const SeqPlan sp = p.plan[n];\n", "    const SeqPlan sp = p.plan[n];\n    ROWS_DELAY(0);\n")
+    moved = mutate(moved, "    const SeqPlan sp = rows_entry<DECODE>(p, n, dec_pos0);\n", "    const SeqPlan sp = rows_entry<DECODE>(p, n, dec_pos0);\n    ROWS_DELAY(0);\n")
     assert any("before the plan load" in p for p in site_problems(moved))
 
 
@@ -151,6 +152,10 @@ def default_text(text, macros):
 VARIANT_NAMES = re.compile(r"\bg_rows_delay\w*|\brows_delay\b|\bRowsDelayConfig\b|\bg_rows_test_pos_offset\b|__nanosleep|__threadfence_block|^\s*#\s*error\b", re.M)
 
 
+DECODE_ENTRY = ("atomicAdd(p.pos + w.slot, 1 << POS_COUNT_SHIFT)", "if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(p.pos + w.slot,")
+DECODE_WRONG = ("atomicAdd(p.pos + w.slot, 0)", "if ((old >> POS_COUNT_SHIFT) == 0) st_relaxed_gpu(", "p.pos[sp.slot] =")
+
+
 def default_build_problems(rows_text, launch_text):
     macros = macros_in([rows_text, launch_text])
     rows = default_text(rows_text, macros)
@@ -162,6 +167,12 @@ def default_build_problems(rows_text, launch_text):
             probs.append("the default build does not read %r" % want)
     for m in VARIANT_NAMES.finditer(rows):
         probs.append("cfbi_rows.cuh: the default build still contains %r" % m.group(0).strip())
+    for want in DECODE_ENTRY:                    # the single-launch entry as the default build reads it: the counting protocol, no wrong variant
+        if want not in rows:
+            probs.append("the default build of the decode entry does not read %r" % want)
+    for bad in DECODE_WRONG:
+        if bad in rows:
+            probs.append("the default build of the decode entry still contains the wrong protocol %r" % bad)
     for fn in ("rows_test_delay_config", "rows_test_delay_hits", "rows_test_pos_offset"):
         body = re.search(r"^int %s\([^)]*\) \{\n(.*?)^\}" % fn, launch, re.M | re.S)
         if body is None:
@@ -174,6 +185,7 @@ def default_build_problems(rows_text, launch_text):
 def test_the_variant_macros_of_the_row_engine_are_found(rows_text, launch_text):
     found = macros_in([rows_text, launch_text])
     assert {"CFBI_ROWS_DELAY_NS", "CFBI_ROWS_TEST_NO_END_BARRIER", "CFBI_ROWS_TEST_POS_OOB", "CFBI_ROWS_TEST_COMPILE_ERROR", "CFBI_ROWS_PROFILE", "CFBI_NEG_CONTROL"} <= found
+    assert {"CFBI_DECODE_TEST_DELAY_NS", "CFBI_DECODE_TEST_EVERY_CTA_WRITES", "CFBI_DECODE_TEST_FIRST_ARRIVER"} <= found      # the hooks of the single-launch decode entry
 
 
 def test_the_default_build_of_the_hooks_is_the_unhooked_kernel(rows_text, launch_text):
@@ -185,6 +197,10 @@ def test_the_default_build_of_the_hooks_is_the_unhooked_kernel(rows_text, launch
     ("the end barrier removed by default", "rows", "#else\n#define ROWS_SYNC_END() ROWS_SYNC(7)\n#endif", "#else\n#define ROWS_SYNC_END() ROWS_DELAY(7)\n#endif", "ROWS_SYNC_END() ROWS_SYNC(7)"),
     ("the position offset compiled in", "rows", "#else\n#define ROWS_POS_INDEX(slot) (slot)\n#endif", "#else\n#define ROWS_POS_INDEX(slot) ((slot) + 1)\n#endif", "ROWS_POS_INDEX(slot) (slot)"),
     ("a sleep outside the macro", "rows", "    ROWS_DELAY(0);   // test hook", "    __nanosleep(1);\n    ROWS_DELAY(0);   // test hook", "__nanosleep"),
+    ("the first-arriver election by default", "rows", "#else\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(", "#else\n            if ((old >> POS_COUNT_SHIFT) == 0) st_relaxed_gpu(", "== p.H - 1) st_relaxed_gpu"),
+    ("the non-counting read by default", "rows", "#else\n            const int old = atomicAdd(p.pos + w.slot, 1 << POS_COUNT_SHIFT);", "#else\n            const int old = atomicAdd(p.pos + w.slot, 0);", "1 << POS_COUNT_SHIFT"),
+    ("the every-CTA store by default", "rows", "#ifdef CFBI_DECODE_TEST_EVERY_CTA_WRITES\n        if (tid == 0) p.pos[sp.slot]", "#if 1\n        if (tid == 0) p.pos[sp.slot]", "wrong protocol"),
+    ("a sleep of the decode entry outside its macro", "rows", "#ifdef CFBI_DECODE_TEST_DELAY_NS\n            __nanosleep(", "#if 1\n            __nanosleep(", "__nanosleep"),
     ("the compile error outside its macro", "rows", "#ifdef CFBI_ROWS_TEST_COMPILE_ERROR\n#error", "#if 1\n#error", "#error"),
     ("a setter that works by default", "launch", "    (void)offset;\n    return (int)cudaErrorNotSupported;", "    return (int)cudaMemcpyToSymbol(g_rows_test_pos_offset, &offset, sizeof(offset));", "rows_test_pos_offset"),
 ])
@@ -239,7 +255,8 @@ def test_the_default_build_defines_no_test_macro_of_any_prefix():
 
 
 @pytest.mark.parametrize("macro", ["CFBI_ROWS_DELAY_NS", "CFBI_ROWS_TEST_NO_END_BARRIER", "CFBI_ROWS_TEST_POS_OOB", "CFBI_ROWS_TEST_COMPILE_ERROR", "CFBI_ROWS_TEST_ANYTHING_NEW",
-                                   "CFBI_ROWS_PROFILE", "CFBI_NEG_CONTROL", "CFBI_DYN_TEST_SKIP_ITEM", "CFBI_UMMA_RACE_DELAY_NS", "CFBI_CONV_NEG_CONTROL"])
+                                   "CFBI_ROWS_PROFILE", "CFBI_NEG_CONTROL", "CFBI_DYN_TEST_SKIP_ITEM", "CFBI_UMMA_RACE_DELAY_NS", "CFBI_CONV_NEG_CONTROL",
+                                   "CFBI_DECODE_TEST_DELAY_NS", "CFBI_DECODE_TEST_EVERY_CTA_WRITES", "CFBI_DECODE_TEST_FIRST_ARRIVER", "CFBI_DECODE_TEST_ANYTHING_NEW"])
 def test_a_planted_define_of_any_prefix_is_caught(macro):
     srcs, flags, nvcc = real_guard_inputs()
     planted = dict(srcs)

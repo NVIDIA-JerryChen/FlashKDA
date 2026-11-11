@@ -5,6 +5,8 @@
 #include "cfbi/cfbi_prep.cuh"
 #include "cfbi/cfbi_primitives.cuh"
 
+#include <type_traits>
+
 namespace cfbi {
 
 // ---- layouts ---------------------------------------------------------------------------------
@@ -108,11 +110,20 @@ struct Params {
     // K1 stores the UT part of the workspace in 16-column slices whatever the tiles are.
     int tile_x32;
     int tile_bvb;
-    // The token windows of the call, for the single-launch decode kernel (rows_kernel<true>), which has no plan kernel in front of it: sequence n owns the tokens
-    // [cu_seqlens[n], cu_seqlens[n + 1]) or, without cu_seqlens, [n * fixed_len, (n + 1) * fixed_len) (the plan kernel's arguments). Appended last: no other offset moves.
+};
+// Params is the first argument of every kernel, and a kernel with a further argument behind it (k2_dyn_kernel's schedule) finds that argument at the offset sizeof(Params) of the
+// constant bank: a field added here moves it, which is another machine code for a kernel that the change does not own. The layout is therefore fixed; what only one launch path
+// needs goes into a type of its own (DecodeParams).
+static_assert(sizeof(Params) == 152, "Params is the argument block of every kernel: a change of its size changes the machine code of the kernels that take a further argument behind it");
+
+// The arguments of the single-launch decode kernel (rows_kernel<true>, cfbi_rows.cuh), which has no plan kernel in front of it: the call's Params and the token windows of the
+// call (the plan kernel's own arguments): sequence n owns the tokens [cu_seqlens[n], cu_seqlens[n + 1]) or, without cu_seqlens, [n * fixed_len, (n + 1) * fixed_len).
+struct DecodeParams : Params {
     const int64_t* cu_seqlens;
     int fixed_len;
 };
+static_assert(sizeof(DecodeParams) == sizeof(Params) + 16, "the decode arguments (a pointer and an int, padded) follow the common block: no offset of Params moves");
+static_assert(std::is_trivially_copyable<DecodeParams>::value, "a kernel argument is copied byte by byte");
 
 // 8 consecutive bf16 (16-byte aligned) -> 8 fp32 (exact).
 __device__ __forceinline__ void load8_bf16(const __nv_bfloat16* p, float (&x)[8]) {

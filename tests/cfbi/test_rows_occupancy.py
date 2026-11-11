@@ -2,17 +2,17 @@
 ``rows_kernel`` on the current device. It is not part of the documented API; the grid sizing of the decode tests (``helpers.decode_sequences``) reads it, so does the budget table and
 the resource gate.
 
-* every instantiation that a launch can use is reported (the optimised row engine and the frozen reference) with the threads, static and dynamic shared memory and registers of its
-  launch, and the occupancy API's CTAs per SM;
+* every instantiation that a launch can use is reported (the optimised row engine behind the plan kernel, its single-launch decode instantiation and the frozen reference) with the
+  threads, static and dynamic shared memory and registers of its launch, and the occupancy API's CTAs per SM;
 * the figures obey the arithmetic limits of the device (registers, shared memory with the per-CTA reserve, threads);
-* the optimised row engine keeps two CTAs per SM (``__launch_bounds__(256, 2)``) on the devices it runs on;
+* both instantiations of the optimised row engine keep two CTAs per SM (``__launch_bounds__(256, 2)``) on the devices they run on;
 * the grid of the decode families is derived from the binding, never from a constant.
 """
 import pytest
 import torch
 
 import helpers
-from helpers import ROWS_OPTIMISED, ROWS_REFERENCE, rows_instance, sequences_beyond_waves, skip_or_fail
+from helpers import ROWS_DECODE, ROWS_OPTIMISED, ROWS_REFERENCE, rows_instance, sequences_beyond_waves, skip_or_fail
 
 
 @pytest.fixture(scope="module")
@@ -21,7 +21,7 @@ def occupancy(ext):
 
 
 def test_the_binding_reports_every_instantiation_of_the_row_engine(occupancy):
-    assert [i["name"] for i in occupancy["instances"]] == [ROWS_OPTIMISED, ROWS_REFERENCE]
+    assert [i["name"] for i in occupancy["instances"]] == [ROWS_OPTIMISED, ROWS_DECODE, ROWS_REFERENCE]
     for i in occupancy["instances"]:
         assert i["threads"] == 256 and i["dynamic_smem"] == 0, i
         assert i["static_smem"] > 0 and 0 < i["registers"] <= 255 and i["ctas_per_sm"] >= 1, i
@@ -39,9 +39,10 @@ def test_the_figures_obey_the_arithmetic_limits_of_the_device(occupancy):
 def test_the_optimised_row_engine_keeps_two_ctas_per_sm_where_it_runs(ext):
     if ext.resolve_impl(0, -1) == ext.resolve_impl(3, -1):
         skip_or_fail("the optimised kernels do not run on this device (_impl=0 resolves to the reference kernels)")
-    inst, dev = rows_instance(ext)
-    assert inst["registers"] <= 128, "__launch_bounds__(256, 2) allows 128 registers"
-    assert inst["ctas_per_sm"] >= 2, inst
+    for name in (ROWS_OPTIMISED, ROWS_DECODE):                              # every optimised instantiation
+        inst, dev = rows_instance(ext, name)
+        assert inst["registers"] <= 128, (name, "__launch_bounds__(256, 2) allows 128 registers")
+        assert inst["ctas_per_sm"] >= 2, (name, inst)
 
 
 def test_the_binding_is_not_part_of_the_documented_api(ext):

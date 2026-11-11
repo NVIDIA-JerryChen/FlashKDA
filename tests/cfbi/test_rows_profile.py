@@ -39,12 +39,14 @@ PERTURB = "CFBI_ROWS_PROFILE_PERTURB"
 # what belongs to the profile in the row engine / in the launcher (the stamp macro ROWS_TS is a no-op outside the profile build and may stay unguarded)
 ROWS_PROFILE_NAMES = re.compile(r"\bprof_\w+|\bg_rows_prof\b|\bROWS_PROF_\w+|\bclock64\b|%%smid|\btp\b|\bCFBI_ROWS_PROFILE_PERTURB\b")
 LAUNCH_PROFILE_NAMES = re.compile(r"\bg_rows_prof\b|\bROWS_PROF_\w+")
-KERNEL_HEAD = re.compile(r"^__global__ void __launch_bounds__\(NTHREADS, CFBI_ROWS_MINB\) rows_kernel\(const Params p\) \{")
+KERNEL_HEAD = re.compile(r"^__global__ void __launch_bounds__\(NTHREADS, CFBI_ROWS_MINB\) rows_kernel\(const RowsParams<DECODE> p\) \{")
+ENTRY_CALL = "rows_entry<DECODE>("   # the plan load of rows_kernel<false> and the derived entry of rows_kernel<true>
 STAMP = re.compile(r"\bROWS_TS\((\d)\)")
 BARRIER = re.compile(r"\bROWS_SYNC(?:_END)?\(\d?\);")     # every barrier of the row engine is one of the numbered barrier macros (cfbi_rows.cuh): barrier n is ROWS_SYNC(n), the one that ends a row ROWS_SYNC_END()
 EXIT_STAMP = re.compile(r"\[8\] = \(unsigned\)\(clock64\(\) - prof_entry\)")
 GLOBAL_STORE = re.compile(r"\b(?:Xg|Rk|Rg|Ru|Rut|Rw|R|Eg|p\.out|p\.out_f32|p\.pos|p\.E|p\.rows)\[[^\]]*\]\s*=[^=]")
 ROW_LOOP = re.compile(r"^    for \(int i = 0; i < nrows; \+\+i\) \{")
+AFTER_LOOP = "    if (DECODE) {"          # the first statement behind the row loop: the end of the kernel (the position word of the call, then the exit stamp)
 POS_STORE = "p.pos[ROWS_POS_INDEX(sp.slot)] ="
 
 # the barriers and stamps of one row in source order (a barrier inside an ``if`` is still one entry; SYNC<n> is barrier n, SYNC7 the barrier that ends the row): changes with the barrier
@@ -93,9 +95,9 @@ def code_lines(body):
 
 
 def row_loop(body):
-    """``(first, last)`` indexes of ``body`` of the row loop: its opening line up to the line before the statement that follows it (the fused ``pos`` store)."""
+    """``(first, last)`` indexes of ``body`` of the row loop: its opening line up to the line before the statement that follows it (the end of the kernel, ``AFTER_LOOP``)."""
     first = next(k for k, (n, l, g) in enumerate(body) if ROW_LOOP.match(l))
-    last = next(k for k, (n, l, g) in enumerate(body) if POS_STORE in l) - 1
+    last = next(k for k, (n, l, g) in enumerate(body) if l == AFTER_LOOP) - 1
     return first, last
 
 
@@ -115,7 +117,7 @@ def entry_problems(text):
     else:
         if GUARD not in body[code[0][0]][2]:
             probs.append("the entry stamp is not inside a %s region" % GUARD)
-        plan = [k for k, l in code if "p.plan[" in l]
+        plan = [k for k, l in code if ENTRY_CALL in l]
         if not plan or plan[0] < code[0][0]:
             probs.append("the plan load does not come after the entry stamp")
     first_clock = next((k for k, (n, l, g) in enumerate(body) if "clock64" in l and not l.strip().startswith("//")), None)
@@ -237,7 +239,7 @@ def test_the_entry_stamp_is_the_first_statement_of_the_row_kernel(rows_text):
 def test_an_entry_stamp_after_the_plan_load_is_caught(rows_text):
     entry = "#ifdef CFBI_ROWS_PROFILE\n    const long long prof_entry = clock64();   // the profile starts at kernel entry: before the plan load and the rest of the prologue\n#endif\n"
     moved = mutate(rows_text, entry, "")
-    moved = mutate(moved, "    const SeqPlan sp = p.plan[n];\n", "    const SeqPlan sp = p.plan[n];\n" + entry)
+    moved = mutate(moved, "    const SeqPlan sp = rows_entry<DECODE>(p, n, dec_pos0);\n", "    const SeqPlan sp = rows_entry<DECODE>(p, n, dec_pos0);\n" + entry)
     assert any("not the entry stamp" in p for p in entry_problems(moved))
     unguarded_entry = mutate(rows_text, entry, "    const long long prof_entry = clock64();\n")
     assert any("not inside" in p for p in entry_problems(unguarded_entry))
@@ -248,7 +250,7 @@ def test_the_exit_stamp_follows_the_last_global_store(rows_text):
 
 
 def test_an_exit_stamp_before_a_store_is_caught(rows_text):
-    store = "    if (p.fuse_pos && tid == 0) p.pos[ROWS_POS_INDEX(sp.slot)] = (int)(((int64_t)sp.pos0 + sp.len) % BT);   // same value from every head CTA\n"
+    store = "        p.pos[ROWS_POS_INDEX(sp.slot)] = (int)(((int64_t)sp.pos0 + sp.len) % BT);   // same value from every head CTA (sp.pos0 is the plan kernel's snapshot)\n"
     stamp = "        g_rows_prof[prof_last][n * H + h][8] = (unsigned)(clock64() - prof_entry);   // after the last global store of the kernel\n"
     moved = mutate(mutate(rows_text, store, ""), stamp, stamp + store)       # the fused pos store now follows the exit stamp
     probs = exit_problems(moved)

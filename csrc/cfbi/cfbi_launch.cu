@@ -230,8 +230,6 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
     p.ws = a.ws;
     p.tile_x32 = 0;
     p.tile_bvb = 16;
-    p.cu_seqlens = a.cu_seqlens;   // only the single-launch decode kernel reads these two (the plan kernel gets them as arguments)
-    p.fixed_len = a.fixed_len;
 
     const int mode = resolve_mode(a.mode, a.impl);   // the binding has already done this and supplied a state if needed
     p.fuse_pos = mode == 1 ? 1 : 0;
@@ -242,8 +240,10 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
     if (run_k1 && run_k2 && a.E != nullptr) {
         // head rows (finishing the open chunk) or, in mode 1, every row
         if (a.impl & IMPL_REF_ROWS) ref::rows_kernel<<<dim3(a.N, a.H), NTHREADS, ROWS_DYNAMIC_SMEM, stream>>>(p);
-        else if (one_kernel) rows_kernel<true><<<dim3(a.N, a.H), NTHREADS, ROWS_DYNAMIC_SMEM, stream>>>(p);
-        else rows_kernel<false><<<dim3(a.N, a.H), NTHREADS, ROWS_DYNAMIC_SMEM, stream>>>(p);
+        else if (one_kernel) {
+            const DecodeParams dp{p, a.cu_seqlens, a.fixed_len};   // the token windows only this kernel reads (the plan kernel gets them as arguments)
+            rows_kernel<true><<<dim3(a.N, a.H), NTHREADS, ROWS_DYNAMIC_SMEM, stream>>>(dp);
+        } else rows_kernel<false><<<dim3(a.N, a.H), NTHREADS, ROWS_DYNAMIC_SMEM, stream>>>(p);
     }
     if (mode == 0) {
         const int64_t max_chunks = (a.T_total + BT - 1) / BT + a.N;   // upper bound; extra CTAs exit at once

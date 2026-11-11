@@ -83,7 +83,8 @@ def require_impl(ext, impl):
         pytest.skip("the device-scheduled K2 does not run on this device (impl bit 16 is dropped)")
 
 
-ROWS_OPTIMISED = "cfbi::rows_kernel"
+ROWS_OPTIMISED = "cfbi::rows_kernel<false>"        # the optimised row engine behind the plan kernel
+ROWS_DECODE = "cfbi::rows_kernel<true>"           # the single-launch decode (no plan kernel in front of it)
 ROWS_REFERENCE = "cfbi::ref::rows_kernel"
 WAVES = 2.5                    # the decode families run on grids of at least this many times the CTAs that are resident at once
 
