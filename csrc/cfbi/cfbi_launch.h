@@ -211,7 +211,7 @@ int rows_occupancy(int index, RowsOccupancy* out);
 
 // Row-engine test variants (cfbi_rows.cuh; tests only). rows_test_delay_config sets the delay hook of a build compiled with CFBI_ROWS_DELAY_NS: the length ``ns`` of a delay (0: the
 // compiled default), the ``warp`` that sleeps (-1: every warp), the CTAs that sleep (cta % cta_mod == cta_rem with cta = sequence * H + head; cta_mod 0: every CTA) and the delay
-// sites (bit n: site n; site 0 is the kernel entry, site n of 1 .. 7 is the barrier n of a row), and zeroes the hit counter; rows_test_delay_hits reads the counter (the number of warps
+// sites (bit n: site n; site 0 is the kernel entry, site n of 1 .. 7 is the barrier n of a row, site 8 follows barrier 6), and zeroes the hit counter; rows_test_delay_hits reads the counter (the number of warps
 // that slept since the configuration); rows_test_pos_offset sets the offset of the out-of-bounds control compiled with CFBI_ROWS_TEST_POS_OOB. Every function returns 0, the CUDA
 // error of the call that failed, or cudaErrorNotSupported in a build without the matching macro.
 int rows_test_delay_config(unsigned ns, int warp, int cta_mod, int cta_rem, unsigned sites);

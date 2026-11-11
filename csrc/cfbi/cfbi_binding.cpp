@@ -162,7 +162,7 @@ void rows_test_check(int err, const char* what) {
     TORCH_CHECK(err == 0, what, ": ", cudaGetErrorString((cudaError_t)err));
 }
 void rows_test_delay_config_py(int64_t ns, int warp, int cta_mod, int cta_rem, int64_t sites) {
-    TORCH_CHECK(ns >= 0 && ns <= 1000000 && sites >= 0 && sites < 256 && cta_mod >= 0 && warp >= -1 && warp < 8, "rows_test_delay_config: argument out of range");
+    TORCH_CHECK(ns >= 0 && ns <= 1000000 && sites >= 0 && sites < 512 && cta_mod >= 0 && warp >= -1 && warp < 8, "rows_test_delay_config: argument out of range");
     rows_test_check(cfbi::rows_test_delay_config((unsigned)ns, warp, cta_mod, cta_rem, (unsigned)sites), "rows_test_delay_config");
 }
 int64_t rows_test_delay_hits_py() {

@@ -12,7 +12,7 @@ import pytest
 import torch
 
 import helpers
-from helpers import ROWS_OPTIMISED, ROWS_REFERENCE, rows_instance, sequences_beyond_waves
+from helpers import ROWS_OPTIMISED, ROWS_REFERENCE, rows_instance, sequences_beyond_waves, skip_or_fail
 
 
 @pytest.fixture(scope="module")
@@ -38,7 +38,7 @@ def test_the_figures_obey_the_arithmetic_limits_of_the_device(occupancy):
 
 def test_the_optimised_row_engine_keeps_two_ctas_per_sm_where_it_runs(ext):
     if ext.resolve_impl(0, -1) == ext.resolve_impl(3, -1):
-        pytest.skip("the optimised kernels do not run on this device (_impl=0 resolves to the reference kernels)")
+        skip_or_fail("the optimised kernels do not run on this device (_impl=0 resolves to the reference kernels)")
     inst, dev = rows_instance(ext)
     assert inst["registers"] <= 128, "__launch_bounds__(256, 2) allows 128 registers"
     assert inst["ctas_per_sm"] >= 2, inst

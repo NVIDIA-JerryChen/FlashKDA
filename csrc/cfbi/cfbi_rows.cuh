@@ -41,17 +41,19 @@ __device__ unsigned g_rows_prof[ROWS_PROF_POS][ROWS_PROF_CTAS][ROWS_PROF_STAMPS]
 #endif
 
 // Test hooks of the row engine (variant builds only: the default build defines none of these macros and compiles to the same machine code, which Gate X shows).
-// ROWS_SYNC(n) is barrier n of a row (1 .. 6) and ROWS_SYNC_END() the barrier that ends it (7); ROWS_DELAY(n) is delay site n: 0 = kernel entry, before the first loads, n = before
-// barrier n. CFBI_ROWS_DELAY_NS compiles the delay hook (its value is the default length of a delay in ns; the host chooses sites, warp and CTAs at run time through
+// ROWS_SYNC(n) is barrier n of a row (1 .. 6) and ROWS_SYNC_END() the barrier that ends it (7); ROWS_DELAY(n) is delay site n: 0 = kernel entry, before the first loads, 1 .. 7 = before
+// barrier n, 8 = right after barrier 6 (the start of the chunk-end phase, which reads S.g2 and S.gend: the window that the barrier ending the row protects against the prologue of the
+// next row). CFBI_ROWS_DELAY_NS compiles the delay hook (its value is the default length of a delay in ns; the host chooses sites, warp and CTAs at run time through
 // rows_test_delay_config in cfbi_launch.cu and reads how many delays ran through rows_test_delay_hits). CFBI_ROWS_TEST_NO_END_BARRIER removes the barrier that ends a row (a racy
-// negative control: a delayed warp then lets the others start the next row), CFBI_ROWS_TEST_POS_OOB writes the fused position of a sequence at pos[slot + offset] (an
-// out-of-bounds control for memcheck; the host sets the offset through rows_test_pos_offset).
+// negative control: a warp that sleeps in the chunk-end phase (site 8) then lets the others start the next row and rewrite S.g2 under it), CFBI_ROWS_TEST_POS_OOB writes the fused
+// position of a sequence at pos[slot + offset] (an out-of-bounds control for memcheck; the host sets the offset through rows_test_pos_offset) and CFBI_ROWS_TEST_COMPILE_ERROR stops
+// the compilation (the control that shows that a variant that does not build fails its test).
 #ifdef CFBI_ROWS_DELAY_NS
 struct RowsDelayConfig {
     unsigned ns;           // length of a delay (0: CFBI_ROWS_DELAY_NS)
     int warp;              // the warp that sleeps (-1: every warp)
     int cta_mod, cta_rem;  // the CTAs that sleep: cta % cta_mod == cta_rem with cta = n * H + h (cta_mod 0: every CTA)
-    unsigned sites;        // bit n: delay site n is active
+    unsigned sites;        // bit n: delay site n is active (n = 0 .. 8)
 };
 __device__ RowsDelayConfig g_rows_delay;
 __device__ unsigned long long g_rows_delay_hits;
@@ -73,6 +75,9 @@ __device__ __forceinline__ void rows_delay(int site) {
 #define ROWS_SYNC_END() ROWS_DELAY(7)
 #else
 #define ROWS_SYNC_END() ROWS_SYNC(7)
+#endif
+#ifdef CFBI_ROWS_TEST_COMPILE_ERROR
+#error "CFBI_ROWS_TEST_COMPILE_ERROR: a deliberate compile error (the control that shows that a variant that does not build fails its test)"
 #endif
 #ifdef CFBI_ROWS_TEST_POS_OOB
 __device__ int g_rows_test_pos_offset;
@@ -429,6 +434,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
         if (pos == BT - 1) {
             if (tid < HEAD_K) S.gend[tid] = ex2_ftz(S.g2[tid]);
             ROWS_SYNC(6);
+            ROWS_DELAY(8);
             for (int mt = 0; mt < 8; ++mt) {
                 float big[2][4], sml[2][4], eold[2][4];
 #pragma unroll

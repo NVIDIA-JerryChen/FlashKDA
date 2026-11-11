@@ -108,3 +108,23 @@ def sequences_beyond_waves(capacity, heads, waves=WAVES):
 def decode_sequences(ext, heads, waves=WAVES):
     """The number of sequences of a decode call beyond ``waves`` resident waves on this device."""
     return sequences_beyond_waves(resident_ctas(ext), heads, waves)
+
+
+MUST_RUN_MAJOR = 10            # B200 and B300 (compute capability 10.x): the devices where every test of the row-engine suite must run
+
+
+def must_run(capability):
+    """Is this a device where the row-engine tests may not be skipped (a Blackwell data-centre part, compute capability 10.x)? ``capability`` is ``(major, minor)`` or None."""
+    return capability is not None and capability[0] == MUST_RUN_MAJOR
+
+
+def skip_or_fail(reason, capability=None):
+    """``pytest.skip(reason)``, except on a device where the suite must run (B200, B300): the condition that would skip the test fails it there, so that an unsupported arch, a missing
+    tool or a missing optimised kernel cannot turn a gate into a silent pass. ``capability`` defaults to the current device's (None without CUDA: a skip)."""
+    import pytest
+
+    if capability is None and torch.cuda.is_available():
+        capability = tuple(torch.cuda.get_device_capability())
+    if must_run(capability):
+        pytest.fail("must run on compute capability %d.%d but would be skipped: %s" % (capability[0], capability[1], reason), pytrace=False)
+    pytest.skip(reason)
