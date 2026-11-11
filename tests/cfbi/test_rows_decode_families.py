@@ -15,10 +15,13 @@ chunk at every position, the chunk end included; rows that follow a chunk end in
 Controls that must fail, so that the comparison can fail: one flipped bit in each compared object is reported (and a flipped bit in a stale cache row, which is not part of the state, is
 not); a launch from a stale state differs; the build with the sabotaged fma (``CFBI_NEG_CONTROL``) differs from the reference on these workloads; a variant that does not build fails its
 test instead of skipping it.
+
+Every group of cases that launches kernels (the families of one head count, the controls) runs in a child process under ``GROUP_TIMEOUT_S`` (``rows_bounded``): a hang fails the test and kills
+the child, and every case keeps its id and its assertions (the group functions below return the outcome of each case; the tests assert the one they are named after).
 """
 import pytest
-import torch
 
+import rows_bounded as rb
 import rows_workload as rw
 from helpers import WAVES, resident_ctas, skip_or_fail
 from rows_workload import Family
@@ -35,6 +38,8 @@ FAMILIES = [
 ]
 BY_NAME = {f.name: f for f in FAMILIES}
 HEADS = [12, 3]
+FLIPS = [("out", "out"), ("out32", "out32"), ("E", "E"), ("row", "rows"), ("pos", "pos")]       # the object that is corrupted, the field that must report it
+GROUP_TIMEOUT_S = 600     # per group: the families of one head count take about 30 s and the controls about 60 s on a B200 (a first run adds the JIT builds); a hang ends here
 
 
 @pytest.fixture(autouse=True)
@@ -73,52 +78,101 @@ def expectations(fam, cov, ext):
     return probs
 
 
-@pytest.mark.parametrize("H", HEADS)
-@pytest.mark.parametrize("fam", FAMILIES, ids=repr)
-def test_the_family_is_bitwise_the_reference_beyond_2_5_waves(ext, fam, H):
+# ---- the cases (they run in the child process of their group) -------------------------------------------------------------------------------------------
+def family_case(ext, fam, H):
     results = rw.run_family(ext, fam, H, seed=11)
     cov = rw.coverage(results)
     assert cov["steps"] == fam.steps
     assert expectations(fam, cov, ext) == [], cov
 
 
-# ---- controls: the comparison can fail ------------------------------------------------------------------------------------------------------------------
-@pytest.fixture(scope="module")
-def two_steps(ext):
-    """Two successive launches of a pool family with padding and empty sequences, both arms equal (asserted by ``run_family``)."""
-    results = rw.run_family(ext, BY_NAME["varlen_pool"], 12, seed=21)
-    assert len(results) >= 2
-    return results
-
-
-@pytest.mark.parametrize("what,field", [("out", "out"), ("out32", "out32"), ("E", "E"), ("row", "rows"), ("pos", "pos")])
-def test_a_single_flipped_bit_is_reported_in_the_object_that_holds_it(two_steps, what, field):
+def flip_case(two_steps, what, field):
     step, opt, ref, warm = two_steps[-1]
     assert all(v == 0 for v in rw.mismatch(opt, ref).values())
     m = rw.mismatch(rw.corrupt(opt, what), ref)
     assert m == {k: (1 if k == field else 0) for k in m}, (what, m)
 
 
-def test_a_flipped_bit_in_a_stale_cache_row_is_not_part_of_the_state(two_steps):
+def stale_row_case(two_steps):
     step, opt, ref, warm = two_steps[-1]
     assert all(v == 0 for v in rw.mismatch(rw.corrupt(opt, "stale_row"), ref).values())
 
 
-def test_a_launch_from_a_stale_state_differs(ext, two_steps):
+def stale_state_case(ext, two_steps):
     (step1, opt1, ref1, warm1), (step2, opt2, ref2, warm2) = two_steps[0], two_steps[1]
     stale = rw.run_arm(ext, rw.OPTIMISED, warm1, step2)       # the state before the previous launch: the oracle ran from the state after it
     m = rw.mismatch(stale, ref2)
     assert sum(m.values()) > 0, m
 
 
-def test_the_sabotaged_row_engine_build_differs_from_the_reference_on_these_workloads(ext):
+def sabotaged_case(ext):
     bad = rw.build_variant("negctl", ("CFBI_NEG_CONTROL=1",))
-    fam = BY_NAME["decode_pool_padding"]
-    results = rw.run_family(ext, fam, 12, seed=31)
+    results = rw.run_family(ext, BY_NAME["decode_pool_padding"], 12, seed=31)
     step, opt, ref, warm = results[0]
     sab = rw.run_arm(bad, rw.OPTIMISED, warm, step)
     m = rw.mismatch(sab, ref)
     assert m["out32"] > 0 or m["out"] > 0 or m["E"] > 0 or m["rows"] > 0, "the sabotaged build matches the reference: the workload cannot see a changed row engine (%s)" % m
+
+
+# ---- the groups (one child process each) ------------------------------------------------------------------------------------------------------------------
+def group_families(ext, heads):
+    """Every family at ``heads`` heads: the outcome of each (None = passed)."""
+    return {"cases": {repr(fam): rb.capture(family_case, ext, fam, heads) for fam in FAMILIES}, "reps": 1}
+
+
+def group_controls(ext):
+    """The controls that make the comparison fail on purpose; they share two successive launches of a pool family with padding and empty sequences (both arms equal, asserted by ``run_family``)."""
+    two_steps = rw.run_family(ext, BY_NAME["varlen_pool"], 12, seed=21)
+    assert len(two_steps) >= 2
+    cases = {"flipped:" + what: rb.capture(flip_case, two_steps, what, field) for what, field in FLIPS}
+    cases["stale_row"] = rb.capture(stale_row_case, two_steps)
+    cases["stale_state"] = rb.capture(stale_state_case, ext, two_steps)
+    cases["sabotaged_build"] = rb.capture(sabotaged_case, ext)
+    return {"cases": cases, "reps": 1}
+
+
+@pytest.fixture(scope="module")
+def family_groups(ext):
+    """The result of the family group of a head count, run once in its own bounded child process."""
+    cache = {}
+
+    def get(heads):
+        if heads not in cache:
+            cache[heads] = rb.run_group("test_rows_decode_families", "group_families", {"heads": heads}, GROUP_TIMEOUT_S)
+        return cache[heads]
+
+    return get
+
+
+@pytest.fixture(scope="module")
+def control_group(ext):
+    return rb.run_group("test_rows_decode_families", "group_controls", {}, GROUP_TIMEOUT_S)
+
+
+@pytest.mark.parametrize("H", HEADS)
+@pytest.mark.parametrize("fam", FAMILIES, ids=repr)
+def test_the_family_is_bitwise_the_reference_beyond_2_5_waves(family_groups, fam, H):
+    outcome = family_groups(H)["cases"][repr(fam)]
+    assert outcome is None, outcome
+
+
+# ---- controls: the comparison can fail ------------------------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("what,field", FLIPS)
+def test_a_single_flipped_bit_is_reported_in_the_object_that_holds_it(control_group, what, field):
+    outcome = control_group["cases"]["flipped:" + what]
+    assert outcome is None, outcome
+
+
+def test_a_flipped_bit_in_a_stale_cache_row_is_not_part_of_the_state(control_group):
+    assert control_group["cases"]["stale_row"] is None, control_group["cases"]["stale_row"]
+
+
+def test_a_launch_from_a_stale_state_differs(control_group):
+    assert control_group["cases"]["stale_state"] is None, control_group["cases"]["stale_state"]
+
+
+def test_the_sabotaged_row_engine_build_differs_from_the_reference_on_these_workloads(control_group):
+    assert control_group["cases"]["sabotaged_build"] is None, control_group["cases"]["sabotaged_build"]
 
 
 def test_a_variant_that_does_not_build_fails_instead_of_skipping():

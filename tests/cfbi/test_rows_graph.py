@@ -7,6 +7,9 @@ the state starts from a warm pool with open chunks, and after every replay the o
 runs the same inputs and the same ``slot_ids`` on its own copy of the pool.
 
 Control: a replay whose ``slot_ids`` buffer was not rewritten, compared with a reference that ran the new slots, differs: the comparison does see the slots.
+
+A graph replay that never completes would hang the test from inside its own process, so the two cases run as one group in a child process under ``GROUP_TIMEOUT_S`` (``rows_bounded``): a
+hang fails the test and kills the child's process group; the cases keep their ids and their assertions.
 """
 import random
 import types
@@ -15,6 +18,7 @@ import pytest
 import torch
 
 import helpers
+import rows_bounded as rb
 import rows_workload as rw
 from flash_kda.cfbi import alloc_state
 from helpers import make_case, skip_or_fail
@@ -23,6 +27,7 @@ from rows_workload import Outcome
 H = 12
 STEPS = 10
 PAD = 0.3
+GROUP_TIMEOUT_S = 600     # the two cases take a few seconds on a B200 (a first run adds the JIT build of the extension); a hang ends here
 
 
 @pytest.fixture(autouse=True)
@@ -89,7 +94,8 @@ class Replay:
         torch.cuda.synchronize()
 
 
-def test_graph_replay_with_rewritten_slot_ids_is_bitwise_the_reference_beyond_2_5_waves(ext):
+# ---- the cases (they run in the child process of their group) -------------------------------------------------------------------------------------------
+def rewritten_case(ext):
     r = Replay(ext, 91)
     assert r.live_ctas >= helpers.WAVES * helpers.resident_ctas(ext), "the graph's live grid is not beyond %.1f resident waves" % helpers.WAVES
     seen = set()
@@ -106,7 +112,7 @@ def test_graph_replay_with_rewritten_slot_ids_is_bitwise_the_reference_beyond_2_
     assert len(seen) == STEPS, "the slots were not rewritten at every replay"
 
 
-def test_a_replay_with_stale_slot_ids_differs_from_the_reference(ext):
+def stale_case(ext):
     r = Replay(ext, 92)
     old = r.next_slots()
     r.load_inputs(0)
@@ -122,3 +128,21 @@ def test_a_replay_with_stale_slot_ids_differs_from_the_reference(ext):
     torch.cuda.synchronize()
     m = rw.mismatch(Outcome(r.out, r.out32, r.pool), Outcome(ref_out, ref_out32, r.ref_pool))
     assert sum(m.values()) > 0, "a replay with stale slot_ids matches a reference that ran the new slots: the comparison cannot see the slots (%s)" % m
+
+
+# ---- the group (one child process) ------------------------------------------------------------------------------------------------------------------------
+def group_graph(ext):
+    return {"cases": {"rewritten_slot_ids": rb.capture(rewritten_case, ext), "stale_slot_ids": rb.capture(stale_case, ext)}, "reps": STEPS}
+
+
+@pytest.fixture(scope="module")
+def graph_group(ext):
+    return rb.run_group("test_rows_graph", "group_graph", {}, GROUP_TIMEOUT_S)
+
+
+def test_graph_replay_with_rewritten_slot_ids_is_bitwise_the_reference_beyond_2_5_waves(graph_group):
+    assert graph_group["cases"]["rewritten_slot_ids"] is None, graph_group["cases"]["rewritten_slot_ids"]
+
+
+def test_a_replay_with_stale_slot_ids_differs_from_the_reference(graph_group):
+    assert graph_group["cases"]["stale_slot_ids"] is None, graph_group["cases"]["stale_slot_ids"]
