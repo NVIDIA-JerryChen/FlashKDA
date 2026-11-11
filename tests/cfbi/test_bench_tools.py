@@ -25,6 +25,7 @@ import bench_records as br  # noqa: E402
 import codegen_gate as cg  # noqa: E402
 import compare_bench  # noqa: E402
 import compare_binaries as cb  # noqa: E402
+import suite_record as sr  # noqa: E402
 import varlen_corpus as vc  # noqa: E402
 
 BASE_COMMIT = "2dcb4f89714eb4dcc67a69c6e421ee2c60e1cb1a"
@@ -1111,3 +1112,86 @@ def test_decode_run_meta_carries_the_fields_of_a_usable_record():
     assert br.validate_record(rec, "baseline", expect_commit=BASE_COMMIT) == []
     rec["cells"] = [wall_cell(WALL_KEY, [14.0] * 4)]                      # fewer trials than a per-process median needs
     assert any("at least 5 are required" in p for p in br.validate_record(rec, "baseline"))
+
+
+# ---- per-test-file counts of a pytest run (benchmarks/suite_record.py) ---------------------------------------------------------------------------
+
+JUNIT = """<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="1" failures="1" skipped="1" tests="7">
+<testcase classname="tests.cfbi.test_arch" name="test_a" time="0.1" />
+<testcase classname="tests.cfbi.test_arch" name="test_b[x]" time="0.1" />
+<testcase classname="tests.cfbi.test_vs_ref" name="test_c" time="0.1"><failure message="boom">trace</failure></testcase>
+<testcase classname="tests.cfbi.test_vs_ref" name="test_d" time="0.1" />
+<testcase classname="tests.cfbi.test_guard_zones.TestGuards" name="test_e" time="0.1"><skipped type="pytest.skip" message="not here">skipped</skipped></testcase>
+<testcase classname="tests.cfbi.test_guard_zones.TestGuards" name="test_f" time="0.1" />
+<testcase classname="tests.cfbi.test_cp" name="test_g" time="0.1"><error message="setup failed">trace</error></testcase>
+</testsuite></testsuites>
+"""
+PROBE = """NVIDIA B200, 183359 MiB
+3.12.3 2.14.0a0+4fdf77b940.nv26.08 13.4 NVIDIA B200 148
+/usr/local/cuda/bin/nvcc
+"""
+
+
+def suite_record_of(text, commit=BASE_COMMIT, suite="S", **meta):
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "r.xml")
+    with open(path, "w") as f:
+        f.write(text)
+    m = {"suite": suite, "commit": commit, "dirty": False, "gpu": "NVIDIA B200", "sm_count": 148}
+    m.update(meta)
+    return sr.build_record(sr.parse_junit(path), m)
+
+
+def test_suite_record_counts_tests_per_file_with_failures_errors_and_skips():
+    rec = suite_record_of(JUNIT)
+    assert sr.structure_problems(rec) == []
+    assert rec["files"]["tests/cfbi/test_arch.py"] == {"passed": 2, "failed": 0, "skipped": 0, "errors": 0, "total": 2}
+    assert rec["files"]["tests/cfbi/test_vs_ref.py"] == {"passed": 1, "failed": 1, "skipped": 0, "errors": 0, "total": 2}
+    assert rec["files"]["tests/cfbi/test_guard_zones.py"] == {"passed": 1, "failed": 0, "skipped": 1, "errors": 0, "total": 2}     # a test class maps to its file
+    assert rec["files"]["tests/cfbi/test_cp.py"]["errors"] == 1
+    assert rec["totals"] == {"passed": 4, "failed": 1, "skipped": 1, "errors": 1, "total": 7}
+    assert rec["failed"] == ["tests/cfbi/test_vs_ref.py::test_c", "tests/cfbi/test_cp.py::test_g"]
+    assert rec["skipped"] == [{"id": "tests/cfbi/test_guard_zones.py::test_e", "reason": "not here"}]
+    assert sr.classname_to_file("tests.cfbi.test_x.TestY") == "tests/cfbi/test_x.py" and sr.classname_to_file("tests.cfbi.test_x") == "tests/cfbi/test_x.py"
+    assert sr.parse_probe(PROBE) == {"python": "3.12.3", "torch": "2.14.0a0+4fdf77b940.nv26.08", "cuda": "13.4", "gpu": "NVIDIA B200", "sm_count": 148}
+    assert sr.parse_probe("no probe line") == {}
+
+
+def test_suite_record_check_rejects_fewer_tests_missing_files_and_unlisted_failures():
+    clean = JUNIT.replace('<failure message="boom">trace</failure>', "").replace('<error message="setup failed">trace</error>', "")
+    base = suite_record_of(clean)
+    assert sr.check(base, suite_record_of(clean)) == []
+    assert sr.check(base, suite_record_of(clean.replace('<testcase classname="tests.cfbi.test_arch" name="test_a" time="0.1" />', ""))) != []       # one test fewer
+    assert any("is missing in the candidate" in p for p in sr.check(base, suite_record_of(clean.replace("tests.cfbi.test_cp", "tests.cfbi.test_other"))))
+    more = clean.replace("</testsuite>", '<testcase classname="tests.cfbi.test_new" name="test_n" time="0.1" /></testsuite>')
+    assert sr.check(base, suite_record_of(more)) == []                                                                                           # new files are fine
+    failing = suite_record_of(JUNIT)                                                                                                             # failures of the candidate
+    assert any("failed or errored test" in p for p in sr.check(base, failing))
+    assert not [p for p in sr.check(base, failing, ["tests/cfbi/test_vs_ref.py::test_c", "tests/cfbi/test_cp.py::test_g"]) if "failed or errored" in p]
+    assert any("different suites" in p for p in sr.check(base, suite_record_of(clean, suite="gate")))
+    assert sr.check(base, {"schema": "x"}) != [] and sr.check({"schema": sr.SCHEMA, "meta": {}, "files": {}}, base) != []
+
+
+def test_suite_record_cli_builds_checks_and_refuses_bad_input():
+    d = tempfile.mkdtemp()
+    xml_path, probe, out = (os.path.join(d, n) for n in ("r.xml", "probe.txt", "rec.json"))
+    with open(xml_path, "w") as f:
+        f.write(JUNIT)
+    with open(probe, "w") as f:
+        f.write(PROBE)
+    args = ["--junit", xml_path, "--suite", "S", "--out", out, "--commit", BASE_COMMIT, "--probe", probe, "--env", "CFBI_BIG=1", "--ignored", "tests/cfbi/x.py"]
+    assert sr.main(args) == 0
+    with open(out) as f:
+        rec = json.load(f)
+    assert rec["meta"]["gpu"] == "NVIDIA B200" and rec["meta"]["sm_count"] == 148 and rec["meta"]["env"] == {"CFBI_BIG": "1"} and rec["meta"]["cuda"] == "13.4"
+    assert rec["meta"]["ignored"] == ["tests/cfbi/x.py"] and rec["meta"]["dirty"] is False
+    assert sr.main(["--check", out, out]) == 1                                                       # the record has failures that nobody allowed
+    allow = os.path.join(d, "allow.txt")
+    with open(allow, "w") as f:
+        f.write("# by design on this device\ntests/cfbi/test_vs_ref.py::test_c\ntests/cfbi/test_cp.py::test_g\n")
+    assert sr.main(["--check", out, out, "--allow-failures", allow]) == 0
+    assert sr.main(["--junit", os.path.join(d, "missing.xml"), "--suite", "S", "--out", out, "--commit", "x"]) == 2
+    assert sr.main(["--suite", "S"]) == 2
+    with open(xml_path, "w") as f:
+        f.write("<not xml")
+    assert sr.main(args) == 2
