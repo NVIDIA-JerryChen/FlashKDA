@@ -645,16 +645,13 @@ def file_sha256(path):
     return h.hexdigest()
 
 
-def manifest_from_build(build_log, tool_versions, label, allow_non_production_flags=False, artifact=None):
-    """The toolchain manifest of a production build: the nvcc command lines of its build log (verbose torch JIT build) plus the probed tool versions.
-
-    The build log must contain the compile of at least one ``.cu`` file (the log of a cached build does not and is refused); every unit must have been compiled with
-    the same parameters; the production flags of ``_ext.py`` must all be present. The sha256 of the log is recorded so that the manifest names the build it describes;
-    ``artifact`` (the built extension that the resource / SASS / ELF dumps were taken from) is recorded with its sha256 as well."""
-    text, versions_text = read_text(build_log), read_text(tool_versions)
+def build_log_parameters(text, name="the build log"):
+    """``(units, first)`` of a verbose torch JIT build log: the parsed nvcc compile of every ``.cu`` unit and the common parameter set (``flags``, ``std``, ``archs``,
+    ``src_hash``, ``variant_defines``). Raises ``Unusable`` for a log without a compile of a ``.cu`` file (the log of a cached build has none), for units compiled
+    with different parameters and for a command line without a standard or an architecture."""
     units = [c for c in (parse_nvcc_command(ln) for ln in text.splitlines()) if c and c["unit"].endswith(".cu")]
     if not units:
-        raise Unusable("the build log %s holds no nvcc compile of a .cu file: it cannot describe a toolchain (the log of a cached build has none, rebuild with verbose output)" % build_log)
+        raise Unusable("the build log %s holds no nvcc compile of a .cu file: it cannot describe a toolchain (the log of a cached build has none, rebuild with verbose output)" % name)
     first = units[0]
     for u in units[1:]:
         for f in ("flags", "std", "archs", "src_hash", "variant_defines"):
@@ -662,6 +659,34 @@ def manifest_from_build(build_log, tool_versions, label, allow_non_production_fl
                 raise Unusable("the units of the build were compiled with different %s: %s vs %s" % (f, first[f], u[f]))
     if not first["std"] or not first["archs"]:
         raise Unusable("the nvcc command line of the build log names no standard (%r) or no architecture (%r)" % (first["std"], first["archs"]))
+    return units, first
+
+
+def bind_manifest_to_log(manifest, text, name="the build log"):
+    """Raise ``Unusable`` unless ``text`` is the build log that the manifest was made from: the digest of the log equals the recorded one and the compile commands in
+    it give the parameters the manifest states (flags, standard, architectures, variant defines, source hash, units and number of compile lines). A manifest and a
+    log that do not belong together would let one build's flags describe another build's dump."""
+    log = manifest["build_log"]
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if digest != log["sha256"]:
+        raise Unusable("the build log %s (sha256 %s...) is not the log the manifest was made from (sha256 %s...)" % (name, digest[:12], log["sha256"][:12]))
+    units, first = build_log_parameters(text, name)
+    conflicts = ["%s: log %s, manifest %s" % (f, first[f], manifest.get(f)) for f in ("flags", "std", "archs", "src_hash", "variant_defines") if first[f] != manifest.get(f)]
+    names = sorted(os.path.basename(u["unit"]) for u in units)
+    if names != sorted(log.get("units") or []) or len(units) != log["nvcc_compile_lines"]:
+        conflicts.append("units: log %s (%d compile lines), manifest %s (%s compile lines)" % (names, len(units), sorted(log.get("units") or []), log["nvcc_compile_lines"]))
+    if conflicts:
+        raise Unusable("the compile commands of the build log %s contradict the manifest: %s" % (name, "; ".join(conflicts)))
+
+
+def manifest_from_build(build_log, tool_versions, label, allow_non_production_flags=False, artifact=None):
+    """The toolchain manifest of a production build: the nvcc command lines of its build log (verbose torch JIT build) plus the probed tool versions.
+
+    The build log must contain the compile of at least one ``.cu`` file (the log of a cached build does not and is refused); every unit must have been compiled with
+    the same parameters; the production flags of ``_ext.py`` must all be present. The sha256 of the log is recorded so that the manifest names the build it describes;
+    ``artifact`` (the built extension that the resource / SASS / ELF dumps were taken from) is recorded with its sha256 as well."""
+    text, versions_text = read_text(build_log), read_text(tool_versions)
+    units, first = build_log_parameters(text, build_log)
     missing = [f for f in PRODUCTION_FLAGS if f not in first["flags"]]
     if missing and not allow_non_production_flags:
         raise Unusable("the build did not use the production flags (missing %s)" % missing)
@@ -698,12 +723,15 @@ def validate_manifest(m, where="toolchain manifest"):
 def dump_from_files(regs, sass, manifest, elf, ptxas_log, extra_meta=None):
     """A dump from the cuobjdump text of another toolchain (the container), with the structured toolchain manifest of the build that produced it.
 
-    Every input is required: the resource dump, the SASS dump, the ELF attributes (launch bounds), the ``ptxas -v`` log of the build and the manifest; a dump that
-    cannot show spills and launch bounds, or whose toolchain is only a label, is not accepted as a gate input."""
+    Every input is required: the resource dump, the SASS dump, the ELF attributes (launch bounds), the verbose build log (it holds the ``ptxas -v`` lines) and the manifest;
+    a dump that cannot show spills and launch bounds, or whose toolchain is only a label, is not accepted as a gate input. The build log must be the very log the
+    manifest was made from: its digest and the compile commands in it are checked against the manifest (``bind_manifest_to_log``)."""
     if not (regs and sass and manifest and elf and ptxas_log):
         raise Unusable("a dump of another toolchain needs the resource dump, the SASS dump, the ELF attributes, the ptxas log and the toolchain manifest")
     m = validate_manifest(manifest if isinstance(manifest, dict) else _read_json(manifest, "toolchain manifest"))
-    tables = kernel_table(read_text(regs), read_text(sass), read_text(ptxas_log), read_text(elf), unit=None)
+    log_text = read_text(ptxas_log)
+    bind_manifest_to_log(m, log_text, ptxas_log)
+    tables = kernel_table(read_text(regs), read_text(sass), log_text, read_text(elf), unit=None)
     archs = sorted(tables)
     if archs != sorted(m["archs"]):
         raise Unusable("the manifest names the architectures %s, the dumps hold %s" % (sorted(m["archs"]), archs))
@@ -1048,7 +1076,7 @@ def main(argv=None):
     p.add_argument("--regs", required=True)
     p.add_argument("--sass", required=True)
     p.add_argument("--elf", required=True)
-    p.add_argument("--ptxas-log", required=True)
+    p.add_argument("--ptxas-log", required=True, help="the verbose build log the manifest was made from (its digest and compile commands are checked against the manifest)")
     p.add_argument("--commit", default=None, help="the commit of the source tree that was built (recorded as the tree identity of the dump)")
     p.add_argument("--out", required=True)
 

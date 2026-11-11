@@ -800,17 +800,38 @@ def cg_manifest(**over):
     return m
 
 
-class CgFiles:
-    """The text inputs of a dump of another toolchain, written to a temporary directory: resources, SASS, ptxas log, ELF attributes and the manifest."""
+def cg_build_log(m, ptxas_text):
+    """The verbose build log that the parameters of manifest ``m`` describe: one nvcc compile line per unit, then the ``ptxas -v`` lines."""
+    flags = []
+    for f in m["flags"]:
+        flags += ["--compiler-options", "'%s'" % f[len("--compiler-options "):]] if f.startswith("--compiler-options ") else [f]
+    tail = ["-DCFBI_SRC_HASH=%s" % m["src_hash"]] + ["-D%s" % d for d in m["variant_defines"]] + ["-std=%s" % m["std"]]
+    units = m["build_log"]["units"]
+    lines = ["ninja: build started"]
+    for i, u in enumerate(units):
+        lines.append("[%d/%d] /usr/local/cuda/bin/nvcc -MD -MF %s.o.d -DTORCH_EXTENSION_NAME=x -I/work/csrc %s %s -c /work/csrc/cfbi/%s -o %s.o" % (i + 1, len(units) + 1, u, " ".join(flags), " ".join(tail), u, u))
+    return "\n".join(lines) + "\n" + ptxas_text
 
-    def __init__(self, code=CODE, manifest=None, regs=None, ptxas=None, elf=None, sass=None):
+
+class CgFiles:
+    """The text inputs of a dump of another toolchain, written to a temporary directory: resources, SASS, the verbose build log (with the ptxas lines), ELF attributes
+    and the manifest. With ``bind`` (default) the build log is generated from the manifest's parameters and the manifest's ``build_log`` record is made to describe it,
+    so the two belong together; ``bind=False`` writes the manifest as given and the plain ptxas text as the log (for manifests that are meant to be refused)."""
+
+    def __init__(self, code=CODE, manifest=None, regs=None, ptxas=None, elf=None, sass=None, bind=True):
         self.dir = tempfile.mkdtemp()
         fns = {ROWS: (128, 112), K1: (100, 0)}
+        ptxas_text = ptxas if ptxas is not None else cg_ptxas({ROWS: (112, 4, 4, 128), K1: (0, 0, 0, 100)})
+        self.manifest = manifest if manifest is not None else cg_manifest()
+        log = ptxas_text
+        if bind:
+            log = cg_build_log(self.manifest, ptxas_text)
+            self.manifest = dict(self.manifest, build_log={"sha256": hashlib.sha256(log.encode("utf-8")).hexdigest(), "nvcc_compile_lines": len(self.manifest["build_log"]["units"]),
+                                                          "units": sorted(self.manifest["build_log"]["units"])})
         self.paths = {"regs": self.write("regs.txt", regs if regs is not None else cg_regs(fns)),
                       "sass": self.write("sass.txt", sass if sass is not None else cg_sass({ROWS: code, K1: ["EXIT"]})),
-                      "ptxas": self.write("ptxas.txt", ptxas if ptxas is not None else cg_ptxas({ROWS: (112, 4, 4, 128), K1: (0, 0, 0, 100)})),
+                      "ptxas": self.write("ptxas.txt", log),
                       "elf": self.write("elf.txt", elf if elf is not None else cg_elf({ROWS: (128, 256), K1: (128, 256)}))}
-        self.manifest = manifest if manifest is not None else cg_manifest()
         self.paths["manifest"] = self.write("manifest.json", json.dumps(self.manifest))
 
     def write(self, name, text):
@@ -937,15 +958,55 @@ def test_codegen_files_dump_needs_every_input_and_a_complete_manifest():
             m = cg_manifest()
             m[field] = bad
             with pytest.raises(cg.Unusable):
-                CgFiles(manifest=m).dump()
+                CgFiles(manifest=m, bind=False).dump()
         m = cg_manifest()
         del m[field]
         with pytest.raises(cg.Unusable):
-            CgFiles(manifest=m).dump()
-    for bad in ({"schema": "other"}, dict(cg_manifest(), build_log={"sha256": "x", "nvcc_compile_lines": 3}), dict(cg_manifest(), build_log=None),
-                dict(cg_manifest(), archs=["sm_90a"]), dict(cg_manifest(), flags=[1, 2])):
+            CgFiles(manifest=m, bind=False).dump()
+    for bad in ({"schema": "other"}, dict(cg_manifest(), build_log={"sha256": "x", "nvcc_compile_lines": 3}), dict(cg_manifest(), build_log=None), dict(cg_manifest(), flags=[1, 2])):
         with pytest.raises(cg.Unusable):
-            CgFiles(manifest=bad).dump()
+            CgFiles(manifest=bad, bind=False).dump()
+    other_arch = cg_manifest(flags=[x for x in cg_manifest()["flags"] if not x.startswith("-gencode")] + ["-gencode=arch=compute_90a,code=sm_90a"], archs=["sm_90a"])
+    with pytest.raises(cg.Unusable, match="architectures"):                                                  # a manifest of another architecture does not describe these dumps
+        CgFiles(manifest=other_arch).dump()
+
+
+def test_codegen_files_dump_binds_the_build_log_to_the_manifest():
+    f = CgFiles()
+    p = f.paths
+    log = open(p["ptxas"]).read()
+    assert " -O3 " in log and cg.dump_from_files(p["regs"], p["sass"], p["manifest"], p["elf"], p["ptxas"])["meta"]["build_log"]["sha256"] == f.manifest["build_log"]["sha256"]
+
+    def attempt(manifest=None, log_text=None):
+        """dump_from_files with the files of ``f`` but another manifest and / or another build log."""
+        manifest = p["manifest"] if manifest is None else f.write("m2.json", json.dumps(manifest))
+        log_path = p["ptxas"] if log_text is None else f.write("log2.txt", log_text)
+        return cg.dump_from_files(p["regs"], p["sass"], manifest, p["elf"], log_path)
+
+    with pytest.raises(cg.Unusable, match="not the log the manifest was made from"):                          # review counterexample: the real -O3 manifest, a log copy that says -O2
+        attempt(log_text=log.replace(" -O3 ", " -O2 "))
+    other_build = CgFiles(manifest=cg_manifest(variant_defines=["CFBI_NEG_CONTROL=1"]))                       # the log of another build of the same tree
+    with pytest.raises(cg.Unusable, match="not the log the manifest was made from"):
+        attempt(log_text=open(other_build.paths["ptxas"]).read())
+    with pytest.raises(cg.Unusable, match="not the log the manifest was made from"):                          # one character of the log changed
+        attempt(log_text=log + " ")
+    m = f.manifest
+    contradictions = (("flags", [x.replace("-O3", "-O2") for x in m["flags"]]), ("std", "c++17"), ("archs", ["sm_90a"]), ("src_hash", "0x1ull"),
+                      ("variant_defines", ["CFBI_NEG_CONTROL=1"]))
+    for field, value in contradictions:                                                                      # the true digest, but the manifest says something else than the commands do
+        with pytest.raises(cg.Unusable, match="contradict the manifest.*%s" % field):
+            attempt(manifest=dict(m, **{field: value}))
+    for bad in (dict(m["build_log"], nvcc_compile_lines=2), dict(m["build_log"], units=["a.cu", "b.cu"]), dict(m["build_log"], units=["a.cu", "b.cu", "other.cu"])):
+        with pytest.raises(cg.Unusable, match="contradict the manifest.*units"):
+            attempt(manifest=dict(m, build_log=bad))
+    plain = open(p["ptxas"]).read().split("ptxas info", 1)[1]                                                # a log without any compile line cannot belong to a manifest
+    plain = "ptxas info" + plain
+    with pytest.raises(cg.Unusable, match="no nvcc compile"):
+        attempt(manifest=dict(m, build_log=dict(m["build_log"], sha256=hashlib.sha256(plain.encode("utf-8")).hexdigest())), log_text=plain)
+    out = os.path.join(f.dir, "o.json")
+    args = ["dump-files", "--manifest", p["manifest"], "--regs", p["regs"], "--sass", p["sass"], "--elf", p["elf"]]
+    assert cg.main(args + ["--ptxas-log", p["ptxas"], "--out", out]) == 0                                    # the command line: the matching log passes, the changed one is exit 2
+    assert cg.main(args + ["--ptxas-log", f.write("o2.log", log.replace(" -O3 ", " -O2 ")), "--out", out]) == 2
 
 
 def test_codegen_same_label_with_a_different_toolchain_is_refused_and_a_variant_or_source_change_is_not():
@@ -1039,16 +1100,20 @@ def test_codegen_manifest_comes_from_the_build_log_and_the_probed_tool_versions(
     with open(out) as fh:
         assert json.load(fh) == m
     assert cg.main(["manifest", "--build-log", os.path.join(d, "cached.log"), "--tool-versions", versions, "--label", "x", "--out", out]) == 2
-    f = CgFiles(manifest=m)                                                                                   # and the manifest feeds a dump
-    dump_args = ["--regs", f.paths["regs"], "--sass", f.paths["sass"], "--elf", f.paths["elf"], "--ptxas-log", f.paths["ptxas"]]
+    f = CgFiles(manifest=m)                                                                                   # and the manifest feeds a dump of the very log it was made from
+    full = write("full.log", "\n".join(jit_log().splitlines()[:-1]) + "\n" + cg_ptxas({ROWS: (112, 4, 4, 128), K1: (0, 0, 0, 100)}))
+    assert cg.main(["manifest", "--build-log", full, "--tool-versions", versions, "--label", "container toolchain", "--out", out]) == 0
+    dump_args = ["--regs", f.paths["regs"], "--sass", f.paths["sass"], "--elf", f.paths["elf"], "--ptxas-log", full]
     assert cg.main(["dump-files", "--manifest", out] + dump_args + ["--out", os.path.join(d, "dump.json")]) == 0
     with open(os.path.join(d, "dump.json")) as fh:
         assert json.load(fh)["meta"]["tree"]["commit"] is None
     assert cg.main(["dump-files", "--manifest", out] + dump_args + ["--commit", BASE_COMMIT, "--out", os.path.join(d, "dump1.json")]) == 0
     with open(os.path.join(d, "dump1.json")) as fh:                                                           # the identity of the built source tree is recorded when it is given
         assert json.load(fh)["meta"]["tree"]["commit"] == BASE_COMMIT
-    wrong = write("wrong.json", json.dumps(dict(m, archs=["sm_90a"])))                                          # a manifest of another architecture does not describe this dump
+    wrong = write("wrong.json", json.dumps(dict(json.load(open(out)), archs=["sm_90a"])))                       # a manifest that contradicts its own log does not describe this dump
     assert cg.main(["dump-files", "--manifest", wrong] + dump_args + ["--out", os.path.join(d, "dump2.json")]) == 2
+    o2 = write("full-o2.log", open(full).read().replace(" -O3 ", " -O2 "))                                      # the real manifest with a copy of the log whose commands say -O2
+    assert cg.main(["dump-files", "--manifest", out] + dump_args[:-1] + [o2, "--out", os.path.join(d, "dump3.json")]) == 2
 
 
 def test_codegen_reference_figures_are_a_warning_not_a_failure():
