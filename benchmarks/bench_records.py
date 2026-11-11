@@ -365,19 +365,41 @@ def campaign_cell_problems(records, role):
     return problems, union, union - (set.intersection(*sets) if sets else set())
 
 
+def uses_profiler(metric):
+    """True when the compared metric comes from the profiled pass of a trial (the kernel sum, a derived kernel metric or one kernel); only the GPU-elapsed and the CPU
+    wall metrics are measured without it. The effective profiler calls are part of the proof of a re-run for the former and not for the latter."""
+    return metric not in WALL_METRICS
+
+
+def count_names(metric):
+    """The recorded counts that a comparison of ``metric`` depends on: the calls per trial, and for a profiled metric the profiled calls too."""
+    return ("calls_per_trial", "profile_calls") if uses_profiler(metric) else ("calls_per_trial",)
+
+
+def _positive_int(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
 def _arg_values(records, key, name):
-    return sorted(set(c.get("args", {}).get(name) for r in records for c in r["cells"] if c["key"] == key), key=lambda x: (x is None, x))
+    """The distinct values of the cell argument ``name`` over the records (a missing argument is ``None``), in a fixed order."""
+    vals = {}
+    for r in records:
+        for c in r["cells"]:
+            if c["key"] == key:
+                v = (c.get("args") or {}).get(name)
+                vals[json.dumps(v, sort_keys=True)] = v
+    return [vals[k] for k in sorted(vals)]
 
 
-def rerun_problems(first, rerun, side, key):
-    """Why the re-run records of ``side`` do not prove a three-times-calls re-run of cell ``key`` of the first campaign (an empty list means they do)."""
+def rerun_problems(first, rerun, side, key, metric):
+    """Why the re-run records of ``side`` do not prove a three-times-calls re-run of cell ``key`` of the first campaign for the compared ``metric`` (an empty list means
+    they do). The counts of ``count_names(metric)`` must each be recorded as one strictly positive integer in the first campaign and in the re-run, and the re-run's must
+    be exactly three times the first campaign's: a count that is absent on both sides is not read as "there was no such measurement"."""
     out = []
-    for name in ("calls_per_trial", "profile_calls"):
+    for name in count_names(metric):
         f, r = _arg_values(first, key, name), _arg_values(rerun, key, name)
-        if name == "profile_calls" and f == [None] and r == [None]:
-            continue                                               # a cell without a kernel-sum pass has nothing to scale
-        if len(f) != 1 or len(r) != 1 or f[0] is None or r[0] is None:
-            out.append("%s %s of cell %r is not recorded consistently (first campaign %s, re-run %s)" % (side, name, key, f, r))
+        if len(f) != 1 or len(r) != 1 or not _positive_int(f[0]) or not _positive_int(r[0]):
+            out.append("%s %s of cell %r is not recorded as one positive integer in the first campaign and in the re-run (first campaign %s, re-run %s)" % (side, name, key, f, r))
         elif r[0] != RERUN_SCALE * f[0]:
             out.append("%s re-run of cell %r has %s = %s, not %d times the first campaign's %s" % (side, key, name, r[0], RERUN_SCALE, f[0]))
     for field in RERUN_SAME_CONFIG:
@@ -502,11 +524,12 @@ def compare(base, cand, metric="k2_stage_us", tol_pct=1.0, mode="regress", expec
             continue
         if judged_on == "rerun":
             for role, first, rerun in (("baseline", base, base_rerun), ("candidate", cand, cand_rerun)):
-                problems.extend(rerun_problems(first, rerun, role, key))
-            fb, fc = _arg_values(base, key, "calls_per_trial"), _arg_values(cand, key, "calls_per_trial")
-            rb, rc = _arg_values(base_rerun, key, "calls_per_trial"), _arg_values(cand_rerun, key, "calls_per_trial")
-            if fb != fc or rb != rc:
-                problems.append("cell %r: the baseline and the candidate used different calls per trial (first %s vs %s, re-run %s vs %s)" % (key, fb, fc, rb, rc))
+                problems.extend(rerun_problems(first, rerun, role, key, metric))
+            for name in count_names(metric):
+                fb, fc = _arg_values(base, key, name), _arg_values(cand, key, name)
+                rb, rc = _arg_values(base_rerun, key, name), _arg_values(cand_rerun, key, name)
+                if fb != fc or rb != rc:
+                    problems.append("cell %r: the baseline and the candidate used different %s (first %s vs %s, re-run %s vs %s)" % (key, name, fb, fc, rb, rc))
         bv, cv = pooled_values(base_k, key, metric), pooled_values(cand_k, key, metric)
         med_b, med_c = statistics.median(bv), statistics.median(cv)
         if med_b == 0 or (med_c == 0 and (metric in DERIVED_METRICS or metric in WALL_METRICS)):

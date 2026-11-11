@@ -1457,9 +1457,9 @@ def test_a_rerun_proves_three_times_the_calls_of_the_same_configuration():
     base, cand = wall_sets([100.0, 100.45, 100.9], [100.15, 100.6, 101.05])
     good = wall_sets([100.0, 100.05, 99.95], [100.1, 100.15, 100.05], hour="11", scale=3)
 
-    def run(pair):
-        return br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=pair[0], cand_rerun=pair[1])
-    assert run(good)["verdict"] == "PASS"
+    def run(pair, metric="gpu_graph_us"):
+        return br.compare(base, cand, metric=metric, baseline_unstable="widen", base_rerun=pair[0], cand_rerun=pair[1])
+    assert run(good)["verdict"] == "PASS" and run(good, "total_us")["verdict"] != "INVALID"
     for scale in (1, 2, 4):                                                                        # only exactly three times the calls is a re-run
         res = run(wall_sets([100.0, 100.05, 99.95], [100.1, 100.15, 100.05], hour="11", scale=scale))
         assert res["verdict"] == "INVALID" and any("not 3 times" in p for p in res["problems"]), scale
@@ -1470,11 +1470,13 @@ def test_a_rerun_proves_three_times_the_calls_of_the_same_configuration():
             edit(r)
         return pair
     half = edited("baseline", lambda r: r["cells"][0]["args"].update(profile_calls=PROFILE_CALLS))   # the profiled calls were not scaled
-    res = run(half)
+    res = run(half, "total_us")                                                                    # the kernel sum depends on them ...
     assert res["verdict"] == "INVALID" and any("profile_calls" in p and "not 3 times" in p and "baseline" in p for p in res["problems"])
+    assert run(half)["verdict"] == "PASS"                                                          # ... a wall metric does not (the wall-only contract is explicit)
     for field in ("calls_per_trial", "profile_calls"):                                             # a count that is not recorded cannot be proven
-        res = run(edited("candidate", lambda r: r["cells"][0]["args"].pop(field)))
-        assert res["verdict"] == "INVALID" and any(field in p and "not recorded consistently" in p for p in res["problems"]), field
+        res = run(edited("candidate", lambda r: r["cells"][0]["args"].pop(field)), "total_us")
+        assert res["verdict"] == "INVALID" and any(field in p and "not recorded as one positive integer" in p for p in res["problems"]), field
+    assert run(edited("candidate", lambda r: r["cells"][0]["args"].pop("calls_per_trial")))["verdict"] == "INVALID"        # the calls of a trial matter for every metric
     for field, value in (("commit", "ffff000"), ("trials", 7), ("host", "node9"), ("impl", 1), ("sample_stat", "pooled"), ("env_impl", "32"), ("torch", "9.9"), ("cuda", "9.9"),
                          ("src", "/other/snapshot")):
         res = run(edited("candidate", lambda r: r["meta"].update({field: value})))                 # another snapshot, configuration or machine
@@ -1486,6 +1488,60 @@ def test_a_rerun_proves_three_times_the_calls_of_the_same_configuration():
         r["cells"][0]["args"].update(calls_per_trial=1000, profile_calls=100)
     res = br.compare(skewed_b, skewed_c, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=good[0], cand_rerun=good[1])
     assert res["verdict"] == "INVALID" and any("not 3 times" in p or "different calls" in p for p in res["problems"])
+
+
+def total_follows_wall(records):
+    """Give every sample a kernel sum equal to its ``gpu_graph_us`` (plan kernel 2 us, the rest in the rows kernel), so that ``total_us`` has the spread of the wall metric."""
+    for r in records:
+        for cell in r["cells"]:
+            for sm in cell["samples"]:
+                sm.update(br.derive({"plan_kernel": 2.0, "rows_kernel": sm["gpu_graph_us"] - 2.0}))
+
+
+def test_a_kernel_sum_rerun_needs_the_recorded_profiled_calls_on_both_sides_and_in_both_campaigns():
+    base, cand = wall_sets([100.0, 100.45, 100.9], [100.15, 100.6, 101.05])                          # 0.9 % spread on each side, offset by 0.15 %
+    rbase, rcand = wall_sets([100.0, 100.45, 100.9], [100.15, 100.6, 101.05], hour="11", scale=3)     # still unstable with three times the calls: noise-limited
+    for recs in (base, cand, rbase, rcand):
+        total_follows_wall(recs)
+
+    def run(b=base, c=cand, rb=rbase, rc=rcand, metric="total_us"):
+        return br.compare(b, c, metric=metric, baseline_unstable="widen", base_rerun=rb, cand_rerun=rc)
+    ok = run()
+    assert ok["verdict"] == "PASS" and ok["rows"][0]["noise_limited"] and ok["rows"][0]["judged_on"] == "rerun" and abs(ok["rows"][0]["base_spread_pct"] - 0.9) < 0.05
+
+    def without(records, name="profile_calls"):
+        out = json.loads(json.dumps(records))
+        for r in out:
+            for cell in r["cells"]:
+                cell["args"].pop(name, None)
+        return out
+    stripped = [without(x) for x in (base, cand, rbase, rcand)]                                    # review counterexample: the field is gone from all four record sets
+    for metric in ("total_us", "plan_kernel"):                                                     # the kernel sum and a single kernel
+        res = run(*stripped, metric=metric)
+        assert res["verdict"] == "INVALID", metric
+        assert any("profile_calls" in p and "not recorded as one positive integer" in p and "baseline" in p for p in res["problems"]), metric
+        assert any("profile_calls" in p and "not recorded as one positive integer" in p and "candidate" in p for p in res["problems"]), metric
+    wall = run(*stripped, metric="gpu_graph_us")                                                   # wall-only contract: the same records are valid for a wall metric
+    assert wall["verdict"] == "PASS" and wall["rows"][0]["judged_on"] == "rerun"
+    for which in range(4):                                                                         # the field missing from one record set only
+        sets = list([base, cand, rbase, rcand])
+        sets[which] = without(sets[which])
+        res = run(*sets)
+        assert res["verdict"] == "INVALID" and any("profile_calls" in p for p in res["problems"]), which
+    for bad in (0, -64, 64.0, True, "64", None):                                                   # only a strictly positive integer is a count
+        sets = [json.loads(json.dumps(x)) for x in (base, cand, rbase, rcand)]
+        for rec in sets[2] + sets[3]:
+            rec["cells"][0]["args"]["profile_calls"] = bad
+        res = run(*sets)
+        assert res["verdict"] == "INVALID" and any("profile_calls" in p for p in res["problems"]), bad
+    other = [json.loads(json.dumps(x)) for x in (base, cand, rbase, rcand)]                          # each side scaled by three, but from different profiler bases
+    for rec in other[1]:
+        rec["cells"][0]["args"]["profile_calls"] = PROFILE_CALLS // 2
+    for rec in other[3]:
+        rec["cells"][0]["args"]["profile_calls"] = 3 * (PROFILE_CALLS // 2)
+    res = run(*other)
+    assert res["verdict"] == "INVALID" and any("different profile_calls" in p for p in res["problems"])
+    assert run(*other, metric="gpu_graph_us")["verdict"] == "PASS"                                 # which a wall metric does not care about
 
 
 def test_classify_rows_reads_slower_faster_and_noise_limited_cells():
@@ -1993,10 +2049,10 @@ def test_decode_reruns_prove_three_times_the_calls_and_the_profiled_calls_to_the
         first, _, _, _ = run_decode_cell(monkeypatch, regime, 1)
         rerun, _, _, _ = run_decode_cell(monkeypatch, regime, 3)
         key = first["key"]
-        assert br.rerun_problems(as_records(first), as_records(rerun), "baseline", key) == [], regime
+        assert br.rerun_problems(as_records(first), as_records(rerun), "baseline", key, "total_us") == [], regime
         unscaled = json.loads(json.dumps(rerun))                                                  # a re-run whose profiled calls were not scaled is not a re-run
         unscaled["args"]["profile_calls"] = first["args"]["profile_calls"]
-        assert any("profile_calls" in p and "not 3 times" in p for p in br.rerun_problems(as_records(first), as_records(unscaled), "baseline", key)), regime
+        assert any("profile_calls" in p and "not 3 times" in p for p in br.rerun_problems(as_records(first), as_records(unscaled), "baseline", key, "total_us")), regime
     odd, _, _, _ = run_decode_cell(monkeypatch, "lockstep", 1, profile_calls=65)                  # 65 calls are not a whole cycle: two cycles are profiled, and recorded
     assert odd["args"]["profile_calls"] == 128 and odd["args"]["profile_cycles"] == 2
 
