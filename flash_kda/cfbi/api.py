@@ -79,8 +79,19 @@ def prefill(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, state: Cf
     pool slot ``slot_ids[n]`` (``alloc_state(S, H)`` with any ``S``), so a serving engine can keep one state pool and
     pass the active sequences' slots without gathering/scattering 224 KiB per head. ``slot_ids[n] == -1`` skips the
     entry (no tokens processed, no state access, ``out`` rows untouched), which keeps fixed-shape CUDA-graph decode
-    batches possible. Slots of one call must be distinct. The indirection is resolved on the device, so the contents of
-    ``slot_ids`` may change between graph replays.
+    batches possible. The indirection is resolved on the device, so the contents of ``slot_ids`` may change between
+    graph replays.
+
+    Preconditions of the state and of the call. None of them is checked on the device (a check would need a device
+    synchronisation); they matter because the decode that runs as one kernel counts the arrivals of the head CTAs of a
+    sequence in the high bits of the ``pos`` word while it runs: (1) the non-negative entries of ``slot_ids`` are
+    distinct within one call (the ``-1`` padding entries skip the call and may repeat); (2) every ``pos`` word is at
+    rest, in 0 .. 63, with no residue of an earlier call: a call that was interrupted (a kernel that was killed or never
+    completed) may leave the count in the word, which no later call heals, and a ``pos`` in 0 .. 63 does not prove that
+    a call finished (``E`` and the cache rows may be half updated), so clearing the count does not repair such a
+    sequence, its state has to be rebuilt; (3) the state is owned by one stream while a call runs, another stream may
+    use it after an event or a synchronisation; (4) the launch gives every sequence exactly ``H`` CTAs, one per head
+    (the library launches that; the state and the tensors of a call must agree on ``H``).
     """
     _guard(q.device)
     load_ext().forward(q, k, v, g, beta, float(scale), out, A_log, dt_bias, float(lower_bound),
@@ -90,7 +101,8 @@ def prefill(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, state: Cf
 def decode(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, state: CfbiState, *,
            out_fp32: Optional[torch.Tensor] = None, slot_ids: Optional[torch.Tensor] = None, _impl: Optional[int] = None):
     """One token per sequence (``q`` bf16 ``[N, 1, H, 128]`` or ``[N, H, 128]``); same arithmetic as ``prefill``.
-    ``slot_ids``: see ``prefill`` (pool slot per sequence, ``-1`` = padding entry)."""
+    ``slot_ids``: see ``prefill`` (pool slot per sequence, ``-1`` = padding entry), which also lists the preconditions of
+    the state (distinct slots, ``pos`` at rest without residue, one stream, exactly ``H`` CTAs per sequence)."""
     if q.dim() == 3:
         q, k, v, g, out = (x.unsqueeze(1) for x in (q, k, v, g, out))
         beta = beta.unsqueeze(1)
