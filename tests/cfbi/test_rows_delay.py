@@ -6,8 +6,8 @@ of the barriers of a row (sites 1 .. 7, barrier 7 ends the row) and right after 
 
 * The default build has no hook: its setters raise (a test of a variant that ran on the wrong build would otherwise pass without having delayed anything).
 * Without a configuration the variant sleeps nowhere and its bits are the default build's.
-* For 2000 ns and 20000 ns, at every site and at all of them, with all warps, with one warp, and with one warp of every third CTA, five repetitions each on a multi-row mode-1 launch beyond
-  2.5 resident waves (pool, permuted slots, padding entries, chunk ends inside the launch): every bit of both outputs, E, the valid rows and pos equals the default build's and the
+* For 2000 ns and 20000 ns, at every site and at all of them, with all warps, with one warp, and with one warp of every third CTA, five repetitions each on a multi-row mode-1 launch and on
+  the single-row decode launch, both beyond 2.5 resident waves (pool, permuted slots, padding entries, chunk ends): every bit of both outputs, E, the valid rows and pos equals the default build's and the
   reference's. The delay is *live*: the hit counter read back equals the number of warps that must have slept at that site (rows that pass it times the warps and CTAs chosen), and the
   launch takes longer by a fraction of the serial sleeping time of its slowest CTA, which a delay that did nothing would not.
 * The variant without the barrier that ends a row (``CFBI_ROWS_TEST_NO_END_BARRIER``) is a racy control: a warp that sleeps in the chunk-end phase lets the others start the next row and
@@ -31,6 +31,7 @@ SITES = {"entry": 0, "barrier1": 1, "barrier2": 2, "barrier3": 3, "barrier4": 4,
 ALL_SITES = sum(1 << s for s in SITES.values())
 TARGETS = {"all_warps": (-1, 0, 0), "warp0": (0, 0, 0), "warp7_of_every_third_cta": (7, 3, 1)}    # warp, cta_mod, cta_rem
 MIXED = Family("delay_multirow", fixed=5, pool=True, pad=0.3, fills="crossing", steps=1)
+DECODE = Family("delay_decode", fixed=1, pool=True, pad=0.3, fills="mixed", steps=1)         # one row per sequence: the production decode launch
 CROSSING = Family("racy_multirow", fixed=5, pool=True, pad=0.0, fills="sixty", steps=1)
 WARPS = 8
 
@@ -56,6 +57,17 @@ def make_workload(ext, fam, seed):
 @pytest.fixture(scope="module")
 def workload(ext):
     return make_workload(ext, MIXED, 77)
+
+
+@pytest.fixture(scope="module")
+def decode_workload(ext):
+    return make_workload(ext, DECODE, 79)
+
+
+@pytest.fixture(scope="module", params=["multirow", "decode"])
+def shaped(request, workload, decode_workload):
+    """The launch that the delay is tested on: five rows per sequence (a next row exists, chunk ends are followed by rows) or the single-row decode launch."""
+    return {"multirow": workload, "decode": decode_workload}[request.param]
 
 
 @pytest.fixture(scope="module")
@@ -129,8 +141,8 @@ def test_the_delay_variant_without_a_configuration_sleeps_nowhere_and_changes_no
 # ---- the bits do not depend on timing; the delay is live -----------------------------------------------------------------------------------------------------
 @pytest.mark.parametrize("ns", NS)
 @pytest.mark.parametrize("site", list(SITES) + ["all_sites"])
-def test_a_delay_at_a_site_changes_no_bit_and_the_hits_are_read_back(dly, workload, ns, site):
-    step, warm, ref, opt = workload
+def test_a_delay_at_a_site_changes_no_bit_and_the_hits_are_read_back(dly, shaped, ns, site):
+    step, warm, ref, opt = shaped
     mask = ALL_SITES if site == "all_sites" else 1 << SITES[site]
     for tname, target in TARGETS.items():
         want = expected_hits(step, warm, mask, target)
