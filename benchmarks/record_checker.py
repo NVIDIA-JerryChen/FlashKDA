@@ -1709,7 +1709,10 @@ def main(argv=None):
         if a.cmd == "decision":
             if a.evidence:
                 import decision_record as dr
-                document = open(a.document, encoding="utf-8").read() if a.document else None
+                document = None
+                if a.document:
+                    with open(a.document, encoding="utf-8") as f:
+                        document = f.read()
                 return _report(dr.record_problems(load_json(a.record), dr.load_evidence(a.evidence), a.repo, document, a.head))
             return _report(decision_problems(load_json(a.record)))
         if a.cmd == "handoff":
