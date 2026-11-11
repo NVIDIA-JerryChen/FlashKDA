@@ -2110,6 +2110,25 @@ def test_suite_record_check_needs_a_comparable_run():
     assert sr.check(base, suite_record_of(clean, **dict(meta, host="other-node", label="x"))) == []                           # the host and the label do not matter
 
 
+def test_suite_record_check_compares_suite_sd_with_the_s_baseline_only_with_the_sd_environment():
+    """Suite Sd is Suite S with ``FLASH_KDA_CFBI_IMPL=64`` and has no baseline of its own: its per-file counts are judged against the Suite S baseline, but only when its environment is the
+    baseline's plus exactly that variable (and everything else is comparable as for any two runs)."""
+    clean = JUNIT.replace('<failure message="boom">trace</failure>', "").replace('<error message="setup failed">trace</error>', "")
+    meta = {"python": "3.12.3", "torch": "2.14.0", "cuda": "13.4", "env": {"CFBI_BIG": "1"}}
+    base = suite_record_of(clean, **meta)
+    sd_env = {"CFBI_BIG": "1", "FLASH_KDA_CFBI_IMPL": "64"}
+    sd = suite_record_of(clean, suite="Sd", **dict(meta, env=sd_env))
+    assert sr.check(base, sd) == []
+    for name, env in (("another value of the variable", {"CFBI_BIG": "1", "FLASH_KDA_CFBI_IMPL": "16"}), ("the variable missing", {"CFBI_BIG": "1"}),
+                      ("another variable as well", dict(sd_env, FLASH_KDA_CFBI_X="1")), ("another CFBI_BIG", {"CFBI_BIG": "0", "FLASH_KDA_CFBI_IMPL": "64"})):
+        assert any("Suite Sd" in p for p in sr.check(base, suite_record_of(clean, suite="Sd", **dict(meta, env=env)))), name
+    assert any("different suites" in p for p in sr.check(sd, base))                                                            # an S candidate against an Sd baseline: not the rule
+    assert any("different suites" in p for p in sr.check(suite_record_of(clean, suite="gate", **dict(meta, env={"CFBI_BIG": "1"})), sd))
+    fewer = clean.replace('<testcase classname="tests.cfbi.test_arch" name="test_a" time="0.1" />', "")
+    assert fewer != clean and any("passed, the baseline has" in p for p in sr.check(base, suite_record_of(fewer, suite="Sd", **dict(meta, env=sd_env))))   # the per-file counts still apply
+    assert any("not comparable: gpu" in p for p in sr.check(base, suite_record_of(clean, suite="Sd", **dict(meta, env=sd_env, gpu="NVIDIA B300 SXM6 AC"))))
+
+
 # ---- the layer-chain graph benchmark: cells, node lists and the zero-free step (the measurement needs a GPU) -------------------------------------
 
 CHAIN_COUNTS = {"void cfbi::lin::linear_kernel<128, 2>(cfbi::lin::Args)": 6.0, "void cfbi::conv::conv_kernel<4>(cfbi::conv::Args)": 3.0,

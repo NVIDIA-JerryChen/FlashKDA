@@ -23,6 +23,8 @@ leaves files out of its suite says so with ``--subset``; ``--complete`` tells wh
 
 ``--check``: the candidate must have, for every file of the baseline, at least as many passed tests, and no failed or errored test other than the ids
 listed in ``--allow-failures`` (one id per line: the failures that are by design on a device); files that only the candidate has are allowed (new tests).
+A Suite Sd candidate (Suite S run with ``FLASH_KDA_CFBI_IMPL=64``) has no baseline of its own and is judged against the Suite S baseline, provided its environment is the
+baseline's plus exactly that variable.
 
 exit status: 0 ok, 1 the check fails, 2 unusable input
 """
@@ -39,6 +41,7 @@ COUNTS = ("passed", "failed", "skipped", "errors", "total")
 OUTCOMES = ("passed", "failed", "errors", "skipped")
 MERGE_SAME = ("suite", "commit", "dirty", "tree", "gpu", "sm_count", "env", "python", "torch", "cuda")   # what the parts of a merge must agree on
 SUITES = ("gate", "S", "Sd")
+SD_ENV = ("FLASH_KDA_CFBI_IMPL", "64")             # what Suite Sd adds to the environment of Suite S: calls that pass no _impl are then the request for the two-launch decode
 KINDS = ("single", "merge")
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{7,40}$")   # a commit hash or an abbreviation of at least seven lowercase hexadecimal characters
 TOOLCHAIN = ("python", "torch", "cuda")            # versions that a baseline and the run compared with it must share
@@ -253,7 +256,8 @@ def comparability_problems(baseline, candidate):
     """Why two structurally valid records are not runs of the same suite on the same device with the same toolchain and environment (empty: comparable)."""
     b, c = baseline["meta"], candidate["meta"]
     problems = []
-    if b["suite"] != c["suite"]:
+    sd_against_s = b["suite"] == "S" and c["suite"] == "Sd"
+    if b["suite"] != c["suite"] and not sd_against_s:
         problems.append("the records are of different suites (%s, %s)" % (b["suite"], c["suite"]))
     for name, m in (("baseline", b), ("candidate", c)):
         if m["dirty"] is not False:
@@ -261,7 +265,10 @@ def comparability_problems(baseline, candidate):
     for field in ("gpu", "sm_count"):
         if b[field] != c[field]:
             problems.append("the records are not comparable: %s %r against %r" % (field, b[field], c[field]))
-    if (b.get("env") or {}) != (c.get("env") or {}):
+    if sd_against_s:
+        if (c.get("env") or {}) != dict(b.get("env") or {}, **dict([SD_ENV])):
+            problems.append("the records are not comparable: Suite Sd must run in the environment of Suite S plus %s=%s (%r against %r)" % (SD_ENV + (b.get("env") or {}, c.get("env") or {})))
+    elif (b.get("env") or {}) != (c.get("env") or {}):
         problems.append("the records are not comparable: env %r against %r" % (b.get("env") or {}, c.get("env") or {}))
     for field in TOOLCHAIN:
         bv, cv = b.get(field), c.get(field)
