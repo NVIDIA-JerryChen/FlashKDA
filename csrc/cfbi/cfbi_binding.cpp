@@ -252,9 +252,10 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     c10::cuda::CUDAGuard guard(q.device());
     int eff_impl = cfbi::resolve_impl((int)impl);
     const int eff_mode = cfbi::resolve_mode((int)mode, eff_impl);
-    // Default routing (see cfbi_launch.h): only a call that asks for nothing (impl 0, no forced tile width) and that the optimised kernels run as they are.
+    // Default routing (see cfbi_launch.h): only a call that asks for nothing (impl 0, no forced tile width) and that the optimised kernels run as they are. Bit 64
+    // (IMPL_DECODE_PLAN) chooses the schedule of a decode call and changes nothing for any other call, so it does not switch this routing off either.
     // A plan buffer supplied by the caller that is too small for the schedule keeps the old kernels (an explicit impl 16 is an error instead, below).
-    if (impl == 0 && k2_bv == 0 && eff_impl == 0 && eff_mode == 0 && cu_seqlens.has_value() &&
+    if ((impl & ~cfbi::IMPL_DECODE_PLAN) == 0 && k2_bv == 0 && (eff_impl & ~cfbi::IMPL_DECODE_PLAN) == 0 && eff_mode == 0 && cu_seqlens.has_value() &&
         (!plan_in.has_value() || plan_in->numel() >= cfbi::plan_ints(N, H)) && cfbi::k2_dyn_default_route(N, H, T_total, q.get_device())) {
         eff_impl |= cfbi::IMPL_K2_DYN;
     }
@@ -354,6 +355,18 @@ std::vector<int64_t> device_caps_py(int64_t device) {
             (int64_t)cfbi::k1_smem_bytes(cfbi::IMPL_REF_CHUNK)};
 }
 
+// The pure policy of cfbi_policy.h for any SM count and compute capability (major * 10 + minor), no device involved: the tests compare it with the specification.
+int checked_int(int64_t v, const char* what) {
+    TORCH_CHECK(v >= INT32_MIN && v <= INT32_MAX, what, " does not fit a 32-bit integer");
+    return (int)v;
+}
+bool decode_single_launch_policy_py(int64_t mode, int64_t impl, int64_t N, int64_t H, int64_t sms, int64_t cc) {
+    return cfbi::decode_single_launch_policy(checked_int(mode, "mode"), checked_int(impl, "impl"), N, H, checked_int(sms, "sms"), checked_int(cc, "cc"));
+}
+
+// Hidden calibration control (cfbi_launch.h): returns the previous setting.
+bool decode_single_force_py(bool on) { return cfbi::decode_single_force(on ? 1 : 0) != 0; }
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -387,8 +400,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("k2_route", &cfbi::k2_dyn_default_route, "whether the default implementation (impl 0) runs the device-scheduled K2 for a cu_seqlens call of N sequences, "
           "H heads and T_total tokens on a device (< 0: the current one)", py::arg("N"), py::arg("H"), py::arg("T_total"), py::arg("device") = -1);
     m.def("decode_single_launch", &cfbi::decode_single_launch, "whether a call that runs `mode` (1 = decode) with the resolved implementation bits `impl` for N sequences and H heads is one "
-          "kernel launch of the row engine, without the plan kernel, on a device (< 0: the current one)", py::arg("mode"), py::arg("impl"), py::arg("N"), py::arg("H"),
-          py::arg("device") = -1);
+          "kernel launch of the row engine, without the plan kernel, on a device (< 0: the current one); honours the hidden calibration control", py::arg("mode"), py::arg("impl"),
+          py::arg("N"), py::arg("H"), py::arg("device") = -1);
+    m.def("decode_single_launch_policy", &decode_single_launch_policy_py, "hidden: the pure policy of the single-launch decode for any SM count and compute capability (major * 10 + minor): "
+          "the function that the device-reading wrapper calls", py::arg("mode"), py::arg("impl"), py::arg("N"), py::arg("H"), py::arg("sms"), py::arg("cc"));
+    m.def("decode_single_force", &decode_single_force_py, "hidden calibration control (not part of the documented API): while on, a decode call of the optimised row engine without impl bit 64 "
+          "is one launch whatever the size of the grid and the device; returns the previous setting", py::arg("on"));
     m.def("probe_dot3", &probe_dot3, "dot3 tile probe", py::arg("A"), py::arg("B"), py::arg("reverse_k") = false);
     m.def("probe_transc", &probe_transc, "ex2/tanh/rsqrt approximations", py::arg("x"), py::arg("which"));
     m.def("probe_prep", &probe_prep, "per-token prep probe", py::arg("q"), py::arg("k"), py::arg("g"),

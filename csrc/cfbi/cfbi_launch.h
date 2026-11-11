@@ -135,6 +135,11 @@ inline int resolve_mode(int mode, int impl) { return (mode == 0 && (impl & IMPL_
 // resolve_impl return them. The binding uses the answer to skip the plan allocation, the launcher to skip the plan kernel: both call this function with the same arguments. A failed
 // device query keeps the plan kernel.
 bool decode_single_launch(int mode, int impl, int64_t N, int64_t H, int device = -1);
+// Hidden calibration control (not part of the documented API, and no build option: the default build contains no test macro): while it is on, decode_single_launch is true for every
+// call that decode_single_launch_eligible accepts (mode 1, the optimised row engine, no IMPL_DECODE_PLAN), whatever the size of the grid and the device's routing set. The correctness
+// and protocol tests of the single launch run through it, and the benchmark measures above the limit with it. It is a switch of the process: set it while no call is in flight (the
+// binding and the launcher both ask decode_single_launch and must get the same answer). Returns the previous setting (0 or 1).
+int decode_single_force(int on);
 // Dynamic shared memory per CTA of the K1 kernel of the implementation selected by `impl`.
 size_t k1_smem_bytes(int impl);
 

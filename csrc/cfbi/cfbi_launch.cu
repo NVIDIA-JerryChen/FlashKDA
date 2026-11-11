@@ -12,6 +12,8 @@
 #include "cfbi/ref/ref_k2.cuh"
 #include "cfbi/ref/ref_rows.cuh"
 
+#include <atomic>
+
 namespace cfbi {
 
 int version() { return 1; }
@@ -197,10 +199,15 @@ bool k2_dyn_default_route(int64_t N, int64_t H, int64_t T_total, int device) {
     return (100 * (co - cd) - K2_ROUTE_OVERHEAD_PCT * co) * stage >= 100 * co * k2_route_builder_x10ns(N, nh);
 }
 
+static std::atomic<int> g_decode_single_force{0};   // the hidden calibration control (cfbi_launch.h)
+
+int decode_single_force(int on) { return g_decode_single_force.exchange(on != 0 ? 1 : 0); }
+
 // The rule is decode_single_launch_policy (cfbi_policy.h), documented at the declaration (cfbi_launch.h); this reads the device. A failed device query keeps the plan kernel (the
-// safe, old schedule): the SM count then is not positive and the capability is 0.
+// safe, old schedule): the SM count then is not positive and the capability is 0. The calibration control applies the eligible part of the rule and nothing else.
 bool decode_single_launch(int mode, int impl, int64_t N, int64_t H, int device) {
     if (!decode_single_launch_eligible(mode, impl, N, H)) return false;
+    if (g_decode_single_force.load() != 0) return true;
     if (device < 0 && cudaGetDevice(&device) != cudaSuccess) return false;
     int sms = 0;
     if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) return false;

@@ -28,3 +28,14 @@ def gen():
     g = torch.Generator(device="cuda")
     g.manual_seed(20261102)
     return g
+
+
+@pytest.fixture()
+def forced(ext):
+    """The hidden calibration control on: every decode call of the optimised row engine without impl bit 64 is ONE launch, whatever the device and the size of the grid. The tests that
+    compare the single launch with the reference run through it, so they test the single launch on every device that runs the optimised row engine, and each asserts its launch set."""
+    previous = ext.decode_single_force(True)
+    try:
+        yield
+    finally:
+        ext.decode_single_force(previous)

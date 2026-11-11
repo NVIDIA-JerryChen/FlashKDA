@@ -5,8 +5,9 @@ What changed is only where a sequence's token window, slot and open-chunk fill c
 itself (``seq_window``, the plan kernel's own function) and the H head CTAs of a sequence count their arrivals in the high bits of the ``pos`` word, the last one to arrive
 stores the plain new fill. No floating-point operation moved, so every scenario compares bits with zero tolerance:
 
-* the launch sets (a profiler check: one ``rows_kernel<true>`` and nothing else by default; the plan kernel plus ``rows_kernel<false>`` for ``_impl=64``; the frozen
-  reference keeps its plan kernel; mode 0 is untouched) and the gate on the grid size (``decode_single_launch``, specified here),
+* the launch sets (a profiler check: one ``rows_kernel<true>`` and nothing else where the policy says so or the hidden calibration control is on; the plan kernel plus
+  ``rows_kernel<false>`` for ``_impl=64``; the frozen reference keeps its plan kernel; mode 0 is untouched) and the policy on the grid size and the device
+  (``decode_single_launch``, specified in ``decode_policy.py``),
 * decode chains from every chunk phase on grids of MORE than two waves of CTAs (the late starters that the arrival count exists for), with a state pool, padding entries
   (``slot_ids == -1``) and chunk ends inside the chain, against the reference kernels and against the two-launch optimised decode,
 * mode 1 with several tokens per sequence (fixed length and ``cu_seqlens``, empty sequences, padding entries),
@@ -23,35 +24,40 @@ from torch.profiler import ProfilerActivity, profile
 
 from flash_kda.cfbi import alloc_state, decode, prefill, state_equal, state_mismatch
 
-from helpers import make_case, n_diff
+import decode_policy as dp
+from helpers import make_case, n_diff, skip_or_fail
 from test_vs_ref import _call_inputs, _cu
 
 REF_ROWS, REF, ROWS_ONLY, DECODE_PLAN = 1, 3, 4, 64
-GATE_CTAS_PER_SM = 8   # DECODE_SINGLE_MAX_CTAS_PER_SM of csrc/cfbi/cfbi_launch.h
 
 
 def _sms():
     return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 
 
+def _cc():
+    return dp.cc_number(torch.cuda.get_device_capability())
+
+
 def spec_single_launch(mode, impl, N, H, sms):
-    """The rule of ``decode_single_launch`` (csrc/cfbi/cfbi_launch.h), ``impl`` as resolve_impl returns it: mode 1, not the frozen reference row engine, not the plan-kernel
-    request, and at most GATE_CTAS_PER_SM CTAs (N * H) per SM."""
-    return mode == 1 and not (impl & (REF_ROWS | DECODE_PLAN)) and N >= 1 and H >= 1 and N * H <= GATE_CTAS_PER_SM * sms
+    """The policy of the device that runs the test (``decode_policy.py``: the one specification of ``decode_single_launch_policy``), ``impl`` as resolve_impl returns it."""
+    return dp.policy(mode, impl, N, H, sms, _cc())
 
 
 def many_wave_n(H):
-    """A sequence count whose grid (N x H CTAs) needs more than two waves of the two resident CTAs per SM, and still passes the gate."""
+    """A sequence count whose grid (N x H CTAs) needs more than two waves of the two resident CTAs per SM, and still passes the gate of the policy."""
     sms = _sms()
     N = (6 * sms) // H + 1
-    assert 4 * sms < N * H <= GATE_CTAS_PER_SM * sms
+    assert 4 * sms < N * H <= dp.MAX_CTAS_PER_SM * sms
     return N
 
 
 def require_single_launch(ext, N, H):
+    """The call that follows is ONE launch: by the policy of the device or because the control is on (``forced``). A device that cannot run it this way is a skip, except on B200 and
+    B300, where it is a failure."""
     impl = ext.resolve_impl(0, -1)
-    if not spec_single_launch(1, impl, N, H, _sms()):
-        pytest.skip("this device does not run decode as one launch by default (impl 0 resolves to %d)" % impl)
+    if not ext.decode_single_launch(1, impl, N, H):
+        skip_or_fail("this device does not run decode as one launch here (impl 0 resolves to %d, grid %d x %d)" % (impl, N, H))
 
 
 # ---- observing the launches --------------------------------------------------------------------------------------------------------------------------
@@ -87,11 +93,35 @@ def decode_fn(N, H, impl, seed=1):
 
 
 # ---- which kernels launch ----------------------------------------------------------------------------------------------------------------------------
+def expected_decode_launches(ext, impl, N, H):
+    """The launch set of a decode call of N sequences and H heads that the specification predicts for this device (the control off): one ``rows_kernel<true>`` and nothing else, or
+    the plan kernel and the row engine behind it (the frozen reference where ``impl`` resolves to it)."""
+    eff = ext.resolve_impl(impl, -1)
+    if spec_single_launch(1, eff, N, H, _sms()):
+        return {"rows_kernel<true>": 1}
+    return {"plan_kernel": 1, ("ref::rows_kernel" if eff & REF_ROWS else "rows_kernel<false>"): 1}
+
+
 @pytest.mark.parametrize("N, H", [(1, 12), (4, 6), (16, 3), (40, 12)])
-def test_default_decode_is_one_launch(ext, N, H):
+def test_the_default_launch_set_is_what_the_specification_predicts_for_this_device(ext, N, H):
+    assert dict(kernel_counts(decode_fn(N, H, 0))) == expected_decode_launches(ext, 0, N, H)    # no plan kernel, no finalize kernel where the policy says one launch
+
+
+@pytest.mark.parametrize("N, H", [(1, 12), (4, 6), (16, 3), (40, 12)])
+def test_the_control_makes_decode_one_launch(ext, forced, N, H):
     require_single_launch(ext, N, H)
-    cnt = kernel_counts(decode_fn(N, H, 0))
-    assert dict(cnt) == {"rows_kernel<true>": 1}, dict(cnt)   # no plan kernel, no finalize kernel: one launch per decode call
+    assert dict(kernel_counts(decode_fn(N, H, 0))) == {"rows_kernel<true>": 1}
+
+
+def test_the_control_forces_a_grid_beyond_the_limit_and_nothing_else(ext, forced):
+    """Above the limit the policy keeps the plan kernel; the control takes the limit and the routing set away, and nothing else: the request for two launches (bit 64) and the reference
+    row engine keep theirs."""
+    sms = _sms()
+    N, H = dp.MAX_CTAS_PER_SM * sms // 12 + 1, 12
+    require_single_launch(ext, N, H)
+    assert dict(kernel_counts(decode_fn(N, H, 0))) == {"rows_kernel<true>": 1}
+    for impl in (DECODE_PLAN, REF_ROWS, REF):
+        assert dict(kernel_counts(decode_fn(4, 6, impl))) == expected_decode_launches(ext, impl, 4, 6) != {"rows_kernel<true>": 1}
 
 
 def test_the_other_requests_keep_the_plan_kernel(ext):
@@ -103,14 +133,13 @@ def test_the_other_requests_keep_the_plan_kernel(ext):
 
 
 def test_the_gate_keeps_the_plan_kernel_for_grids_beyond_it(ext):
-    require_single_launch(ext, 1, 1)
     H, sms = 12, _sms()
-    N = (GATE_CTAS_PER_SM * sms) // H + 1                 # one sequence more than the gate takes
+    N = (dp.MAX_CTAS_PER_SM * sms) // H + 1               # one sequence more than the gate takes
     assert not spec_single_launch(1, ext.resolve_impl(0, -1), N, H, sms)
-    assert dict(kernel_counts(decode_fn(N, H, 0))) == {"plan_kernel": 1, "rows_kernel<false>": 1}
-    N = (GATE_CTAS_PER_SM * sms) // H                     # the largest grid the gate takes (N * H <= 8 * SMs)
-    assert spec_single_launch(1, ext.resolve_impl(0, -1), N, H, sms)
-    assert dict(kernel_counts(decode_fn(N, H, 0))) == {"rows_kernel<true>": 1}
+    assert dict(kernel_counts(decode_fn(N, H, 0))) == expected_decode_launches(ext, 0, N, H) == {"plan_kernel": 1, "rows_kernel<false>": 1}
+    N = (dp.MAX_CTAS_PER_SM * sms) // H                   # the largest grid the gate takes (N * H <= 8 * SMs), on a device of the routing set
+    assert spec_single_launch(1, ext.resolve_impl(0, -1), N, H, sms) == (_cc() // 10 == dp.ROUTING_CC_MAJOR)
+    assert dict(kernel_counts(decode_fn(N, H, 0))) == expected_decode_launches(ext, 0, N, H)
 
 
 def test_prefill_keeps_its_launches(ext):
@@ -134,9 +163,9 @@ def test_the_gate_matches_the_specification(ext):
     shapes = [(N, H) for N in (1, 2, 7, 64, 65, 255, 1024) for H in (1, 3, 12, 33, 64)]
     for H in (1, 6, 12, 32):                                   # the boundary N * H == 8 * SMs and its neighbours
         for dn in (-1, 0, 1):
-            shapes.append((max(1, (GATE_CTAS_PER_SM * sms) // H + dn), H))
-    shapes.append((GATE_CTAS_PER_SM * sms, 1))
-    shapes.append((GATE_CTAS_PER_SM * sms + 1, 1))
+            shapes.append((max(1, (dp.MAX_CTAS_PER_SM * sms) // H + dn), H))
+    shapes.append((dp.MAX_CTAS_PER_SM * sms, 1))
+    shapes.append((dp.MAX_CTAS_PER_SM * sms + 1, 1))
     for mode in (0, 1):
         for impl in (0, 1, 2, 3, 4, 5, 8, 16, 32, 64, 65, 66, 67, 68, 127):
             eff = ext.resolve_impl(impl, -1)
@@ -192,7 +221,7 @@ def plain_pos(st):
 
 @pytest.mark.parametrize("other", [REF, DECODE_PLAN], ids=["reference", "two_launch"])
 @pytest.mark.parametrize("pool", [False, True], ids=["compact", "pool_and_padding"])
-def test_decode_chain_beyond_two_waves_is_bit_identical(ext, other, pool):
+def test_decode_chain_beyond_two_waves_is_bit_identical(ext, forced, other, pool):
     """Prefill every sequence to a different chunk phase (61, 62, 63, 0, 1, 2 mod 64: the chain crosses chunk ends), then decode with the default implementation and with
     ``other`` from copies of the same state: identical bf16 and fp32 outputs, E, valid row-cache planes and pos after every step, on a grid of more than two waves."""
     H, steps = 12, 5
@@ -229,7 +258,7 @@ def test_decode_chain_beyond_two_waves_is_bit_identical(ext, other, pool):
 
 
 @pytest.mark.parametrize("N, H", [(1, 1), (1, 12), (3, 7), (24, 12), (75, 12), (5, 33)])
-def test_one_token_from_a_zero_state_matches_the_reference_on_every_grid_shape(ext, N, H):
+def test_one_token_from_a_zero_state_matches_the_reference_on_every_grid_shape(ext, forced, N, H):
     require_single_launch(ext, N, H)
     ref = None
     for impl in (REF, DECODE_PLAN, 0):
@@ -255,7 +284,7 @@ def _mode1_call(case, sub, cu_call, st, ids, impl):
 
 
 @pytest.mark.parametrize("impl", [0, ROWS_ONLY, DECODE_PLAN | ROWS_ONLY], ids=["mode1", "rows_only", "rows_only_plan"])
-def test_fixed_length_mode1_call_matches_the_reference(ext, impl):
+def test_fixed_length_mode1_call_matches_the_reference(ext, forced, impl):
     """No ``cu_seqlens``: every batch entry is one sequence of T tokens (``fixed_len`` = T), run through the row engine from a warm state; 60 + 7 tokens cross a chunk end."""
     N, H, T0, T1 = 40, 3, 60, 7
     case = make_case(N * (T0 + T1), H, "authors", seed=8)
@@ -275,7 +304,7 @@ def test_fixed_length_mode1_call_matches_the_reference(ext, impl):
 
 
 @pytest.mark.parametrize("impl", [0, DECODE_PLAN], ids=["mode1", "two_launch"])
-def test_varlen_mode1_call_with_empty_sequences_and_padding_entries(ext, impl):
+def test_varlen_mode1_call_with_empty_sequences_and_padding_entries(ext, forced, impl):
     """``cu_seqlens`` with empty sequences and entries whose slot is -1 (they own tokens that are skipped), over a state pool warmed to different fills."""
     H, S = 2, 9
     lens = [5, 0, 70, 1, 0, 130, 64, 33]
@@ -304,7 +333,7 @@ def test_varlen_mode1_call_with_empty_sequences_and_padding_entries(ext, impl):
 
 
 # ---- CUDA graph --------------------------------------------------------------------------------------------------------------------------------------
-def test_cuda_graph_replay_with_rewritten_slot_ids_beyond_two_waves(ext):
+def test_cuda_graph_replay_with_rewritten_slot_ids_beyond_two_waves(ext, forced):
     """A fixed-shape decode batch of more than two waves of CTAs captured once, replayed with the slot assignment rewritten every step (entries change slots, some are
     padding); every replay equals the reference decode on a copy of the pool, bit for bit, and no arrival counter is left behind. No plan buffer exists in the graph."""
     H, steps = 12, 4

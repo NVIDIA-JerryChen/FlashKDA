@@ -134,6 +134,7 @@ def test_invalid_values_raise(ext):
             fn(bad)
     with pytest.raises((RuntimeError, ValueError)):
         ext.resolve_impl(128, -1)
+    fn(64)                                           # bit 64 (decode keeps its plan kernel) is a valid request; a prefill call ignores it
     fn(OLD)                                          # the old K2 kernels, explicitly
     fn(OLD, 1003)                                    # ... which keep their test hook
     for bv in (1000, 1001, 1037):
