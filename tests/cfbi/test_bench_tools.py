@@ -938,11 +938,40 @@ def test_codegen_row_engine_family_and_new_kernels_need_launch_bound_and_referen
                 cg.check_dump(target)
     added = cg_copy(base)                                                                                    # a new kernel needs the base row engine as reference
     added["kernels"]["sm_100a"]["cfbi::new_kernel"] = cg_kernel(reg=100, sass="new", maxreg=None, maxthr=None)
-    assert cg.compare_dumps(base, added)["exit"] == 0                                                        # attributes are only required for the row-engine family
+    for mode in ("identity", "change"):
+        with pytest.raises(cg.Unusable, match="launch-bound attribute max_threads is missing"):             # a new kernel without its launch bounds is unusable evidence ...
+            cg.compare_dumps(base, added, mode=mode)
+    for field in ("max_threads", "maxreg"):
+        with pytest.raises(cg.Unusable, match="launch-bound attribute %s is missing" % field):
+            cg.compare_dumps(base, cg_edit(added, "sm_100a", "cfbi::new_kernel", **{"max_threads": 256, "maxreg": 128, field: None}))
+    legit = cg_edit(added, "sm_100a", "cfbi::new_kernel", max_threads=256, maxreg=128)                       # ... a new kernel with the base's bounds passes ...
+    rep = cg.compare_dumps(base, legit)
+    assert rep["exit"] == 0 and rep["added"] == ["sm_100a cfbi::new_kernel"] and rep["gate_r"]["failures"] == []
+    for fields, text in (({"max_threads": 512}, "launch-bound attribute max_threads 512 differs from the base 256"), ({"maxreg": 255}, "launch-bound attribute maxreg 255 differs from the base 128")):
+        rep = cg.compare_dumps(base, cg_edit(legit, "sm_100a", "cfbi::new_kernel", **fields))                # ... and wrong bounds fail it
+        assert rep["exit"] == 1 and any(text in f for f in rep["gate_r"]["failures"]), (fields, rep["gate_r"])
+    d = tempfile.mkdtemp()                                                                                   # the command line: missing evidence is exit 2, wrong evidence exit 1
+    for name, dump in (("base", base), ("missing", added), ("legit", legit), ("wrong", cg_edit(legit, "sm_100a", "cfbi::new_kernel", max_threads=512))):
+        with open(os.path.join(d, name + ".json"), "w") as fh:
+            json.dump(dump, fh)
+    assert [cg.main(["compare", "--base", os.path.join(d, "base.json"), "--cand", os.path.join(d, n + ".json")]) for n in ("legit", "missing", "wrong")] == [0, 2, 1]
+    exempt = cg_copy(base)                                                                                   # the exemption of existing kernels outside the owned family stays
+    exempt["kernels"]["sm_100a"]["cfbi::k2_kernel<Li16E>"].update(reg=200, sass_hash=cg_hash("k2-new"))
+    rep = cg.compare_dumps(base, exempt, allow={"aliases": {}, "may_differ": ["cfbi::k2_kernel"]})
+    assert rep["exit"] == 0 and rep["allowed"] and not rep["gate_r"]["failures"]
+    allow = {"aliases": {"cfbi::rows_kernel_v2": "cfbi::rows_kernel"}, "may_differ": []}                      # a row-engine kernel under another name is still the row engine
+    renamed = cg_copy(base)
+    for arch in renamed["kernels"]:
+        renamed["kernels"][arch]["cfbi::rows_kernel_v2"] = renamed["kernels"][arch].pop("cfbi::rows_kernel")
+    assert cg.compare_dumps(base, renamed, allow, mode="change")["exit"] == 0
+    rep = cg.compare_dumps(base, cg_edit(renamed, "sm_100a", "cfbi::rows_kernel_v2", maxreg=255), allow, mode="change")
+    assert rep["exit"] == 1 and any("launch-bound attribute maxreg 255" in f for f in rep["gate_r"]["failures"])
+    with pytest.raises(cg.Unusable, match="launch-bound attribute maxreg is missing"):
+        cg.compare_dumps(base, cg_edit(renamed, "sm_100a", "cfbi::rows_kernel_v2", maxreg=None), allow, mode="change")
     no_ref = cg_copy(base)
     no_ref["kernels"]["sm_100a"].pop("cfbi::rows_kernel")
     with pytest.raises(cg.Unusable):
-        cg.compare_dumps(no_ref, cg_edit(added, "sm_100a", "cfbi::new_kernel", reg=100))
+        cg.compare_dumps(no_ref, cg_edit(legit, "sm_100a", "cfbi::new_kernel", reg=100))
 
 
 def test_codegen_files_dump_needs_every_input_and_a_complete_manifest():

@@ -866,8 +866,21 @@ def _field_diffs(b, c):
     return out
 
 
-def _gate_r(arch, key, rec, ref, owned):
-    """Failures of the resource gate for one kernel (``rec``) against the base reference kernel ``ref``."""
+def gate_r_role(ckey, aliases, base_keys, owned):
+    """The role of a candidate kernel for the resource gate: ``owned`` (a kernel of the owned family, or an alias of one: a rename does not take it out of the gate),
+    ``new`` (only the candidate has it) or None (an existing kernel that is not owned, which the gate does not bind: K2 needs more than 128 registers)."""
+    bkey = aliases.get(ckey, ckey)
+    if family(ckey) in owned or family(bkey) in owned:
+        return "owned"
+    return "new" if bkey not in base_keys else None
+
+
+def _gate_r(arch, key, rec, ref, role):
+    """Failures of the resource gate for one kernel (``rec``) against the base reference kernel ``ref``; ``role`` is ``owned`` or ``new`` (``gate_r_role``). The owned
+    family and every new kernel are bound alike: at most 128 registers, stack and spill not above the base's, and the launch-bound attributes present and equal to the
+    base's (``__launch_bounds__(256, 2)``): a missing attribute is unusable evidence (exit 2), a different value a failure (exit 1)."""
+    if role not in ("owned", "new"):
+        raise ValueError("the role of a resource-gate target is owned or new, got %r" % (role,))
     if ref is None:
         raise Unusable("%s %s: the base has no %s to bound the stack and spill figures, the resource gate cannot be evaluated" % (arch, key, GATE_R_REF))
     fails = []
@@ -878,13 +891,12 @@ def _gate_r(arch, key, rec, ref, owned):
     for f in _SPILL_FIELDS:
         if rec[f] > ref[f]:
             fails.append("%s %d B above the base %d B" % (f.replace("_", " "), rec[f], ref[f]))
-    if family(key) in owned:
-        for f in _ATTR_FIELDS:
-            if rec.get(f) is None or ref.get(f) is None:
-                raise Unusable("%s %s: the launch-bound attribute %s is missing (candidate %r, base reference %r), the resource gate cannot be evaluated"
-                               % (arch, key, f, rec.get(f), ref.get(f)))
-            if rec[f] != ref[f]:
-                fails.append("launch-bound attribute %s %d differs from the base %d" % (f, rec[f], ref[f]))
+    for f in _ATTR_FIELDS:
+        if rec.get(f) is None or ref.get(f) is None:
+            raise Unusable("%s %s: the launch-bound attribute %s is missing (%s kernel %r, base reference %r), the resource gate cannot be evaluated"
+                           % (arch, key, f, role, rec.get(f), ref.get(f)))
+        if rec[f] != ref[f]:
+            fails.append("launch-bound attribute %s %d differs from the base %d" % (f, rec[f], ref[f]))
     return fails
 
 
@@ -905,9 +917,9 @@ def compare_dumps(base, cand, allow=None, mode="identity", prev=None, owned=DEFA
     diffs, allowed, added, gate, notes = [], [], [], {"checked": [], "failures": []}, []
     compared = 0
 
-    def check_gate_r(arch, ckey, rec, ref):
+    def check_gate_r(arch, ckey, rec, ref, role):
         gate["checked"].append((arch, ckey))
-        gate["failures"].extend("%s %s: %s" % (arch, ckey, why) for why in _gate_r(arch, ckey, rec, ref, owned))
+        gate["failures"].extend("%s %s: %s" % (arch, ckey, why) for why in _gate_r(arch, ckey, rec, ref, role))
 
     base_content = base["meta"]["tree"].get("content_hash")
     if base_content and base_content == cand["meta"]["tree"].get("content_hash") and base["meta"].get("variant") == cand["meta"].get("variant"):
@@ -942,19 +954,20 @@ def compare_dumps(base, cand, allow=None, mode="identity", prev=None, owned=DEFA
             tolerated = bkey in may_differ or family(bkey) in may_differ or (mode == "change" and family(bkey) in owned)
             if tolerated:
                 allowed.append(entry)
-                if family(bkey) in owned:                    # the resource gate binds the row-engine family and new kernels, not every tolerated change (K2 needs more than 128 registers)
-                    check_gate_r(arch, ckey, ck[ckey], ref)
+                role = gate_r_role(ckey, aliases, bk, owned)
+                if role == "owned":                          # the resource gate binds the row-engine family and new kernels, not every tolerated change (K2 needs more than 128 registers)
+                    check_gate_r(arch, ckey, ck[ckey], ref, role)
             else:
                 diffs.append(entry)
         for ckey in sorted(ck):
             if aliases.get(ckey, ckey) in bk:
                 continue
             added.append("%s %s" % (arch, ckey))
-            check_gate_r(arch, ckey, ck[ckey], ref)
-        if mode == "change":                                          # the owned family is gated even when it did not change against the base
+            check_gate_r(arch, ckey, ck[ckey], ref, gate_r_role(ckey, aliases, bk, owned))
+        if mode == "change":                                          # the owned family is gated even when it did not change against the base, an alias of it included
             for ckey in sorted(ck):
-                if family(ckey) in owned and (arch, ckey) not in gate["checked"]:
-                    check_gate_r(arch, ckey, ck[ckey], ref)
+                if gate_r_role(ckey, aliases, bk, owned) == "owned" and (arch, ckey) not in gate["checked"]:
+                    check_gate_r(arch, ckey, ck[ckey], ref, "owned")
     for ckey in sorted(set(aliases) - used_alias):
         notes.append("allow-list alias %s matches no candidate kernel" % ckey)
     if prev is not None and mode == "change":
