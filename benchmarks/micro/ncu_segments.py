@@ -1,58 +1,48 @@
 """Summarise an Nsight Compute SASS source CSV (ncu --page source --csv --print-source sass) per barrier-delimited segment.
-usage: python ncu_segments.py <csv> [topN]"""
-import csv, sys
-from collections import Counter, defaultdict
+usage: python ncu_segments.py <csv> [topN] [--json OUT [--meta META.json]]
 
-path = sys.argv[1]
-topn = int(sys.argv[2]) if len(sys.argv) > 2 else 12
-rows = []
-with open(path, newline="") as f:
-    lines = f.read().splitlines()
-hdr_i = next(i for i, l in enumerate(lines) if l.startswith('"Address"'))
-rd = csv.DictReader(lines[hdr_i:])
-stall_cols = [c for c in rd.fieldnames if c.startswith("stall_") and "Not Issued" not in c]
-for r in rd:
-    rows.append(r)
-def num(x):
-    try: return float(x)
-    except: return 0.0
-tot_exec = sum(num(r["Instructions Executed"]) for r in rows)
-tot_samp = sum(num(r["Warp Stall Sampling (All Samples)"]) for r in rows)
-print(f"{len(rows)} static instructions, {tot_exec:.0f} warp-instructions executed, {tot_samp:.0f} stall samples")
-segs, cur = [], []
-for r in rows:
-    cur.append(r)
-    if "BAR.SYNC" in r["Source"] or "BAR.ARV" in r["Source"]:
-        segs.append(cur); cur = []
-if cur: segs.append(cur)
-print(f"{'seg':>3} {'static':>6} {'exec(M)':>8} {'%exec':>6} {'samples':>8} {'%samp':>6}  mma  lds  ldg  stg  sts  top stalls")
-for i, s in enumerate(segs):
-    ex = sum(num(r["Instructions Executed"]) for r in s)
-    sm = sum(num(r["Warp Stall Sampling (All Samples)"]) for r in s)
-    mma = sum(1 for r in s if "HMMA" in r["Source"] or "MMA" in r["Source"].split()[0:2].__str__())
-    cnt = Counter()
-    for r in s:
-        op = r["Source"].split()[0] if r["Source"].split() else ""
-        cnt[op.split(".")[0]] += 1
-    st = defaultdict(float)
-    for r in s:
-        for c in stall_cols:
-            st[c] += num(r[c])
-    top = sorted(st.items(), key=lambda kv: -kv[1])[:3]
-    tops = " ".join(f"{k[6:]}={v/sm*100:.0f}%" for k, v in top if sm)
-    print(f"{i:>3} {len(s):>6} {ex/1e6:>8.2f} {ex/tot_exec*100:>5.1f}% {sm:>8.0f} {sm/tot_samp*100:>5.1f}%  {cnt['HMMA']:>3}  {cnt['LDS']:>3}  {cnt['LDG']:>3}  {cnt['STG']:>3}  {cnt['STS']:>3}  {tops}")
-print("\nhottest instructions by stall samples:")
-for r in sorted(rows, key=lambda r: -num(r["Warp Stall Sampling (All Samples)"]))[:topn]:
-    st = sorted(((c, num(r[c])) for c in stall_cols), key=lambda kv: -kv[1])[:2]
-    print(f"  {r['Address'][-5:]} samples={num(r['Warp Stall Sampling (All Samples)']):>6.0f} exec={num(r['Instructions Executed']):>9.0f} {r['Source'].strip()[:70]:<70} " + " ".join(f"{k[6:]}={v:.0f}" for k, v in st))
+The text is the table of the barrier-delimited segments (static and executed instructions, stall samples, instruction counts and the top stall reasons of each), the instructions with
+the most stall samples and the executed instructions by opcode. ``--json`` also writes the summary as a ``cfbi-ncu-segments-v1`` record (see ``benchmarks/ncu_record.py``): the
+metadata of the collection (device, commit, case, ncu settings, hash of the report) come from the JSON file given with ``--meta``, the hash of the CSV is added."""
+import argparse
+import hashlib
+import json
+import os
+import sys
 
-print("\nexecuted warp-instructions by opcode (all segments):")
-byop = Counter(); static = Counter()
-for r in rows:
-    toks = r["Source"].split()
-    if not toks: continue
-    op = toks[0]
-    if op.startswith("@"): op = toks[1] if len(toks) > 1 else op
-    byop[op.split(".")[0]] += num(r["Instructions Executed"]); static[op.split(".")[0]] += 1
-for op, v in byop.most_common(28):
-    print(f"  {op:<10} {v/1e6:>8.2f} M  {v/tot_exec*100:>5.1f}%   static {static[op]}")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import ncu_record as nr  # noqa: E402
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("csv")
+    ap.add_argument("topn", nargs="?", type=int, default=12)
+    ap.add_argument("--json", default=None, help="write the summary as a cfbi-ncu-segments-v1 record")
+    ap.add_argument("--meta", default=None, help="JSON file with the metadata of the collection (for --json)")
+    a = ap.parse_args(argv)
+    rows, stall_cols = nr.load_rows(a.csv)
+    summary = nr.summarise(rows, stall_cols, a.topn)
+    print(nr.format_summary(summary))
+    if a.json:
+        meta = {}
+        if a.meta:
+            with open(a.meta) as f:
+                meta = json.load(f)
+        meta["source_csv"] = {"name": os.path.basename(a.csv), "sha256": sha256(a.csv), "bytes": os.path.getsize(a.csv)}
+        with open(a.json, "w") as f:
+            json.dump(nr.build_record(meta, summary), f, indent=1, sort_keys=True)
+            f.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

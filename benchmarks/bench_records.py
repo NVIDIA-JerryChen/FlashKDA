@@ -221,15 +221,11 @@ def known_metric(records, metric):
     return any(metric in s["kernels"] for rec in records for cell in rec["cells"] for s in cell["samples"])
 
 
-def validate_record(rec, role="baseline", expect_commit=None, require_clean=True):
-    """Problems of one record (an empty list means valid). ``role`` is only used in the messages."""
-    structural = structure_problems(rec)
-    if structural:
-        return ["%s: %s" % (role, p) for p in structural]
-    where = "%s record %s" % (role, rec.get("_path", "?"))
+def identity_problems(meta, where, expect_commit=None, require_clean=True, required=REQUIRED_META):
+    """Problems of the identity fields of a record's metadata: commit (hexadecimal, at least 7 characters, the expected one when given), dirty (a boolean, false when a clean tree is
+    required), GPU and host (non-empty strings) and SM count (a positive integer). One validation for every kind of record (``where`` names the record in the messages)."""
     problems = []
-    meta = rec["meta"]
-    for field in REQUIRED_META:
+    for field in required:
         if meta.get(field) is None:
             problems.append("%s: metadata field %r is missing" % (where, field))
     commit = meta.get("commit")
@@ -251,6 +247,17 @@ def validate_record(rec, role="baseline", expect_commit=None, require_clean=True
             problems.append("%s: metadata field %r must be a non-empty string, got %r" % (where, field, meta[field]))
     if meta.get("sm_count") is not None and not _positive_int(meta["sm_count"]):
         problems.append("%s: metadata field 'sm_count' must be a positive integer, got %r" % (where, meta["sm_count"]))
+    return problems
+
+
+def validate_record(rec, role="baseline", expect_commit=None, require_clean=True):
+    """Problems of one record (an empty list means valid). ``role`` is only used in the messages."""
+    structural = structure_problems(rec)
+    if structural:
+        return ["%s: %s" % (role, p) for p in structural]
+    where = "%s record %s" % (role, rec.get("_path", "?"))
+    meta = rec["meta"]
+    problems = identity_problems(meta, where, expect_commit, require_clean)
     stat = sample_stat_of(rec)
     if stat not in ("pooled", PROCESS_MEDIAN):
         problems.append("%s: unknown sample statistic %r" % (where, stat))
