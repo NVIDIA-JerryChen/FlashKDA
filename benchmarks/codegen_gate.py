@@ -63,7 +63,8 @@ MATRIX_ARCHS = ("sm_80", "sm_86", "sm_89", "sm_90a", "sm_100a", "sm_103a", "sm_1
 DEFAULT_UNITS = ("csrc/cfbi/cfbi_launch.cu", "csrc/cfbi/cfbi_k2_dyn.cu", "csrc/cfbi/cfbi_probe.cu")
 DEFAULT_CONDA = "/home/scratch.jennym_gpu/miniforge3/envs/tlang"
 DEFAULT_OWNED = ("cfbi::rows_kernel",)           # the family a row-engine step may change (change mode) and gate R applies to
-GATE_R_REF = "cfbi::rows_kernel"                 # the base kernel whose stack and spill figures bound every gate-R target
+GATE_R_REF = "cfbi::rows_kernel"                 # the base kernel whose stack and spill figures bound a gate-R target that has no kernel of its own in the base: the row engine ...
+GATE_R_REF_INSTANCE = "cfbi::rows_kernel<Lb0E>"  # ... or, in a base that has it as instantiations, the one behind the plan kernel (rows_kernel<false>; <Lb1E> is the single-launch decode)
 REG_CAP = 128                                    # __launch_bounds__(256, 2): 64K registers / (2 * 256 threads)
 # Reference figures of the base rows_kernel (same-compiler values of the recorded round); a deviation is toolchain drift (a warning), not a failure.
 LITERALS = {
@@ -866,6 +867,18 @@ def _field_diffs(b, c):
     return out
 
 
+def gate_r_reference(base_kernels, bkey=None, owned=DEFAULT_OWNED):
+    """The base kernel whose resource figures bound a resource-gate target whose key in the base is ``bkey`` (``base_kernels``: ``{key: record}`` of one architecture): the base kernel of
+    that very key when it belongs to the owned family, so that every instantiation of the row engine is held to its own figures; otherwise the base's row engine: the plain
+    ``rows_kernel`` of a base from before the instantiations, else the instantiation behind the plan kernel. ``None`` when the base has none of them."""
+    if bkey is not None and family(bkey) in owned and bkey in base_kernels:
+        return base_kernels[bkey]
+    for key in (GATE_R_REF, GATE_R_REF_INSTANCE):
+        if key in base_kernels:
+            return base_kernels[key]
+    return None
+
+
 def gate_r_role(ckey, aliases, base_keys, owned):
     """The role of a candidate kernel for the resource gate: ``owned`` (a kernel of the owned family, or an alias of one: a rename does not take it out of the gate),
     ``new`` (only the candidate has it) or None (an existing kernel that is not owned, which the gate does not bind: K2 needs more than 128 registers)."""
@@ -882,7 +895,7 @@ def _gate_r(arch, key, rec, ref, role):
     if role not in ("owned", "new"):
         raise ValueError("the role of a resource-gate target is owned or new, got %r" % (role,))
     if ref is None:
-        raise Unusable("%s %s: the base has no %s to bound the stack and spill figures, the resource gate cannot be evaluated" % (arch, key, GATE_R_REF))
+        raise Unusable("%s %s: the base has no %s (nor %s) to bound the stack and spill figures, the resource gate cannot be evaluated" % (arch, key, GATE_R_REF, GATE_R_REF_INSTANCE))
     fails = []
     if rec["reg"] > REG_CAP:
         fails.append("%d registers (limit %d)" % (rec["reg"], REG_CAP))
@@ -938,7 +951,6 @@ def compare_dumps(base, cand, allow=None, mode="identity", prev=None, owned=DEFA
             if bkey in by_base:
                 raise Unusable("%s: the candidate kernels %s and %s both map to the base kernel %s" % (arch, by_base[bkey], ckey, bkey))
             by_base[bkey] = ckey
-        ref = bk.get(GATE_R_REF)
         for bkey in sorted(bk):
             ckey = by_base.get(bkey)
             if ckey is None:
@@ -956,18 +968,18 @@ def compare_dumps(base, cand, allow=None, mode="identity", prev=None, owned=DEFA
                 allowed.append(entry)
                 role = gate_r_role(ckey, aliases, bk, owned)
                 if role == "owned":                          # the resource gate binds the row-engine family and new kernels, not every tolerated change (K2 needs more than 128 registers)
-                    check_gate_r(arch, ckey, ck[ckey], ref, role)
+                    check_gate_r(arch, ckey, ck[ckey], gate_r_reference(bk, bkey, owned), role)
             else:
                 diffs.append(entry)
         for ckey in sorted(ck):
             if aliases.get(ckey, ckey) in bk:
                 continue
             added.append("%s %s" % (arch, ckey))
-            check_gate_r(arch, ckey, ck[ckey], ref, gate_r_role(ckey, aliases, bk, owned))
+            check_gate_r(arch, ckey, ck[ckey], gate_r_reference(bk, aliases.get(ckey, ckey), owned), gate_r_role(ckey, aliases, bk, owned))
         if mode == "change":                                          # the owned family is gated even when it did not change against the base, an alias of it included
             for ckey in sorted(ck):
                 if gate_r_role(ckey, aliases, bk, owned) == "owned" and (arch, ckey) not in gate["checked"]:
-                    check_gate_r(arch, ckey, ck[ckey], ref, "owned")
+                    check_gate_r(arch, ckey, ck[ckey], gate_r_reference(bk, aliases.get(ckey, ckey), owned), "owned")
     for ckey in sorted(set(aliases) - used_alias):
         notes.append("allow-list alias %s matches no candidate kernel" % ckey)
     if prev is not None and mode == "change":
@@ -994,7 +1006,7 @@ def literal_check(dump):
     """Warnings for deviations of the base ``rows_kernel`` figures from the recorded literals (toolchain drift)."""
     out = []
     for arch, lit in LITERALS.items():
-        rec = dump["kernels"].get(arch, {}).get(GATE_R_REF)
+        rec = gate_r_reference(dump["kernels"].get(arch, {}))
         if rec is None:
             continue
         for f, want in sorted(lit.items()):
@@ -1020,7 +1032,7 @@ def format_report(rep, base=None):
         lines.append("NOTE: %s" % n)
     if base is not None:
         for arch in sorted(LITERALS):
-            rec = base["kernels"].get(arch, {}).get(GATE_R_REF)
+            rec = gate_r_reference(base["kernels"].get(arch, {}))
             if rec is not None:
                 recorded = sorted(LITERALS[arch].items())
                 measured = [(f, rec.get(f)) for f, _ in recorded]

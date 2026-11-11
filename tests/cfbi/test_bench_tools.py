@@ -526,6 +526,19 @@ def cg_base():
     return cg_dump({"sm_100a": arch((4, 4)), "sm_90a": arch((428, 172))})
 
 
+def cg_inst_base():
+    """A base from after the single-launch import: the row engine only as its two instantiations, ``<Lb0E>`` behind the plan kernel and ``<Lb1E>`` the single-launch decode (no plain
+    ``cfbi::rows_kernel``); the other kernels as in ``cg_base``."""
+    def arch(plan_spill, one_spill, one_stack):
+        return {"cfbi::rows_kernel<Lb0E>": cg_kernel(reg=128, stack=112, spill=plan_spill, sass="rows0"),
+                "cfbi::rows_kernel<Lb1E>": cg_kernel(reg=128, stack=one_stack, spill=one_spill, sass="rows1"),
+                "cfbi::ref::rows_kernel": cg_kernel(reg=48, sass="ref-rows", maxreg=None, maxthr=None),
+                "cfbi::k1_kernel<Li16E>": cg_kernel(reg=128, sass="k1"),
+                "cfbi::k2_kernel<Li16E>": cg_kernel(reg=172, sass="k2"),
+                "cfbi::plan_kernel": cg_kernel(reg=40, sass="plan")}
+    return cg_dump({"sm_100a": arch((4, 4), (0, 0), 96), "sm_90a": arch((428, 172), (420, 172), 168)})
+
+
 def cg_copy(dump):
     return json.loads(json.dumps(dump))
 
@@ -624,6 +637,52 @@ def test_codegen_allow_list_aliases_and_allowed_differences():
         both["kernels"][arch]["cfbi::rows_kernel"] = dict(both["kernels"][arch]["cfbi::rows_kernel<Lb0E>"])
     with pytest.raises(cg.Unusable):                                     # two candidate kernels cannot stand for one base kernel
         cg.compare_dumps(base, both, allow)
+
+
+def test_codegen_resource_gate_follows_the_row_engine_instantiations():
+    """After the single-launch import every base of a later step has the row engine as ``<Lb0E>`` and ``<Lb1E>``: the resource gate finds its reference there (it used to look for the
+    plain kernel and could not be evaluated), holds every instantiation to its OWN base figures, and bounds a new instantiation by the one behind the plan kernel."""
+    base = cg_inst_base()
+    assert cg.compare_dumps(base, base)["exit"] == 0 and cg.literal_check(base) == []
+    rep = cg.compare_dumps(base, base, mode="change")                    # the owned family is gated even when unchanged, each instantiation against its own base kernel
+    assert rep["exit"] == 0 and sorted(k for a, k in rep["gate_r"]["checked"] if a == "sm_100a") == ["cfbi::rows_kernel<Lb0E>", "cfbi::rows_kernel<Lb1E>"]
+    worse = cg_edit(base, "sm_100a", "cfbi::rows_kernel<Lb1E>", stack=100, sass_hash=cg_hash("rows1-new"))      # 100 B is below the other instantiation's 112 B, above its own 96 B
+    rep = cg.compare_dumps(base, worse, mode="change")
+    assert rep["exit"] == 1 and any("rows_kernel<Lb1E>: stack 100 B above the base 96 B" in f for f in rep["gate_r"]["failures"]), rep["gate_r"]
+    assert cg.compare_dumps(base, cg_edit(base, "sm_100a", "cfbi::rows_kernel<Lb1E>", stack=90, sass_hash=cg_hash("rows1-new")), mode="change")["exit"] == 0
+    spill = cg_edit(base, "sm_100a", "cfbi::rows_kernel<Lb0E>", spill_stores=8, sass_hash=cg_hash("rows0-new"))
+    rep = cg.compare_dumps(base, spill, mode="change")
+    assert rep["exit"] == 1 and any("rows_kernel<Lb0E>: spill stores 8 B above the base 4 B" in f for f in rep["gate_r"]["failures"])
+    assert cg.compare_dumps(base, cg_edit(base, "sm_100a", "cfbi::plan_kernel", sass_hash=cg_hash("plan-new")), mode="change")["exit"] == 1        # a kernel that is not owned stays identical
+    new = cg_copy(base)                                                  # a new instantiation is bounded by the one behind the plan kernel (112 B of stack on sm_100a)
+    for arch in new["kernels"]:
+        new["kernels"][arch]["cfbi::rows_kernel<Lb2E>"] = dict(base["kernels"][arch]["cfbi::rows_kernel<Lb0E>"], sass_hash=cg_hash("rows2"))
+    rep = cg.compare_dumps(base, new, mode="change")
+    assert rep["exit"] == 0 and any("rows_kernel<Lb2E>" in a for a in rep["added"]) and rep["gate_r"]["failures"] == []
+    over = cg_edit(new, "sm_100a", "cfbi::rows_kernel<Lb2E>", stack=113)
+    assert any("rows_kernel<Lb2E>: stack 113 B above the base 112 B" in f for f in cg.compare_dumps(base, over, mode="change")["gate_r"]["failures"])
+    drift = cg_edit(base, "sm_100a", "cfbi::rows_kernel<Lb0E>", spill_stores=8)
+    assert any("toolchain drift" in w for w in cg.literal_check(drift))
+    assert "CROSS-CHECK sm_100a cfbi::rows_kernel:" in cg.format_report(cg.compare_dumps(base, base), base)
+    no_ref = cg_copy(new)                                                # a base without any row engine cannot bound anything
+    for arch in no_ref["kernels"]:
+        for key in ("cfbi::rows_kernel<Lb0E>", "cfbi::rows_kernel<Lb1E>"):
+            no_ref["kernels"][arch].pop(key)
+    with pytest.raises(cg.Unusable, match=r"nor cfbi::rows_kernel<Lb0E>"):
+        cg.compare_dumps(no_ref, new, mode="change")
+
+
+def test_codegen_single_launch_import_against_a_base_with_the_plain_row_engine():
+    """The comparison that the import itself needed: the base has the plain ``rows_kernel``, the candidate its instantiation ``<Lb0E>`` (an alias) and the new ``<Lb1E>``."""
+    base, allow = cg_base(), {"aliases": {"cfbi::rows_kernel<Lb0E>": "cfbi::rows_kernel"}, "may_differ": []}
+    cand = cg_copy(base)
+    for arch in cand["kernels"]:
+        cand["kernels"][arch]["cfbi::rows_kernel<Lb0E>"] = cand["kernels"][arch].pop("cfbi::rows_kernel")
+        cand["kernels"][arch]["cfbi::rows_kernel<Lb1E>"] = cg_kernel(reg=128, stack=96, spill=(0, 0), sass="rows1")
+    rep = cg.compare_dumps(base, cand, allow)
+    assert rep["exit"] == 0 and len(rep["added"]) == 2 and rep["gate_r"]["failures"] == []
+    bad = cg_edit(cand, "sm_100a", "cfbi::rows_kernel<Lb1E>", stack=113)
+    assert any("rows_kernel<Lb1E>: stack 113 B above the base 112 B" in f for f in cg.compare_dumps(base, bad, allow)["gate_r"]["failures"])
 
 
 def test_codegen_missing_base_kernels_and_new_kernels():
@@ -1201,7 +1260,7 @@ def test_codegen_controls_with_nvcc():
         built = {k: f.result() for k, f in futs.items()}
     assert cg.compare_dumps(base, built["same"])["exit"] == 0
     neg = cg.compare_dumps(base, built["neg"])
-    assert neg["exit"] == 1 and any("cfbi::rows_kernel:" in d for d in neg["differences"]), neg
+    assert neg["exit"] == 1 and any("cfbi::rows_kernel<" in d for d in neg["differences"]), neg          # the row engine is an instantiation of a template: <Lb0E> and <Lb1E>
     for name in ("regs", "spill"):
         rep = cg.compare_dumps(base, built[name], mode="change")
         assert rep["exit"] == 1 and rep["gate_r"]["failures"] and not rep["differences"], (name, rep)
