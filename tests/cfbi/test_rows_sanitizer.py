@@ -97,7 +97,7 @@ OOB_DRIVER = PRELUDE + textwrap.dedent('''
     pool = alloc_state(S, H)
     mod.rows_test_pos_offset({offset})
     step = Step(par, H, [1, 1, 1, 1], [3, 7, 1, 9], True, 71)
-    rw.run_step(mod, 0, pool, step)
+    rw.run_step(mod, 64, pool, step)      # _impl 64: the plan kernel and the row engine behind it, the path whose fused position store the variant offsets (a decode call of the single launch has no such store)
     torch.cuda.synchronize()
     print("{done} offset", {offset})
 ''')

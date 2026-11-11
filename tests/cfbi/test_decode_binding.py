@@ -10,7 +10,9 @@ headers) and shows that the check can fail. The other tests read the sources:
 * the wrapper applies the control to the eligible part of the rule and nothing else.
 """
 import ast
+import os
 import re
+import shutil
 import subprocess
 import sys
 import sysconfig
@@ -37,13 +39,25 @@ def cuda_include(nvcc):
     return None
 
 
+def host_compiler(tc):
+    """The C++ compiler that goes with the Python that runs the test: the conda compiler of the toolchain when the test runs in that environment (the login node), otherwise the system's (the
+    container of a GPU node, whose Python and torch headers are the system's and need the system's multiarch include directories)."""
+    if os.path.dirname(os.path.abspath(tc["ccbin"])) == os.path.join(sys.prefix, "bin"):
+        return tc["ccbin"]
+    return shutil.which("c++") or shutil.which("g++") or tc["ccbin"]
+
+
 def syntax_check(tc, source, cwd, fatal=False):
-    """``(exit status, output)`` of a syntax-only compile of ``source`` as the JIT build compiles the binding (the torch headers, the extension name), with the host compiler of ``tc``."""
+    """``(exit status, output)`` of a syntax-only compile of ``source`` as the JIT build compiles the binding (the torch headers, the extension name), with the host compiler that goes with the
+    running Python and the CUDA headers of torch's toolkit (else those next to ``tc``'s nvcc)."""
     torch_utils = pytest.importorskip("torch.utils.cpp_extension")
-    include = cuda_include(tc["nvcc"])
+    import torch
+
+    home = getattr(torch_utils, "CUDA_HOME", None)
+    include = Path(home) / "include" if home and (Path(home) / "include" / "cuda_runtime_api.h").exists() else cuda_include(tc["nvcc"])
     if include is None:
-        pytest.skip("no CUDA include directory next to nvcc")
-    cmd = [tc["ccbin"], "-std=c++17", "-fsyntax-only", "-DTORCH_EXTENSION_NAME=cfbi_check", "-DTORCH_API_INCLUDE_EXTENSION_H", "-D_GLIBCXX_USE_CXX11_ABI=1", "-I", str(CSRC.parent)]
+        pytest.skip("no CUDA include directory")
+    cmd = [host_compiler(tc), "-std=c++17", "-fsyntax-only", "-DTORCH_EXTENSION_NAME=cfbi_check", "-DTORCH_API_INCLUDE_EXTENSION_H", "-D_GLIBCXX_USE_CXX11_ABI=%d" % int(torch._C._GLIBCXX_USE_CXX11_ABI), "-I", str(CSRC.parent)]
     cmd += ["-I" + p for p in torch_utils.include_paths()] + ["-I" + sysconfig.get_paths()["include"], "-I" + str(include)]
     if fatal:
         cmd.append("-Wfatal-errors")

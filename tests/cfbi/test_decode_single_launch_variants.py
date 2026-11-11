@@ -60,7 +60,7 @@ def build_variant(name, defines):
         try:
             _BUILT[name] = load_variant(name, tuple(defines))
         except Exception as e:   # pragma: no cover - the variants need a JIT build
-            pytest.skip(f"cannot build the variant {name}: {e}")
+            pytest.fail(f"cannot build the variant {name}: {e}", pytrace=False)   # a variant that does not build is a failure of the test, never a skip
         _BUILT[name].decode_single_force(True)   # a variant is a module of its own, with its own switch: its decode calls are the single launch whatever the device and the grid
     return _BUILT[name]
 
