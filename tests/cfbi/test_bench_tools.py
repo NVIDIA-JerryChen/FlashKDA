@@ -21,6 +21,7 @@ for _p in (_ROOT / "benchmarks", _ROOT / "tests" / "cfbi"):
         sys.path.insert(0, str(_p))
 
 import bench_decode as bd  # noqa: E402
+import bench_layer_chain as lc  # noqa: E402
 import bench_records as br  # noqa: E402
 import codegen_gate as cg  # noqa: E402
 import compare_bench  # noqa: E402
@@ -1195,3 +1196,46 @@ def test_suite_record_cli_builds_checks_and_refuses_bad_input():
     with open(xml_path, "w") as f:
         f.write("<not xml")
     assert sr.main(args) == 2
+
+
+# ---- the layer-chain graph benchmark: cells, node lists and the zero-free step (the measurement needs a GPU) -------------------------------------
+
+CHAIN_COUNTS = {"void cfbi::lin::linear_kernel<128, 2>(cfbi::lin::Args)": 6.0, "void cfbi::conv_kernel<4>(cfbi::Args)": 3.0,
+                "void cfbi::plan_kernel(long const*, int)": 1.0, "void cfbi::rows_kernel(cfbi::Params)": 1.0}
+
+
+def test_layer_chain_cells_and_the_expected_kernel_node_lists():
+    specs = lc.cell_specs()
+    assert [s["key"] for s in specs] == ["chain;N=1;H=12;Dm=2048;regime=lockstep;", "chain;N=64;H=12;Dm=2048;regime=lockstep;"]
+    assert [s["N"] for s in lc.select_cells(specs, ["N=1;"])] == [1] and [s["N"] for s in lc.select_cells(specs, ["N=64;"])] == [64] and lc.select_cells(specs, ["N=6;"]) == []
+    assert lc.calls_per_trial(dict(lc.DEFAULTS)) == 1536 and lc.calls_per_trial(dict(lc.DEFAULTS, calls_scale=3)) == 4608 and lc.calls_per_trial(dict(lc.DEFAULTS, calls=100)) == 128
+    compute, aux = lc.split_nodes(CHAIN_COUNTS)
+    assert sum(compute.values()) == 11 and aux == {} and compute["rows_kernel"] == 1 and compute["plan_kernel"] == 1
+    assert lc.check_nodes(compute, aux, 11, []) is None and lc.check_nodes(compute, aux, None, None) is None
+    assert "expected 10" in lc.check_nodes(compute, aux, 10, [])                                   # the single-launch decode has one kernel less
+    single = {k: v for k, v in CHAIN_COUNTS.items() if "plan_kernel" not in k}
+    c1, a1 = lc.split_nodes(single)
+    assert lc.check_nodes(c1, a1, 10, []) is None and "launches 10 compute kernels" in lc.check_nodes(c1, a1, 11, [])
+    noisy = dict(CHAIN_COUNTS)                                                                       # a graph with zero-fill and copy nodes: they are auxiliary nodes
+    noisy["Memset (Device)"], noisy["void at::native::vectorized_elementwise_kernel<4, FillFunctor>"] = 10.0, 2.0
+    c2, a2 = lc.split_nodes(noisy)
+    assert sum(c2.values()) == 11 and sorted(a2) == ["Memset (Device)", "void at::native::vectorized_elementwise_kernel<4, FillFunctor>"]
+    msg = lc.check_nodes(c2, a2, 11, [])
+    assert "auxiliary nodes" in msg and "Memset (Device)" in msg
+    assert lc.check_nodes(c2, a2, 11, sorted(a2)) is None                                           # the explicit list of the auxiliary nodes that may remain
+    assert lc.check_nodes(c2, a2, 11, ["Memset (Device)"]) is not None
+
+
+def test_layer_chain_step_has_no_zero_fill_or_fp32_side_output_call():
+    """The step that is captured must not hold auxiliary zeroing (the layer of the chain test zero-fills its fp32 outputs inside the calls)."""
+    tree = ast.parse((_ROOT / "benchmarks" / "bench_layer_chain.py").read_text())
+    step = [n for c in tree.body if isinstance(c, ast.ClassDef) and c.name == "ChainEnv" for n in c.body if isinstance(n, ast.FunctionDef) and n.name == "step"]
+    assert len(step) == 1
+    names = set()
+    for node in ast.walk(step[0]):
+        if isinstance(node, ast.Call):
+            f = node.func
+            names.add(f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", ""))
+            names.update(k.arg for k in node.keywords)
+    assert not names & {"zeros", "zeros_like", "zero_", "fill_", "full", "full_like", "empty", "empty_like", "out_fp32"}, names
+    assert {"out"} <= names                                                                           # the outputs are pre-allocated buffers passed as out=
