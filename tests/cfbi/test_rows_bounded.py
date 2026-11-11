@@ -7,7 +7,7 @@ shown here, with fake drivers (``fake_groups.py`` written into a temporary direc
 * a failing *case* is a value of the group, not a failure of it; stray output of the child does not disturb the result;
 * a group that hangs fails within its limit, says so, and leaves nothing running: the child is gone, and so is a grandchild that it started (the whole process group is killed);
 * a group that crashes fails with its own error text and exit status; one that exits without its result fails and says so; one that returns no cases fails;
-* source rules over the three GPU stress modules: each states an explicit ``GROUP_TIMEOUT_S`` and passes it to every ``run_group`` call, and no test function of them launches kernels itself
+* source rules over the GPU stress modules (the row-engine delay, decode families and graph tests and the arrival-protocol variants of the single launch): each states an explicit ``GROUP_TIMEOUT_S`` and passes it to every ``run_group`` call, and no test function of them launches kernels itself
   (every stress workload runs inside a group), with mutants that break each rule.
 """
 import ast
@@ -22,7 +22,7 @@ import pytest
 import rows_bounded as rb
 
 TESTS = Path(__file__).resolve().parent
-STRESS_MODULES = ("test_rows_delay.py", "test_rows_decode_families.py", "test_rows_graph.py")
+STRESS_MODULES = ("test_rows_delay.py", "test_rows_decode_families.py", "test_rows_graph.py", "test_decode_single_launch_variants.py")
 LAUNCHING = {"run_family", "run_arm", "run_step", "time_step", "warm_pool", "make_workload", "Replay", "synchronize"}      # helpers that launch kernels or wait on the device
 
 FAKE = textwrap.dedent('''

@@ -134,13 +134,17 @@ def test_the_bounded_racecheck_workload_passes_coverage_problems_and_is_not_beyo
 
 
 # ---- every user of the quota asserts the floor ---------------------------------------------------------------------------------------------------------
+SIZERS = ("active_n", "draw_step")                                        # what puts a quota of live sequences on a grid: the planners of the single-launch module and the families of rows_workload
+CHECKERS = ("assert_live_floor", "beyond_waves_problems")                  # what asserts the floor of the live CTAs of a planned launch
+
+
 def floor_problems(source):
-    """The functions that size a workload with ``active_n`` but never call ``assert_live_floor``."""
+    """The functions that size a workload (``SIZERS``) but never assert the floor of its live CTAs (``CHECKERS``)."""
     out = []
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.FunctionDef):
-            names = {c.func.id for c in ast.walk(node) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
-            if "active_n" in names and "assert_live_floor" not in names:
+            names = {c.func.id if isinstance(c.func, ast.Name) else c.func.attr for c in ast.walk(node) if isinstance(c, ast.Call) and isinstance(c.func, (ast.Name, ast.Attribute))}
+            if names & set(SIZERS) and not names & set(CHECKERS):
                 out.append(node.name)
     return out
 
@@ -148,7 +152,7 @@ def floor_problems(source):
 @pytest.mark.parametrize("module", GPU_MODULES)
 def test_every_test_that_sizes_a_workload_with_the_active_quota_asserts_the_floor(module):
     source = (TESTS / module).read_text()
-    assert "active_n(" in source and "big_n" not in source                 # the retired name (a nominal grid) is gone
+    assert ("active_n(" in source or "draw_step(" in source) and "big_n" not in source      # the retired name (a nominal grid) is gone
     assert floor_problems(source) == []
 
 
@@ -159,3 +163,35 @@ def test_the_floor_rule_fails_on_a_copy_without_the_assertion():
     mutant = head + sep + tail.replace("assert_live_floor(ext, launches, H)", "pass", 1)
     assert floor_problems(mutant) == ["test_mode1_calls_with_several_tokens_per_sequence_across_chunks_on_a_big_grid"]
     assert len(floor_problems(source.replace("assert_live_floor(", "unchecked("))) >= 6
+    variants = (TESTS / "test_decode_single_launch_variants.py").read_text()
+    assert floor_problems(variants.replace("rw.beyond_waves_problems(", "rw.unchecked(")) == ["make_workload"]
+
+
+# ---- the hits that a decode-entry delay must have (what the device tests of the arrival protocol read back) --------------------------------------------------------------------------
+def test_the_hits_of_the_decode_entry_sites_follow_from_the_plan():
+    lens = [1, 0, 1, 1, 1, 1]
+    slots = [3, 4, -1, 0, 7, 2]                    # an empty sequence (entry 1) and a padding entry (entry 2) run nothing
+    live = 4
+    for H in (1, 3, 12):
+        assert lg.arrival_hits(lens, slots, H, lg.SITE_BEFORE) == live * H == lg.arrival_hits(lens, slots, H, lg.SITE_ALL)
+        assert lg.arrival_hits(lens, slots, H, lg.SITE_FIRST) == live == lg.arrival_hits(lens, slots, H, lg.SITE_LAST)
+        assert lg.arrival_hits(lens, slots, H, (9, 10, 11, 12)) == 2 * live * H + 2 * live
+    assert lg.arrival_hits([2, 2, 2], None, 3, lg.SITE_BEFORE) == 9                         # a compact state: every entry is live
+
+
+def test_the_hits_of_a_selection_of_ctas_count_the_live_ctas_of_the_selection():
+    lens = [1] * 5 + [0]
+    slots = [-1, 1, 2, 3, 4, 5]
+    H = 3
+    live_ctas = [n * H + h for n in range(1, 5) for h in range(H)]              # entries 1 .. 4 run; entry 0 is a padding entry, entry 5 is empty
+    for mod, rem in ((2, 0), (2, 1), (3, 1), (5, 4), (7, 0)):
+        assert lg.arrival_hits(lens, slots, H, lg.SITE_BEFORE, mod, rem) == sum(1 for c in live_ctas if c % mod == rem)
+        assert lg.arrival_hits(lens, slots, H, lg.SITE_ALL, mod, rem) == lg.arrival_hits(lens, slots, H, lg.SITE_BEFORE, mod, rem)
+    assert lg.arrival_hits(lens, slots, H, lg.SITE_BEFORE, 2, 0) + lg.arrival_hits(lens, slots, H, lg.SITE_BEFORE, 2, 1) == lg.arrival_hits(lens, slots, H, lg.SITE_BEFORE)
+
+
+def test_the_first_and_the_last_arrival_cannot_be_counted_for_a_selection_of_ctas():
+    with pytest.raises(AssertionError, match="not told by their index"):
+        lg.arrival_hits([1], [0], 4, lg.SITE_FIRST, 2, 1)
+    with pytest.raises(AssertionError, match="not a decode-entry site"):
+        lg.arrival_hits([1], [0], 4, 8)

@@ -70,3 +70,29 @@ def launches(takes, slots=None):
     """``[(lens, slots)]`` of the planned launches for ``rows_workload.launch_coverage`` (``slots`` default: entry n on slot n)."""
     n = len(takes[0])
     return [(list(take), list(range(n)) if slots is None else list(slots)) for take in takes]
+
+
+# ---- the delay sites of the arrival protocol of the single-launch decode (csrc/cfbi/cfbi_rows.cuh, rows_entry): which delays a launch must run ---------------------------------------
+SITE_BEFORE, SITE_FIRST, SITE_LAST, SITE_ALL = 9, 10, 11, 12      # before the arrival; after the arrival of the first / of the last CTA of its sequence; after the arrival of every CTA
+PLACEMENTS = {"before": SITE_BEFORE, "first": SITE_FIRST, "last": SITE_LAST, "all": SITE_ALL}
+
+
+def arrival_hits(lens, slots, heads, sites, cta_mod=0, cta_rem=0):
+    """How many delays a launch must run at the decode-entry ``sites`` (a site number or an iterable of them), from its plan alone: a CTA reaches the arrival only if its sequence is live (a slot
+    >= 0 and tokens), so padding entries and empty sequences hit nothing. Sites 9 (before the arrival) and 12 (after the arrival of every CTA) are hit by every selected CTA (``cta % cta_mod ==
+    cta_rem`` with ``cta = sequence * heads + head``; ``cta_mod`` 0: every CTA); sites 10 and 11 are hit by the first and by the last CTA of a live sequence to arrive, one each: which CTA that
+    is, is decided by the arrival order and not by the index, so they can only be counted for every CTA selected (``cta_mod`` 0). ``slots`` None: a compact state (sequence n on slot n)."""
+    if isinstance(sites, int):
+        sites = (sites,)
+    live = [n for n in range(len(lens)) if lens[n] > 0 and (slots is None or slots[n] >= 0)]
+    total = 0
+    for site in sites:
+        assert site in PLACEMENTS.values(), "site %r is not a decode-entry site" % (site,)
+        if site in (SITE_FIRST, SITE_LAST):
+            assert cta_mod == 0, "the first and the last CTA to arrive are not told by their index: delay every CTA"
+            total += len(live)
+        elif cta_mod == 0:
+            total += len(live) * heads
+        else:
+            total += sum(1 for n in live for h in range(heads) if (n * heads + h) % cta_mod == cta_rem)
+    return total

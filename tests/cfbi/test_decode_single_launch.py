@@ -474,6 +474,8 @@ def test_a_variant_that_never_stores_from_the_elected_cta_leaves_arrival_bits_an
     rng = random.Random(5)
     par = rw.make_params(H, 5)
     step, S = rw.draw_step(ext, fam, H, par, rng, 50, instance=helpers.ROWS_DECODE)
+    caps = {"default build": helpers.resident_ctas(ext, rw.SINGLE.instance), "variant": helpers.resident_ctas(mod, rw.SINGLE.instance)}
+    assert not rw.beyond_waves_problems([step.live_ctas()], caps), rw.beyond_waves_problems([step.live_ctas()], caps)      # beyond 2.5 live waves of the instantiation of BOTH builds, before any launch
     warm = rw.warm_pool(ext, S, H, rw.draw_fills(rng, S, fam.fills), par, 5)
     good = rw.run_arm(ext, rw.SINGLE, warm, step)
     bad = rw.run_arm(mod, rw.SINGLE, warm, step)                    # the variant launches the single launch too
