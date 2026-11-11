@@ -236,8 +236,8 @@ def test_the_stress_modules_state_an_explicit_limit_and_run_every_workload_in_a_
 def test_a_stress_module_without_a_limit_or_with_a_workload_outside_a_group_is_caught():
     texts = stress_texts()
     delay = texts["test_rows_delay.py"]
-    assert any("GROUP_TIMEOUT_S must be stated" in p for p in module_problems("m", delay.replace("GROUP_TIMEOUT_S = 600", "GROUP_TIMEOUT_S = None", 1)))
-    assert any("GROUP_TIMEOUT_S must be stated" in p for p in module_problems("m", delay.replace("GROUP_TIMEOUT_S = 600", "", 1)))
+    assert any("GROUP_TIMEOUT_S must be stated" in p for p in module_problems("m", delay.replace("GROUP_TIMEOUT_S = 1200", "GROUP_TIMEOUT_S = None", 1)))
+    assert any("GROUP_TIMEOUT_S must be stated" in p for p in module_problems("m", delay.replace("GROUP_TIMEOUT_S = 1200", "", 1)))
     assert any("without the explicit GROUP_TIMEOUT_S" in p for p in module_problems("m", delay.replace('"group_misc", {}, GROUP_TIMEOUT_S)', '"group_misc", {}, 99999)', 1)))
     inline = delay + "\n\ndef test_a_stress_workload_in_the_test_itself(ext):\n    rw.run_arm(ext, 0, None, None)\n"
     assert any("launches kernels itself (run_arm)" in p for p in module_problems("m", inline))
