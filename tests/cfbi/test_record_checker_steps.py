@@ -768,10 +768,12 @@ def test_the_handoff_command_line(handoff_repo, tmp_path):
 # ---- the final record ------------------------------------------------------------------------------------------------------------------------
 PERF_DOC = ("# Performance\n\n## Results\nNumbers.\n\n## Not done / known limits\nThe cell %s is slower than the base on B200 with every change reverted too (the node, not the code).\n\n"
             "## Appendix\nx\n")
-DECODE_CELLS = {"decode;N=1;H=12;regime=lockstep;": 14.0, "decode;N=64;H=12;regime=lockstep;": 55.0, "decode;N=64;H=12;regime=cold;": 61.0}
-CHAIN_CELLS = {"chain;N=1;H=12;Dm=2048;regime=lockstep;": 90.0}
+GPU = {"b200": ("NVIDIA B200", 148), "b300": ("NVIDIA B300 SXM6 AC", 148)}
+DECODE_KEYS, CHAIN_KEYS = rc.canonical_cells("decode"), rc.canonical_cells("chain")
+MEDIANS = {"decode": dict((k, 14.0 + 0.5 * i) for i, k in enumerate(DECODE_KEYS)), "chain": dict((k, 90.0 + 25.0 * i) for i, k in enumerate(CHAIN_KEYS))}
 SLOW_CELL = "decode;N=64;H=12;regime=lockstep;"
-METRIC = "k2_stage_us"
+SLOW_METRIC = "gpu_graph_us"                       # the metric that a regression of SLOW_CELL shows in
+LOOP_SUBSTRINGS = tuple("regime=%s;" % r for r in rc.bd.LOOP_REGIMES)
 
 
 @pytest.fixture(scope="module")
@@ -790,38 +792,78 @@ def final_repo(tmp_path_factory):
     return h
 
 
-def campaign_files(d, name, cells, base, cand, host="node-a", slow=None, allocation="sc-1", metric=METRIC):
-    """One campaign: three interleaved records per side written to ``d`` (``cells``: key -> total_us of the base; the candidate side is ``slow[key]`` times slower where given), the comparison
-    report that ``compare_bench --json`` would write for it, and the entry of the final record that names them."""
-    slow = slow or {}
-    base_recs = [tbt.rec(base, dict((k, [v] * 5) for k, v in cells.items()), "2026-11-05T10:0%d:00Z" % (2 * i), host=host) for i in range(3)]
-    cand_recs = [tbt.rec(cand, dict((k, [v * slow.get(k, 1.0)] * 5) for k, v in cells.items()), "2026-11-05T10:0%d:00Z" % (2 * i + 1), host=host) for i in range(3)]
-    pa, pb = tbt.write_records(str(d), name + "-A", base_recs), tbt.write_records(str(d), name + "-B", cand_recs)
-    result = br.compare(base_recs, cand_recs, metric=metric, tol_pct=1.0, mode="regress", expect_base_commit=base)
+def final_cell(campaign, key, median, slow=1.0, scale=1, spread=0.0, idx=0):
+    """A cell of a final campaign with the wall metrics of its kind (the host loop metrics only in the loop regimes, a chain cell has the graph ones) and a kernel sum; ``slow`` scales the
+    ``gpu_graph_us`` of the cell only; ``scale``: the factor of a three-times campaign on the benchmark's default calls; ``spread``: the relative step of the per-process median from one
+    record file of a side to the next (``idx`` is the file's index): the spread that Method M judges is the one between the files, not the one between the trials of a file."""
+    median = median * (1.0 + spread * idx)
+    loop = campaign == "decode" and any(x in key for x in LOOP_SUBSTRINGS)
+    wall = []
+    for t in tbt.trials(median, spread):
+        w = {"gpu_graph_us": t * slow}
+        if campaign == "decode":
+            w["gpu_eager_us"] = t + 1.0
+            if loop:
+                w.update(cpu_graph_us=t + 3.0, cpu_eager_us=t + 4.0)
+        else:
+            w["cpu_graph_us"] = t + 3.0
+        wall.append(w)
+    runs = [{tbt.PLAN_K: 2.0, tbt.ROWS_K: 10.0, tbt.FILL_K: 40.0} for _ in wall]
+    return br.make_cell(campaign, key, {"calls_per_trial": scale * tbt.CALLS, "profile_calls": scale * tbt.PROFILE_CALLS}, runs, drop_helpers=True, wall=wall)
+
+
+def final_rec(campaign, dev, commit, ts, host, slows=None, scale=1, cells=None, spreads=None, idx=0):
+    gpu, sm = GPU[dev]
+    keys = cells if cells is not None else (DECODE_KEYS if campaign == "decode" else CHAIN_KEYS)
+    meta = {"commit": commit, "dirty": False, "gpu": gpu, "sm_count": sm, "host": host, "timestamp": ts, "sample_stat": br.PROCESS_MEDIAN, "trials": 5}
+    return {"schema": br.SCHEMA, "meta": meta, "cells": [final_cell(campaign, k, MEDIANS[campaign][k], (slows or {}).get(k, 1.0), scale, (spreads or {}).get(k, 0.0), idx) for k in keys]}
+
+
+def campaign_files(d, name, campaign, dev, a_commit, b_commit, host, allocation, slows=None, cells=None, scale=1, spreads=None, rerun_cells=None, rerun_slows=None, scope=None):
+    """One campaign: three interleaved records per side (``cells``: the cells that they hold, all of them by default), a re-run of ``rerun_cells`` with three times the calls when asked for,
+    and the comparison report that ``compare_bench --json`` would write for it (made by the comparator with the driver's parameters); the entry of the final record that names them.
+    ``scope``: ``{metric: [cells]}`` for a campaign that judges flagged cells only, else the complete campaign."""
+    def make(side, commit, hour, slow, sc, keys, sp, offset):
+        return [final_rec(campaign, dev, commit, "2026-11-10T%s:%02d:00Z" % (hour, 2 * i + offset), host, slows=slow, scale=sc, cells=keys, spreads=sp, idx=i) for i in range(3)]
+
+    a1, b1 = make("A", a_commit, "10", None, scale, cells, spreads, 0), make("B", b_commit, "10", slows, scale, cells, spreads, 1)
+    a2 = make("A", a_commit, "11", None, 3 * scale, rerun_cells, None, 0) if rerun_cells else []
+    b2 = make("B", b_commit, "11", rerun_slows if rerun_slows is not None else slows, 3 * scale, rerun_cells, None, 1) if rerun_cells else []
+    files = {"A": tbt.write_records(str(d), name + "-A1", a1), "B": tbt.write_records(str(d), name + "-B1", b1)}
+    again = {"A": tbt.write_records(str(d), name + "-A2", a2) if a2 else [], "B": tbt.write_records(str(d), name + "-B2", b2) if b2 else []}
+    wanted = rc.canonical_coverage(campaign) if scope is None else scope
+    results = [br.compare(a1, b1, base_rerun=a2 or None, cand_rerun=b2 or None, **rc.compare_kwargs(m, rc.TOLERANCE_PCT, a_commit, rc.metric_cells(campaign, m) if scope is None else list(scope[m])))
+               for m in sorted(wanted)]
     report = Path(d) / (name + "-report.json")
-    report.write_text(json.dumps([result], default=str))
-    return {"report": str(report), "records": pa + pb, "allocation": allocation}
+    report.write_text(json.dumps(results, default=str))
+    return {"report": str(report), "records_first": files, "records_rerun": again, "allocation": allocation}
 
 
 def final_record(d, h, slow=None, known_limits=(), host="node-a"):
-    """The final record of both devices (each with a decode and a chain campaign of the measured commit against the base) and its baselines."""
+    """The final record of both devices (each with a decode and a chain campaign of the measured commit against the base on the benchmark's own cells) and its baselines."""
     d = Path(d)
     devices = {}
     for dev in rc.DEVICES:
         baseline = d / ("baseline-%s.json" % dev)
-        baseline.write_text(json.dumps({"commit": h["base"], "decode_matrix": {"cells": sorted(DECODE_CELLS), "metrics": [METRIC], "bench": "decode", "tolerance_pct": 1.0},
-                                        "layer_chain": {"cells": sorted(CHAIN_CELLS), "metrics": [METRIC], "bench": "chain", "tolerance_pct": 1.0}}))
-        campaigns = {"decode": campaign_files(d, "%s-decode" % dev, DECODE_CELLS, h["base"], h["final"], host="%s-%s" % (host, dev), slow=(slow or {}).get(dev), allocation="sc-%s-1" % dev),
-                     "chain": campaign_files(d, "%s-chain" % dev, CHAIN_CELLS, h["base"], h["final"], host="%s-%s" % (host, dev), allocation="sc-%s-1" % dev)}
+        gpu, sm = GPU[dev]
+        baseline.write_text(json.dumps({"commit": h["base"], "gpu": gpu, "sm_count": sm,
+                                        "decode_matrix": {"cells": sorted(DECODE_KEYS), "metrics": list(rc.CANONICAL_METRICS["decode"]), "bench": "decode", "tolerance_pct": 1.0},
+                                        "layer_chain": {"cells": sorted(CHAIN_KEYS), "metrics": list(rc.CANONICAL_METRICS["chain"]), "bench": "chain", "tolerance_pct": 1.0}}))
+        node = "%s-%s" % (host, dev)
+        campaigns = {"decode": campaign_files(d, "%s-decode" % dev, "decode", dev, h["base"], h["final"], node, "sc-%s-1" % dev, slows=(slow or {}).get(dev)),
+                     "chain": campaign_files(d, "%s-chain" % dev, "chain", dev, h["base"], h["final"], node, "sc-%s-1" % dev)}
         devices[dev] = {"baseline": str(baseline), "campaigns": campaigns}
     return {"schema": rc.FINAL_SCHEMA, "meta": {"commit": h["final"], "base": h["base"], "dirty": False}, "devices": devices, "known_limits": list(known_limits), "_path": "mem"}
 
 
-def known_limit(d, h, dev="b200", cell=SLOW_CELL, factor=1.08, confirm_host="node-b", confirm_alloc="sc-b200-2", reverted_factor=1.08):
-    """The known-limit entry for a regression of ``cell``: its confirmation on another node and allocation, and the run with every change reverted (the candidate is the base)."""
-    return {"device": dev, "campaign": "decode", "metric": METRIC, "cell": cell,
-            "confirmation": campaign_files(d, "%s-confirm" % dev, DECODE_CELLS, h["base"], h["final"], host=confirm_host, slow={cell: factor}, allocation=confirm_alloc),
-            "all_changes_reverted": campaign_files(d, "%s-reverted" % dev, DECODE_CELLS, h["base"], h["base"], host="node-c", slow={cell: reverted_factor}, allocation="sc-b200-3")}
+def known_limit(d, h, dev="b200", cell=SLOW_CELL, factor=1.08, confirm_host="node-b", confirm_alloc="sc-b200-2", reverted_factor=1.08, confirm_scale=3, confirm_cells=None, name="limit"):
+    """The known-limit entry for a regression of ``cell``: its confirmation (the flagged cell only, with three times the calls, on another node and allocation) and the run with every change
+    reverted (the candidate side is the base again)."""
+    scope = {SLOW_METRIC: [cell]}
+    conf = campaign_files(d, "%s-%s-confirm" % (name, dev), "decode", dev, h["base"], h["final"], confirm_host, confirm_alloc, slows={cell: factor}, cells=confirm_cells or [cell], scale=confirm_scale,
+                          scope=scope if confirm_cells is None else None)
+    rev = campaign_files(d, "%s-%s-reverted" % (name, dev), "decode", dev, h["base"], h["base"], "node-c", "sc-b200-3", slows={cell: reverted_factor}, cells=[cell], scope=scope)
+    return {"device": dev, "campaign": "decode", "metric": SLOW_METRIC, "cell": cell, "confirmation": conf, "all_changes_reverted": rev}
 
 
 def fcheck(rec, h, head=None, document=PERF_DOC % SLOW_CELL):
@@ -832,6 +874,16 @@ def test_a_complete_final_record_passes_against_a_docs_only_history(tmp_path, fi
     rec = final_record(tmp_path, final_repo)
     assert fcheck(rec, final_repo) == []
     assert fcheck(rec, final_repo, head=final_repo["final"]) == []                         # HEAD is the measured commit itself
+
+
+def test_the_coverage_is_the_benchmarks_own(tmp_path, final_repo):
+    """38 decode cells (the matrix in three regimes and the probe positions) and the host loop metrics on the 12 loop cells; two chain cells; five and three metrics."""
+    cov = rc.canonical_coverage("decode")
+    assert len(DECODE_KEYS) == 38 and sorted(cov) == sorted(br.WALL_METRICS + ("total_us",))
+    assert len(cov["gpu_graph_us"]) == 38 and len(cov["cpu_graph_us"]) == 12 and len(cov["cpu_eager_us"]) == 12 and all(any(x in k for x in LOOP_SUBSTRINGS) for k in cov["cpu_graph_us"])
+    assert len(CHAIN_KEYS) == 2 and sorted(rc.canonical_coverage("chain")) == ["cpu_graph_us", "gpu_graph_us", "total_us"]
+    rec = final_record(tmp_path, final_repo)
+    assert len(json.loads(Path(rec["devices"]["b200"]["campaigns"]["decode"]["report"]).read_text())) == 5
 
 
 def test_the_record_commit_rule_and_the_clean_tree_apply_to_the_final_record(tmp_path, final_repo):
@@ -852,6 +904,87 @@ def test_the_record_commit_rule_and_the_clean_tree_apply_to_the_final_record(tmp
     assert fcheck(rec, h) == []
 
 
+# ---- the round-3 review's counterexamples: the final record is recomputed from the raw records ----------------------------------------------------------------
+def rewrite_records(entry, side, edit):
+    """Rewrite every raw record file of ``side`` (first campaign and re-run) of a campaign entry after ``edit(record)``."""
+    for path in entry["records_first"][side] + entry["records_rerun"][side]:
+        rec = json.loads(Path(path).read_text())
+        edit(rec)
+        Path(path).write_text(json.dumps(rec))
+
+
+def double_samples(rec):
+    for cell in rec["cells"]:
+        for sm in cell["samples"]:
+            for k in list(sm):
+                if k.endswith("_us") and isinstance(sm[k], (int, float)):
+                    sm[k] *= 2.0
+
+
+def test_doubled_raw_candidate_samples_with_an_unchanged_report_are_rejected(tmp_path, final_repo):
+    """The comparator on the raw records says FAIL (every cell +100 %); the report still says PASS: the report is a claim that is recomputed, not a source."""
+    rec = final_record(tmp_path, final_repo)
+    assert fcheck(rec, final_repo) == []
+    entry = rec["devices"]["b200"]["campaigns"]["decode"]
+    rewrite_records(entry, "B", double_samples)
+    probs = fcheck(rec, final_repo)
+    assert has(probs, "the report differs from the raw records") and has(probs, "has no known-limit entry")
+
+
+def test_one_raw_record_per_side_while_the_report_claims_three_is_rejected(tmp_path, final_repo):
+    rec = final_record(tmp_path, final_repo)
+    entry = rec["devices"]["b300"]["campaigns"]["chain"]
+    entry["records_first"] = {"A": entry["records_first"]["A"][:1], "B": entry["records_first"]["B"][:1]}
+    probs = fcheck(rec, final_repo)
+    assert has(probs, "the comparison recomputed from the raw records is INVALID") and has(probs, "at least 3 interleaved repeats")
+
+
+def test_raw_cells_missing_in_every_file_are_rejected_whatever_the_report_claims(tmp_path, final_repo):
+    rec = final_record(tmp_path, final_repo)
+    entry = rec["devices"]["b200"]["campaigns"]["decode"]
+    dropped = DECODE_KEYS[-3:]
+    rewrite_records(entry, "A", lambda r: r.update(cells=[c for c in r["cells"] if c["key"] not in dropped]))
+    rewrite_records(entry, "B", lambda r: r.update(cells=[c for c in r["cells"] if c["key"] not in dropped]))
+    probs = fcheck(rec, final_repo)
+    assert has(probs, "holds 35 cell(s), the benchmark's definition holds 38") and has(probs, "missing %s" % sorted(dropped)[:3])
+
+
+def row_of(results, key=SLOW_CELL):
+    return next(r for r in results[0]["rows"] if r["key"] == key)
+
+
+def test_a_self_consistent_invented_report_row_is_rejected(tmp_path, final_repo):
+    """cand = 2 x base, difference 100 %, effective tolerance 1000 %, status PASS: consistent in itself, not what the raw records give."""
+    rec = final_record(tmp_path, final_repo)
+    entry = rec["devices"]["b200"]["campaigns"]["decode"]
+    edit_report(entry, lambda res: row_of(res).update(cand_median=row_of(res)["base_median"] * 2, median_delta_pct=100.0, delta_pct=100.0, tol_pct_effective=1000.0, status="PASS"))
+    assert has(fcheck(rec, final_repo), "the report differs from the raw records in")
+
+
+def test_raw_records_of_another_gpu_under_a_device_entry_are_rejected(tmp_path, final_repo):
+    """The round-3 positive fixture accepted NVIDIA B200 raw records under the b300 entry."""
+    rec = final_record(tmp_path, final_repo)
+    entry = rec["devices"]["b300"]["campaigns"]["decode"]
+    rewrite_records(entry, "A", lambda r: r["meta"].update(gpu="NVIDIA B200"))
+    rewrite_records(entry, "B", lambda r: r["meta"].update(gpu="NVIDIA B200"))
+    probs = fcheck(rec, final_repo)
+    assert has(probs, "is of the GPU 'NVIDIA B200', the device is b300") and has(probs, "the baseline's device is")
+
+
+def test_a_baseline_that_declares_less_than_the_benchmarks_coverage_is_not_an_authority(tmp_path, final_repo):
+    """Three decode cells and one chain cell with a metric that decode does not use were accepted as the baseline's coverage."""
+    rec = final_record(tmp_path, final_repo)
+    path = Path(rec["devices"]["b200"]["baseline"])
+    thin = json.loads(path.read_text())
+    thin["decode_matrix"].update(cells=DECODE_KEYS[:3], metrics=["k2_stage_us"])
+    thin["layer_chain"].update(cells=CHAIN_KEYS[:1])
+    path.write_text(json.dumps(thin))
+    probs = fcheck(rec, final_repo)
+    assert has(probs, "the baseline's metrics ['k2_stage_us'] are not the campaign's") and has(probs, "the baseline's cells are not the benchmark's 38 cells") and has(probs, "not the benchmark's 2 cells")
+    path.write_text(json.dumps(dict(thin, gpu="NVIDIA B300 SXM6 AC")))
+    assert has(fcheck(rec, final_repo), "the baseline is of the GPU 'NVIDIA B300 SXM6 AC', the device is b200")
+
+
 def edit_report(entry, edit):
     """Rewrite a campaign's report file after ``edit(results)``."""
     path = Path(entry["report"])
@@ -860,32 +993,24 @@ def edit_report(entry, edit):
     path.write_text(json.dumps(data))
 
 
-def row_of(results, key=SLOW_CELL):
-    return next(r for r in results[0]["rows"] if r["key"] == key)
-
-
 @pytest.mark.parametrize("name,edit,expected", [
-    ("a candidate median that contradicts the declared difference", lambda res: row_of(res).update(cand_median=row_of(res)["base_median"] * 2), "apart, the report says"),
-    ("a base median that contradicts it", lambda res: row_of(res).update(base_median=row_of(res)["base_median"] * 3), "apart, the report says"),
-    ("a median that is missing", lambda res: row_of(res).pop("cand_median"), "positive finite numbers"),
-    ("a median that is zero", lambda res: row_of(res).update(base_median=0), "positive finite numbers"),
-    ("a median that is NaN", lambda res: row_of(res).update(cand_median=float("nan")), "positive finite numbers"),
-    ("a difference that is missing", lambda res: row_of(res).pop("median_delta_pct"), "apart, the report says"),
-    ("a cell that is missing", lambda res: res[0]["rows"].pop(0), "missing"),
-    ("a cell that is not one of the baseline's", lambda res: res[0]["rows"].append(dict(row_of(res), key="decode;N=9;H=9;regime=lockstep;")), "unexpected"),
+    ("a candidate median that contradicts the declared difference", lambda res: row_of(res).update(cand_median=row_of(res)["cand_median"] * 2), "the report differs from the raw records in"),
+    ("a difference that is missing", lambda res: row_of(res).pop("median_delta_pct"), "the report differs from the raw records in"),
+    ("a status that the raw records do not give", lambda res: row_of(res).update(status="FAIL"), "the report differs from the raw records in"),
+    ("a spread that is invented", lambda res: row_of(res).update(base_spread_pct=2.5), "the report differs from the raw records in"),
+    ("a cell judged on another campaign", lambda res: row_of(res).update(judged_on="rerun"), "the report differs from the raw records in"),
+    ("a cell that is missing", lambda res: res[0]["rows"].pop(0), "the report has"),
+    ("a cell that is not one of the benchmark's", lambda res: res[0]["rows"].append(dict(row_of(res), key="decode;N=9;H=9;regime=lockstep;")), "unexpected"),
     ("a cell twice", lambda res: res[0]["rows"].append(dict(row_of(res))), "not unique"),
-    ("a report with another metric", lambda res: res[0].update(metric="total_us"), "the report has the metrics"),
-    ("a report without the metric of the baseline", lambda res: res.clear() or res.append({"metric": "k1_us", "rows": [], "mode": "regress", "verdict": "PASS", "tol_pct": 1.0}), "the report has the metrics"),
-    ("an INVALID comparison", lambda res: res[0].update(verdict="INVALID"), "not INVALID"),
-    ("a comparison of another mode", lambda res: res[0].update(mode="within"), "regress comparison"),
-    ("another tolerance", lambda res: res[0].update(tol_pct=5.0), "tolerance"),
-    ("a PASS for a row that is slower beyond its tolerance", lambda res: row_of(res).update(delta_pct=row_of(res)["tol_pct_effective"] + 1.0, status="PASS"), "does not agree"),
-    ("a FAIL for a row that is not slower", lambda res: row_of(res).update(status="FAIL"), "does not agree"),
-    ("an effective tolerance below the tolerance", lambda res: row_of(res).update(tol_pct_effective=0.1), "effective tolerance"),
-    ("no status", lambda res: row_of(res).pop("status"), "a status"),
+    ("a report with another metric", lambda res: res[0].update(metric="k1_us"), "the report has the metrics"),
+    ("a report without a metric", lambda res: res.pop(), "the report has the metrics"),
+    ("a verdict that the raw records do not give", lambda res: res[0].update(verdict="FAIL"), "the report says verdict"),
+    ("a comparison of another mode", lambda res: res[0].update(mode="within"), "the report says mode"),
+    ("another tolerance", lambda res: res[0].update(tol_pct=5.0), "the report says tol_pct"),
+    ("an unstable policy that is not the driver's", lambda res: res[0].update(unstable_policy="invalid"), "the report says unstable_policy"),
     ("a report that is not a list", lambda res: res.append(3), "not a comparison report"),
 ])
-def test_a_final_report_that_contradicts_its_numbers_or_misses_cells_is_rejected(tmp_path, final_repo, name, edit, expected):
+def test_a_final_report_that_contradicts_the_raw_records_is_rejected(tmp_path, final_repo, name, edit, expected):
     rec = final_record(tmp_path, final_repo)
     assert fcheck(rec, final_repo) == []
     edit_report(rec["devices"]["b300"]["campaigns"]["decode"], edit)
@@ -900,25 +1025,27 @@ def test_a_report_that_is_not_a_report_or_is_gone_is_rejected(tmp_path, final_re
     assert has(fcheck(rec, final_repo), "cannot be read")
 
 
-def test_the_raw_records_of_the_final_campaign_are_of_the_measured_commit_the_base_and_one_host(tmp_path, final_repo):
+def test_the_sides_of_the_raw_records_are_given_not_guessed_and_carry_the_commits_they_must(tmp_path, final_repo):
     h = final_repo
     rec = final_record(tmp_path, h)
     entry = rec["devices"]["b200"]["campaigns"]["decode"]
-    older = campaign_files(tmp_path, "older", DECODE_CELLS, h["base"], "a" * 40, host="node-b200")                         # the candidate side of an older tree
-    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].update(records=older["records"])), h), "no raw record is of the commit that is measured")
-    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].update(records=[])), h), "raw records that the report was made from must be named")
-    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].update(records=entry["records"] + [str(tmp_path / "gone.json")])), h), "cannot be read again")
-    other_host = campaign_files(tmp_path, "otherhost", DECODE_CELLS, h["base"], h["final"], host="node-z")
-    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].update(records=entry["records"] + other_host["records"][:1])), h), "more than one host")
-    base_only = [p for p in entry["records"] if "-A" in os.path.basename(p)]
-    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].update(records=base_only)), h), "no raw record is of the commit that is measured")
-    cand_only = [p for p in entry["records"] if "-B" in os.path.basename(p)]
-    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].update(records=cand_only)), h), "nothing to compare with")
-    third = campaign_files(tmp_path, "third", DECODE_CELLS, "c" * 40, h["final"], host="node-a-b200")
-    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].update(records=third["records"])), h), "neither the base")
-    dirty = tbt.rec(h["final"], dict((k, [v] * 5) for k, v in DECODE_CELLS.items()), "2026-11-05T11:00:00Z", host="node-a-b200", dirty=True)
-    dirty_path = tbt.write_records(str(tmp_path), "dirtyrec", [dirty])[0]
-    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].update(records=entry["records"] + [dirty_path])), h), "dirty")
+    flat = dict(entry, records=entry["records_first"]["A"] + entry["records_first"]["B"])
+    flat.pop("records_first")
+    flat.pop("records_rerun")
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"].update(decode=flat)), h), "listed as records_first and records_rerun")
+    swapped = dict(entry, records_first={"A": entry["records_first"]["B"], "B": entry["records_first"]["A"]})
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"].update(decode=swapped)), h), "side A must be")
+    one_side = dict(entry, records_first={"A": entry["records_first"]["A"], "B": []})
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"].update(decode=one_side)), h), "must name the raw records of both sides")
+    gone = dict(entry, records_first={"A": entry["records_first"]["A"], "B": entry["records_first"]["B"] + [str(tmp_path / "gone.json")]})
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"].update(decode=gone)), h), "cannot be read again")
+    older = campaign_files(tmp_path, "older", "decode", "b200", h["base"], "a" * 40, "node-a-b200", "sc-b200-1")                      # the candidate side of an older tree
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"].update(decode=older)), h), "side B must be")
+    other_host = campaign_files(tmp_path, "otherhost", "decode", "b200", h["base"], h["final"], "node-z", "sc-b200-1")
+    mixed = dict(entry, records_first={"A": entry["records_first"]["A"], "B": other_host["records_first"]["B"]})
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"].update(decode=mixed)), h), "hosts")
+    rewrite_records(entry, "B", lambda r: r["meta"].update(dirty=True))
+    assert has(fcheck(rec, h), "dirty")
 
 
 def test_a_final_record_needs_both_devices_both_campaigns_and_the_baselines(tmp_path, final_repo):
@@ -933,6 +1060,22 @@ def test_a_final_record_needs_both_devices_both_campaigns_and_the_baselines(tmp_
     assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"].update(baseline=str(wrong))), h), "the base of the loop is")
 
 
+def test_an_unstable_cell_needs_its_rerun_with_three_times_the_calls_and_a_legal_one_passes(tmp_path, final_repo):
+    h = final_repo
+    cell = DECODE_KEYS[3]
+    spreads = {cell: 0.01}                                                    # the per-process medians of a side step by 1 %: a 2 % spread, unstable in the first campaign
+    assert fcheck(final_record(tmp_path, h), h) == []
+    without = campaign_files(tmp_path, "norerun", "decode", "b200", h["base"], h["final"], "node-a-b200", "sc-b200-1", spreads=spreads)
+    rec = mutated(final_record(tmp_path, h), lambda r: r["devices"]["b200"]["campaigns"].update(decode=without))
+    assert has(fcheck(rec, h), "the comparison recomputed from the raw records is INVALID")
+    legal = campaign_files(tmp_path, "rerun", "decode", "b200", h["base"], h["final"], "node-a-b200", "sc-b200-1", spreads=spreads, rerun_cells=[cell])
+    assert fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"].update(decode=legal)), h) == []
+    scale_one = campaign_files(tmp_path, "rerun1", "decode", "b200", h["base"], h["final"], "node-a-b200", "sc-b200-1", spreads=spreads, rerun_cells=[cell])
+    rewrite_records(scale_one, "A", lambda r: [c["args"].update(calls_per_trial=tbt.CALLS, profile_calls=tbt.PROFILE_CALLS) for c in r["cells"] if r["meta"]["timestamp"].startswith("2026-11-10T11")])
+    rewrite_records(scale_one, "B", lambda r: [c["args"].update(calls_per_trial=tbt.CALLS, profile_calls=tbt.PROFILE_CALLS) for c in r["cells"] if r["meta"]["timestamp"].startswith("2026-11-10T11")])
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"].update(decode=scale_one)), h), "recomputed from the raw records is INVALID")
+
+
 def test_a_regression_of_the_final_ab_needs_a_known_limit_with_its_evidence(tmp_path, final_repo):
     h = final_repo
     slow = {"b200": {SLOW_CELL: 1.08}}
@@ -940,20 +1083,29 @@ def test_a_regression_of_the_final_ab_needs_a_known_limit_with_its_evidence(tmp_
     assert has(fcheck(unconfirmed, h), "has no known-limit entry")
     limit = known_limit(tmp_path, h)
     rec = final_record(tmp_path, h, slow=slow, known_limits=[limit])
-    assert fcheck(rec, h) == []
+    assert fcheck(rec, h) == []                                                                                          # the legal flagged-only confirmation with three times the calls passes
     cases = (
         ("no document", lambda: rc.final_problems(rec, h["repo"], h["docs"], None), "needs the performance document"),
         ("a document that does not name the cell", lambda: fcheck(rec, h, document=PERF_DOC % "decode;N=2;H=2;regime=cold;"), "does not name the cell"),
         ("a document without the section", lambda: fcheck(rec, h, document="# nothing\n"), "does not name the cell"),
         ("a confirmation on the node of the final A/B", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].update(
-            confirmation=known_limit(tmp_path, h, confirm_host="node-a-b200")["confirmation"])), h), "same node"),
+            confirmation=known_limit(tmp_path, h, confirm_host="node-a-b200", name="samenode")["confirmation"])), h), "same node"),
         ("a confirmation under the same allocation", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0]["confirmation"].update(allocation="sc-b200-1")), h), "second allocation is required"),
         ("a confirmation that does not fail the cell", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].update(
-            confirmation=known_limit(tmp_path, h, factor=1.0)["confirmation"])), h), "does not confirm"),
+            confirmation=known_limit(tmp_path, h, factor=1.0, name="nofail")["confirmation"])), h), "does not confirm"),
+        ("a confirmation with the calls of the first campaign", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].update(
+            confirmation=known_limit(tmp_path, h, confirm_scale=1, name="scale1")["confirmation"])), h), "not 3 times the first campaign's"),
+        ("a confirmation with nine times the calls (compounded)", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].update(
+            confirmation=known_limit(tmp_path, h, confirm_scale=9, name="scale9")["confirmation"])), h), "not 3 times the first campaign's"),
+        ("a confirmation of every cell instead of the flagged ones", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].update(
+            confirmation=campaign_files(tmp_path, "everycell", "decode", "b200", h["base"], h["final"], "node-b", "sc-b200-2", slows={SLOW_CELL: 1.08}, scale=3))), h), "flagged set"),
+        ("a confirmation that is itself re-run", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].update(
+            confirmation=campaign_files(tmp_path, "rerunconf", "decode", "b200", h["base"], h["final"], "node-b", "sc-b200-2", slows={SLOW_CELL: 1.08}, cells=[SLOW_CELL], scale=3,
+                                        rerun_cells=[SLOW_CELL], scope={SLOW_METRIC: [SLOW_CELL]}))), h), "never re-run"),
         ("a run with all changes reverted that shows no shift", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].update(
-            all_changes_reverted=known_limit(tmp_path, h, reverted_factor=1.0)["all_changes_reverted"])), h), "caused by the changes"),
+            all_changes_reverted=known_limit(tmp_path, h, reverted_factor=1.0, name="noshift")["all_changes_reverted"])), h), "caused by the changes"),
         ("a run with all changes reverted that is of the final tree", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].update(
-            all_changes_reverted=known_limit(tmp_path, h)["confirmation"])), h), "neither the base"),
+            all_changes_reverted=known_limit(tmp_path, h, name="finaltree")["confirmation"])), h), "side B must be"),
         ("no confirmation", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].pop("confirmation")), h), "the campaign evidence is missing"),
         ("no run with all changes reverted", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].pop("all_changes_reverted")), h), "the campaign evidence is missing"),
         ("a limit for another cell", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].update(cell="decode;N=1;H=12;regime=lockstep;")), h), "has no known-limit entry"),
@@ -961,6 +1113,16 @@ def test_a_regression_of_the_final_ab_needs_a_known_limit_with_its_evidence(tmp_
     )
     for name, run, expected in cases:
         assert has(run(), expected), (name, run()[:3])
+
+
+def test_a_confirmation_report_that_contradicts_its_raw_records_is_rejected(tmp_path, final_repo):
+    """The known limit's campaigns are recomputed from their raw records too: a confirmation whose report says FAIL for the cell while its raw records do not fail it."""
+    h = final_repo
+    rec = final_record(tmp_path, h, slow={"b200": {SLOW_CELL: 1.08}}, known_limits=[known_limit(tmp_path, h, factor=1.0, name="invented")])
+    probs = fcheck(rec, h)
+    assert has(probs, "does not confirm")                                                                                 # the raw records of the confirmation do not fail the cell
+    edit_report(rec["known_limits"][0]["confirmation"], lambda res: row_of(res).update(status="FAIL", delta_pct=8.0, median_delta_pct=8.0, cand_median=row_of(res)["base_median"] * 1.08))
+    assert has(fcheck(rec, h), "the report differs from the raw records")
 
 
 def test_the_final_command_line(tmp_path, final_repo, capsys):
@@ -982,6 +1144,22 @@ def test_the_final_command_line(tmp_path, final_repo, capsys):
     assert "outside docs/" in capsys.readouterr().out
     assert rc.main(args + ["--record", str(tmp_path / "missing.json")]) == 2
     assert rc.main(["decision", "--record", str(good)]) == 1
+
+
+def test_the_final_command_line_rejects_the_doubled_raw_candidate_samples(tmp_path, final_repo, capsys):
+    """The round-3 counterexample at the command line: the raw candidate samples doubled, the report untouched: exit 1 and VERDICT: FAIL (it was exit 0 and PASS)."""
+    h = final_repo
+    rec = final_record(tmp_path, h)
+    path = tmp_path / "final.json"
+    rec.pop("_path")
+    path.write_text(json.dumps(rec))
+    args = ["final", "--repo", str(h["repo"]), "--head", h["docs"], "--record", str(path)]
+    assert rc.main(args) == 0
+    capsys.readouterr()
+    rewrite_records(rec["devices"]["b200"]["campaigns"]["decode"], "B", double_samples)
+    assert rc.main(args) == 1
+    out = capsys.readouterr().out
+    assert "VERDICT: FAIL" in out and "the report differs from the raw records" in out
 
 
 # ---- the consolidated baseline ---------------------------------------------------------------------------------------------------------------

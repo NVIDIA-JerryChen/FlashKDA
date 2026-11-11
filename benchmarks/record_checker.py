@@ -48,11 +48,15 @@ decision a decision record has the keys ``row_engine_order`` (the steps of the r
 handoff  ``cfbi-handoff-v1``: the value-split and the operand-swap hand-offs (branch of the form ``explore/<run>/<topic>``, commit, both existing in the repository, the probe test on the branch,
          the next free implementation bit: 128 when single-launch decode took 64, else 64) and the known-limit section of the performance document (topics named without plan identifiers).
 final    ``cfbi-final-v1``: the final A/B of the final candidate against the base on every device. The record commit rule (the commit differs from HEAD only under ``docs/``) and a clean tree
-         are applied against ``--repo`` (required); per device the consolidated baseline says which cells and metrics a complete campaign has; each campaign (the decode matrix and the layer
-         chain) is a ``compare_bench.py --json`` report plus the raw records it was made from: the records are of the measured commit and the base, clean, from one host; the report has
-         every cell and metric of the baseline, positive finite medians whose difference is recomputed, and a status that agrees with the effective tolerance. A regression (a FAIL
-         row) is a known limit only with a confirmation campaign (the cell fails again, on another node and allocation) and a campaign with every change reverted (the same shift is there,
-         so the changes do not cause it), and the performance document (``--document``) must name the cell in its known-limit section.
+         are applied against ``--repo`` (required). Per device the consolidated baseline must declare the benchmark's own coverage (the decode matrix and probe cells of
+         ``bench_decode.cell_specs``, the layer-chain cells of ``bench_layer_chain.cell_specs``, the five decode and three chain metrics, tolerance 1 %) on the device's GPU. Each campaign
+         (the decode matrix and the layer chain) lists its raw records as ``records_first`` and ``records_rerun``, each ``{A: [...], B: [...]}`` (side A the base tree, side B the final
+         tree), plus the allocation and the comparison report; the verdicts are RECOMPUTED from the raw records with the committed comparator under the campaign driver's parameters
+         (regress, 1 %, three interleaved repeats, widening, a clean candidate) and the report must agree row by row (a claim, never a source). The raw files are of the commits their
+         side must be, of the device's GPU and the baseline's, from one host, and hold every cell of the benchmark (a re-run file some of them); the judged cells are the benchmark's.
+         A regression (a FAIL row of the recomputation) is a known limit only with a confirmation campaign (the flagged cells and no others, three times the calls of the first
+         campaign, never re-run, on another node and allocation, and the cell fails again) and a campaign with every change reverted (recomputed too: the same shift is there, so the
+         changes do not cause it), and the performance document (``--document``) must name the cell in its known-limit section.
 """
 import argparse
 import json
@@ -64,6 +68,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bench_decode as bd  # noqa: E402
+import bench_layer_chain as bl  # noqa: E402
 import bench_records as br  # noqa: E402
 import codegen_gate as cg  # noqa: E402
 import ncu_record as nr  # noqa: E402
@@ -448,6 +453,12 @@ LOOP_METRICS = ("cpu_eager_us", "cpu_graph_us")                       # host tim
 LOOP_CELLS = tuple("regime=%s;" % r for r in bd.LOOP_REGIMES)
 
 
+def compare_kwargs(metric, tolerance, base_commit, cells):
+    """The parameters of the campaign driver's comparison, which every recomputation of a verdict from raw records uses (the producer's: the regress gate, three interleaved repeats,
+    the widening of noise-limited cells, a clean candidate, the cell filter of the metric)."""
+    return dict(metric=metric, tol_pct=tolerance, mode="regress", expect_base_commit=base_commit, require_clean_cand=True, min_repeats=3, baseline_unstable="widen", cells=cells)
+
+
 def metric_cells(bench, metric):
     """The cell filter that a campaign applies to ``metric`` (None: every cell): the host loop metrics of a decode campaign exist for the loop regimes only."""
     return list(LOOP_CELLS) if bench == "decode" and metric in LOOP_METRICS else None
@@ -532,8 +543,7 @@ def campaign_problems(c, name, commit, allow_missing_raw=False):
     base_first, cand_first = [loaded[p] for p in first["A"]], [loaded[p] for p in first["B"]]
     base_rerun, cand_rerun = [loaded[p] for p in rerun.get("A") or []], [loaded[p] for p in rerun.get("B") or []]
     for m in metrics:
-        kw = dict(metric=m, tol_pct=c["tolerance_pct"], mode="regress", expect_base_commit=commit, require_clean_cand=True, min_repeats=3, baseline_unstable="widen",
-                  cells=metric_cells(c.get("bench"), m))
+        kw = compare_kwargs(m, c["tolerance_pct"], commit, metric_cells(c.get("bench"), m))
         final = br.compare(base_first, cand_first, base_rerun=base_rerun or None, cand_rerun=cand_rerun or None, **kw)["verdict"]
         if final != c["final_verdicts"][m]:
             problems.append("%s: the final verdict of %s is %s when recomputed from the raw records, the baseline says %s" % (where, m, final, c["final_verdicts"][m]))
@@ -1176,6 +1186,28 @@ def handoff_problems(rec, repo=None, single_launch_adopted=None):
 FINAL_SCHEMA = "cfbi-final-v1"
 CAMPAIGNS = ("decode", "chain")
 CAMPAIGN_KEY = {"decode": "decode_matrix", "chain": "layer_chain"}          # where the consolidated baseline of a device lists the cells and metrics of a campaign
+TOLERANCE_PCT = 1.0                                                          # the regress gate of Method M
+CANONICAL_METRICS = {"decode": tuple(sorted(br.WALL_METRICS + ("total_us",))), "chain": ("cpu_graph_us", "gpu_graph_us", "total_us")}
+DEVICE_GPU = {"b200": "B200", "b300": "B300"}                                # what the GPU name of the raw records of a device must contain
+CONFIRMATION_SAME_CONFIG = tuple(f for f in br.RERUN_SAME_CONFIG if f != "host")      # a confirmation runs on another node: it shares every other field with the first campaign
+ROW_EXACT = ("key", "kind", "metric", "status", "judged_on", "noise_limited", "needs_rerun", "n_base", "n_cand")
+ROW_NUMERIC = ("base_median", "cand_median", "median_delta_pct", "delta_pct", "tol_pct_effective", "base_spread_pct", "cand_spread_pct", "cand_judged", "base_reference")
+REPORT_SCALARS = ("verdict", "tol_pct", "mode", "unstable_policy")
+
+
+def canonical_cells(campaign):
+    """The cells of a complete campaign, from the benchmark that defines them (never from a record): the decode matrix and probe cells, or the layer-chain shapes."""
+    return [s["key"] for s in (bd.cell_specs() if campaign == "decode" else bl.cell_specs())]
+
+
+def canonical_coverage(campaign):
+    """``{metric: [cell keys]}`` that a complete campaign judges: every canonical metric on every cell, the host loop metrics of a decode campaign on the loop regimes only."""
+    keys = canonical_cells(campaign)
+    out = {}
+    for metric in CANONICAL_METRICS[campaign]:
+        sub = metric_cells(campaign, metric)
+        out[metric] = sorted(k for k in keys if not sub or any(x in k for x in sub))
+    return out
 
 
 def _load_report(path):
@@ -1190,90 +1222,184 @@ def _load_report(path):
     return data, None
 
 
-def campaign_evidence_problems(entry, where, campaign, expected, base, cand_commit, tolerance):
-    """One measured campaign of the final record (the final A/B, a confirmation, the run with every change reverted): the comparison report, the raw records it was made from and what the
-    two say together. ``expected``: the baseline's entry of the campaign (cells, metrics, bench); ``cand_commit`` the commit that the candidate side must be; ``base`` the base commit.
-    Returns ``(problems, info)``: ``info`` holds the host of the records and the rows by ``(metric, cell)``."""
-    info = {"host": None, "rows": {}}
+def _listing(entry, name, where, problems, allow_empty):
+    """``{A: [paths], B: [paths]}`` of a record listing of a campaign entry (``allow_empty``: both lists may be empty, a re-run that did not take place)."""
+    listing = entry.get(name)
+    if listing is None and allow_empty:
+        return {"A": [], "B": []}
+    if not isinstance(listing, dict) or not all(isinstance(listing.get(side), list) and all(text(x) for x in listing[side]) for side in ("A", "B")):
+        problems.append("%s: %s must be given as {A: [paths], B: [paths]}: which side a raw file belongs to is part of the evidence, it is not guessed" % (where, name))
+        return None
+    if allow_empty and bool(listing["A"]) != bool(listing["B"]):
+        problems.append("%s: %s must hold records for both sides or for neither" % (where, name))
+        return None
+    if not allow_empty and not (listing["A"] and listing["B"]):
+        problems.append("%s: %s must name the raw records of both sides" % (where, name))
+        return None
+    return listing
+
+
+def _same(a, b):
+    return a == b if not isinstance(a, float) and not isinstance(b, float) else (num(a) and num(b) and math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9))
+
+
+def report_problems(report, result, where):
+    """Where a comparison report differs from the comparison recomputed from the raw records: the verdict, the parameters and every row (median, delta, spread, effective
+    tolerance, status, the campaign it was judged on, noise-limited, needs a re-run)."""
+    out = []
+    for field in REPORT_SCALARS:
+        if not _same(report.get(field), result.get(field)):
+            out.append("%s: the report says %s = %r, the raw records give %r" % (where, field, report.get(field), result.get(field)))
+    rows = dict((r.get("key"), r) for r in report["rows"] if isinstance(r, dict))
+    want = dict((r["key"], r) for r in result["rows"])
+    if len(rows) != len(report["rows"]):
+        out.append("%s: the report's rows are not unique cells" % where)
+    if set(rows) != set(want):
+        out.append("%s: the report has %d cell(s), the raw records judge %d: missing %s, unexpected %s" % (where, len(rows), len(want), sorted(set(want) - set(rows))[:3], sorted(set(rows) - set(want))[:3]))
+    for key in sorted(set(rows) & set(want)):
+        bad = [f for f in ROW_EXACT + ROW_NUMERIC if not _same(rows[key].get(f), want[key].get(f))]
+        if bad:
+            out.append("%s, %s: the report differs from the raw records in %s (%s)" % (where, key, ", ".join(bad), "; ".join("%s: report %r, raw %r" % (f, rows[key].get(f), want[key].get(f)) for f in bad[:3])))
+    return out
+
+
+def baseline_contract_problems(baseline, dev, campaign, where):
+    """What the consolidated baseline of a device must say about a campaign: the benchmark, the tolerance, the metrics and the cells of the benchmark's own definition (the final
+    campaigns are judged on that coverage, so a baseline that declares less is not an authority for it), and a GPU that is the device."""
+    spec = baseline.get(CAMPAIGN_KEY[campaign])
+    if not isinstance(spec, dict):
+        return ["%s: the baseline has no %s campaign" % (where, CAMPAIGN_KEY[campaign])]
+    out = []
+    if spec.get("bench") != campaign:
+        out.append("%s: the baseline's %s campaign is of the benchmark %r" % (where, CAMPAIGN_KEY[campaign], spec.get("bench")))
+    if spec.get("tolerance_pct") != TOLERANCE_PCT:
+        out.append("%s: the baseline's tolerance is %r %%, the regress gate is %s %%" % (where, spec.get("tolerance_pct"), TOLERANCE_PCT))
+    if sorted(spec.get("metrics") or []) != sorted(CANONICAL_METRICS[campaign]):
+        out.append("%s: the baseline's metrics %s are not the campaign's %s" % (where, sorted(spec.get("metrics") or []), sorted(CANONICAL_METRICS[campaign])))
+    want = sorted(canonical_cells(campaign))
+    if sorted(spec.get("cells") or []) != want:
+        got = set(spec.get("cells") or [])
+        out.append("%s: the baseline's cells are not the benchmark's %d cells (missing %s, unexpected %s)" % (where, len(want), sorted(set(want) - got)[:3], sorted(got - set(want))[:3]))
+    if DEVICE_GPU[dev] not in str(baseline.get("gpu")):
+        out.append("%s: the baseline is of the GPU %r, the device is %s" % (where, baseline.get("gpu"), dev))
+    return out
+
+
+def campaign_evidence_problems(entry, where, campaign, dev, baseline, base, a_commit, b_commit, scope=None, allow_rerun=True):
+    """One measured campaign of the final record (the final A/B, a confirmation, the run with every change reverted), recomputed from its raw records.
+
+    ``entry``: ``{allocation, report, records_first: {A, B}, records_rerun: {A, B}}``: the raw record files of the first campaign and of the re-run over the unstable cells, side A (the
+    base tree) and side B (the candidate tree, or the base tree again when every change is reverted), and the comparison report (``compare_bench.py --json``), which is a claim.
+    Every metric is compared again with ``br.compare`` under the parameters of the campaign driver (regress gate, 1 %, three interleaved repeats, widening of noise-limited cells, a
+    clean candidate) and the report must say what the comparison gives, row by row. The sides' commits are ``a_commit`` / ``b_commit``, the GPU of every file the device's (and the
+    baseline's), the coverage the benchmark's own: ``scope`` None means the complete campaign (every canonical metric on its cells), else ``{metric: [cells]}``, which the campaign
+    must judge exactly (a confirmation or a reverted run covers the flagged cells and no others). ``allow_rerun`` False: the campaign is itself the three-times campaign and is never re-run.
+    Returns ``(problems, info)``; ``info`` holds the host, the first-campaign records by side and the recomputed rows by ``(metric, cell)``."""
+    info = {"host": None, "rows": {}, "first": None}
     if not isinstance(entry, dict):
         return ["%s: the campaign evidence is missing" % where], info
     problems = []
+    if "records" in entry and "records_first" not in entry:
+        problems.append("%s: the raw records are listed as records_first and records_rerun, each {A: [...], B: [...]} (a flat list does not say which side a file is)" % where)
     if not text(entry.get("allocation")):
         problems.append("%s: the allocation (the node job that the campaign ran on) must be named" % where)
-    paths = entry.get("records")
-    if not (isinstance(paths, list) and paths and all(text(x) for x in paths)):
-        problems.append("%s: the raw records that the report was made from must be named" % where)
-        paths = []
-    hosts, commits = set(), set()
-    for path in paths:
+    first = _listing(entry, "records_first", where, problems, False)
+    rerun = _listing(entry, "records_rerun", where, problems, True)
+    if first is None or rerun is None:
+        return problems, info
+    if rerun["A"] and not allow_rerun:
+        problems.append("%s: a campaign that is itself the three-times campaign is never re-run (the factor would compound): records_rerun must be empty" % where)
+    loaded = {}
+    for path in _paths(first) + _paths(rerun):
         try:
-            rec = br.load_record(path)
+            loaded[path] = br.load_record(path)
         except (OSError, ValueError) as e:
             problems.append("%s: the raw record %s cannot be read again (%s)" % (where, path, e))
-            continue
-        problems.extend("%s: %s" % (where, q) for q in br.validate_record(rec, "final", None, True))
-        meta = rec.get("meta") or {}
-        hosts.add(meta.get("host"))
-        commit = str(meta.get("commit"))
-        commits.add(commit)
-        if not (commit_matches(commit, base) or commit_matches(commit, cand_commit)):
-            problems.append("%s: the raw record %s is of commit %s: neither the base %s nor the measured candidate %s" % (where, path, commit, base[:10], cand_commit[:10]))
-    if paths and not any(commit_matches(c, cand_commit) for c in commits):
-        problems.append("%s: no raw record is of the commit that is measured (%s): the report belongs to another tree" % (where, cand_commit))
-    if paths and cand_commit != base and not any(commit_matches(c, base) for c in commits):
-        problems.append("%s: no raw record is of the base %s: there is nothing to compare with" % (where, base))
+    if len(loaded) != len(set(_paths(first) + _paths(rerun))):
+        return problems, info
+    sides = {"A": a_commit, "B": b_commit}
+    hosts = set()
+    for side in ("A", "B"):
+        for path in first[side] + rerun[side]:
+            meta = loaded[path].get("meta") or {}
+            hosts.add(meta.get("host"))
+            if not commit_matches(str(meta.get("commit")), sides[side]):
+                problems.append("%s: the raw record %s of side %s is of commit %s, side %s must be %s" % (where, path, side, meta.get("commit"), side, sides[side][:10]))
+            if DEVICE_GPU[dev] not in str(meta.get("gpu")):
+                problems.append("%s: the raw record %s is of the GPU %r, the device is %s" % (where, path, meta.get("gpu"), dev))
+            if meta.get("gpu") != baseline.get("gpu") or meta.get("sm_count") != baseline.get("sm_count"):
+                problems.append("%s: the raw record %s is of %r with %r SMs, the baseline's device is %r with %r SMs" % (where, path, meta.get("gpu"), meta.get("sm_count"), baseline.get("gpu"), baseline.get("sm_count")))
     if len(hosts) == 1:
         info["host"] = next(iter(hosts))
-    elif paths:
-        problems.append("%s: the raw records come from more than one host (%s): a campaign runs on one allocation" % (where, ", ".join(sorted(str(h) for h in hosts))))
+    else:
+        problems.append("%s: the raw records come from %d hosts (%s): a campaign runs on one allocation" % (where, len(hosts), ", ".join(sorted(str(h) for h in hosts))))
+    if problems:
+        return problems, info
+    wanted = canonical_coverage(campaign) if scope is None else dict((m, sorted(c)) for m, c in scope.items())
+    every = sorted(set(k for cells in wanted.values() for k in cells)) if scope is not None else sorted(canonical_cells(campaign))
+    what = "benchmark's definition" if scope is None else "flagged set"
+    for side in ("A", "B"):
+        for path in first[side]:                                  # a first-campaign file holds every cell of the campaign
+            got = sorted(c.get("key") for c in loaded[path].get("cells", []) if isinstance(c, dict))
+            if got != every:
+                problems.append("%s: the raw record %s holds %d cell(s), the %s holds %d: missing %s, unexpected %s" % (
+                    where, path, len(got), what, len(every), sorted(set(every) - set(got))[:3], sorted(set(got) - set(every))[:3]))
+        for path in rerun[side]:                                  # a re-run file holds the cells that were re-run: some of them, and none that the campaign does not have
+            got = sorted(c.get("key") for c in loaded[path].get("cells", []) if isinstance(c, dict))
+            if not got or set(got) - set(every):
+                problems.append("%s: the re-run record %s holds %d cell(s), %s of the %s are not among them" % (where, path, len(got), "none" if not got else "some", what))
+    if problems:
+        return problems, info
+    a_first, b_first = [loaded[p] for p in first["A"]], [loaded[p] for p in first["B"]]
+    a_rerun, b_rerun = [loaded[p] for p in rerun["A"]], [loaded[p] for p in rerun["B"]]
+    info["first"] = {"A": a_first, "B": b_first}
     results, why = _load_report(entry.get("report")) if text(entry.get("report")) else (None, "is not named")
     if results is None:
-        return problems + ["%s: the comparison report %s" % (where, why)], info
-    metrics = expected.get("metrics") if isinstance(expected.get("metrics"), list) else []
-    seen = [r.get("metric") for r in results]
-    if sorted(seen) != sorted(metrics):
-        problems.append("%s: the report has the metrics %s, the baseline has %s" % (where, sorted(str(m) for m in seen), sorted(metrics)))
-    for result in results:
-        metric, w = result.get("metric"), "%s, %s" % (where, result.get("metric"))
-        if result.get("mode") != "regress" or result.get("verdict") not in ("PASS", "FAIL"):
-            problems.append("%s: the report is a %s comparison with the verdict %r: a regress comparison with a verdict of PASS or FAIL is required (not INVALID)" % (w, result.get("mode"), result.get("verdict")))
-        if result.get("tol_pct") != tolerance:
-            problems.append("%s: the report's tolerance is %r %%, the baseline's is %r %%" % (w, result.get("tol_pct"), tolerance))
-        wanted = set(c for c in (expected.get("cells") or []) if not metric_cells(expected.get("bench"), metric) or any(m in c for m in metric_cells(expected.get("bench"), metric)))
-        rows = dict((r.get("key"), r) for r in result["rows"] if isinstance(r, dict))
-        if len(rows) != len(result["rows"]):
-            problems.append("%s: the report's rows are not unique cells" % w)
-        if set(rows) != wanted:
-            problems.append("%s: the report has %d cell(s), the baseline's cells for this metric are %d: missing %s, unexpected %s" % (
-                w, len(rows), len(wanted), sorted(wanted - set(rows))[:3], sorted(set(rows) - wanted)[:3]))
-        for key, row in sorted(rows.items(), key=lambda kv: str(kv[0])):
-            rw = "%s, %s" % (w, key)
-            if not (num(row.get("base_median")) and num(row.get("cand_median")) and row["base_median"] > 0 and row["cand_median"] > 0):
-                problems.append("%s: the base and candidate medians must be positive finite numbers (%r, %r)" % (rw, row.get("base_median"), row.get("cand_median")))
-                continue
-            delta = (row["cand_median"] / row["base_median"] - 1.0) * 100.0
-            if not (num(row.get("median_delta_pct")) and abs(delta - row["median_delta_pct"]) <= 1e-6 * max(1.0, abs(delta))):
-                problems.append("%s: the medians %r and %r are %.4f %% apart, the report says %r %%" % (rw, row["base_median"], row["cand_median"], delta, row.get("median_delta_pct")))
-            eff = row.get("tol_pct_effective")
-            if not (num(eff) and num(row.get("delta_pct")) and eff >= result.get("tol_pct", 0) and row.get("status") in ("PASS", "FAIL")):
-                problems.append("%s: a status (PASS or FAIL), the delta and the effective tolerance (not below the tolerance) are required" % rw)
-                continue
-            if (row["status"] == "FAIL") != (row["delta_pct"] > eff):
-                problems.append("%s: the status %s does not agree with the delta %.4f %% against the effective tolerance %.4f %%" % (rw, row["status"], row["delta_pct"], eff))
-            info["rows"][(metric, key)] = row
+        problems.append("%s: the comparison report %s" % (where, why))
+    elif sorted(str(r.get("metric")) for r in results) != sorted(wanted):
+        problems.append("%s: the report has the metrics %s, the campaign judges %s" % (where, sorted(str(r.get("metric")) for r in results), sorted(wanted)))
+        results = None
+    by_metric = dict((r.get("metric"), r) for r in results) if results else {}
+    for metric in sorted(wanted):
+        w = "%s, %s" % (where, metric)
+        cells = metric_cells(campaign, metric) if scope is None else list(wanted[metric])
+        res = br.compare(a_first, b_first, base_rerun=a_rerun or None, cand_rerun=b_rerun or None, **compare_kwargs(metric, TOLERANCE_PCT, base, cells))
+        if res["verdict"] not in ("PASS", "FAIL"):
+            problems.append("%s: the comparison recomputed from the raw records is %s, not a measurement: %s" % (w, res["verdict"], "; ".join(res["problems"][:3])))
+            continue
+        rows = [r["key"] for r in res["rows"]]
+        if sorted(rows) != sorted(wanted[metric]):
+            problems.append("%s: the raw records judge %d cell(s), the %s has %d: missing %s, unexpected %s" % (
+                w, len(rows), "benchmark's definition" if scope is None else "flagged set", len(wanted[metric]), sorted(set(wanted[metric]) - set(rows))[:3], sorted(set(rows) - set(wanted[metric]))[:3]))
+        for row in res["rows"]:
+            info["rows"][(metric, row["key"])] = row
+        if metric in by_metric:
+            problems.extend(report_problems(by_metric[metric], res, w))
     return problems, info
+
+
+def scale_problems(first, confirmation, wanted, where):
+    """Why a confirmation is not the three-times campaign of the first campaign for the cells it confirms: for every flagged cell and side the calls per trial (and the profiled calls of a
+    kernel-sum metric) are recorded as one positive integer in both and the confirmation's are exactly three times the first campaign's (taken from the first campaign, not from a re-run
+    of it: the factor never compounds), under the same configuration but for the node."""
+    out = []
+    for metric, keys in sorted(wanted.items()):
+        for key in keys:
+            for side, name in (("A", "baseline"), ("B", "candidate")):
+                out.extend("%s: %s" % (where, p) for p in br.rerun_problems(first[side], confirmation[side], name, key, metric, same_config=CONFIRMATION_SAME_CONFIG))
+    return out
 
 
 def final_problems(rec, repo=None, head="HEAD", document_text=None):
     """Problems of a ``cfbi-final-v1`` record (the final A/B of the final candidate against the base on every device).
 
-    The record names the commit that was measured (``meta.commit``) and, per device, the consolidated baseline (which cells and metrics a complete campaign has), the final A/B
-    campaigns (decode matrix and layer chain) and, for every regression that the final A/B shows (a FAIL row of the comparison), a known limit: the confirmation campaign on another
-    allocation and the campaign with every change reverted. Each campaign is a comparison report (``compare_bench.py --json``), the raw records it was made from and the allocation.
-    What is checked: the docs-only record-commit rule and a clean tree against ``repo`` / ``head`` (the commit must be one of the repository and differ from HEAD only under
-    ``docs/``), the raw records of the final A/B (commit measured, base, clean, one host), the report (every cell and metric of the baseline, positive finite medians, the difference
-    recomputed from them, status against the effective tolerance), and for a regression: the confirmation (the cell fails again, on another node and allocation) and the run with all
-    changes reverted (the same shift is there, so it is not caused by the changes), and the performance document, which must name the cell in its known-limit section."""
+    The record names the commit that was measured (``meta.commit``) and, per device, the consolidated baseline and the final A/B campaigns (decode matrix and layer chain) and, for every
+    regression that the final A/B shows (a FAIL row of the comparison recomputed from the raw records), a known limit: the confirmation campaign on another allocation and the campaign
+    with every change reverted. What is checked: the docs-only record-commit rule and a clean tree against ``repo`` / ``head`` (the commit must be one of the repository and differ from
+    HEAD only under ``docs/``); per device the baseline's coverage is the benchmark's own and its GPU the device; every campaign is recomputed from its raw records (see
+    ``campaign_evidence_problems``: the sides, the commits, the GPU, the coverage, the comparison itself and the report row by row); a regression needs a known-limit entry whose
+    confirmation judges exactly the flagged cells with three times the calls of the first campaign on another node and allocation and fails again, whose run with all changes reverted
+    shows the same shift (so the changes do not cause it), and the performance document must name the cell in its known-limit section."""
     where = "final record %s" % (rec.get("_path", "?") if isinstance(rec, dict) else "?")
     if not isinstance(rec, dict) or rec.get("schema") != FINAL_SCHEMA:
         return ["%s: not a %s record" % (where, FINAL_SCHEMA)]
@@ -1292,7 +1418,7 @@ def final_problems(rec, repo=None, head="HEAD", document_text=None):
     base, final = meta.get("base"), meta.get("commit")
     if not (hexcommit(base) and hexcommit(final)):
         return problems
-    regressions, campaign_info = [], {}
+    regressions, campaign_info, baselines = [], {}, {}
     for dev in DEVICES:
         d = devices[dev] if isinstance(devices[dev], dict) else {}
         try:
@@ -1300,17 +1426,19 @@ def final_problems(rec, repo=None, head="HEAD", document_text=None):
         except (KeyError, OSError, ValueError) as e:
             problems.append("%s: %s: the consolidated baseline %r cannot be read (%s)" % (where, dev, d.get("baseline"), e))
             continue
+        baselines[dev] = baseline
         if not commit_matches(str(baseline.get("commit")), base):
             problems.append("%s: %s: the consolidated baseline is of commit %s, the base of the loop is %s" % (where, dev, baseline.get("commit"), base))
         for campaign in CAMPAIGNS:
-            expected = baseline.get(CAMPAIGN_KEY[campaign])
+            cw = "%s: %s %s" % (where, dev, campaign)
+            contract = baseline_contract_problems(baseline, dev, campaign, cw)
+            problems.extend(contract)
             entry = (d.get("campaigns") or {}).get(campaign) if isinstance(d.get("campaigns"), dict) else None
-            if not isinstance(expected, dict):
-                problems.append("%s: %s: the baseline has no %s campaign" % (where, dev, CAMPAIGN_KEY[campaign]))
+            if contract:
                 continue
-            probs, info = campaign_evidence_problems(entry, "%s: %s %s" % (where, dev, campaign), campaign, expected, base, final, expected.get("tolerance_pct"))
+            probs, info = campaign_evidence_problems(entry, cw, campaign, dev, baseline, base, base, final)
             problems.extend(probs)
-            campaign_info[(dev, campaign)] = (entry, expected, info)
+            campaign_info[(dev, campaign)] = (entry, info)
             regressions.extend((dev, campaign, metric, key) for (metric, key), row in sorted(info["rows"].items()) if row.get("status") == "FAIL")
     limits = rec.get("known_limits") if isinstance(rec.get("known_limits"), list) else []
     section = known_limit_section(document_text) if document_text is not None else None
@@ -1320,19 +1448,25 @@ def final_problems(rec, repo=None, head="HEAD", document_text=None):
         if entry is None:
             problems.append("%s: a regression that the final A/B shows has no known-limit entry with its confirmation and its run with all changes reverted" % w)
             continue
-        original, expected, info = campaign_info[(dev, campaign)]
-        conf_probs, conf = campaign_evidence_problems(entry.get("confirmation"), "%s, confirmation" % w, campaign, expected, base, final, expected.get("tolerance_pct"))
-        rev_probs, rev = campaign_evidence_problems(entry.get("all_changes_reverted"), "%s, all changes reverted" % w, campaign, expected, base, base, expected.get("tolerance_pct"))
+        original, info = campaign_info[(dev, campaign)]
+        flagged = {}
+        for (m, k), row in info["rows"].items():
+            if row.get("status") == "FAIL":
+                flagged.setdefault(m, []).append(k)
+        conf_probs, conf = campaign_evidence_problems(entry.get("confirmation"), "%s, confirmation" % w, campaign, dev, baselines[dev], base, base, final, scope=flagged, allow_rerun=False)
+        rev_probs, rev = campaign_evidence_problems(entry.get("all_changes_reverted"), "%s, all changes reverted" % w, campaign, dev, baselines[dev], base, base, base, scope=flagged)
         problems.extend(conf_probs + rev_probs)
+        if not conf_probs:
+            problems.extend(scale_problems(info["first"], conf["first"], flagged, "%s, confirmation" % w))
         if conf_probs or rev_probs:
             continue
-        if (metric, key) not in conf["rows"] or conf["rows"][(metric, key)].get("status") != "FAIL":
+        if conf["rows"].get((metric, key), {}).get("status") != "FAIL":
             problems.append("%s: the confirmation campaign does not confirm the regression: the cell does not fail there" % w)
         if conf["host"] is not None and conf["host"] == info["host"]:
             problems.append("%s: the confirmation ran on the same node (%s) as the final A/B: a second allocation is required" % (w, conf["host"]))
         if entry["confirmation"].get("allocation") == (original or {}).get("allocation"):
             problems.append("%s: the confirmation names the allocation of the final A/B: a second allocation is required" % w)
-        if (metric, key) not in rev["rows"] or rev["rows"][(metric, key)].get("status") != "FAIL":
+        if rev["rows"].get((metric, key), {}).get("status") != "FAIL":
             problems.append("%s: the same shift is not there with all changes reverted: the regression is caused by the changes, a known limit is not allowed (revert the latest step and re-validate)" % w)
         if document_text is None:
             problems.append("%s: a known limit needs the performance document (give it): the cell must be named in its known-limit section" % w)

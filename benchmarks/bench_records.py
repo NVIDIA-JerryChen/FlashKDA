@@ -424,10 +424,11 @@ def _arg_values(records, key, name):
     return [vals[k] for k in sorted(vals)]
 
 
-def rerun_problems(first, rerun, side, key, metric):
+def rerun_problems(first, rerun, side, key, metric, same_config=RERUN_SAME_CONFIG):
     """Why the re-run records of ``side`` do not prove a three-times-calls re-run of cell ``key`` of the first campaign for the compared ``metric`` (an empty list means
     they do). The counts of ``count_names(metric)`` must each be recorded as one strictly positive integer in the first campaign and in the re-run, and the re-run's must
-    be exactly three times the first campaign's: a count that is absent on both sides is not read as "there was no such measurement"."""
+    be exactly three times the first campaign's: a count that is absent on both sides is not read as "there was no such measurement". ``same_config``: the meta fields that the
+    two record lists must share (a confirmation campaign on another node shares all of them but the host)."""
     out = []
     for name in count_names(metric):
         f, r = _arg_values(first, key, name), _arg_values(rerun, key, name)
@@ -435,7 +436,7 @@ def rerun_problems(first, rerun, side, key, metric):
             out.append("%s %s of cell %r is not recorded as one positive integer in the first campaign and in the re-run (first campaign %s, re-run %s)" % (side, name, key, f, r))
         elif r[0] != RERUN_SCALE * f[0]:
             out.append("%s re-run of cell %r has %s = %s, not %d times the first campaign's %s" % (side, key, name, r[0], RERUN_SCALE, f[0]))
-    for field in RERUN_SAME_CONFIG:
+    for field in same_config:
         a = set(json.dumps((x.get("meta") or {}).get(field), sort_keys=True) for x in first)
         b = set(json.dumps((x.get("meta") or {}).get(field), sort_keys=True) for x in rerun)
         if len(a) != 1 or a != b:
