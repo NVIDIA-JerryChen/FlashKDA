@@ -7,6 +7,11 @@ Stamps (cycles of ``clock64``, relative to the stamp taken at kernel entry): per
 kernel exit (kept in the slot of the last row of a CTA) and ``ts[9]`` is the SM id + 1 (0: the slot holds no row). The seven row phases are the differences of neighbouring
 stamps; the prologue is ``ts[0]`` (kernel entry to the first row), the epilogue ``ts[8] - ts[7]`` and the measured row duration ``ts[7] - ts[0]``.
 
+Two limits of what a stamp says. The exit stamp is taken by thread 0 after its own last global store (the ``pos`` store of the fused finish): it does not wait for the stores of the
+other threads or of the memory system to retire, so the kernel total is the time of the last instruction of thread 0, not the time at which the grid is complete. And ``ts[0]`` is the
+time from kernel entry, so it is the prologue only for the first row of a CTA: the records are made for decode, where every CTA runs one row per call (a CTA with several rows would
+carry the earlier rows in the ``ts[0]`` of the later ones).
+
 Every mean of a group is taken over the same rows, so the phases add up to the row duration (a median of totals is not a sum of medians).
 Groups: ``regular`` = the rows at positions 0 .. 62, ``chunk_end`` = the rows at position 63 (the chunk-end row), ``all`` = both. A cell is one shape (N sequences, H heads).
 """
