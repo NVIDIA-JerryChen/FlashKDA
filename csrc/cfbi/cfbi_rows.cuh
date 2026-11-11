@@ -28,6 +28,13 @@
 namespace cfbi {
 
 #ifdef CFBI_ROWS_PROFILE
+// Row-engine profile (profile build only, read back by the host through rows_profile_read in cfbi_launch.cu): clock64 stamps of every row of every CTA relative to the
+// stamp taken at kernel entry. Slot [row position][CTA = n * H + h]: entries 0..7 = ROWS_TS(0..7) of the row, 8 = kernel exit (written to the slot of the last row of the
+// CTA), 9 = SM id + 1 (0: the slot holds no row).
+constexpr int ROWS_PROF_POS = 64;
+constexpr int ROWS_PROF_CTAS = 4096;
+constexpr int ROWS_PROF_STAMPS = 10;
+__device__ unsigned g_rows_prof[ROWS_PROF_POS][ROWS_PROF_CTAS][ROWS_PROF_STAMPS];
 #define ROWS_TS(i) do { if (threadIdx.x == 0) tp[i] = clock64(); } while (0)
 #else
 #define ROWS_TS(i) do {} while (0)
@@ -115,6 +122,9 @@ __device__ __forceinline__ void rows_m_tiles(RowSmem& S, const float* Rut, const
 #define CFBI_ROWS_MINB 2
 #endif
 __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Params p) {
+#ifdef CFBI_ROWS_PROFILE
+    const long long prof_entry = clock64();   // the profile starts at kernel entry: before the plan load and the rest of the prologue
+#endif
     __shared__ RowSmem S;
     const int n = blockIdx.x, h = blockIdx.y, H = p.H;
     const SeqPlan sp = p.plan[n];
@@ -138,6 +148,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
 
 #ifdef CFBI_ROWS_PROFILE
     long long tp[9];
+    int prof_last = -1;   // position of the last row of this CTA that was recorded
 #endif
     int pos = sp.pos0;
     // cached rows b..pos-1 of UT | W (role column) and of U (value column, tid < 128) of the current sub-block, and the
@@ -149,6 +160,9 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
     for (int jj = 0; jj < 16; ++jj) { xpre[jj] = 0.f; upre[jj] = 0.f; }
     for (int i = 0; i < nrows; ++i) {
         ROWS_TS(0);
+#ifdef CFBI_ROWS_PROFILE
+        const int prof_pos = pos;   // the position of this row (pos is advanced at its end)
+#endif
         const int64_t tok = (int64_t)sp.tok0 + i;
         const int64_t off = (tok * H + h) * HEAD_K;   // q/k/v/g/out row offset
         const int s = pos >> 4, b = pos & ~15, slot = pos & 15;
@@ -435,12 +449,25 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
         __syncthreads();
 #ifdef CFBI_ROWS_PROFILE
         ROWS_TS(7);
-        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && (i < 3 || pos % 16 == 4 || pos == 0))
-            printf("rows pos=%d: prep %lld | akk/aqk %lld | M tiles %lld | UT/W chain %lld | P1/P2 %lld | U,O %lld | chunk-end/sync %lld | total %lld\n", pos,
-                   tp[1] - tp[0], tp[2] - tp[1], tp[3] - tp[2], tp[4] - tp[3], tp[5] - tp[4], tp[6] - tp[5], tp[7] - tp[6], tp[7] - tp[0]);
+        prof_last = prof_pos;
+        if (threadIdx.x == 0 && n * H + h < ROWS_PROF_CTAS) {   // after the last stamp of the row: the buffer write is outside every measured phase
+            unsigned smid;
+            asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+            unsigned* r = g_rows_prof[prof_pos][n * H + h];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) r[k] = (unsigned)(tp[k] - prof_entry);
+            r[9] = smid + 1;
+        }
 #endif
     }
     if (p.fuse_pos && tid == 0) p.pos[sp.slot] = (int)(((int64_t)sp.pos0 + sp.len) % BT);   // same value from every head CTA
+#ifdef CFBI_ROWS_PROFILE
+    if (threadIdx.x == 0 && prof_last >= 0 && n * H + h < ROWS_PROF_CTAS)
+        g_rows_prof[prof_last][n * H + h][8] = (unsigned)(clock64() - prof_entry);   // after the last global store of the kernel
+#ifdef CFBI_ROWS_PROFILE_PERTURB   // negative control of the bit-identity check of the profile build: one output bit of one CTA differs
+    if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) reinterpret_cast<unsigned short*>(p.out)[(int64_t)sp.tok0 * H * HEAD_K] ^= 1;
+#endif
+#endif
 }
 
 }  // namespace cfbi

@@ -114,6 +114,16 @@ std::vector<torch::Tensor> dyn_start_log(int64_t n) {
     return {t, s, torch::tensor({static_cast<int64_t>(got)}, torch::dtype(torch::kInt64))};
 }
 
+// Profile build only (CFBI_ROWS_PROFILE; any other build returns an empty tensor): the clock stamps of the rows of the last calls, int32 [row position, CTA, stamp]
+// (layout in cfbi_rows.cuh), and a reset of the buffer.
+torch::Tensor rows_profile_read_py() {
+    int positions = 0, ctas = 0, stamps = 0;
+    cfbi::rows_profile_dims(&positions, &ctas, &stamps);
+    auto t = torch::zeros({positions, ctas, stamps}, torch::dtype(torch::kInt32));
+    if (positions > 0) cfbi::rows_profile_read(reinterpret_cast<unsigned*>(t.data_ptr<int>()), positions * ctas * stamps);
+    return t;
+}
+
 // One entry point for prefill, the training forward and decode.
 //   q,k,v,g: bf16 [B,T,H,128]; beta: bf16 [B,T,H] (raw logits); out: bf16 [B,T,H,128] (written in place).
 //   State (E fp32 [N,H,128,128], rows fp32 [N,H,5,64,128], pos int32 [N]) is all-or-none: given => prefill/decode
@@ -311,6 +321,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "run the plan kernel and the K2 schedule builder (tests): fills `plan` (workspace_sizes(...)[1] ints); sms 0 = this device's SM count",
           py::arg("plan"), py::arg("H"), py::arg("N"), py::arg("fixed_len"), py::arg("cu_seqlens") = py::none(), py::arg("pos") = py::none(),
           py::arg("slot_ids") = py::none(), py::arg("sms") = 0, py::arg("k2_bv") = 0);
+    m.def("rows_profile_read", &rows_profile_read_py, "row-engine profile stamps [row position, CTA, stamp] (profile build only)");
+    m.def("rows_profile_clear", &cfbi::rows_profile_clear, "reset the row-engine profile buffer (profile build only)");
     m.def("dyn_start_log", &dyn_start_log, "(start ns, SM, [count]) of the first n CTAs of the last device-scheduled K2 (start-order probe build only)", py::arg("n"));
     m.def("sched_capacity", [](int64_t H) { return cfbi::k2_sched_capacity(H); }, "most sequences the K2 schedule builder takes for H heads", py::arg("H"));
     m.def("k2_route", &cfbi::k2_dyn_default_route, "whether the default implementation (impl 0) runs the device-scheduled K2 for a cu_seqlens call of N sequences, "

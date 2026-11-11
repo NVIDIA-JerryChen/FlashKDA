@@ -262,4 +262,37 @@ void launch_probe_k2_schedule(const K2SchedProbeArgs& a, cudaStream_t stream) {
     k2_sched_build(plan, a.N, a.H, sms, a.k2_bv, a.cu_seqlens == nullptr, stream);
 }
 
+// ---- row-engine profile (see cfbi_rows.cuh and cfbi_launch.h): host access to the device buffer, inert in every build without CFBI_ROWS_PROFILE ----------------
+void rows_profile_dims(int* positions, int* ctas, int* stamps) {
+#ifdef CFBI_ROWS_PROFILE
+    *positions = ROWS_PROF_POS;
+    *ctas = ROWS_PROF_CTAS;
+    *stamps = ROWS_PROF_STAMPS;
+#else
+    *positions = *ctas = *stamps = 0;
+#endif
+}
+
+int rows_profile_read(unsigned* out, int count) {
+#ifdef CFBI_ROWS_PROFILE
+    const int total = ROWS_PROF_POS * ROWS_PROF_CTAS * ROWS_PROF_STAMPS;
+    if (count > total) count = total;
+    cudaDeviceSynchronize();
+    cudaMemcpyFromSymbol(out, g_rows_prof, sizeof(unsigned) * count);
+    return count;
+#else
+    (void)out; (void)count;
+    return 0;
+#endif
+}
+
+void rows_profile_clear() {
+#ifdef CFBI_ROWS_PROFILE
+    void* dev = nullptr;
+    cudaDeviceSynchronize();
+    cudaGetSymbolAddress(&dev, g_rows_prof);
+    cudaMemset(dev, 0, sizeof(g_rows_prof));
+#endif
+}
+
 }  // namespace cfbi

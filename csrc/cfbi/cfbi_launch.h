@@ -191,4 +191,10 @@ void launch_probe_k2_schedule(const K2SchedProbeArgs& a, cudaStream_t stream);
 // launch of a build compiled with CFBI_DYN_TEST_START_LOG into the host arrays and returns n; any other build has no log and returns 0.
 int k2_dyn_test_log(unsigned long long* times, unsigned* smids, int n);
 
+// Row-engine profile (cfbi_rows.cuh): the dimensions [row position][CTA][stamp] of the device buffer of a build compiled with CFBI_ROWS_PROFILE (all zero in any other
+// build), a copy of its first ``count`` unsigned words to the host (returns the number copied, 0 without a profile build) and a reset to zero.
+void rows_profile_dims(int* positions, int* ctas, int* stamps);
+int rows_profile_read(unsigned* out, int count);
+void rows_profile_clear();
+
 }  // namespace cfbi
