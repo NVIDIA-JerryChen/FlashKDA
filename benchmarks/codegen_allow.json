@@ -1,0 +1,6 @@
+{
+  "schema": "cfbi-codegen-allow-v1",
+  "comment": "aliases map a candidate kernel key onto the base kernel it must equal (for example an instantiation of a kernel that the base has as a plain function); may_differ lists base kernel keys or families whose code may differ in identity mode",
+  "aliases": {},
+  "may_differ": []
+}

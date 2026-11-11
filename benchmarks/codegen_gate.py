@@ -1,0 +1,894 @@
+#!/usr/bin/env python3
+"""Compile-only code-generation gate for the CF-BI CUDA sources (plain Python, no torch, no GPU).
+
+The tool compiles every CUDA translation unit of the CF-BI extension of a source tree with one nvcc, one host compiler and the production flags of
+``flash_kda/cfbi/_ext.py``, reads the machine code and the resource figures of every kernel (``cuobjdump``, ``ptxas -v``) into a *dump*, and
+compares the dumps of two trees (a base and a candidate) built in the same invocation or taken from a cache under an identical key. A dump can also be
+made from cuobjdump text that another toolchain produced (the node modes ``regs`` and ``sass`` of the container), so the same gate runs on the production toolchain.
+
+usage:
+  codegen_gate.py dump       --tree DIR --out FILE [--archs sm_90a sm_100a sm_103a] [--define NAME[=VALUE] ...] [--cache-dir DIR] [--keep-dir DIR]
+  codegen_gate.py dump-files --regs FILE --sass FILE --label TEXT --out FILE [--elf FILE] [--ptxas-log FILE]
+  codegen_gate.py compare    --base FILE --cand FILE [--prev FILE] [--mode identity|change] [--allow FILE] [--json FILE]
+  codegen_gate.py gate       --base-tree DIR --cand-tree DIR [--prev-tree DIR] [--mode identity|change] [--cand-define NAME[=VALUE] ...] [--cache-dir DIR]
+  codegen_gate.py matrix     --tree DIR [--archs ...]
+
+Identity mode: every kernel of the base exists in the candidate with the same resources and the same normalised SASS hash unless it is on the allow-list;
+kernels and instantiations that only the candidate has are listed and checked against the resource gate (gate R). Change mode: the kernels of the owned family
+(``cfbi::rows_kernel`` by default) may differ, must satisfy gate R against the base, and every other kernel stays identical to the base.
+
+The normalised SASS drops instruction offsets, encodings (the control words included) and trailer comments; operands and immediates stay, so an
+operand-only or an immediate-only change is a difference. Name mangling of template arguments is handled by the kernel key (``cfbi::k2_kernel<Li16E>``)
+and by the ``aliases`` of the allow-list file (candidate key -> base key).
+
+exit status: 0 pass, 1 differences or a resource-gate failure, 2 unusable input (unreadable or incompatible dumps, toolchain mismatch, a failed build, empty kernel sets)
+"""
+import argparse
+import ast
+import concurrent.futures
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import compare_binaries as cb  # noqa: E402  (resource-usage parser and the arch / function line patterns)
+
+SCHEMA = "cfbi-codegen-v1"
+ALLOW_SCHEMA = "cfbi-codegen-allow-v1"
+
+# Copied from NVCC_FLAGS of flash_kda/cfbi/_ext.py (importing setup.py or the package would run a submodule update / need torch);
+# tests/cfbi/test_bench_tools.py compares this list with the source text of _ext.py.
+PRODUCTION_FLAGS = [
+    "-O3",
+    "-fmad=false",
+    "-ftz=false",
+    "-prec-div=true",
+    "-prec-sqrt=true",
+    "--expt-relaxed-constexpr",
+    "-lineinfo",
+    "--ptxas-options=-v",
+]
+STD = "c++20"                                    # torch's cpp_extension passes the standard; the system g++ 8.5 cannot compile it
+FIXED_SRC_HASH = "0x0000000000000000ull"         # _ext.py passes a hash of the sources; a constant keeps two trees comparable
+GATE_ARCHS = ("sm_90a", "sm_100a", "sm_103a")
+MATRIX_ARCHS = ("sm_80", "sm_86", "sm_89", "sm_90a", "sm_100a", "sm_103a", "sm_120a")   # CFBI_CUDA_ARCHS of setup.py
+DEFAULT_UNITS = ("csrc/cfbi/cfbi_launch.cu", "csrc/cfbi/cfbi_k2_dyn.cu", "csrc/cfbi/cfbi_probe.cu")
+DEFAULT_CONDA = "/home/scratch.jennym_gpu/miniforge3/envs/tlang"
+DEFAULT_OWNED = ("cfbi::rows_kernel",)           # the family a row-engine step may change (change mode) and gate R applies to
+GATE_R_REF = "cfbi::rows_kernel"                 # the base kernel whose stack and spill figures bound every gate-R target
+REG_CAP = 128                                    # __launch_bounds__(256, 2): 64K registers / (2 * 256 threads)
+# Reference figures of the base rows_kernel (same-compiler values of the recorded round); a deviation is toolchain drift (a warning), not a failure.
+LITERALS = {
+    "sm_100a": {"reg": 128, "spill_stores": 4, "spill_loads": 4, "stack": 112},
+    "sm_103a": {"reg": 128, "spill_stores": 12, "spill_loads": 8, "stack": 112},
+    "sm_90a": {"reg": 128, "spill_stores": 428, "spill_loads": 172},
+}
+DEFAULT_ALLOW = os.path.join(os.path.dirname(os.path.abspath(__file__)), "codegen_allow.json")
+
+_RESOURCE_FIELDS = ("reg", "stack", "shared", "local")
+_SPILL_FIELDS = ("spill_stores", "spill_loads")
+_ATTR_FIELDS = ("max_threads", "maxreg")
+_TOOLCHAIN_FIELDS = ("source", "label", "nvcc", "host_compiler", "flags", "std", "archs", "src_hash")
+
+
+class Unusable(Exception):
+    """Input that cannot be compared (exit status 2)."""
+
+
+# ---- kernel names -----------------------------------------------------------------------------------------------------------------------------
+
+def split_mangled(name):
+    """``(namespace path, template arguments, parameters)`` of a simple Itanium-mangled name, or None.
+
+    ``_ZN4cfbi9k2_kernelILi16EEEvNS_6ParamsE`` -> ``(("cfbi", "k2_kernel"), "Li16E", "vNS_6ParamsE")``. Only plain (nested) names with an optional template
+    argument list are understood; the caller falls back to the mangled text for anything else.
+    """
+    if not name.startswith("_Z") or len(name) < 4:
+        return None
+    s, n = name, len(name)
+
+    def source_name(i):
+        j = i
+        while j < n and s[j].isdigit():
+            j += 1
+        if j == i:
+            raise ValueError
+        k = int(s[i:j])
+        if j + k > n:
+            raise ValueError
+        return s[j:j + k], j + k
+
+    def skip_group(i):
+        """Index after the group that opens at ``s[i]`` (one of I N X J) and closes with E."""
+        depth = 0
+        while i < n:
+            c = s[i]
+            if c in "INXJ":
+                depth += 1
+                i += 1
+            elif c == "E":
+                depth -= 1
+                i += 1
+                if depth == 0:
+                    return i
+            elif c.isdigit():
+                i = source_name(i)[1]
+            elif c == "L":                       # literal: type letters, value, closing E
+                i += 1
+                while s[i] != "E":
+                    i += 1
+                i += 1
+            elif c == "S":                       # substitution: St Sa ... or S<seq-id>_
+                i += 1
+                if s[i].islower():
+                    i += 1
+                else:
+                    while s[i] != "_":
+                        i += 1
+                    i += 1
+            else:
+                i += 1
+        raise ValueError
+
+    try:
+        i, path, targs = 2, [], ""
+        if s[i] == "N":
+            i += 1
+            while s[i] != "E":
+                if s[i].isdigit():
+                    ident, i = source_name(i)
+                    path.append(ident)
+                elif s[i] == "I":
+                    j = skip_group(i)
+                    targs = s[i + 1:j - 1]
+                    i = j
+                else:
+                    return None
+            i += 1
+        elif s[i].isdigit():
+            ident, i = source_name(i)
+            path.append(ident)
+            if i < n and s[i] == "I":
+                j = skip_group(i)
+                targs = s[i + 1:j - 1]
+                i = j
+        else:
+            return None
+        return tuple(path), targs, s[i:]
+    except (ValueError, IndexError):
+        return None
+
+
+def kernel_key(name):
+    """Readable, mangling-independent key: ``cfbi::rows_kernel``, ``cfbi::k2_kernel<Li16E>``; the mangled text when the name is not understood."""
+    sp = split_mangled(name)
+    if sp is None or not sp[0]:
+        return name
+    return "::".join(sp[0]) + ("<%s>" % sp[1] if sp[1] else "")
+
+
+def family(key):
+    """The key without its template arguments."""
+    return key.split("<", 1)[0]
+
+
+def assign_keys(names):
+    """``{key: mangled name}``; names that would share a key get their parameter text appended (deterministic)."""
+    groups = {}
+    for name in sorted(names):
+        groups.setdefault(kernel_key(name), []).append(name)
+    out = {}
+    for key, same in groups.items():
+        if len(same) == 1:
+            out[key] = same[0]
+        else:
+            for name in same:
+                sp = split_mangled(name)
+                out["%s(%s)" % (key, sp[2] if sp else name)] = name
+    return out
+
+
+# ---- parsers of the tool outputs --------------------------------------------------------------------------------------------------------------
+
+_OFFSET = re.compile(r"^\s*/\*[0-9a-f]{4,6}\*/\s*")
+_COMMENT = re.compile(r"/\*.*?\*/")
+_PTXAS_ENTRY = re.compile(r"ptxas info\s*:\s*Compiling entry function '([^']+)' for '(sm_\w+)'")
+_PTXAS_STACK = re.compile(r"(\d+) bytes stack frame, (\d+) bytes spill stores, (\d+) bytes spill loads")
+_PTXAS_USED = re.compile(r"ptxas info\s*:\s*Used (\d+) registers")
+_ELF_INFO = re.compile(r"^\.nv\.info\.(_Z\S+)\s*$")
+_ELF_ATTR = re.compile(r"^\s*Attribute:\s*(EIATTR_\w+)")
+_ELF_VALUE = re.compile(r"^\s*Value:\s*(.*)$")
+
+
+def normalise_instruction(line):
+    """The instruction text of one ``cuobjdump -sass`` line without offset, encoding comment and terminating ``;``; None for every other line.
+
+    The control word of an instruction sits on a second, comment-only line: it is not an instruction and is dropped with the other encodings."""
+    m = _OFFSET.match(line)
+    if not m:
+        return None
+    body = _COMMENT.sub("", line[m.end():]).strip()
+    if body.endswith(";"):
+        body = body[:-1].rstrip()
+    return " ".join(body.split()) or None
+
+
+def strict_line(line):
+    """Like ``normalise_instruction`` but keeping the encoding comments (and the comment-only control-word lines): diagnostic hash only."""
+    m = _OFFSET.match(line)
+    if m:
+        return " ".join(line[m.end():].split()) or None
+    text = line.strip()
+    if text.startswith("/*") and text.endswith("*/"):
+        return " ".join(text.split())
+    return None
+
+
+def parse_sass_functions(text):
+    """``{(arch, mangled name): {"lines": [...], "strict": [...]}}`` of a ``cuobjdump -sass`` dump."""
+    out, arch, func = {}, "?", None
+    for line in text.splitlines():
+        m = cb._ARCH.match(line)
+        if m:
+            arch, func = m.group(1), None
+            continue
+        m = cb._FUNC.match(line)
+        if m:
+            func = (arch, m.group(1))
+            out[func] = {"lines": [], "strict": []}
+            continue
+        if func is None:
+            continue
+        norm = normalise_instruction(line)
+        if norm is not None:
+            out[func]["lines"].append(norm)
+        st = strict_line(line)
+        if st is not None:
+            out[func]["strict"].append(st)
+    return out
+
+
+def parse_ptxas_log(text):
+    """``{(arch, mangled name): {"stack", "spill_stores", "spill_loads", "registers"}}`` of the ``ptxas -v`` lines of a build log."""
+    out, cur = {}, None
+    for line in text.splitlines():
+        m = _PTXAS_ENTRY.search(line)
+        if m:
+            cur = (m.group(2), m.group(1))
+            out[cur] = {}
+            continue
+        if cur is None:
+            continue
+        m = _PTXAS_STACK.search(line)
+        if m:
+            out[cur].update(stack=int(m.group(1)), spill_stores=int(m.group(2)), spill_loads=int(m.group(3)))
+            continue
+        m = _PTXAS_USED.search(line)
+        if m:
+            out[cur]["registers"] = int(m.group(1))
+    return out
+
+
+def parse_elf_attributes(text):
+    """``{(arch, mangled name): {"max_threads", "maxreg"}}`` from the ``.nv.info.<function>`` blocks of ``cuobjdump -elf``
+    (``EIATTR_MAX_THREADS`` = the product of the block bounds, ``EIATTR_MAXREG_COUNT`` = the register bound that minBlocks of ``__launch_bounds__`` implies)."""
+    out, arch, func, attr = {}, "?", None, None
+    for line in text.splitlines():
+        m = cb._ARCH.match(line)
+        if m:
+            arch, func, attr = m.group(1), None, None
+            continue
+        m = _ELF_INFO.match(line)
+        if m:
+            func, attr = (arch, m.group(1)), None
+            out.setdefault(func, {})
+            continue
+        if func is None:
+            continue
+        if line and not line[0].isspace():       # next section header
+            func = attr = None
+            continue
+        m = _ELF_ATTR.match(line)
+        if m:
+            attr = m.group(1)
+            continue
+        m = _ELF_VALUE.match(line)
+        if m and attr in ("EIATTR_MAX_THREADS", "EIATTR_MAXREG_COUNT"):
+            nums = [int(x, 16) for x in re.findall(r"0x[0-9a-fA-F]+", m.group(1))]
+            if nums:
+                if attr == "EIATTR_MAXREG_COUNT":
+                    out[func]["maxreg"] = nums[0]
+                else:
+                    prod = 1
+                    for v in nums:
+                        prod *= v
+                    out[func]["max_threads"] = prod
+            attr = None
+    return out
+
+
+def digest(lines):
+    h = hashlib.sha256()
+    for line in lines:
+        h.update(line.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def kernel_table(regs_text, sass_text, ptxas_text=None, elf_text=None, unit=None):
+    """``{arch: {key: record}}`` from the text outputs of one build."""
+    res = cb.parse_resource_usage(regs_text)
+    sass = parse_sass_functions(sass_text)
+    ptxas = parse_ptxas_log(ptxas_text) if ptxas_text else {}
+    attrs = parse_elf_attributes(elf_text) if elf_text else {}
+    by_arch = {}
+    for (arch, name), r in res.items():
+        s = sass.get((arch, name))
+        rec = {"name": name, "unit": unit, "reg": r["REG"], "stack": r["STACK"], "shared": r["SHARED"], "local": r["LOCAL"],
+               "instructions": len(s["lines"]) if s else None,
+               "sass_hash": digest(s["lines"]) if s else None,
+               "sass_hash_strict": digest(s["strict"]) if s else None}
+        p = ptxas.get((arch, name), {})
+        rec["spill_stores"], rec["spill_loads"] = p.get("spill_stores"), p.get("spill_loads")
+        a = attrs.get((arch, name), {})
+        rec["max_threads"], rec["maxreg"] = a.get("max_threads"), a.get("maxreg")
+        by_arch.setdefault(arch, {})[name] = rec
+    out = {}
+    for arch, recs in by_arch.items():
+        keys = assign_keys(recs)
+        out[arch] = {key: recs[name] for key, name in keys.items()}
+    return out
+
+
+def merge_tables(tables):
+    """Merge the tables of several translation units; a function that two units define must have the same code."""
+    out, warnings = {}, []
+    for tab in tables:
+        for arch, kernels in tab.items():
+            dst = out.setdefault(arch, {})
+            for key, rec in kernels.items():
+                if key in dst:
+                    if dst[key]["sass_hash"] != rec["sass_hash"]:
+                        warnings.append("%s %s is defined by %s and %s with different code" % (arch, key, dst[key]["unit"], rec["unit"]))
+                    continue
+                dst[key] = rec
+    return out, warnings
+
+
+# ---- trees, toolchain, builds -----------------------------------------------------------------------------------------------------------------
+
+def read_text(path):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def units_of(tree):
+    """The CUDA translation units of the extension: the ``.cu`` entries of ``_SOURCES`` in ``flash_kda/cfbi/_ext.py`` (parsed, not imported)."""
+    path = os.path.join(tree, "flash_kda", "cfbi", "_ext.py")
+    try:
+        mod = ast.parse(read_text(path))
+        for node in mod.body:
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "_SOURCES" for t in node.targets):
+                return ["csrc/cfbi/" + s for s in ast.literal_eval(node.value) if s.endswith(".cu")]
+    except (OSError, SyntaxError, ValueError):
+        pass
+    return list(DEFAULT_UNITS)
+
+
+def ext_flags_of(tree):
+    """``NVCC_FLAGS`` of the tree's ``flash_kda/cfbi/_ext.py`` (parsed, not imported), or None."""
+    try:
+        mod = ast.parse(read_text(os.path.join(tree, "flash_kda", "cfbi", "_ext.py")))
+    except (OSError, SyntaxError):
+        return None
+    for node in mod.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "NVCC_FLAGS" for t in node.targets):
+            return list(ast.literal_eval(node.value))
+    return None
+
+
+def tree_content_hash(tree):
+    """Hash of every file under ``csrc`` plus ``flash_kda/cfbi/_ext.py``: what a build reads."""
+    h = hashlib.sha256()
+    paths = []
+    for base, _, files in os.walk(os.path.join(tree, "csrc")):
+        paths.extend(os.path.join(base, f) for f in files)
+    ext = os.path.join(tree, "flash_kda", "cfbi", "_ext.py")
+    if os.path.exists(ext):
+        paths.append(ext)
+    for p in sorted(paths):
+        h.update(os.path.relpath(p, tree).encode("utf-8"))
+        with open(p, "rb") as f:
+            h.update(f.read())
+    return h.hexdigest()
+
+
+def _git(tree, *args):
+    try:
+        r = subprocess.run(["git", "-C", tree] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    except OSError:
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def tree_commit(tree):
+    marker = os.path.join(tree, "SNAPSHOT_COMMIT")
+    if os.path.exists(marker):
+        return read_text(marker).strip()
+    return _git(tree, "rev-parse", "HEAD")
+
+
+def find_toolchain(nvcc=None, ccbin=None):
+    """``{"nvcc", "ccbin", "cuobjdump", "label", ...}`` of the toolchain (defaults: the conda environment ``tlang``)."""
+    nvcc = nvcc or os.environ.get("CFBI_GATE_NVCC") or os.path.join(DEFAULT_CONDA, "bin", "nvcc")
+    if not os.path.exists(nvcc):
+        raise Unusable("nvcc not found at %s (use --nvcc or CFBI_GATE_NVCC)" % nvcc)
+    bindir = os.path.dirname(os.path.abspath(nvcc))
+    ccbin = ccbin or os.environ.get("CFBI_GATE_CCBIN") or os.path.join(bindir, "x86_64-conda-linux-gnu-g++")
+    if not os.path.exists(ccbin):
+        raise Unusable("host compiler not found at %s (use --ccbin or CFBI_GATE_CCBIN)" % ccbin)
+    cuobjdump = os.path.join(bindir, "cuobjdump")
+    if not os.path.exists(cuobjdump):
+        raise Unusable("cuobjdump not found next to nvcc (%s)" % cuobjdump)
+
+    def first(cmd, pick):
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+        for ln in lines:
+            if pick in ln:
+                return ln.strip()
+        return lines[0].strip() if lines else "?"
+
+    return {"nvcc": nvcc, "ccbin": ccbin, "cuobjdump": cuobjdump,
+            "nvcc_version": first([nvcc, "--version"], "release"),
+            "host_version": first([ccbin, "--version"], ""),
+            "label": "%s | %s" % (first([nvcc, "--version"], "release"), first([ccbin, "--version"], ""))}
+
+
+def _run(cmd, cwd=None):
+    r = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    return r.returncode, r.stdout, r.stderr
+
+
+def gencode_flags(archs):
+    out = []
+    for arch in archs:
+        out += ["-gencode", "arch=compute_%s,code=%s" % (arch[3:], arch)]
+    return out
+
+
+def compile_command(tc, unit, archs, defines, obj):
+    return ([tc["nvcc"], "-ccbin", tc["ccbin"], "-std=" + STD] + PRODUCTION_FLAGS + ["-DCFBI_SRC_HASH=" + FIXED_SRC_HASH]
+            + ["-D" + d for d in defines] + ["-I", "csrc"] + gencode_flags(archs) + ["--threads", str(max(1, len(archs))), "-c", unit, "-o", obj])
+
+
+def build_unit(tree, tc, unit, archs, defines, work):
+    """Compile one translation unit (from the tree root, so the identifier inside the object does not depend on the tree location) and read it."""
+    obj = os.path.join(work, os.path.basename(unit) + ".o")
+    rc, out, err = _run(compile_command(tc, unit, archs, defines, obj), cwd=tree)
+    if rc != 0:
+        raise Unusable("build of %s failed (exit %d):\n%s" % (unit, rc, "\n".join((err or out).splitlines()[-25:])))
+    ptxas_text = out + "\n" + err
+    texts = {}
+    for name, flags in (("regs", ["--dump-resource-usage"]), ("sass", ["-sass"]), ("elf", ["-elf"])):
+        rc, out, err = _run([tc["cuobjdump"]] + flags + [obj])
+        if rc != 0:
+            raise Unusable("cuobjdump %s of %s failed: %s" % (" ".join(flags), obj, err.strip()[:300]))
+        texts[name] = out
+    return kernel_table(texts["regs"], texts["sass"], ptxas_text, texts["elf"], unit=unit), texts, ptxas_text
+
+
+def cache_key(toolchain, defines, units, content):
+    """Key of a cached dump: the toolchain (compiler versions, flags, architectures), the source-variant defines, the units and the content hash of
+    the sources. A change of any of them gives another key, so a cached base can never stand in for a different tree or toolchain."""
+    blob = json.dumps({"toolchain": toolchain, "defines": sorted(defines), "units": list(units), "content": content, "schema": SCHEMA}, sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:20]
+
+
+def dump_tree(tree, archs=GATE_ARCHS, defines=(), tc=None, jobs=None, cache_dir=None, keep_dir=None):
+    """The dump of one tree (a dict, schema ``cfbi-codegen-v1``); read from ``cache_dir`` when a dump with an identical key exists."""
+    tree = os.path.abspath(tree)
+    tc = tc or find_toolchain()
+    archs, defines = list(archs), sorted(defines)
+    units = units_of(tree)
+    content = tree_content_hash(tree)
+    commit = tree_commit(tree)
+    toolchain = {"source": "nvcc", "label": tc["label"], "nvcc": tc["nvcc_version"], "host_compiler": tc["host_version"],
+                 "flags": list(PRODUCTION_FLAGS), "std": STD, "archs": archs, "src_hash": FIXED_SRC_HASH}
+    key = cache_key(toolchain, defines, units, content)
+    cache_file = os.path.join(cache_dir, "codegen-%s.json" % key) if cache_dir else None
+    if cache_file and os.path.exists(cache_file):
+        with open(cache_file, encoding="utf-8") as f:
+            dump = json.load(f)
+        dump["meta"]["cache"] = "hit"
+        return dump
+    drift = ext_flags_of(tree)
+    warnings = []
+    if drift is not None and drift != PRODUCTION_FLAGS:
+        warnings.append("NVCC_FLAGS of the tree differ from the flags of this tool: %s" % drift)
+    work = keep_dir or tempfile.mkdtemp(prefix="codegen-")
+    os.makedirs(work, exist_ok=True)
+    t0 = time.time()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs or min(8, max(1, len(units)))) as pool:
+            futs = [pool.submit(build_unit, tree, tc, u, archs, defines, work) for u in units]
+            results = [fut.result() for fut in futs]
+    finally:
+        if not keep_dir:
+            shutil.rmtree(work, ignore_errors=True)
+    tables = [r[0] for r in results]
+    kernels, merge_warnings = merge_tables(tables)
+    if keep_dir:
+        for u, (_, texts, ptxas_text) in zip(units, results):
+            stem = os.path.join(keep_dir, os.path.basename(u))
+            for name, text in list(texts.items()) + [("ptxas", ptxas_text)]:
+                with open("%s.%s.txt" % (stem, name), "w", encoding="utf-8") as f:
+                    f.write(text)
+    dump = {"schema": SCHEMA,
+            "meta": {"toolchain": toolchain, "variant": {"defines": defines},
+                     "tree": {"path": tree, "commit": commit, "content_hash": content, "units": units},
+                     "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "build_seconds": round(time.time() - t0, 1),
+                     "cache": "miss" if cache_file else "off", "warnings": warnings + merge_warnings},
+            "kernels": kernels}
+    if cache_file:
+        os.makedirs(cache_dir, exist_ok=True)
+        tmp = cache_file + ".tmp%d" % os.getpid()
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(dump, f, indent=1, sort_keys=True)
+        os.replace(tmp, cache_file)
+    return dump
+
+
+def dump_from_files(regs, sass, label, elf=None, ptxas_log=None, extra_meta=None):
+    """A dump from cuobjdump text of another toolchain (the container): ``label`` names that toolchain and must match between the two dumps compared."""
+    tables = kernel_table(read_text(regs), read_text(sass), read_text(ptxas_log) if ptxas_log else None, read_text(elf) if elf else None, unit=None)
+    archs = sorted(tables)
+    meta = {"toolchain": {"source": "files", "label": label, "nvcc": None, "host_compiler": None, "flags": None, "std": None, "archs": archs, "src_hash": None},
+            "variant": {"defines": []}, "tree": {"path": None, "commit": None, "content_hash": None, "units": []},
+            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "cache": "off", "warnings": []}
+    if extra_meta:
+        meta["tree"].update(extra_meta)
+    return {"schema": SCHEMA, "meta": meta, "kernels": tables}
+
+
+def matrix_build(tree, archs=MATRIX_ARCHS, tc=None, jobs=None):
+    """Compile every unit for every architecture separately: ``[(unit, arch, ok, message)]``."""
+    tree = os.path.abspath(tree)
+    tc = tc or find_toolchain()
+    units = units_of(tree)
+    work = tempfile.mkdtemp(prefix="codegen-matrix-")
+
+    def one(unit, arch):
+        obj = os.path.join(work, "%s.%s.o" % (os.path.basename(unit), arch))
+        rc, out, err = _run(compile_command(tc, unit, [arch], [], obj), cwd=tree)
+        if rc == 0:
+            return unit, arch, True, ""
+        return unit, arch, False, "\n".join((err or out).splitlines()[-8:])
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs or 8) as pool:
+            futs = [pool.submit(one, u, a) for u in units for a in archs]
+            return [f.result() for f in futs]
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# ---- comparison -------------------------------------------------------------------------------------------------------------------------------
+
+def load_dump(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            dump = json.load(f)
+    except (OSError, ValueError) as e:
+        raise Unusable("cannot read the dump %s: %s" % (path, e))
+    return check_dump(dump, path)
+
+
+def check_dump(dump, label="dump"):
+    if not isinstance(dump, dict) or dump.get("schema") != SCHEMA:
+        raise Unusable("%s: schema is not %s" % (label, SCHEMA))
+    if not isinstance(dump.get("kernels"), dict) or not isinstance(dump.get("meta"), dict) or not isinstance(dump["meta"].get("toolchain"), dict):
+        raise Unusable("%s: malformed dump" % label)
+    archs = dump["meta"]["toolchain"].get("archs") or []
+    for arch in archs:
+        if not dump["kernels"].get(arch):
+            raise Unusable("%s: no kernels for %s (an empty kernel set would make every comparison vacuous)" % (label, arch))
+    if not dump["kernels"]:
+        raise Unusable("%s: no kernels at all" % label)
+    return dump
+
+
+def load_allow(path):
+    if path is None:
+        return {"aliases": {}, "may_differ": []}
+    try:
+        with open(path, encoding="utf-8") as f:
+            allow = json.load(f)
+    except (OSError, ValueError) as e:
+        raise Unusable("cannot read the allow-list %s: %s" % (path, e))
+    if allow.get("schema") != ALLOW_SCHEMA:
+        raise Unusable("%s: schema is not %s" % (path, ALLOW_SCHEMA))
+    allow.setdefault("aliases", {})
+    allow.setdefault("may_differ", [])
+    return allow
+
+
+def require_same_toolchain(a, b, what):
+    ta, tb = a["meta"]["toolchain"], b["meta"]["toolchain"]
+    bad = ["%s: %r vs %r" % (f, ta.get(f), tb.get(f)) for f in _TOOLCHAIN_FIELDS if ta.get(f) != tb.get(f)]
+    if bad:
+        raise Unusable("%s were built with different toolchains (%s); only same-toolchain dumps can be compared. Source-variant defines are recorded "
+                       "separately and may differ." % (what, "; ".join(bad)))
+
+
+def _field_diffs(b, c):
+    out = []
+    for f in _RESOURCE_FIELDS + ("instructions",):
+        if b.get(f) != c.get(f):
+            out.append("%s %s -> %s" % (f.upper(), b.get(f), c.get(f)))
+    for f in _SPILL_FIELDS + _ATTR_FIELDS:
+        if b.get(f) is not None and c.get(f) is not None and b[f] != c[f]:
+            out.append("%s %s -> %s" % (f.upper(), b[f], c[f]))
+    if b.get("sass_hash") != c.get("sass_hash"):
+        out.append("normalised SASS differs")
+    return out
+
+
+def _gate_r(arch, key, rec, ref, owned):
+    """Failures of the resource gate for one kernel (``rec``) against the base reference kernel ``ref``."""
+    fails = []
+    if rec["reg"] > REG_CAP:
+        fails.append("%d registers (limit %d)" % (rec["reg"], REG_CAP))
+    if ref is None:
+        fails.append("no base %s on %s to bound the stack and spill figures" % (GATE_R_REF, arch))
+        return fails
+    if rec["stack"] > ref["stack"]:
+        fails.append("stack %d B above the base %d B" % (rec["stack"], ref["stack"]))
+    for f in _SPILL_FIELDS:
+        if rec.get(f) is not None and ref.get(f) is not None and rec[f] > ref[f]:
+            fails.append("%s %d B above the base %d B" % (f.replace("_", " "), rec[f], ref[f]))
+    if family(key) in owned:
+        for f in _ATTR_FIELDS:
+            if rec.get(f) is not None and ref.get(f) is not None and rec[f] != ref[f]:
+                fails.append("launch-bound attribute %s %d differs from the base %d" % (f, rec[f], ref[f]))
+    return fails
+
+
+def compare_dumps(base, cand, allow=None, mode="identity", prev=None, owned=DEFAULT_OWNED):
+    """Compare two dumps. Returns a dict: ``exit`` (0 / 1), ``differences``, ``allowed``, ``added``, ``gate_r``, ``notes``, ``compared``.
+
+    Raises ``Unusable`` when the dumps cannot be compared (toolchain mismatch, empty kernel sets, ambiguous aliases)."""
+    if mode not in ("identity", "change"):
+        raise Unusable("mode must be identity or change")
+    allow = allow or {"aliases": {}, "may_differ": []}
+    check_dump(base, "base")
+    check_dump(cand, "candidate")
+    require_same_toolchain(base, cand, "the base and the candidate")
+    if prev is not None:
+        check_dump(prev, "previous")
+        require_same_toolchain(base, prev, "the base and the previous accepted state")
+    aliases, may, owned = dict(allow.get("aliases", {})), set(allow.get("may_differ", [])), set(owned)
+    diffs, allowed, added, gate, notes = [], [], [], {"checked": [], "failures": []}, []
+    compared = 0
+    if base["meta"]["tree"].get("content_hash") and base["meta"]["tree"].get("content_hash") == cand["meta"]["tree"].get("content_hash") \
+            and base["meta"].get("variant") == cand["meta"].get("variant"):
+        notes.append("the candidate tree and the base tree have the same content and variant: an A/A comparison")
+    used_alias = set()
+    for arch in sorted(base["kernels"]):
+        bk, ck = base["kernels"][arch], cand["kernels"].get(arch)
+        if not ck:
+            diffs.append("%s: no kernels in the candidate" % arch)
+            continue
+        by_base = {}
+        for ckey in ck:
+            bkey = aliases.get(ckey, ckey)
+            if ckey in aliases:
+                used_alias.add(ckey)
+            if bkey in by_base:
+                raise Unusable("%s: the candidate kernels %s and %s both map to the base kernel %s" % (arch, by_base[bkey], ckey, bkey))
+            by_base[bkey] = ckey
+        ref = bk.get(GATE_R_REF)
+        for bkey in sorted(bk):
+            ckey = by_base.get(bkey)
+            if ckey is None:
+                diffs.append("%s %s: missing in the candidate" % (arch, bkey))
+                continue
+            compared += 1
+            fd = _field_diffs(bk[bkey], ck[ckey])
+            if not fd:
+                if bk[bkey].get("sass_hash_strict") != ck[ckey].get("sass_hash_strict"):
+                    notes.append("%s %s: instructions equal, encodings or control words differ (scheduling only)" % (arch, bkey))
+                continue
+            ok = (bkey in may or family(bkey) in may) or (mode == "change" and family(bkey) in owned)
+            (allowed if ok else diffs).append("%s %s: %s" % (arch, bkey, ", ".join(fd)))
+            if ok:
+                gate["checked"].append((arch, ckey))
+                for why in _gate_r(arch, ckey, ck[ckey], ref, owned):
+                    gate["failures"].append("%s %s: %s" % (arch, ckey, why))
+        for ckey in sorted(ck):
+            if aliases.get(ckey, ckey) in bk:
+                continue
+            added.append("%s %s" % (arch, ckey))
+            gate["checked"].append((arch, ckey))
+            for why in _gate_r(arch, ckey, ck[ckey], ref, owned):
+                gate["failures"].append("%s %s: %s" % (arch, ckey, why))
+        if mode == "change":                                          # the owned family is gated even when it did not change against the base
+            for ckey in sorted(ck):
+                if family(ckey) in owned and (arch, ckey) not in gate["checked"]:
+                    gate["checked"].append((arch, ckey))
+                    for why in _gate_r(arch, ckey, ck[ckey], ref, owned):
+                        gate["failures"].append("%s %s: %s" % (arch, ckey, why))
+    for ckey in sorted(set(aliases) - used_alias):
+        notes.append("allow-list alias %s matches no candidate kernel" % ckey)
+    if prev is not None and mode == "change":
+        for arch in sorted(cand["kernels"]):
+            for ckey, rec in sorted(cand["kernels"][arch].items()):
+                if family(ckey) in owned:
+                    p = prev["kernels"].get(arch, {}).get(aliases.get(ckey, ckey))
+                    state = "new" if p is None else ("unchanged" if not _field_diffs(p, rec) else "changed")
+                    notes.append("%s %s: %s against the previous accepted state" % (arch, ckey, state))
+    if compared == 0:
+        raise Unusable("no kernel of the base was compared")
+    exit_code = 1 if (diffs or gate["failures"]) else 0
+    return {"mode": mode, "exit": exit_code, "compared": compared, "differences": diffs, "allowed": allowed, "added": added, "gate_r": gate,
+            "notes": notes}
+
+
+def literal_check(dump):
+    """Warnings for deviations of the base ``rows_kernel`` figures from the recorded literals (toolchain drift)."""
+    out = []
+    for arch, lit in LITERALS.items():
+        rec = dump["kernels"].get(arch, {}).get(GATE_R_REF)
+        if rec is None:
+            continue
+        for f, want in sorted(lit.items()):
+            if rec.get(f) is not None and rec[f] != want:
+                out.append("%s %s of %s is %s, the recorded figure is %s (toolchain drift)" % (arch, f, GATE_R_REF, rec[f], want))
+    return out
+
+
+def format_report(rep, base=None):
+    lines = []
+    for d in rep["differences"]:
+        lines.append("DIFF: %s" % d)
+    for d in rep["allowed"]:
+        lines.append("ALLOWED DIFFERENCE: %s" % d)
+    for a in rep["added"]:
+        lines.append("ADDED (candidate only): %s" % a)
+    for f in rep["gate_r"]["failures"]:
+        lines.append("GATE R: %s" % f)
+    for n in rep["notes"]:
+        lines.append("NOTE: %s" % n)
+    if base is not None:
+        for arch in sorted(LITERALS):
+            rec = base["kernels"].get(arch, {}).get(GATE_R_REF)
+            if rec is not None:
+                lines.append("CROSS-CHECK %s %s: %s (recorded: %s)" % (
+                    arch, GATE_R_REF, ", ".join("%s %s" % (f.replace("_", " "), rec.get(f)) for f in sorted(LITERALS[arch])),
+                    ", ".join("%s %s" % (f.replace("_", " "), v) for f, v in sorted(LITERALS[arch].items()))))
+        for w in literal_check(base):
+            lines.append("WARNING: %s" % w)
+    lines.append("kernels compared: %d, differences: %d, allowed: %d, added: %d, gate R checked: %d, gate R failures: %d"
+                 % (rep["compared"], len(rep["differences"]), len(rep["allowed"]), len(rep["added"]), len(rep["gate_r"]["checked"]),
+                    len(rep["gate_r"]["failures"])))
+    lines.append("VERDICT: %s" % ("PASS" if rep["exit"] == 0 else "FAIL"))
+    return "\n".join(lines)
+
+
+# ---- command line -----------------------------------------------------------------------------------------------------------------------------
+
+def _write_json(path, obj):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=1, sort_keys=True)
+        f.write("\n")
+
+
+def _compare_and_print(base, cand, a, prev=None):
+    allow = load_allow(a.allow if a.allow else (DEFAULT_ALLOW if os.path.exists(DEFAULT_ALLOW) else None))
+    rep = compare_dumps(base, cand, allow, a.mode, prev=prev)
+    print(format_report(rep, base))
+    if getattr(a, "json", None):
+        _write_json(a.json, rep)
+    return rep["exit"]
+
+
+def _toolchain(a):
+    return find_toolchain(getattr(a, "nvcc", None), getattr(a, "ccbin", None))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+    tool = argparse.ArgumentParser(add_help=False)
+    tool.add_argument("--nvcc", default=None)
+    tool.add_argument("--ccbin", default=None)
+    tool.add_argument("--jobs", type=int, default=None)
+    tool.add_argument("--archs", nargs="+", default=None)
+
+    p = sub.add_parser("dump", parents=[tool])
+    p.add_argument("--tree", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--define", action="append", default=[])
+    p.add_argument("--cache-dir", default=None)
+    p.add_argument("--keep-dir", default=None)
+
+    p = sub.add_parser("dump-files")
+    p.add_argument("--regs", required=True)
+    p.add_argument("--sass", required=True)
+    p.add_argument("--label", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--elf", default=None)
+    p.add_argument("--ptxas-log", default=None)
+
+    p = sub.add_parser("compare")
+    p.add_argument("--base", required=True)
+    p.add_argument("--cand", required=True)
+    p.add_argument("--prev", default=None)
+    p.add_argument("--mode", choices=("identity", "change"), default="identity")
+    p.add_argument("--allow", default=None)
+    p.add_argument("--json", default=None)
+
+    p = sub.add_parser("gate", parents=[tool])
+    p.add_argument("--base-tree", required=True)
+    p.add_argument("--cand-tree", required=True)
+    p.add_argument("--prev-tree", default=None)
+    p.add_argument("--mode", choices=("identity", "change"), default="identity")
+    p.add_argument("--allow", default=None)
+    p.add_argument("--json", default=None)
+    p.add_argument("--base-define", action="append", default=[])
+    p.add_argument("--cand-define", action="append", default=[])
+    p.add_argument("--cache-dir", default=None)
+
+    p = sub.add_parser("matrix", parents=[tool])
+    p.add_argument("--tree", required=True)
+
+    a = ap.parse_args(argv)
+    if not a.cmd:
+        ap.print_usage(sys.stderr)
+        return 2
+    try:
+        if a.cmd == "dump":
+            dump = dump_tree(a.tree, a.archs or GATE_ARCHS, a.define, _toolchain(a), a.jobs, a.cache_dir, a.keep_dir)
+            _write_json(a.out, dump)
+            print("dump of %s: %d kernels on %s (cache: %s)" % (a.tree, sum(len(v) for v in dump["kernels"].values()), ", ".join(sorted(dump["kernels"])),
+                                                              dump["meta"].get("cache")))
+            return 0
+        if a.cmd == "dump-files":
+            dump = dump_from_files(a.regs, a.sass, a.label, a.elf, a.ptxas_log)
+            check_dump(dump, a.out)
+            _write_json(a.out, dump)
+            print("dump of %s: %d kernels on %s" % (a.sass, sum(len(v) for v in dump["kernels"].values()), ", ".join(sorted(dump["kernels"]))))
+            return 0
+        if a.cmd == "compare":
+            return _compare_and_print(load_dump(a.base), load_dump(a.cand), a, load_dump(a.prev) if a.prev else None)
+        if a.cmd == "gate":
+            tc, archs = _toolchain(a), a.archs or GATE_ARCHS
+            base = dump_tree(a.base_tree, archs, a.base_define, tc, a.jobs, a.cache_dir)
+            cand = dump_tree(a.cand_tree, archs, a.cand_define, tc, a.jobs, None)
+            prev = dump_tree(a.prev_tree, archs, a.base_define, tc, a.jobs, a.cache_dir) if a.prev_tree else None
+            print("toolchain: %s" % tc["label"])
+            print("base: %s (cache %s), candidate: %s" % (base["meta"]["tree"].get("commit"), base["meta"].get("cache"), cand["meta"]["tree"].get("commit")))
+            return _compare_and_print(base, cand, a, prev)
+        if a.cmd == "matrix":
+            res = matrix_build(a.tree, a.archs or MATRIX_ARCHS, _toolchain(a), a.jobs)
+            bad = [r for r in res if not r[2]]
+            for unit, arch, ok, msg in res:
+                print("%-4s %s %s" % ("OK" if ok else "FAIL", arch, unit))
+                if not ok:
+                    print(msg)
+            print("compile matrix: %d of %d builds failed" % (len(bad), len(res)))
+            return 1 if bad else 0
+    except Unusable as e:
+        print("unusable input: %s" % e, file=sys.stderr)
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -4,11 +4,15 @@ Plain Python: no GPU and no torch are needed (run them without the package conft
 where torch is not installed). The negative cases show that the gates can fail: a wrong, dirty or unstable baseline is refused, a 1 % slower
 candidate fails the 0.5 % protection gate, and a build with one more register or a spill is reported as different.
 """
+import ast
+import concurrent.futures
 import json
 import os
 import sys
 import tempfile
 from pathlib import Path
+
+import pytest
 
 _ROOT = Path(__file__).resolve().parents[2]
 for _p in (_ROOT / "benchmarks", _ROOT / "tests" / "cfbi"):
@@ -16,6 +20,7 @@ for _p in (_ROOT / "benchmarks", _ROOT / "tests" / "cfbi"):
         sys.path.insert(0, str(_p))
 
 import bench_records as br  # noqa: E402
+import codegen_gate as cg  # noqa: E402
 import compare_bench  # noqa: E402
 import compare_binaries as cb  # noqa: E402
 import varlen_corpus as vc  # noqa: E402
@@ -430,3 +435,426 @@ def test_binary_comparison_cli_exit_codes():
     assert cb.main(["--base-regs", a, "--cand-regs", b]) == 0
     assert cb.main(["--base-regs", a, "--cand-regs", c]) == 1
     assert cb.main(["--base-regs", a, "--cand-regs", os.path.join(d, "missing.txt")]) == 2
+
+
+# ---- compile-only code-generation gate (benchmarks/codegen_gate.py) ----------------------------------------------------------------------------
+
+ROWS = "_ZN4cfbi11rows_kernelENS_6ParamsE"
+K1 = "_ZN4cfbi9k1_kernelILi16EEEvNS_6ParamsE"
+CODE = ["LDC R1, c[0x0][0x37c]", "S2R R5, SR_CTAID.X", "IMAD.WIDE.U32 R2, R5, 0x20, R2", "LDG.E R0, desc[UR16][R2.64+0xc]", "@!P0 EXIT",
+        "FFMA R7, R2, R3, R4", "EXIT"]
+
+
+def cg_sass(functions, arch="sm_100a", offset0=0, enc=0x1000, ctrl=0x2000):
+    """``cuobjdump -sass`` text of ``{function: [instruction text]}``: an instruction line, then its control-word line, as cuobjdump prints them."""
+    out = ["Fatbin elf code:", "================", "arch = %s" % arch, "", "\tcode for %s" % arch]
+    for name, insns in functions.items():
+        out += ["\t\tFunction : %s" % name, '\t.headerflags\t@"EF_CUDA_SM100"']
+        for i, ins in enumerate(insns):
+            out.append("        /*%04x*/                   %s ;      /* 0x%016x */" % (offset0 + 16 * i, ins, enc + i))
+            out.append("                                         /* 0x%016x */" % (ctrl + i))
+        out.append("\t\t..........")
+    return "\n".join(out) + "\n"
+
+
+def cg_regs(functions, arch="sm_100a"):
+    out = ["Fatbin elf code:", "================", "arch = %s" % arch, "", "Resource usage:", " Common:", "  GLOBAL:0"]
+    for name, (reg, stack) in functions.items():
+        out += [" Function %s:" % name, "  REG:%d STACK:%d SHARED:0 LOCAL:0 CONSTANT[0]:16 TEXTURE:0 SURFACE:0 SAMPLER:0" % (reg, stack)]
+    return "\n".join(out) + "\n"
+
+
+def cg_table(code=CODE, **kw):
+    return cg.kernel_table(cg_regs({ROWS: (128, 0), K1: (100, 0)}), cg_sass({ROWS: code, K1: ["EXIT"]}, **kw))
+
+
+def cg_kernel(reg=128, stack=0, spill=(0, 0), sass="h0", ins=100, shared=0, local=0, maxthr=256, maxreg=128):
+    return {"name": "n", "unit": None, "reg": reg, "stack": stack, "shared": shared, "local": local, "instructions": ins, "sass_hash": sass,
+            "sass_hash_strict": sass, "spill_stores": spill[0], "spill_loads": spill[1], "max_threads": maxthr, "maxreg": maxreg}
+
+
+def cg_dump(kernels, label="toolchain-A", defines=(), content="tree-1"):
+    return {"schema": cg.SCHEMA,
+            "meta": {"toolchain": {"source": "nvcc", "label": label, "nvcc": "nvcc 13.1.115", "host_compiler": "g++ 14.3.0", "flags": list(cg.PRODUCTION_FLAGS),
+                                   "std": cg.STD, "archs": sorted(kernels), "src_hash": cg.FIXED_SRC_HASH},
+                     "variant": {"defines": list(defines)}, "tree": {"path": None, "commit": None, "content_hash": content, "units": []}},
+            "kernels": kernels}
+
+
+def cg_base():
+    """Two architectures with five kernels each: the row engine, its frozen reference, K1, K2 and the plan kernel."""
+    def arch(rows_spill):
+        return {"cfbi::rows_kernel": cg_kernel(reg=128, stack=112, spill=rows_spill, sass="rows"),
+                "cfbi::ref::rows_kernel": cg_kernel(reg=48, sass="ref-rows", maxreg=None, maxthr=None),
+                "cfbi::k1_kernel<Li16E>": cg_kernel(reg=128, sass="k1"),
+                "cfbi::k2_kernel<Li16E>": cg_kernel(reg=172, sass="k2"),
+                "cfbi::plan_kernel": cg_kernel(reg=40, sass="plan")}
+    return cg_dump({"sm_100a": arch((4, 4)), "sm_90a": arch((428, 172))})
+
+
+def cg_copy(dump):
+    return json.loads(json.dumps(dump))
+
+
+def cg_edit(dump, arch, key, **fields):
+    out = cg_copy(dump)
+    out["kernels"][arch][key].update(fields)
+    return out
+
+
+def test_codegen_kernel_keys_ignore_mangling_details():
+    names = {
+        "_ZN4cfbi3ref11rows_kernelENS_6ParamsE": "cfbi::ref::rows_kernel",
+        "_ZN4cfbi11rows_kernelENS_6ParamsE": "cfbi::rows_kernel",
+        "_ZN4cfbi11rows_kernelILb0EEEvNS_6ParamsE": "cfbi::rows_kernel<Lb0E>",
+        "_ZN4cfbi9k2_kernelILi16EEEvNS_6ParamsE": "cfbi::k2_kernel<Li16E>",
+        "_ZN4cfbi19finalize_pos_kernelEPKNS_7SeqPlanEPii": "cfbi::finalize_pos_kernel",
+        "_ZN4cfbi15k2_sched_kernelILi1024EEEvPKNS_7SeqPlanEiiiii": "cfbi::k2_sched_kernel<Li1024E>",
+        "_Z6simplePf": "simple",
+    }
+    for mangled, key in names.items():
+        assert cg.kernel_key(mangled) == key, (mangled, cg.kernel_key(mangled))
+    assert cg.kernel_key("not_a_mangled_name") == "not_a_mangled_name"
+    assert cg.family("cfbi::rows_kernel<Lb1E>") == "cfbi::rows_kernel" and cg.family("cfbi::ref::rows_kernel") == "cfbi::ref::rows_kernel"
+    assert cg.kernel_key("_ZN4cfbi3ref11rows_kernelENS_6ParamsE") != cg.kernel_key("_ZN4cfbi11rows_kernelENS_6ParamsE")   # frozen reference != row engine
+    assert set(cg.assign_keys(["_ZN4cfbi1fEi", "_ZN4cfbi1fEf", "_ZN4cfbi1gEi"])) == {"cfbi::f(i)", "cfbi::f(f)", "cfbi::g"}    # overloads stay apart
+
+
+def test_codegen_normalisation_drops_offsets_encodings_and_trailer_comments_only():
+    a = cg.normalise_instruction("        /*0050*/                   IMAD.WIDE.U32 R2, R5, 0x20, R2 ;                 /* 0x0000002005027825 */")
+    b = cg.normalise_instruction("   /*0a50*/   IMAD.WIDE.U32   R2,  R5, 0x20, R2 ;   /* 0x00000000deadbeef */   /* trailer */")
+    assert a == b == "IMAD.WIDE.U32 R2, R5, 0x20, R2"
+    assert cg.normalise_instruction("                                  /* 0x000fca00078e0002 */") is None      # the control-word line
+    assert cg.normalise_instruction('\t.headerflags\t@"EF_CUDA_SM100"') is None
+    assert cg.normalise_instruction("        /*0080*/              @!P0 EXIT ;   /* 0x0 */") == "@!P0 EXIT"
+    assert cg.normalise_instruction("        /*10080*/ BRA 0x4c10 ; /* 0x1 */") == "BRA 0x4c10"                  # five-digit offsets, branch targets stay
+
+
+def test_codegen_dumps_that_differ_only_in_offsets_and_encodings_compare_equal():
+    base = cg_table()
+    shifted = cg_table(offset0=0x400, enc=0x7000, ctrl=0x9000)
+    a, b = base["sm_100a"]["cfbi::rows_kernel"], shifted["sm_100a"]["cfbi::rows_kernel"]
+    assert a["sass_hash"] == b["sass_hash"] and a["instructions"] == b["instructions"] == len(CODE)
+    assert a["sass_hash_strict"] != b["sass_hash_strict"]                 # the diagnostic hash keeps the encodings
+    rep = cg.compare_dumps(cg_dump(base), cg_dump(shifted))
+    assert rep["exit"] == 0 and rep["differences"] == [] and any("scheduling only" in n for n in rep["notes"])
+
+
+def test_codegen_one_changed_opcode_operand_or_immediate_is_a_difference():
+    base = cg_dump(cg_table())
+    for idx, new in ((5, "FADD R7, R2, R3, R4"),                    # opcode
+                     (5, "FFMA R8, R2, R3, R4"),                    # destination register only
+                     (2, "IMAD.WIDE.U32 R2, R5, 0x24, R2"),         # immediate only
+                     (3, "LDG.E R0, desc[UR16][R2.64+0x10]")):      # address offset only
+        code = list(CODE)
+        code[idx] = new
+        rep = cg.compare_dumps(base, cg_dump(cg_table(code)))
+        assert rep["exit"] == 1 and any("cfbi::rows_kernel" in d and "normalised SASS differs" in d for d in rep["differences"]), new
+    longer = cg.compare_dumps(base, cg_dump(cg_table(CODE + ["NOP"])))
+    assert longer["exit"] == 1 and any("INSTRUCTIONS 7 -> 8" in d for d in longer["differences"])
+
+
+def test_codegen_one_more_register_or_any_spill_is_reported():
+    base = cg_base()
+    for fields, text in (({"reg": 173}, "REG 172 -> 173"), ({"stack": 16}, "STACK 0 -> 16"), ({"local": 8}, "LOCAL 0 -> 8"), ({"shared": 1024}, "SHARED 0 -> 1024"),
+                         ({"spill_stores": 4}, "SPILL_STORES 0 -> 4"), ({"spill_loads": 4}, "SPILL_LOADS 0 -> 4")):
+        rep = cg.compare_dumps(base, cg_edit(base, "sm_100a", "cfbi::k2_kernel<Li16E>", **fields))
+        assert rep["exit"] == 1 and any(text in d for d in rep["differences"]), (fields, rep["differences"])
+
+
+def test_codegen_allow_list_aliases_and_allowed_differences():
+    base = cg_base()
+    cand = cg_copy(base)                                                 # the row engine became an instantiation of a template
+    for arch in cand["kernels"]:
+        cand["kernels"][arch]["cfbi::rows_kernel<Lb0E>"] = cand["kernels"][arch].pop("cfbi::rows_kernel")
+    rep = cg.compare_dumps(base, cand)
+    assert rep["exit"] == 1 and any("cfbi::rows_kernel: missing in the candidate" in d for d in rep["differences"])
+    allow = {"aliases": {"cfbi::rows_kernel<Lb0E>": "cfbi::rows_kernel"}, "may_differ": []}
+    rep = cg.compare_dumps(base, cand, allow)
+    assert rep["exit"] == 0 and rep["added"] == []
+    changed = cg_edit(base, "sm_100a", "cfbi::k1_kernel<Li16E>", sass_hash="k1-new")
+    assert cg.compare_dumps(base, changed)["exit"] == 1
+    for entry in ("cfbi::k1_kernel<Li16E>", "cfbi::k1_kernel"):          # a changed kernel is tolerated only when it is on the allow-list (key or family)
+        rep = cg.compare_dumps(base, changed, {"aliases": {}, "may_differ": [entry]})
+        assert rep["exit"] == 0 and len(rep["allowed"]) == 1, entry
+    rep = cg.compare_dumps(base, base, {"aliases": {"cfbi::gone": "cfbi::rows_kernel"}, "may_differ": []})
+    assert any("matches no candidate kernel" in n for n in rep["notes"])  # an unused alias is reported, never silently ignored
+    both = cg_copy(cand)
+    for arch in both["kernels"]:
+        both["kernels"][arch]["cfbi::rows_kernel"] = dict(both["kernels"][arch]["cfbi::rows_kernel<Lb0E>"])
+    with pytest.raises(cg.Unusable):                                     # two candidate kernels cannot stand for one base kernel
+        cg.compare_dumps(base, both, allow)
+
+
+def test_codegen_missing_base_kernels_and_new_kernels():
+    base = cg_base()
+    missing = cg_copy(base)
+    del missing["kernels"]["sm_90a"]["cfbi::plan_kernel"]
+    rep = cg.compare_dumps(base, missing)
+    assert rep["exit"] == 1 and any("sm_90a cfbi::plan_kernel: missing in the candidate" in d for d in rep["differences"])
+    ok = cg_copy(base)                                                   # new kernels are listed, not a difference, and gated
+    ok["kernels"]["sm_100a"]["cfbi::new_kernel"] = cg_kernel(reg=100, stack=0, spill=(0, 0), sass="new")
+    rep = cg.compare_dumps(base, ok)
+    assert rep["exit"] == 0 and rep["added"] == ["sm_100a cfbi::new_kernel"] and rep["gate_r"]["failures"] == []
+    for fields, text in (({"reg": 129}, "129 registers"), ({"stack": 200}, "stack 200 B above the base 112 B"),
+                         ({"spill_stores": 8}, "spill stores 8 B above the base 4 B"), ({"spill_loads": 9}, "spill loads 9 B above the base 4 B")):
+        rep = cg.compare_dumps(base, cg_edit(ok, "sm_100a", "cfbi::new_kernel", **fields))
+        assert rep["exit"] == 1 and any(text in f for f in rep["gate_r"]["failures"]), (fields, rep["gate_r"])
+
+
+def test_codegen_change_mode_lets_only_the_row_engine_change_and_gates_it():
+    base = cg_base()
+    rows_ok = cg_copy(base)
+    for arch in rows_ok["kernels"]:
+        rows_ok["kernels"][arch]["cfbi::rows_kernel"].update(sass_hash="rows-new", instructions=90)
+    assert cg.compare_dumps(base, rows_ok)["exit"] == 1                  # identity mode: any change is a difference
+    rep = cg.compare_dumps(base, rows_ok, mode="change")
+    assert rep["exit"] == 0 and len(rep["allowed"]) == 2 and len(rep["gate_r"]["checked"]) >= 2
+    for fields, text in (({"reg": 129, "maxreg": 255}, "129 registers"), ({"stack": 113}, "stack 113 B above"), ({"spill_stores": 5}, "spill stores 5 B above"),
+                         ({"maxreg": 255}, "launch-bound attribute maxreg 255")):
+        rep = cg.compare_dumps(base, cg_edit(rows_ok, "sm_100a", "cfbi::rows_kernel", **fields), mode="change")
+        assert rep["exit"] == 1 and any(text in f for f in rep["gate_r"]["failures"]), (fields, rep["gate_r"])
+    for key in ("cfbi::k1_kernel<Li16E>", "cfbi::ref::rows_kernel", "cfbi::plan_kernel"):      # everything else, the frozen reference included, stays identical
+        rep = cg.compare_dumps(base, cg_edit(rows_ok, "sm_90a", key, sass_hash="changed"), mode="change")
+        assert rep["exit"] == 1 and any(key in d for d in rep["differences"]), key
+    assert cg.compare_dumps(base, base, mode="change")["gate_r"]["checked"]                   # the row engine is gated even when it equals the base
+    rep = cg.compare_dumps(base, rows_ok, mode="change", prev=rows_ok)
+    assert any("unchanged against the previous accepted state" in n for n in rep["notes"])
+    with pytest.raises(cg.Unusable):
+        cg.compare_dumps(base, rows_ok, mode="bogus")
+
+
+def test_codegen_refuses_dumps_of_different_toolchains_but_allows_different_variant_defines():
+    base = cg_base()
+    for field, value in (("nvcc", "nvcc 13.4"), ("host_compiler", "g++ 8.5"), ("flags", ["-O2"]), ("label", "another toolchain"), ("source", "files"), ("std", "c++17"),
+                         ("src_hash", "0x1ull")):
+        other = cg_copy(base)
+        other["meta"]["toolchain"][field] = value
+        with pytest.raises(cg.Unusable):
+            cg.compare_dumps(base, other)
+    fewer = cg_copy(base)
+    fewer["meta"]["toolchain"]["archs"] = ["sm_100a"]
+    del fewer["kernels"]["sm_90a"]
+    with pytest.raises(cg.Unusable):
+        cg.compare_dumps(base, fewer)
+    assert cg.compare_dumps(base, cg_dump(base["kernels"], defines=["CFBI_NEG_CONTROL=1"]))["exit"] == 0      # variant defines are recorded separately
+
+
+def test_codegen_empty_dumps_are_unusable_and_an_identical_tree_is_flagged():
+    base = cg_base()
+    empty = cg_copy(base)
+    empty["kernels"]["sm_90a"] = {}
+    with pytest.raises(cg.Unusable):
+        cg.compare_dumps(base, empty)
+    with pytest.raises(cg.Unusable):
+        cg.compare_dumps(empty, base)
+    with pytest.raises(cg.Unusable):
+        cg.compare_dumps(cg_dump({}), cg_dump({}))
+    with pytest.raises(cg.Unusable):
+        cg.check_dump({"schema": "other"})
+    assert any("A/A" in n for n in cg.compare_dumps(base, base)["notes"])
+    assert not any("A/A" in n for n in cg.compare_dumps(base, cg_dump(base["kernels"], content="tree-2"))["notes"])
+
+
+def test_codegen_cache_key_changes_with_every_input():
+    tc = {"source": "nvcc", "label": "a", "flags": ["-O3"], "archs": ["sm_100a"]}
+    key = cg.cache_key(tc, ["X=1"], ["u.cu"], "c1")
+    assert key == cg.cache_key(dict(tc), ["X=1"], ["u.cu"], "c1")
+    others = [cg.cache_key(dict(tc, label="b"), ["X=1"], ["u.cu"], "c1"), cg.cache_key(dict(tc, flags=["-O2"]), ["X=1"], ["u.cu"], "c1"),
+              cg.cache_key(dict(tc, archs=["sm_90a"]), ["X=1"], ["u.cu"], "c1"), cg.cache_key(tc, [], ["u.cu"], "c1"), cg.cache_key(tc, ["X=1"], ["v.cu"], "c1"),
+              cg.cache_key(tc, ["X=1"], ["u.cu"], "c2")]
+    assert all(o != key for o in others) and len(set(others)) == len(others)
+
+
+def test_codegen_tree_helpers():
+    d = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d, "csrc", "cfbi"))
+    os.makedirs(os.path.join(d, "flash_kda", "cfbi"))
+    open(os.path.join(d, "csrc", "cfbi", "x.cuh"), "w").write("a")
+    open(os.path.join(d, "flash_kda", "cfbi", "_ext.py"), "w").write('_SOURCES = ("b.cpp", "u1.cu", "u2.cu")\nNVCC_FLAGS = ["-O3", "-lineinfo"]\n')
+    assert cg.units_of(d) == ["csrc/cfbi/u1.cu", "csrc/cfbi/u2.cu"] and cg.ext_flags_of(d) == ["-O3", "-lineinfo"]
+    h = cg.tree_content_hash(d)
+    open(os.path.join(d, "README"), "w").write("outside the build inputs")
+    assert cg.tree_content_hash(d) == h
+    open(os.path.join(d, "csrc", "cfbi", "x.cuh"), "w").write("b")
+    assert cg.tree_content_hash(d) != h
+    empty = tempfile.mkdtemp()
+    assert cg.units_of(empty) == list(cg.DEFAULT_UNITS) and cg.ext_flags_of(empty) is None
+    open(os.path.join(empty, "SNAPSHOT_COMMIT"), "w").write("abc123\n")
+    assert cg.tree_commit(empty) == "abc123"
+
+
+def test_codegen_flag_unit_and_arch_lists_match_the_sources():
+    assert cg.ext_flags_of(str(_ROOT)) == cg.PRODUCTION_FLAGS            # parsed from the text of flash_kda/cfbi/_ext.py, never imported
+    assert cg.units_of(str(_ROOT)) == list(cg.DEFAULT_UNITS)
+    values = {}
+    for node in ast.parse((_ROOT / "setup.py").read_text()).body:       # setup.py is parsed, not imported (importing it updates the submodules)
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in ("SUPPORTED_CUDA_ARCHS", "CFBI_CUDA_ARCHS") for t in node.targets):
+            values[node.targets[0].id] = eval(compile(ast.Expression(node.value), "setup.py", "eval"), {}, dict(values))
+    assert tuple("sm_" + a for a in values["CFBI_CUDA_ARCHS"]) == cg.MATRIX_ARCHS
+    assert set(cg.GATE_ARCHS) <= set(cg.MATRIX_ARCHS)
+    assert cg.load_allow(cg.DEFAULT_ALLOW)["aliases"] == {}              # the committed allow-list parses
+
+
+PTXAS = """ptxas info    : 103 bytes gmem
+ptxas info    : Compiling entry function '_ZN4cfbi11rows_kernelENS_6ParamsE' for 'sm_100a'
+ptxas info    : Function properties for _ZN4cfbi11rows_kernelENS_6ParamsE
+    112 bytes stack frame, 4 bytes spill stores, 4 bytes spill loads
+ptxas info    : Used 128 registers, used 1 barriers, 112 bytes cumulative stack size, 8192 bytes smem
+ptxas info    : Compile time = 3051.1 ms
+ptxas info    : Compiling entry function '_ZN4cfbi11plan_kernelEPKliPKiS3_iiPNS_7SeqPlanE' for 'sm_100a'
+ptxas info    : Function properties for _ZN4cfbi11plan_kernelEPKliPKiS3_iiPNS_7SeqPlanE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 1 barriers, 4096 bytes smem
+ptxas info    : Compiling entry function '_ZN4cfbi11rows_kernelENS_6ParamsE' for 'sm_90a'
+ptxas info    : Function properties for _ZN4cfbi11rows_kernelENS_6ParamsE
+    168 bytes stack frame, 428 bytes spill stores, 172 bytes spill loads
+ptxas info    : Used 128 registers, used 1 barriers, 8192 bytes smem
+"""
+
+ELF = """
+Fatbin elf code:
+================
+arch = sm_100a
+code version = [1,8]
+
+.nv.info._ZN4cfbi11rows_kernelENS_6ParamsE
+\t<0x1>
+\tAttribute:\tEIATTR_CUDA_API_VERSION
+\tFormat:\tEIFMT_SVAL
+\tValue:\t0x83
+\t<0x4>
+\tAttribute:\tEIATTR_MAXREG_COUNT
+\tFormat:\tEIFMT_HVAL
+\tValue:\t0x80
+\t<0x12>
+\tAttribute:\tEIATTR_MAX_THREADS
+\tFormat:\tEIFMT_SVAL
+\tValue:\t0x100 0x1 0x1
+
+.nv.info._ZN4cfbi11plan_kernelEPKliPKiS3_iiPNS_7SeqPlanE
+\t<0x4>
+\tAttribute:\tEIATTR_MAXREG_COUNT
+\tFormat:\tEIFMT_HVAL
+\tValue:\t0xff
+"""
+
+
+def test_codegen_ptxas_log_and_elf_attribute_parsers():
+    p = cg.parse_ptxas_log(PTXAS)
+    assert p[("sm_100a", ROWS)] == {"stack": 112, "spill_stores": 4, "spill_loads": 4, "registers": 128}
+    assert p[("sm_90a", ROWS)]["spill_stores"] == 428 and p[("sm_90a", ROWS)]["spill_loads"] == 172
+    assert p[("sm_100a", "_ZN4cfbi11plan_kernelEPKliPKiS3_iiPNS_7SeqPlanE")]["registers"] == 40
+    e = cg.parse_elf_attributes(ELF)
+    assert e[("sm_100a", ROWS)] == {"maxreg": 128, "max_threads": 256}
+    assert e[("sm_100a", "_ZN4cfbi11plan_kernelEPKliPKiS3_iiPNS_7SeqPlanE")] == {"maxreg": 255}
+
+
+def test_codegen_dump_from_toolchain_text_files_and_the_operand_only_control():
+    d = tempfile.mkdtemp()
+
+    def write(name, text):
+        path = os.path.join(d, name)
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    regs, ptx = write("a.regs.txt", cg_regs({ROWS: (128, 112), K1: (100, 0)})), write("a.ptxas.txt", PTXAS)
+    base = cg.dump_from_files(regs, write("a.sass.txt", cg_sass({ROWS: CODE, K1: ["EXIT"]})), "container toolchain", ptxas_log=ptx)
+    cg.check_dump(base)
+    rows = base["kernels"]["sm_100a"]["cfbi::rows_kernel"]
+    assert rows["reg"] == 128 and rows["spill_stores"] == 4 and rows["instructions"] == len(CODE)     # the spill figures come from the ptxas lines
+    assert cg.compare_dumps(base, base)["exit"] == 0
+    for idx, new in ((5, "FFMA R8, R2, R3, R4"), (2, "IMAD.WIDE.U32 R2, R5, 0x24, R2")):          # operand only, immediate only: the gate must fail
+        code = list(CODE)
+        code[idx] = new
+        cand = cg.dump_from_files(regs, write("b.sass.txt", cg_sass({ROWS: code, K1: ["EXIT"]})), "container toolchain", ptxas_log=ptx)
+        assert cg.compare_dumps(base, cand)["exit"] == 1, new
+    other = cg.dump_from_files(regs, write("a.sass.txt", cg_sass({ROWS: CODE, K1: ["EXIT"]})), "another toolchain", ptxas_log=ptx)
+    with pytest.raises(cg.Unusable):                                                                   # another toolchain label is not comparable
+        cg.compare_dumps(base, other)
+    with pytest.raises(cg.Unusable):                                                                   # and neither is a dump built by nvcc here
+        cg.compare_dumps(base, cg_base())
+
+
+def test_codegen_reference_figures_are_a_warning_not_a_failure():
+    base = cg_base()
+    assert cg.literal_check(base) == []
+    drift = cg_edit(base, "sm_100a", "cfbi::rows_kernel", spill_stores=8)
+    assert any("toolchain drift" in w for w in cg.literal_check(drift))
+    rep = cg.compare_dumps(drift, drift)
+    assert rep["exit"] == 0 and "WARNING" in cg.format_report(rep, drift) and cg.format_report(rep).endswith("VERDICT: PASS")
+
+
+def test_codegen_cli_exit_codes():
+    d = tempfile.mkdtemp()
+    base = cg_base()
+    paths = {}
+    for name, dump in (("base", base), ("same", base), ("diff", cg_edit(base, "sm_100a", "cfbi::k1_kernel<Li16E>", sass_hash="x")),
+                       ("other", cg_dump(base["kernels"], label="other-toolchain"))):
+        paths[name] = os.path.join(d, name + ".json")
+        with open(paths[name], "w") as f:
+            json.dump(dump, f)
+    out = os.path.join(d, "report.json")
+    assert cg.main(["compare", "--base", paths["base"], "--cand", paths["same"], "--json", out]) == 0
+    with open(out) as f:
+        assert json.load(f)["exit"] == 0
+    assert cg.main(["compare", "--base", paths["base"], "--cand", paths["diff"]]) == 1
+    assert cg.main(["compare", "--base", paths["base"], "--cand", paths["other"]]) == 2
+    assert cg.main(["compare", "--base", paths["base"], "--cand", os.path.join(d, "missing.json")]) == 2
+    with open(os.path.join(d, "bad.json"), "w") as f:
+        f.write("{not json")
+    assert cg.main(["compare", "--base", paths["base"], "--cand", os.path.join(d, "bad.json")]) == 2
+    assert cg.main([]) == 2
+    allow = os.path.join(d, "allow.json")
+    with open(allow, "w") as f:
+        json.dump({"schema": cg.ALLOW_SCHEMA, "aliases": {}, "may_differ": ["cfbi::k1_kernel"]}, f)
+    assert cg.main(["compare", "--base", paths["base"], "--cand", paths["diff"], "--allow", allow]) == 0
+
+
+def _toolchain_or_skip():
+    try:
+        return cg.find_toolchain()
+    except cg.Unusable as e:
+        pytest.skip("no toolchain for the compile-only gate on this machine: %s" % e)
+
+
+def test_codegen_controls_with_nvcc():
+    """The gate on the real sources (login node, conda nvcc): base against base passes, the existing row-engine negative control fails and names the
+    row engine, and register-pressure variants of the row engine fail the resource gate."""
+    tc, tree, cache = _toolchain_or_skip(), str(_ROOT), tempfile.mkdtemp()
+    base = cg.dump_tree(tree, cg.GATE_ARCHS, (), tc, cache_dir=cache)
+    assert set(base["kernels"]) == set(cg.GATE_ARCHS) and all(len(v) >= 10 for v in base["kernels"].values())
+    assert cg.dump_tree(tree, cg.GATE_ARCHS, (), tc, cache_dir=cache)["meta"]["cache"] == "hit"
+    assert cg.literal_check(base) == [], cg.literal_check(base)           # the recorded figures of the base row engine hold with this toolchain
+    variants = {"same": (), "neg": ("CFBI_NEG_CONTROL=1",), "regs": ("CFBI_ROWS_MINB=1",), "spill": ("CFBI_ROWS_MINB=3",)}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(variants)) as pool:
+        futs = {k: pool.submit(cg.dump_tree, tree, cg.GATE_ARCHS, v, tc) for k, v in variants.items()}
+        built = {k: f.result() for k, f in futs.items()}
+    assert cg.compare_dumps(base, built["same"])["exit"] == 0
+    neg = cg.compare_dumps(base, built["neg"])
+    assert neg["exit"] == 1 and any("cfbi::rows_kernel:" in d for d in neg["differences"]), neg
+    for name in ("regs", "spill"):
+        rep = cg.compare_dumps(base, built[name], mode="change")
+        assert rep["exit"] == 1 and rep["gate_r"]["failures"] and not rep["differences"], (name, rep)
+        assert cg.compare_dumps(base, built[name])["exit"] == 1            # identity mode shows the same variant as a difference of the row engine
+
+
+def test_codegen_compile_matrix_and_a_failing_build_with_nvcc():
+    tc = _toolchain_or_skip()
+    res = cg.matrix_build(str(_ROOT), cg.MATRIX_ARCHS, tc)
+    assert len(res) == len(cg.units_of(str(_ROOT))) * len(cg.MATRIX_ARCHS)
+    assert [(u, a, msg) for u, a, ok, msg in res if not ok] == []
+    d = tempfile.mkdtemp()                                               # a deliberate compile error is a failed build, never a skip
+    os.makedirs(os.path.join(d, "csrc", "cfbi"))
+    os.makedirs(os.path.join(d, "flash_kda", "cfbi"))
+    with open(os.path.join(d, "flash_kda", "cfbi", "_ext.py"), "w") as f:
+        f.write('_SOURCES = ("broken.cu",)\n')
+    with open(os.path.join(d, "csrc", "cfbi", "broken.cu"), "w") as f:
+        f.write('#error deliberately broken\n')
+    res = cg.matrix_build(d, ("sm_90a",), tc)
+    assert len(res) == 1 and res[0][2] is False and "deliberately broken" in res[0][3]
+    with pytest.raises(cg.Unusable):
+        cg.dump_tree(d, ("sm_90a",), (), tc)
+    assert cg.main(["matrix", "--tree", d, "--archs", "sm_90a"]) == 1
+    assert cg.main(["gate", "--base-tree", d, "--cand-tree", d, "--archs", "sm_90a"]) == 2
