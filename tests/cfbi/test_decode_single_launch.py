@@ -29,6 +29,7 @@ from flash_kda.cfbi import alloc_state, decode, prefill, state_equal, state_mism
 
 import decode_policy as dp
 import helpers
+import live_grid
 import rows_workload as rw
 from helpers import make_case, n_diff, recording, skip_or_fail
 from test_vs_ref import _call_inputs, _cu
@@ -49,10 +50,21 @@ def spec_single_launch(mode, impl, N, H, sms):
     return dp.policy(mode, impl, N, H, sms, _cc())
 
 
-def big_n(ext, H, paths=(rw.SINGLE, rw.TWO_LAUNCH)):
-    """A sequence count whose decode grid (N x H CTAs) is at least ``WAVES`` waves of the CTAs that are resident at once, for every row-engine instantiation that the compared ``paths``
-    launch (the occupancy API of the extension answers, no constant): the late-starting CTAs that the arrival count exists for are there on every path."""
-    return max(helpers.sequences_beyond_waves(helpers.resident_ctas(ext, p.instance), H) for p in paths)
+def active_n(ext, H, paths=(rw.SINGLE, rw.TWO_LAUNCH)):
+    """The number of ACTIVE sequences (live in every launch, H CTAs each) that make a decode launch at least ``WAVES`` waves of the CTAs that are resident at once, for every row-engine
+    instantiation that the compared ``paths`` launch (the occupancy API of the extension answers, no constant). Padding entries, empty sequences and entries without a token in a launch come ON
+    TOP of this number (``live_grid`` planners), and ``assert_live_floor`` asserts what the planned launches really put on the device."""
+    return max(live_grid.active_quota(helpers.resident_ctas(ext, p.instance), H) for p in paths)
+
+
+def assert_live_floor(ext, launches, H, paths=(rw.SINGLE, rw.TWO_LAUNCH), start_pos=None):
+    """Before any GPU work: every planned launch (``[(lens, slots)]``: a padding entry, an empty sequence and an entry without a token are not live) puts at least ``ceil(2.5 x resident CTAs)``
+    live CTAs on the device, for every instantiation that the compared paths launch. Returns the coverage of the plan (``rows_workload.launch_coverage``)."""
+    cov = rw.launch_coverage(launches, H, start_pos)
+    caps = {p.instance: helpers.resident_ctas(ext, p.instance) for p in paths}
+    problems = rw.beyond_waves_problems(cov["live_ctas"], caps)
+    assert problems == [], problems
+    return cov
 
 
 def require_single_launch(ext, N, H):
@@ -231,15 +243,16 @@ def test_decode_chain_beyond_two_waves_is_bit_identical(ext, forced, other, pool
     same state: identical bf16 and fp32 outputs, E, valid row-cache planes and pos after every step, on a grid of at least 2.5 waves of every instantiation the two sides launch. Every call
     of both sides asserts its own launch set."""
     H, steps = 12, 5
-    N = big_n(ext, H)
+    N, skip = live_grid.padded_batch(active_n(ext, H), 7, 3) if pool else (active_n(ext, H), [])      # the padding entries of the decode batch (no tokens, no state access) come on top of the quota
     require_single_launch(ext, N, H)
-    first = [125 + (n % 6) for n in range(N)]
     rng = random.Random(11)
     S = N + 9 if pool else N
-    ids = torch.tensor(rng.sample(range(S), N), dtype=torch.int32, device="cuda") if pool else None
+    slots = rng.sample(range(S), N) if pool else None
+    assert_live_floor(ext, [([1] * N, [-1 if i in skip else i for i in range(N)])] * steps, H)
+    first = [125 + (n % 6) for n in range(N)]
+    ids = torch.tensor(slots, dtype=torch.int32, device="cuda") if pool else None
     case, cu, st = prefilled(H, N, S, first, steps, ids, seed=21)
     st_a, st_b = st.clone(), st.clone()
-    skip = [i for i in range(N) if pool and i % 7 == 3]          # padding entries of the decode batch: no tokens, no state access
     ids_call = None
     if pool:
         ids_call = ids.clone()
@@ -264,15 +277,14 @@ def test_decode_from_every_phase_on_a_big_grid_is_bit_identical(ext, forced, oth
     reach every position and a chunk end of every sequence; after every step outputs, E, valid rows and pos are identical and no arrival bit is left, and the final positions are exactly
     the starts advanced by 70."""
     H, steps = 12, 70
-    N = max(big_n(ext, H), rw.BT)
+    N = max(active_n(ext, H), rw.BT)
     require_single_launch(ext, N, H)
     first = [2 * rw.BT + n % rw.BT for n in range(N)]            # two whole chunks, then phase n mod 64
-    case, cu, st = prefilled(H, N, N, first, steps, None, seed=41)
-    st_a, st_b = st.clone(), st.clone()
-    cov = rw.launch_coverage([([1] * N, list(range(N)))] * steps, H, start_pos={n: first[n] % rw.BT for n in range(N)})
+    cov = assert_live_floor(ext, [([1] * N, list(range(N)))] * steps, H, start_pos={n: first[n] % rw.BT for n in range(N)})      # every sequence is live in every step
     assert cov["positions"] == list(range(rw.BT)), cov["positions"]                    # a single-token chain has no row after a chunk end inside one launch (the multi-token tests have)
     assert cov["chunk_end_rows"] >= N and cov["cross_subblock_rows"] > 0, cov           # every sequence finishes a chunk within the 70 steps
-    assert min(cov["live_ctas"]) >= helpers.WAVES * helpers.resident_ctas(ext, helpers.ROWS_DECODE), cov["live_ctas"][:2]
+    case, cu, st = prefilled(H, N, N, first, steps, None, seed=41)
+    st_a, st_b = st.clone(), st.clone()
     for t in range(steps):
         ins = step_inputs(case, cu, first, [t] * N)
         oa, fa = decode_on(rw.SINGLE, case, ins, st_a, None)
@@ -289,20 +301,18 @@ def test_mode1_calls_with_several_tokens_per_sequence_across_chunks_on_a_big_gri
     in three successive calls so that its open chunk carries from call to call and its rows cross chunk ends, single launch against ``other`` from the same state, a grid of at least 2.5
     resident waves of every instantiation the two sides launch; the executed rows (derived from the plan of the calls) reach every position, a chunk end and rows after it."""
     H = 3
-    N = big_n(ext, H)
+    lens, takes = live_grid.mode1_plan(active_n(ext, H))      # the active sequences take tokens in every call; the empty and the one- and two-token entries come on top of them
+    N = len(lens)
     require_single_launch(ext, N, H)
-    rng = random.Random(7)
-    lens = [0 if n % 11 == 5 else rng.choice([1, 2, 5, 33, 64, 65, 97, 130]) for n in range(N)]
-    shares = [[L // 3, L // 3, L - 2 * (L // 3)] for L in lens]       # the tokens of a sequence in each of the three calls
+    launches = live_grid.launches(takes)
+    assert_live_floor(ext, launches, H)                       # every one of the three calls is beyond 2.5 live waves, derived from the planned takes before any GPU work
     case = make_case(sum(lens), H, "authors", seed=51)
     cu = _cu(lens)
     st_a, st_b = alloc_state(N, H), alloc_state(N, H)
     done = [0] * N
-    launches = []
     for call in range(3):
-        take = [shares[n][call] for n in range(N)]
+        take = takes[call]
         sub, cu_call = _call_inputs(case, cu, done, take)
-        launches.append((take, list(range(N))))
         oa, fa = mode1_on(rw.SINGLE, case, sub, cu_call, st_a, None)
         ob, fb = mode1_on(other, case, sub, cu_call, st_b, None)
         assert n_diff(oa, ob) == 0 and n_diff(fa, fb) == 0, f"call {call}: outputs differ"
@@ -410,8 +420,9 @@ def test_the_comparisons_of_this_module_see_a_corrupted_reference(ext, forced, w
     """One flipped bit in the reference's bf16 output, fp32 output, E, a valid cache row or pos makes the comparison that the chain tests use (``n_diff``, ``state_equal``) fail, and only
     that one: the equality checks above are not vacuous."""
     H = 12
-    N = big_n(ext, H)
+    N = active_n(ext, H)
     require_single_launch(ext, N, H)
+    assert_live_floor(ext, [([1] * N, list(range(N)))], H)
     first = [61 + n % 6 for n in range(N)]
     case, cu, st = prefilled(H, N, N, first, 2, None, seed=31)
     st_a, st_b = st.clone(), st.clone()
@@ -488,15 +499,16 @@ def test_the_single_launch_stays_inside_its_buffers_beyond_two_waves(ext, forced
     import test_guard_zones as gz
 
     H = 12
-    N = big_n(ext, H)
+    N, n_pad = live_grid.fraction_batch(active_n(ext, H), 8)          # the N // 8 padding entries come on top of the quota
     require_single_launch(ext, N, H)
     S = N + 9
     rng = random.Random(3)
+    slots = rng.sample(range(S), N)
+    for n in rng.sample(range(N), n_pad):
+        slots[n] = -1
+    assert_live_floor(ext, [([1] * N, slots)] * 3, H)
     case = make_case(N, H, "authors", seed=71)
     pool, pg = gz._state(S, H)
-    slots = rng.sample(range(S), N)
-    for n in rng.sample(range(N), N // 8):
-        slots[n] = -1
     gslots = gz.Guarded(torch.tensor(slots, dtype=torch.int32, device="cuda"))
     bufs = {k: gz.Guarded(case[k][:, :N].reshape(N, 1, *case[k].shape[2:]).contiguous()) for k in ("q", "k", "v", "g", "beta")}
     o1, o132 = gz._zeros_guarded(bufs["q"].t.shape, torch.bfloat16), gz._zeros_guarded(bufs["q"].t.shape, torch.float32)
@@ -525,9 +537,10 @@ def test_cuda_graph_replay_with_rewritten_slot_ids_beyond_two_waves(ext, forced,
     for the two-launch graph): under ``FLASH_KDA_CFBI_IMPL=64`` (Suite Sd) a call without it would capture the plan kernel and fail the assertion of the single-launch graph. The graph
     holds exactly the kernels of its path (the scratch launch before the capture and every replay are run under the profiler); no plan buffer exists in the single-launch graph."""
     H, steps = 12, 4
-    N = big_n(ext, H)
+    N, n_pad = live_grid.fraction_batch(active_n(ext, H), 8)          # the N // 8 padding entries of every replay come on top of the quota
     if path is rw.SINGLE:
         require_single_launch(ext, N, H)
+    assert_live_floor(ext, [([1] * N, [-1] * n_pad + list(range(N - n_pad)))] * steps, H, paths=(path,))     # the graph runs on one path: its instantiation only
     S = N + 9
     first = [125 + (n % 6) for n in range(N)]
     rng = random.Random(17)
@@ -565,7 +578,7 @@ def test_cuda_graph_replay_with_rewritten_slot_ids_beyond_two_waves(ext, forced,
     for t in range(steps):
         order = list(range(N))
         rng.shuffle(order)                                      # entry i serves sequence order[i]
-        pad = set(rng.sample(range(N), N // 8))                 # entries that are padding this step
+        pad = set(rng.sample(range(N), n_pad))                  # entries that are padding this step
         for i, n in enumerate(order):
             if i in pad:
                 ids[i] = -1

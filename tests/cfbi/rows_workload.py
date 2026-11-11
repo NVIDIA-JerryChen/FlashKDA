@@ -9,6 +9,7 @@ The grid is derived from the device (``helpers.decode_sequences``: SMs times the
 entries, which exit at once) fill at least ``WAVES`` waves of resident CTAs; extra padding and empty entries come on top.
 """
 import itertools
+import math
 import os
 import random
 
@@ -433,6 +434,20 @@ def launch_coverage(launches, heads, start_pos=None):
     cov["positions"] = sorted(cov["positions"])
     cov["final_pos"] = {slot: p for slot, p in sorted(pos.items())}
     return cov
+
+
+def beyond_waves_problems(live_ctas, capacities, waves=WAVES):
+    """What a workload that claims a grid beyond ``waves`` resident waves misses, derived from what its launches execute: ``live_ctas`` are the live CTAs of every launch (``launch_coverage``: a
+    padding entry, an empty sequence and an entry that takes no token in the launch are not live), ``capacities`` maps each row-engine instantiation that the compared paths launch to its resident
+    CTAs (the occupancy API); every launch must put at least ``ceil(waves * capacity)`` live CTAs on the device for every instantiation. Returns the problems (empty: beyond the waves in every
+    launch). Applied by the callers that claim a size, not by ``coverage_problems``: the bounded racecheck workloads are small by design."""
+    probs = []
+    for i, live in enumerate(live_ctas):
+        for name, cap in sorted(capacities.items()):
+            floor = int(math.ceil(waves * cap))
+            if live < floor:
+                probs.append("launch %d: %d live CTAs are %.2f waves of %s (%d resident), below the %.1f waves (%d live CTAs) that the workload claims" % (i, live, live / float(cap), name, cap, waves, floor))
+    return probs
 
 
 def coverage_problems(cov):

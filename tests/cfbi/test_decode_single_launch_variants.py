@@ -22,7 +22,7 @@ import torch
 from flash_kda.cfbi import state_mismatch
 
 from helpers import n_diff
-from test_decode_single_launch import big_n, kernel_counts, prefilled, require_single_launch, step_inputs
+from test_decode_single_launch import active_n, assert_live_floor, kernel_counts, prefilled, require_single_launch, step_inputs
 
 REF = 3
 H, STEPS, REPEATS = 12, 5, 3
@@ -42,8 +42,10 @@ def single_launch_forced(ext):
 
 @pytest.fixture(scope="module")
 def workload(ext):
-    """At least 2.5 waves of CTAs of every instantiation (``big_n``), every sequence at its own chunk phase (the chain crosses chunk ends), the state every run starts from."""
-    N = big_n(ext, H)
+    """At least 2.5 live waves of CTAs of every instantiation (``active_n``: every sequence is live in every step, no padding), every sequence at its own chunk phase (the chain crosses chunk
+    ends), the state every run starts from."""
+    N = active_n(ext, H)
+    assert_live_floor(ext, [([1] * N, list(range(N)))] * STEPS, H)
     require_single_launch(ext, N, H)
     first = [125 + (n % 6) for n in range(N)]
     case, cu, st = prefilled(H, N, N, first, STEPS, None, seed=31)
