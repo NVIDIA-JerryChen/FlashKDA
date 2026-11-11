@@ -1210,6 +1210,72 @@ def canonical_coverage(campaign):
     return out
 
 
+META_KIND = {"decode": "decode-wall", "chain": "chain-wall"}                 # the kind of record that the benchmark of a campaign writes
+EFFECTIVE_COUNTS = ("calls_per_trial", "profile_calls")                      # recorded by every cell: the calls of a trial and of its profiled pass (the kernel sum needs both)
+
+
+def key_fields(key):
+    """``{field: text}`` of a cell key such as ``chain;N=1;H=12;Dm=2048;regime=lockstep;``."""
+    return dict(part.split("=", 1) for part in key.split(";")[1:] if "=" in part)
+
+
+def canonical_workloads(campaign):
+    """``{cell key: {argument: value}}`` of a campaign, from the benchmark that defines its cells (never from a record): what each cell must measure. A decode cell: N, H, the regime and
+    the probe position (None outside the probe regime); a chain cell: N, H, the model width Dm and the regime that its key names (the chain benchmark runs one)."""
+    out = {}
+    for s in bd.cell_specs() if campaign == "decode" else bl.cell_specs():
+        if campaign == "decode":
+            out[s["key"]] = {"N": s["N"], "H": s["H"], "regime": s["regime"], "pos": s["pos"]}
+        else:
+            out[s["key"]] = {"N": s["N"], "H": s["H"], "Dm": s["Dm"], "regime": key_fields(s["key"])["regime"]}
+    return out
+
+
+def _exactly(a, b):
+    """Equal and of the same type: ``True`` is not the integer 1 and ``1.0`` is not 1."""
+    return a == b and type(a) is type(b)
+
+
+def campaign_contract_problems(records, campaign, where):
+    """What the raw records of a final campaign must be, whatever the comparator is willing to judge (``br.compare`` takes pooled records and records of any workload, on purpose): the
+    process-median records of the campaign's benchmark (meta kind, sample statistic ``process_median``), at least ``br.MIN_TRIALS`` trials that each record declares and each cell holds,
+    and cells that are of the campaign's kind, measure the workload that their key names (``canonical_workloads``) and record their effective counts as positive integers. The first
+    offence of a kind in a record is named, with the number of the others."""
+    out = []
+    want, kind = canonical_workloads(campaign), META_KIND[campaign]
+    for rec in records:
+        name = rec.get("_path", "?")
+        meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
+        stat, trials = br.sample_stat_of(rec), meta.get("trials")
+        if stat != br.PROCESS_MEDIAN:
+            out.append("%s: the raw record %s has sample_stat %r, not %r: a final campaign is judged on the per-process medians of Method M (pooled records are for the A/A tools)" % (where, name, stat, br.PROCESS_MEDIAN))
+        if not count(trials, br.MIN_TRIALS):
+            out.append("%s: the raw record %s declares %r trials per cell: Method M needs at least %d trials" % (where, name, trials, br.MIN_TRIALS))
+        if meta.get("kind") != kind:
+            out.append("%s: the raw record %s is not a %s record (meta kind %r)" % (where, name, kind, meta.get("kind")))
+        found = {}
+        for cell in rec.get("cells", []):
+            key, args = cell.get("key"), cell.get("args") or {}
+            held = len(cell.get("samples") or [])
+            if count(trials, br.MIN_TRIALS) and held != trials:
+                found.setdefault("held", []).append("declares %d trials per cell, the cell %r holds %d samples" % (trials, key, held))
+            if cell.get("kind") != campaign:
+                found.setdefault("kind", []).append("the cell %r is not a %s cell (kind %r)" % (key, campaign, cell.get("kind")))
+            if key not in want:
+                found.setdefault("key", []).append("the cell %r is not a cell of the %s benchmark" % (key, campaign))
+            else:
+                wrong = sorted(f for f, v in want[key].items() if not _exactly(args.get(f), v))
+                if wrong:
+                    found.setdefault("workload", []).append("the cell %r does not measure the workload its key names (%s: record %s, benchmark %s)"
+                                                            % (key, ", ".join(wrong), [args.get(f) for f in wrong], [want[key][f] for f in wrong]))
+            for field in EFFECTIVE_COUNTS:
+                if not count(args.get(field), 1):
+                    found.setdefault("count " + field, []).append("the cell %r has %s = %r: an effective count must be a positive integer" % (key, field, args.get(field)))
+        for details in found.values():
+            out.append("%s: the raw record %s: %s%s" % (where, name, details[0], " (and %d more cell(s) of the record)" % (len(details) - 1) if len(details) > 1 else ""))
+    return out
+
+
 def _load_report(path):
     """``(results, problem)`` of a comparison report (``compare_bench.py --json`` writes a list with one result per metric)."""
     try:
@@ -1302,8 +1368,9 @@ def campaign_evidence_problems(entry, where, campaign, dev, baseline, base, a_co
 
     ``entry``: ``{allocation, report, records_first: {A, B}, records_rerun: {A, B}}``: the raw record files of the first campaign and of the re-run over the unstable cells, side A (the
     base tree) and side B (the candidate tree, or the base tree again when every change is reverted), and the comparison report (``compare_bench.py --json``), which is a claim.
-    Every metric is compared again with ``br.compare`` under the parameters of the campaign driver (regress gate, 1 %, three interleaved repeats, widening of noise-limited cells, a
-    clean candidate) and the report must say what the comparison gives, row by row. The sides' commits are ``a_commit`` / ``b_commit``, the GPU of every file the device's (and the
+    Every raw record must be a Method M record of the benchmark's own workload first (``campaign_contract_problems``). Every metric is then compared again with ``br.compare`` under the
+    parameters of the campaign driver (regress gate, 1 %, three interleaved repeats, widening of noise-limited cells, a clean candidate) and the report must say what the comparison
+    gives, row by row. The sides' commits are ``a_commit`` / ``b_commit``, the GPU of every file the device's (and the
     baseline's), the coverage the benchmark's own: ``scope`` None means the complete campaign (every canonical metric on its cells), else ``{metric: [cells]}``, which the campaign
     must judge exactly (a confirmation or a reverted run covers the flagged cells and no others). ``allow_rerun`` False: the campaign is itself the three-times campaign and is never re-run.
     Returns ``(problems, info)``; ``info`` holds the host, the first-campaign records by side and the recomputed rows by ``(metric, cell)``."""
@@ -1369,6 +1436,9 @@ def campaign_evidence_problems(entry, where, campaign, dev, baseline, base, a_co
                 problems.append("%s: the re-run record %s holds cell(s) that the %s does not have: %s" % (where, path, what, sorted(set(got) - set(every))[:3]))
     if problems:
         return problems, info
+    problems.extend(campaign_contract_problems([loaded[p] for p in paths], campaign, where))        # before the comparator: it judges what it is given, the contract says what is to be given
+    if problems:
+        return problems, info
     a_first, b_first = [loaded[p] for p in first["A"]], [loaded[p] for p in first["B"]]
     a_rerun, b_rerun = [loaded[p] for p in rerun["A"]], [loaded[p] for p in rerun["B"]]
     info["first"] = {"A": a_first, "B": b_first}
@@ -1399,12 +1469,49 @@ def campaign_evidence_problems(entry, where, campaign, dev, baseline, base, a_co
 def scale_problems(first, confirmation, wanted, where):
     """Why a confirmation is not the three-times campaign of the first campaign for the cells it confirms: for every flagged cell and side the calls per trial (and the profiled calls of a
     kernel-sum metric) are recorded as one positive integer in both and the confirmation's are exactly three times the first campaign's (taken from the first campaign, not from a re-run
-    of it: the factor never compounds), under the same configuration but for the node."""
+    of it: the factor never compounds), under the same configuration but for the node, and every cell that it holds has the arguments of the first campaign's (workload, routing, launch
+    mapping) but for the scaled counts: it confirms what was measured, not another shape or another route."""
     out = []
     for metric, keys in sorted(wanted.items()):
         for key in keys:
             for side, name in (("A", "baseline"), ("B", "candidate")):
                 out.extend("%s: %s" % (where, p) for p in br.rerun_problems(first[side], confirmation[side], name, key, metric, same_config=CONFIRMATION_SAME_CONFIG))
+    for side, name in (("A", "baseline"), ("B", "candidate")):
+        out.extend("%s: %s" % (where, p) for p in br.workload_problems(first[side], confirmation[side], "the final A/B %s" % name, "the confirmation %s" % name, br.SCALED_ARGS))
+    return out
+
+
+DEFAULT_ROUTE = {"impl": 0, "env_impl": None}              # what a record of the final A/B says about the routing of its tree: the default one, no environment override
+
+
+def default_route_problems(first, where):
+    """Why a side of the final A/B did not run its tree at the default routing: the final A/B compares the tree that is delivered with the base as both of them behave by default, so
+    neither side may pin another routing (the frozen reference, a forced launch structure) or carry an environment override. A baseline pinned on a slower route would hide a regression,
+    and everything that a known limit binds to the baseline (the confirmation, the reverted run) would be consistent with it and still not mean anything."""
+    out = []
+    for side, name in (("A", "baseline"), ("B", "candidate")):
+        for rec in first[side]:
+            meta = rec.get("meta") or {}
+            for field, want in DEFAULT_ROUTE.items():
+                if not _exactly(meta.get(field), want):
+                    out.append("%s: the %s record %s ran with meta %s = %r: the final A/B measures both trees at their default routing (impl 0, no environment override)"
+                               % (where, name, rec.get("_path", "?"), field, meta.get(field)))
+            cells = [c.get("key") for c in rec.get("cells", []) if not _exactly((c.get("args") or {}).get("impl"), DEFAULT_ROUTE["impl"])]
+            if cells:
+                out.append("%s: the %s record %s has %d cell(s) that did not run at the default routing, impl 0 (first: %r)" % (where, name, rec.get("_path", "?"), len(cells), cells[0]))
+    return out
+
+
+def reverted_problems(original, reverted, where):
+    """Why the run with all changes reverted does not repeat the baseline of the final A/B on its cells. The base commit alone does not say what was executed (the routing is chosen at run
+    time and the frozen reference is the same commit), so both arms must be configured as the baseline side of the final A/B (``CONFIRMATION_SAME_CONFIG``: commit, snapshot, routing,
+    toolchain, trials, statistic, device; the node is what may differ) and the cells that they hold must have its arguments (workload, routing, launch mapping) but for the scaled counts."""
+    out = []
+    what = "the run with all changes reverted is not the baseline behaviour of the final A/B"
+    for arm in ("A", "B"):
+        out.extend("%s: %s: arm %s differs in meta %s (%s vs %s)" % (where, what, arm, f, a, b) for f, a, b in br.config_differences(original["A"], reverted[arm], CONFIRMATION_SAME_CONFIG))
+        out.extend("%s: %s: arm %s: %s" % (where, what, arm, p)
+                   for p in br.workload_problems(original["A"], reverted[arm], "the baseline of the final A/B", "the reverted arm %s" % arm, br.SCALED_ARGS))
     return out
 
 
@@ -1416,8 +1523,9 @@ def final_problems(rec, repo=None, head="HEAD", document_text=None):
     with every change reverted. What is checked: the docs-only record-commit rule and a clean tree against ``repo`` / ``head`` (the commit must be one of the repository and differ from
     HEAD only under ``docs/``); per device the baseline's coverage is the benchmark's own and its GPU the device; every campaign is recomputed from its raw records (see
     ``campaign_evidence_problems``: the sides, the commits, the GPU, the coverage, the comparison itself and the report row by row); a regression needs a known-limit entry whose
-    confirmation judges exactly the flagged cells with three times the calls of the first campaign on another node and allocation and fails again, whose run with all changes reverted
-    shows the same shift (so the changes do not cause it), and the performance document must name the cell in its known-limit section."""
+    confirmation judges exactly the flagged cells with three times the calls of the first campaign on another node and allocation, on the workload and route of the first campaign (see
+    ``scale_problems``), and fails again, whose run with all changes reverted repeats the baseline of the final A/B (``reverted_problems``) and shows the same shift (so the changes do
+    not cause it), and the performance document must name the cell in its known-limit section."""
     where = "final record %s" % (rec.get("_path", "?") if isinstance(rec, dict) else "?")
     if not isinstance(rec, dict) or rec.get("schema") != FINAL_SCHEMA:
         return ["%s: not a %s record" % (where, FINAL_SCHEMA)]
@@ -1456,6 +1564,8 @@ def final_problems(rec, repo=None, head="HEAD", document_text=None):
             entry = d["campaigns"].get(campaign) if isinstance(d.get("campaigns"), dict) else None
             probs, info = campaign_evidence_problems(entry, cw, campaign, dev, baseline, base, base, final)
             problems.extend(probs)
+            if info["first"]:
+                problems.extend(default_route_problems(info["first"], cw))
             campaign_info[(dev, campaign)] = (entry, info)
             regressions.extend((dev, campaign, metric, key) for (metric, key), row in sorted(info["rows"].items()) if row.get("status") == "FAIL")
     limits = rec.get("known_limits") if isinstance(rec.get("known_limits"), list) else []
@@ -1476,6 +1586,8 @@ def final_problems(rec, repo=None, head="HEAD", document_text=None):
         problems.extend(conf_probs + rev_probs)
         if not conf_probs:
             problems.extend(scale_problems(info["first"], conf["first"], flagged, "%s, confirmation" % w))
+        if not rev_probs:
+            problems.extend(reverted_problems(info["first"], rev["first"], "%s, all changes reverted" % w))
         if conf_probs or rev_probs:
             continue
         if conf["rows"].get((metric, key), {}).get("status") != "FAIL":

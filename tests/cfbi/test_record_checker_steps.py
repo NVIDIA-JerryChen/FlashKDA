@@ -774,6 +774,15 @@ MEDIANS = {"decode": dict((k, 14.0 + 0.5 * i) for i, k in enumerate(DECODE_KEYS)
 SLOW_CELL = "decode;N=64;H=12;regime=lockstep;"
 SLOW_METRIC = "gpu_graph_us"                       # the metric that a regression of SLOW_CELL shows in
 LOOP_SUBSTRINGS = tuple("regime=%s;" % r for r in rc.bd.LOOP_REGIMES)
+KIND = {"decode": "decode-wall", "chain": "chain-wall"}                       # the kind of record that the benchmark of a campaign writes
+SPECS = {"decode": dict((s["key"], s) for s in rc.bd.cell_specs()), "chain": dict((s["key"], s) for s in rc.bl.cell_specs())}
+ROUTE = {"decode": {"kernels": ["plan_kernel", "rows_kernel"]}, "chain": {"compute_nodes": {"plan_kernel": 1, "rows_kernel": 1}, "aux_nodes": {}}}      # what a cell launched (base routing)
+
+
+def workload_args(campaign, key):
+    """The cell arguments that name what a cell measures, as the benchmark that writes the cell sets them (a decode cell: N, H, regime, pos; a chain cell: N, H, Dm, regime)."""
+    s = SPECS[campaign][key]
+    return {"N": s["N"], "H": s["H"], "regime": s["regime"], "pos": s["pos"]} if campaign == "decode" else {"N": s["N"], "H": s["H"], "Dm": s["Dm"], "regime": "lockstep"}
 
 
 @pytest.fixture(scope="module")
@@ -809,13 +818,15 @@ def final_cell(campaign, key, median, slow=1.0, scale=1, spread=0.0, idx=0):
             w["cpu_graph_us"] = t + 3.0
         wall.append(w)
     runs = [{tbt.PLAN_K: 2.0, tbt.ROWS_K: 10.0, tbt.FILL_K: 40.0} for _ in wall]
-    return br.make_cell(campaign, key, {"calls_per_trial": scale * tbt.CALLS, "profile_calls": scale * tbt.PROFILE_CALLS}, runs, drop_helpers=True, wall=wall)
+    args = dict(workload_args(campaign, key), impl=0, calls_per_trial=scale * tbt.CALLS, profile_calls=scale * tbt.PROFILE_CALLS, calls_scale=scale, **ROUTE[campaign])
+    return br.make_cell(campaign, key, args, runs, drop_helpers=True, wall=wall)
 
 
 def final_rec(campaign, dev, commit, ts, host, slows=None, scale=1, cells=None, spreads=None, idx=0):
     gpu, sm = GPU[dev]
     keys = cells if cells is not None else (DECODE_KEYS if campaign == "decode" else CHAIN_KEYS)
-    meta = {"commit": commit, "dirty": False, "gpu": gpu, "sm_count": sm, "host": host, "timestamp": ts, "sample_stat": br.PROCESS_MEDIAN, "trials": 5}
+    meta = {"commit": commit, "dirty": False, "gpu": gpu, "sm_count": sm, "host": host, "timestamp": ts, "sample_stat": br.PROCESS_MEDIAN, "trials": 5, "kind": KIND[campaign], "impl": 0,
+            "env_impl": None}
     return {"schema": br.SCHEMA, "meta": meta, "cells": [final_cell(campaign, k, MEDIANS[campaign][k], (slows or {}).get(k, 1.0), scale, (spreads or {}).get(k, 0.0), idx) for k in keys]}
 
 
@@ -1177,6 +1188,190 @@ def test_the_final_command_line_rejects_the_doubled_raw_candidate_samples(tmp_pa
     assert rc.main(args) == 1
     out = capsys.readouterr().out
     assert "VERDICT: FAIL" in out and "the report differs from the raw records" in out
+
+
+# ---- the round-4 review's counterexamples: a final campaign is made of Method M records of the benchmark's own workload ------------------------------------------
+PROBE_CELL = "decode;N=1;H=12;regime=probe;pos=63;"
+CHAIN_CELL = CHAIN_KEYS[0]
+
+
+def one_trial_pooled(rec):
+    """The first control of the review: every cell keeps the middle one of its trials and the record says that it is a pooled record of one trial."""
+    rec["meta"].update(sample_stat="pooled", trials=1)
+    for cell in rec["cells"]:
+        cell["samples"] = [cell["samples"][len(cell["samples"]) // 2]]
+
+
+def keep_samples(n):
+    def edit(rec):
+        for cell in rec["cells"]:
+            cell["samples"] = cell["samples"][:n]
+    return edit
+
+
+def set_meta(**fields):
+    return lambda rec: rec["meta"].update(fields)
+
+
+def set_args(args, keys=None):
+    """Set cell arguments of the cells ``keys`` (every cell by default)."""
+    def edit(rec):
+        for cell in rec["cells"]:
+            if keys is None or cell["key"] in keys:
+                cell["args"].update(args)
+    return edit
+
+
+def drop_arg(name):
+    return lambda rec: [cell["args"].pop(name) for cell in rec["cells"]]
+
+
+def both(*edits):
+    return lambda rec: [e(rec) for e in edits]
+
+
+FINAL_CAMPAIGN_CASES = [
+    # the sampling of Method M: process-median records of at least five trials, declared = held
+    ("one-trial pooled records on both sides, the report untouched (first control of the review)", "decode", "AB", one_trial_pooled, "process_median"),
+    ("the same in the chain campaign", "chain", "AB", one_trial_pooled, "process_median"),
+    ("pooled records of five trials on both sides", "decode", "AB", set_meta(sample_stat="pooled"), "process_median"),
+    ("no sample statistic on both sides", "decode", "AB", lambda rec: rec["meta"].pop("sample_stat"), "process_median"),
+    ("one trial declared, five held", "decode", "B", set_meta(trials=1), "at least 5 trials"),
+    ("three trials declared and held", "decode", "A", both(set_meta(trials=3), keep_samples(3)), "at least 5 trials"),
+    ("five trials declared, four held", "decode", "B", keep_samples(4), "declares 5 trials"),
+    ("a record of another kind", "decode", "B", set_meta(kind="chain-wall"), "is not a decode-wall record"),
+    # the effective counts: positive integers
+    ("no calls per trial", "decode", "B", drop_arg("calls_per_trial"), "positive integer"),
+    ("no profiled calls", "decode", "A", set_args({"profile_calls": 0}), "positive integer"),
+    ("fractional calls per trial", "chain", "B", set_args({"calls_per_trial": 1536.5}), "positive integer"),
+    # the workload: the arguments of a cell are the ones that its key names
+    ("every cell measures N = 1, H = 1, lock-step, position 0, on both sides (second control of the review)", "decode", "AB",
+     set_args({"N": 1, "H": 1, "regime": "lockstep", "pos": 0}), "workload its key names"),
+    ("one cell of another N", "decode", "B", set_args({"N": 2}, [SLOW_CELL]), "workload its key names"),
+    ("a probe cell at another position", "decode", "AB", set_args({"pos": 0}, [PROBE_CELL]), "workload its key names"),
+    ("a lock-step cell run in another regime", "decode", "B", set_args({"regime": "cold"}, [SLOW_CELL]), "workload its key names"),
+    ("a chain cell of another model width", "chain", "AB", set_args({"Dm": 4096}, [CHAIN_CELL]), "workload its key names"),
+    ("a chain cell of another regime", "chain", "B", set_args({"regime": "cold"}, [CHAIN_CELL]), "workload its key names"),
+    ("a cell of another kind", "decode", "B", lambda rec: rec["cells"][3].update(kind="chain"), "is not a decode cell"),
+]
+
+
+@pytest.mark.parametrize("name,campaign,sides,edit,expected", FINAL_CAMPAIGN_CASES, ids=[c[0][:70] for c in FINAL_CAMPAIGN_CASES])
+def test_a_final_campaign_is_made_of_method_m_records_of_the_benchmarks_own_workload(tmp_path, final_repo, name, campaign, sides, edit, expected):
+    rec = final_record(tmp_path, final_repo)
+    assert fcheck(rec, final_repo) == []
+    for side in sides:
+        rewrite_records(rec["devices"]["b200"]["campaigns"][campaign], side, edit)
+    probs = fcheck(rec, final_repo)
+    assert has(probs, expected), (name, probs[:3])
+
+
+def test_the_generic_comparator_keeps_its_pooled_support():
+    """The contract above is the final campaigns': ``br.compare`` still judges pooled records of one trial or of five (the A/A tools and older records use them)."""
+    for edit in (lambda r: r["meta"].update(sample_stat="pooled"), one_trial_pooled):
+        base, cand = tbt.wall_sets([10.0] * 3, [10.0] * 3)
+        for r in base + cand:
+            edit(r)
+        assert br.compare(base, cand, **rc.compare_kwargs("gpu_graph_us", 1.0, tbt.BASE_COMMIT, None))["verdict"] == "PASS"
+
+
+def final_command_line(tmp_path, h, rec, capsys):
+    """Write ``rec`` and run the final command on it; ``(exit status, output)``."""
+    path = tmp_path / "final.json"
+    rec = dict(rec)
+    rec.pop("_path", None)
+    path.write_text(json.dumps(rec))
+    capsys.readouterr()
+    status = rc.main(["final", "--repo", str(h["repo"]), "--head", h["docs"], "--record", str(path), "--document", str(tmp_path / "perf.md")])
+    return status, capsys.readouterr().out
+
+
+def test_the_final_command_line_rejects_one_trial_pooled_records_and_foreign_workloads(tmp_path, final_repo, capsys):
+    """The two controls of the review at the command line: exit 1 and VERDICT: FAIL (both were exit 0 and PASS)."""
+    (tmp_path / "perf.md").write_text(PERF_DOC % SLOW_CELL)
+    for name, edit, expected in (("pooled", one_trial_pooled, "process_median"), ("foreign", set_args({"N": 1, "H": 1, "regime": "lockstep", "pos": 0}), "workload its key names")):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "perf.md").write_text(PERF_DOC % SLOW_CELL)
+        rec = final_record(d, final_repo)
+        assert final_command_line(d, final_repo, rec, capsys)[0] == 0
+        for side in "AB":
+            rewrite_records(rec["devices"]["b200"]["campaigns"]["decode"], side, edit)
+        status, out = final_command_line(d, final_repo, rec, capsys)
+        assert status == 1 and "VERDICT: FAIL" in out and expected in out, (name, out[:400])
+
+
+# ---- B12: a known limit's confirmation and reverted run measure the original workload on the original baseline's route -------------------------------------------
+def limit_record(tmp_path, h):
+    return final_record(tmp_path, h, slow={"b200": {SLOW_CELL: 1.08}}, known_limits=[known_limit(tmp_path, h)])
+
+
+def rewrite_limit(rec, part, sides, edit):
+    """Rewrite the raw records of the ``sides`` of the confirmation or of the run with all changes reverted of the first known limit."""
+    for side in sides:
+        rewrite_records(rec["known_limits"][0][part], side, edit)
+
+
+def on_route(impl, env_impl):
+    """The run was made on routing ``impl``: the meta of the record and the argument of every cell say so."""
+    def edit(rec):
+        rec["meta"].update(impl=impl, env_impl=env_impl)
+        for cell in rec["cells"]:
+            cell["args"]["impl"] = impl
+    return edit
+
+
+FOREIGN = {"N": 256, "H": 33, "regime": "cold", "pos": 63}
+LIMIT_CASES = [
+    ("the confirmation and the reverted run on N = 256, H = 33, cold, position 63 (first control of the review)",
+     [("confirmation", "AB", set_args(FOREIGN)), ("all_changes_reverted", "AB", set_args(FOREIGN))], "workload its key names"),
+    ("the reverted run with A on impl 0 and B on the frozen reference (impl 3, env_impl 3), both commits the base (second control)",
+     [("all_changes_reverted", "B", on_route(3, "3"))], "baseline behaviour of the final A/B"),
+    ("both reverted arms on another route than the baseline of the final A/B", [("all_changes_reverted", "AB", on_route(3, "3"))], "baseline behaviour of the final A/B"),
+    ("a reverted arm with another launch mapping than the baseline", [("all_changes_reverted", "B", set_args({"kernels": ["rows_kernel"]}))], "baseline behaviour of the final A/B"),
+    ("a confirmation of the candidate on another launch mapping than the final A/B", [("confirmation", "B", set_args({"kernels": ["rows_kernel"]}))], "differ in kernels"),
+    ("a confirmation of the baseline on another route than the final A/B", [("confirmation", "A", on_route(3, "3"))], "same snapshot / configuration"),
+    ("a confirmation of cells of another shape", [("confirmation", "AB", set_args({"H": 33}))], "workload its key names"),
+]
+
+
+@pytest.mark.parametrize("name,edits,expected", LIMIT_CASES, ids=[c[0][:70] for c in LIMIT_CASES])
+def test_a_known_limit_measures_the_original_workload_on_the_original_baseline_route(tmp_path, final_repo, name, edits, expected):
+    h = final_repo
+    rec = limit_record(tmp_path, h)
+    assert fcheck(rec, h) == []
+    for part, sides, edit in edits:
+        rewrite_limit(rec, part, sides, edit)
+    probs = fcheck(rec, h)
+    assert has(probs, expected), (name, probs[:3])
+
+
+ROUTE_CASES = [
+    ("the baseline pinned on the frozen reference (impl 3, env_impl 3)", "A", on_route(3, "3")),
+    ("the candidate forced to a launch structure (impl 64)", "B", on_route(64, None)),
+    ("an environment override on the baseline", "A", set_meta(env_impl="3")),
+    ("cells of the baseline that ran on another routing than the record says", "A", set_args({"impl": 3}, [SLOW_CELL])),
+]
+
+
+@pytest.mark.parametrize("name,side,edit", ROUTE_CASES, ids=[c[0][:70] for c in ROUTE_CASES])
+def test_the_final_ab_measures_both_trees_at_their_default_routing(tmp_path, final_repo, name, side, edit):
+    """What the confirmation and the reverted run are bound to must itself be the baseline: a baseline on a slower route would hide a regression and make everything bound to it consistent."""
+    rec = final_record(tmp_path, final_repo)
+    assert fcheck(rec, final_repo) == []
+    rewrite_records(rec["devices"]["b200"]["campaigns"]["decode"], side, edit)
+    probs = fcheck(rec, final_repo)
+    assert has(probs, "default routing"), (name, probs[:3])
+
+
+def test_the_final_command_line_rejects_a_reverted_run_on_another_route(tmp_path, final_repo, capsys):
+    """The second known-limit control of the review at the command line: the reverted run with A on impl 0 and B on the frozen reference, both commits the base."""
+    (tmp_path / "perf.md").write_text(PERF_DOC % SLOW_CELL)
+    rec = limit_record(tmp_path, final_repo)
+    assert final_command_line(tmp_path, final_repo, rec, capsys)[0] == 0
+    rewrite_limit(rec, "all_changes_reverted", "B", on_route(3, "3"))
+    status, out = final_command_line(tmp_path, final_repo, rec, capsys)
+    assert status == 1 and "VERDICT: FAIL" in out and "baseline behaviour of the final A/B" in out, out[:400]
 
 
 # ---- the consolidated baseline ---------------------------------------------------------------------------------------------------------------

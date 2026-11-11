@@ -436,16 +436,24 @@ def rerun_problems(first, rerun, side, key, metric, same_config=RERUN_SAME_CONFI
             out.append("%s %s of cell %r is not recorded as one positive integer in the first campaign and in the re-run (first campaign %s, re-run %s)" % (side, name, key, f, r))
         elif r[0] != RERUN_SCALE * f[0]:
             out.append("%s re-run of cell %r has %s = %s, not %d times the first campaign's %s" % (side, key, name, r[0], RERUN_SCALE, f[0]))
-    for field in same_config:
-        a = set(json.dumps((x.get("meta") or {}).get(field), sort_keys=True) for x in first)
-        b = set(json.dumps((x.get("meta") or {}).get(field), sort_keys=True) for x in rerun)
-        if len(a) != 1 or a != b:
-            out.append("%s re-run does not come from the same snapshot / configuration as its first campaign (meta %s: %s vs %s)" % (side, field, sorted(a), sorted(b)))
+    for field, a, b in config_differences(first, rerun, same_config):
+        out.append("%s re-run does not come from the same snapshot / configuration as its first campaign (meta %s: %s vs %s)" % (side, field, a, b))
     return out
 
 
 def _meta_values(records, field):
     return sorted(set(json.dumps((r.get("meta") or {}).get(field), sort_keys=True) for r in records))
+
+
+def config_differences(first, other, fields):
+    """``[(field, values of first, values of other)]`` for the meta ``fields`` in which two record lists are not one and the same value (each list holds a single value of the field and it
+    is the same in both): the configuration that two campaigns must share (the snapshot, the routing, the toolchain, the statistic, the device) to measure the same thing."""
+    out = []
+    for field in fields:
+        a, b = _meta_values(first, field), _meta_values(other, field)
+        if len(a) != 1 or a != b:
+            out.append((field, a, b))
+    return out
 
 
 def side_config_problems(records, role):
