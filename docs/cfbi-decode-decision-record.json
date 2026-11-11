@@ -1,0 +1,2462 @@
+{
+ "budget_table": {
+  "api_instances": {
+   "b200": [
+    {
+     "ctas_per_sm": 2,
+     "dynamic_smem": 0,
+     "label": "api",
+     "name": "cfbi::rows_kernel",
+     "registers": 128,
+     "static_smem": 8192,
+     "threads": 256
+    },
+    {
+     "ctas_per_sm": 6,
+     "dynamic_smem": 0,
+     "label": "api",
+     "name": "cfbi::ref::rows_kernel",
+     "registers": 40,
+     "static_smem": 8192,
+     "threads": 256
+    }
+   ],
+   "b300": [
+    {
+     "ctas_per_sm": 2,
+     "dynamic_smem": 0,
+     "label": "api",
+     "name": "cfbi::rows_kernel",
+     "registers": 128,
+     "static_smem": 8192,
+     "threads": 256
+    },
+    {
+     "ctas_per_sm": 6,
+     "dynamic_smem": 0,
+     "label": "api",
+     "name": "cfbi::ref::rows_kernel",
+     "registers": 40,
+     "static_smem": 8192,
+     "threads": 256
+    }
+   ]
+  },
+  "carveout": {
+   "b200": {
+    "kernel": "cfbi::rows_kernel",
+    "label": "measured",
+    "reports": 6,
+    "shared_mem_config_bytes": 65536
+   },
+   "b300": {
+    "kernel": "cfbi::rows_kernel",
+    "label": "measured",
+    "reports": 6,
+    "shared_mem_config_bytes": 65536
+   }
+  },
+  "compiled": {
+   "sm_100a": [
+    {
+     "commit": "7ebb5892843b556342652c753343e66f2289f66e",
+     "description": "the optimised row engine of the base tree",
+     "gate_excess": [],
+     "id": "base",
+     "instantiation": "cfbi::rows_kernel",
+     "label": "compiler",
+     "prototype": null,
+     "registers": 128,
+     "spill_loads": 4,
+     "spill_stores": 4,
+     "stack": 112,
+     "static_smem": 8192,
+     "step": null
+    },
+    {
+     "commit": "3362c169aad5c7e7afd7544846b93acf595a584f",
+     "description": "the trims prototype as committed",
+     "gate_excess": [
+      "spill_loads",
+      "spill_stores"
+     ],
+     "id": "trims",
+     "instantiation": "cfbi::rows_kernel",
+     "label": "compiler",
+     "prototype": "row-critical-path-re-pipelining",
+     "registers": 128,
+     "spill_loads": 24,
+     "spill_stores": 32,
+     "stack": 24,
+     "static_smem": 8192,
+     "step": "trims"
+    },
+    {
+     "commit": "3a3fdd50b7b99e7d19c22df0545935b01f99c930",
+     "description": "the staged E tile prototype as committed: it also carries the paired-column loads of the M tiles, which are not part of the tile step",
+     "gate_excess": [
+      "stack",
+      "spill_loads",
+      "spill_stores"
+     ],
+     "id": "e_tile_with_paired_m_loads",
+     "instantiation": "cfbi::rows_kernel",
+     "label": "compiler",
+     "prototype": "coalesced-state-access-path",
+     "registers": 128,
+     "spill_loads": 232,
+     "spill_stores": 428,
+     "stack": 336,
+     "static_smem": 8192,
+     "step": "e_tile"
+    },
+    {
+     "commit": "a5a930aed45605fcb1f62986b70e8b58b8c45f94",
+     "description": "the chunk-end KD tile prototype as committed",
+     "gate_excess": [
+      "stack",
+      "spill_loads",
+      "spill_stores"
+     ],
+     "id": "kd_tile",
+     "instantiation": "cfbi::rows_kernel",
+     "label": "compiler",
+     "prototype": "chunk-end-row-offload",
+     "registers": 128,
+     "spill_loads": 60,
+     "spill_stores": 152,
+     "stack": 160,
+     "static_smem": 40960,
+     "step": "kd_tile"
+    },
+    {
+     "commit": "363c39bf8c5381ee3059d48c548d128b1b3b2b42",
+     "description": "the single-launch prototype with the decode path compiled out",
+     "gate_excess": [],
+     "id": "single_launch_off",
+     "instantiation": "cfbi::rows_kernel<Lb0E>",
+     "label": "compiler",
+     "prototype": "launch-chain-collapse",
+     "registers": 128,
+     "spill_loads": 4,
+     "spill_stores": 4,
+     "stack": 112,
+     "static_smem": 8192,
+     "step": "single_launch"
+    },
+    {
+     "commit": "363c39bf8c5381ee3059d48c548d128b1b3b2b42",
+     "description": "the single-launch prototype with the decode path compiled in",
+     "gate_excess": [],
+     "id": "single_launch_on",
+     "instantiation": "cfbi::rows_kernel<Lb1E>",
+     "label": "compiler",
+     "prototype": "launch-chain-collapse",
+     "registers": 128,
+     "spill_loads": 0,
+     "spill_stores": 0,
+     "stack": 96,
+     "static_smem": 8192,
+     "step": "single_launch"
+    },
+    {
+     "commit": "a8820262da1c6f220e36630531cdb7f9ab167bfd",
+     "description": "the operand-swap prototype with the swap compiled out",
+     "gate_excess": [],
+     "id": "operand_swap_off",
+     "instantiation": "cfbi::rows_kernel<Lb0E>",
+     "label": "compiler",
+     "prototype": "operand-swapped-mma-tiles",
+     "registers": 128,
+     "spill_loads": 4,
+     "spill_stores": 4,
+     "stack": 112,
+     "static_smem": 8192,
+     "step": "operand_swap"
+    },
+    {
+     "commit": "a8820262da1c6f220e36630531cdb7f9ab167bfd",
+     "description": "the operand-swap prototype with the swap compiled in",
+     "gate_excess": [
+      "spill_loads",
+      "spill_stores"
+     ],
+     "id": "operand_swap_on",
+     "instantiation": "cfbi::rows_kernel<Lb1E>",
+     "label": "compiler",
+     "prototype": "operand-swapped-mma-tiles",
+     "registers": 128,
+     "spill_loads": 16,
+     "spill_stores": 20,
+     "stack": 48,
+     "static_smem": 8192,
+     "step": "operand_swap"
+    },
+    {
+     "commit": "013d2d442d0751dec7aa71457fd3db7274a9f7dc",
+     "description": "the value-split prototype with one slice of 128 value columns",
+     "gate_excess": [
+      "spill_loads",
+      "spill_stores"
+     ],
+     "id": "value_split_128",
+     "instantiation": "cfbi::rows_kernel<Li128E>",
+     "label": "compiler",
+     "prototype": "value-split-decode-ctas",
+     "registers": 128,
+     "spill_loads": 8,
+     "spill_stores": 12,
+     "stack": 112,
+     "static_smem": 8192,
+     "step": "value_split"
+    },
+    {
+     "commit": "013d2d442d0751dec7aa71457fd3db7274a9f7dc",
+     "description": "the value-split prototype with slices of 64 value columns",
+     "gate_excess": [
+      "spill_loads",
+      "spill_stores"
+     ],
+     "id": "value_split_64",
+     "instantiation": "cfbi::rows_kernel<Li64E>",
+     "label": "compiler",
+     "prototype": "value-split-decode-ctas",
+     "registers": 128,
+     "spill_loads": 12,
+     "spill_stores": 12,
+     "stack": 80,
+     "static_smem": 8192,
+     "step": "value_split"
+    },
+    {
+     "commit": "013d2d442d0751dec7aa71457fd3db7274a9f7dc",
+     "description": "the value-split prototype with slices of 32 value columns",
+     "gate_excess": [],
+     "id": "value_split_32",
+     "instantiation": "cfbi::rows_kernel<Li32E>",
+     "label": "compiler",
+     "prototype": "value-split-decode-ctas",
+     "registers": 128,
+     "spill_loads": 0,
+     "spill_stores": 0,
+     "stack": 64,
+     "static_smem": 8192,
+     "step": "value_split"
+    },
+    {
+     "commit": "013d2d442d0751dec7aa71457fd3db7274a9f7dc",
+     "description": "the value-split prototype with slices of 16 value columns",
+     "gate_excess": [
+      "spill_loads",
+      "spill_stores"
+     ],
+     "id": "value_split_16",
+     "instantiation": "cfbi::rows_kernel<Li16E>",
+     "label": "compiler",
+     "prototype": "value-split-decode-ctas",
+     "registers": 128,
+     "spill_loads": 20,
+     "spill_stores": 20,
+     "stack": 96,
+     "static_smem": 8192,
+     "step": "value_split"
+    },
+    {
+     "commit": "7ebb5892843b556342652c753343e66f2289f66e",
+     "description": "the frozen reference row engine",
+     "gate_excess": [],
+     "id": "reference",
+     "instantiation": "cfbi::ref::rows_kernel",
+     "label": "compiler",
+     "prototype": null,
+     "registers": 48,
+     "spill_loads": 0,
+     "spill_stores": 0,
+     "stack": 0,
+     "static_smem": 8192,
+     "step": null
+    }
+   ],
+   "sm_103a": [
+    {
+     "commit": "7ebb5892843b556342652c753343e66f2289f66e",
+     "description": "the optimised row engine of the base tree",
+     "gate_excess": [],
+     "id": "base",
+     "instantiation": "cfbi::rows_kernel",
+     "label": "compiler",
+     "prototype": null,
+     "registers": 128,
+     "spill_loads": 8,
+     "spill_stores": 12,
+     "stack": 112,
+     "static_smem": 8192,
+     "step": null
+    },
+    {
+     "commit": "3362c169aad5c7e7afd7544846b93acf595a584f",
+     "description": "the trims prototype as committed",
+     "gate_excess": [
+      "spill_loads",
+      "spill_stores"
+     ],
+     "id": "trims",
+     "instantiation": "cfbi::rows_kernel",
+     "label": "compiler",
+     "prototype": "row-critical-path-re-pipelining",
+     "registers": 128,
+     "spill_loads": 24,
+     "spill_stores": 32,
+     "stack": 24,
+     "static_smem": 8192,
+     "step": "trims"
+    },
+    {
+     "commit": "3a3fdd50b7b99e7d19c22df0545935b01f99c930",
+     "description": "the staged E tile prototype as committed: it also carries the paired-column loads of the M tiles, which are not part of the tile step",
+     "gate_excess": [
+      "stack",
+      "spill_loads",
+      "spill_stores"
+     ],
+     "id": "e_tile_with_paired_m_loads",
+     "instantiation": "cfbi::rows_kernel",
+     "label": "compiler",
+     "prototype": "coalesced-state-access-path",
+     "registers": 128,
+     "spill_loads": 232,
+     "spill_stores": 428,
+     "stack": 336,
+     "static_smem": 8192,
+     "step": "e_tile"
+    },
+    {
+     "commit": "a5a930aed45605fcb1f62986b70e8b58b8c45f94",
+     "description": "the chunk-end KD tile prototype as committed",
+     "gate_excess": [
+      "stack",
+      "spill_loads",
+      "spill_stores"
+     ],
+     "id": "kd_tile",
+     "instantiation": "cfbi::rows_kernel",
+     "label": "compiler",
+     "prototype": "chunk-end-row-offload",
+     "registers": 128,
+     "spill_loads": 60,
+     "spill_stores": 152,
+     "stack": 160,
+     "static_smem": 40960,
+     "step": "kd_tile"
+    },
+    {
+     "commit": "363c39bf8c5381ee3059d48c548d128b1b3b2b42",
+     "description": "the single-launch prototype with the decode path compiled out",
+     "gate_excess": [],
+     "id": "single_launch_off",
+     "instantiation": "cfbi::rows_kernel<Lb0E>",
+     "label": "compiler",
+     "prototype": "launch-chain-collapse",
+     "registers": 128,
+     "spill_loads": 8,
+     "spill_stores": 12,
+     "stack": 112,
+     "static_smem": 8192,
+     "step": "single_launch"
+    },
+    {
+     "commit": "363c39bf8c5381ee3059d48c548d128b1b3b2b42",
+     "description": "the single-launch prototype with the decode path compiled in",
+     "gate_excess": [],
+     "id": "single_launch_on",
+     "instantiation": "cfbi::rows_kernel<Lb1E>",
+     "label": "compiler",
+     "prototype": "launch-chain-collapse",
+     "registers": 128,
+     "spill_loads": 0,
+     "spill_stores": 0,
+     "stack": 96,
+     "static_smem": 8192,
+     "step": "single_launch"
+    },
+    {
+     "commit": "a8820262da1c6f220e36630531cdb7f9ab167bfd",
+     "description": "the operand-swap prototype with the swap compiled out",
+     "gate_excess": [],
+     "id": "operand_swap_off",
+     "instantiation": "cfbi::rows_kernel<Lb0E>",
+     "label": "compiler",
+     "prototype": "operand-swapped-mma-tiles",
+     "registers": 128,
+     "spill_loads": 8,
+     "spill_stores": 12,
+     "stack": 112,
+     "static_smem": 8192,
+     "step": "operand_swap"
+    },
+    {
+     "commit": "a8820262da1c6f220e36630531cdb7f9ab167bfd",
+     "description": "the operand-swap prototype with the swap compiled in",
+     "gate_excess": [
+      "spill_loads",
+      "spill_stores"
+     ],
+     "id": "operand_swap_on",
+     "instantiation": "cfbi::rows_kernel<Lb1E>",
+     "label": "compiler",
+     "prototype": "operand-swapped-mma-tiles",
+     "registers": 128,
+     "spill_loads": 16,
+     "spill_stores": 20,
+     "stack": 48,
+     "static_smem": 8192,
+     "step": "operand_swap"
+    },
+    {
+     "commit": "013d2d442d0751dec7aa71457fd3db7274a9f7dc",
+     "description": "the value-split prototype with one slice of 128 value columns",
+     "gate_excess": [],
+     "id": "value_split_128",
+     "instantiation": "cfbi::rows_kernel<Li128E>",
+     "label": "compiler",
+     "prototype": "value-split-decode-ctas",
+     "registers": 128,
+     "spill_loads": 8,
+     "spill_stores": 12,
+     "stack": 112,
+     "static_smem": 8192,
+     "step": "value_split"
+    },
+    {
+     "commit": "013d2d442d0751dec7aa71457fd3db7274a9f7dc",
+     "description": "the value-split prototype with slices of 64 value columns",
+     "gate_excess": [
+      "spill_loads"
+     ],
+     "id": "value_split_64",
+     "instantiation": "cfbi::rows_kernel<Li64E>",
+     "label": "compiler",
+     "prototype": "value-split-decode-ctas",
+     "registers": 128,
+     "spill_loads": 12,
+     "spill_stores": 12,
+     "stack": 80,
+     "static_smem": 8192,
+     "step": "value_split"
+    },
+    {
+     "commit": "013d2d442d0751dec7aa71457fd3db7274a9f7dc",
+     "description": "the value-split prototype with slices of 32 value columns",
+     "gate_excess": [
+      "spill_loads"
+     ],
+     "id": "value_split_32",
+     "instantiation": "cfbi::rows_kernel<Li32E>",
+     "label": "compiler",
+     "prototype": "value-split-decode-ctas",
+     "registers": 128,
+     "spill_loads": 12,
+     "spill_stores": 12,
+     "stack": 80,
+     "static_smem": 8192,
+     "step": "value_split"
+    },
+    {
+     "commit": "013d2d442d0751dec7aa71457fd3db7274a9f7dc",
+     "description": "the value-split prototype with slices of 16 value columns",
+     "gate_excess": [
+      "spill_loads",
+      "spill_stores"
+     ],
+     "id": "value_split_16",
+     "instantiation": "cfbi::rows_kernel<Li16E>",
+     "label": "compiler",
+     "prototype": "value-split-decode-ctas",
+     "registers": 128,
+     "spill_loads": 24,
+     "spill_stores": 32,
+     "stack": 96,
+     "static_smem": 8192,
+     "step": "value_split"
+    },
+    {
+     "commit": "7ebb5892843b556342652c753343e66f2289f66e",
+     "description": "the frozen reference row engine",
+     "gate_excess": [],
+     "id": "reference",
+     "instantiation": "cfbi::ref::rows_kernel",
+     "label": "compiler",
+     "prototype": null,
+     "registers": 48,
+     "spill_loads": 0,
+     "spill_stores": 0,
+     "stack": 0,
+     "static_smem": 8192,
+     "step": null
+    }
+   ],
+   "sm_90a": [
+    {
+     "commit": "7ebb5892843b556342652c753343e66f2289f66e",
+     "description": "the optimised row engine of the base tree",
+     "gate_excess": [],
+     "id": "base",
+     "instantiation": "cfbi::rows_kernel",
+     "label": "compiler",
+     "prototype": null,
+     "registers": 128,
+     "spill_loads": 172,
+     "spill_stores": 428,
+     "stack": 168,
+     "static_smem": 7808,
+     "step": null
+    },
+    {
+     "commit": "3362c169aad5c7e7afd7544846b93acf595a584f",
+     "description": "the trims prototype as committed",
+     "gate_excess": [],
+     "id": "trims",
+     "instantiation": "cfbi::rows_kernel",
+     "label": "compiler",
+     "prototype": "row-critical-path-re-pipelining",
+     "registers": 128,
+     "spill_loads": 12,
+     "spill_stores": 12,
+     "stack": 16,
+     "static_smem": 7808,
+     "step": "trims"
+    },
+    {
+     "commit": "3a3fdd50b7b99e7d19c22df0545935b01f99c930",
+     "description": "the staged E tile prototype as committed: it also carries the paired-column loads of the M tiles, which are not part of the tile step",
+     "gate_excess": [],
+     "id": "e_tile_with_paired_m_loads",
+     "instantiation": "cfbi::rows_kernel",
+     "label": "compiler",
+     "prototype": "coalesced-state-access-path",
+     "registers": 128,
+     "spill_loads": 44,
+     "spill_stores": 60,
+     "stack": 128,
+     "static_smem": 7808,
+     "step": "e_tile"
+    },
+    {
+     "commit": "a5a930aed45605fcb1f62986b70e8b58b8c45f94",
+     "description": "the chunk-end KD tile prototype as committed",
+     "gate_excess": [],
+     "id": "kd_tile",
+     "instantiation": "cfbi::rows_kernel",
+     "label": "compiler",
+     "prototype": "chunk-end-row-offload",
+     "registers": 128,
+     "spill_loads": 128,
+     "spill_stores": 364,
+     "stack": 128,
+     "static_smem": 40576,
+     "step": "kd_tile"
+    },
+    {
+     "commit": "363c39bf8c5381ee3059d48c548d128b1b3b2b42",
+     "description": "the single-launch prototype with the decode path compiled out",
+     "gate_excess": [],
+     "id": "single_launch_off",
+     "instantiation": "cfbi::rows_kernel<Lb0E>",
+     "label": "compiler",
+     "prototype": "launch-chain-collapse",
+     "registers": 128,
+     "spill_loads": 172,
+     "spill_stores": 428,
+     "stack": 168,
+     "static_smem": 7808,
+     "step": "single_launch"
+    },
+    {
+     "commit": "363c39bf8c5381ee3059d48c548d128b1b3b2b42",
+     "description": "the single-launch prototype with the decode path compiled in",
+     "gate_excess": [],
+     "id": "single_launch_on",
+     "instantiation": "cfbi::rows_kernel<Lb1E>",
+     "label": "compiler",
+     "prototype": "launch-chain-collapse",
+     "registers": 128,
+     "spill_loads": 172,
+     "spill_stores": 420,
+     "stack": 168,
+     "static_smem": 7808,
+     "step": "single_launch"
+    },
+    {
+     "commit": "a8820262da1c6f220e36630531cdb7f9ab167bfd",
+     "description": "the operand-swap prototype with the swap compiled out",
+     "gate_excess": [],
+     "id": "operand_swap_off",
+     "instantiation": "cfbi::rows_kernel<Lb0E>",
+     "label": "compiler",
+     "prototype": "operand-swapped-mma-tiles",
+     "registers": 128,
+     "spill_loads": 172,
+     "spill_stores": 428,
+     "stack": 168,
+     "static_smem": 7808,
+     "step": "operand_swap"
+    },
+    {
+     "commit": "a8820262da1c6f220e36630531cdb7f9ab167bfd",
+     "description": "the operand-swap prototype with the swap compiled in",
+     "gate_excess": [],
+     "id": "operand_swap_on",
+     "instantiation": "cfbi::rows_kernel<Lb1E>",
+     "label": "compiler",
+     "prototype": "operand-swapped-mma-tiles",
+     "registers": 128,
+     "spill_loads": 12,
+     "spill_stores": 16,
+     "stack": 8,
+     "static_smem": 7808,
+     "step": "operand_swap"
+    },
+    {
+     "commit": "013d2d442d0751dec7aa71457fd3db7274a9f7dc",
+     "description": "the value-split prototype with one slice of 128 value columns",
+     "gate_excess": [],
+     "id": "value_split_128",
+     "instantiation": "cfbi::rows_kernel<Li128E>",
+     "label": "compiler",
+     "prototype": "value-split-decode-ctas",
+     "registers": 128,
+     "spill_loads": 32,
+     "spill_stores": 76,
+     "stack": 32,
+     "static_smem": 7808,
+     "step": "value_split"
+    },
+    {
+     "commit": "013d2d442d0751dec7aa71457fd3db7274a9f7dc",
+     "description": "the value-split prototype with slices of 64 value columns",
+     "gate_excess": [
+      "spill_loads"
+     ],
+     "id": "value_split_64",
+     "instantiation": "cfbi::rows_kernel<Li64E>",
+     "label": "compiler",
+     "prototype": "value-split-decode-ctas",
+     "registers": 128,
+     "spill_loads": 216,
+     "spill_stores": 372,
+     "stack": 144,
+     "static_smem": 7808,
+     "step": "value_split"
+    },
+    {
+     "commit": "013d2d442d0751dec7aa71457fd3db7274a9f7dc",
+     "description": "the value-split prototype with slices of 32 value columns",
+     "gate_excess": [
+      "stack",
+      "spill_loads",
+      "spill_stores"
+     ],
+     "id": "value_split_32",
+     "instantiation": "cfbi::rows_kernel<Li32E>",
+     "label": "compiler",
+     "prototype": "value-split-decode-ctas",
+     "registers": 128,
+     "spill_loads": 536,
+     "spill_stores": 572,
+     "stack": 312,
+     "static_smem": 7808,
+     "step": "value_split"
+    },
+    {
+     "commit": "013d2d442d0751dec7aa71457fd3db7274a9f7dc",
+     "description": "the value-split prototype with slices of 16 value columns",
+     "gate_excess": [],
+     "id": "value_split_16",
+     "instantiation": "cfbi::rows_kernel<Li16E>",
+     "label": "compiler",
+     "prototype": "value-split-decode-ctas",
+     "registers": 128,
+     "spill_loads": 88,
+     "spill_stores": 224,
+     "stack": 80,
+     "static_smem": 7808,
+     "step": "value_split"
+    },
+    {
+     "commit": "7ebb5892843b556342652c753343e66f2289f66e",
+     "description": "the frozen reference row engine",
+     "gate_excess": [],
+     "id": "reference",
+     "instantiation": "cfbi::ref::rows_kernel",
+     "label": "compiler",
+     "prototype": null,
+     "registers": 48,
+     "spill_loads": 0,
+     "spill_stores": 0,
+     "stack": 0,
+     "static_smem": 7296,
+     "step": null
+    }
+   ]
+  },
+  "configurations": {
+   "sm_100a": [
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "api",
+     "dynamic_bytes": 0,
+     "formula": "row_smem",
+     "id": "base",
+     "l1_after_measured_carveout_bytes": 196608,
+     "l1_after_measured_carveout_label": "model",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 243712,
+     "label": "compiler",
+     "per_cta_bytes": 9216,
+     "slack_bytes": 215040,
+     "static_bytes": 8192,
+     "static_within_cap": true,
+     "two_ctas_bytes": 18432,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 67584,
+     "formula": "row_smem + e_tile",
+     "id": "e_tile",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 108544,
+     "label": "arithmetic",
+     "per_cta_bytes": 76800,
+     "slack_bytes": 79872,
+     "static_bytes": 8192,
+     "static_within_cap": true,
+     "two_ctas_bytes": 153600,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 0,
+     "formula": "row_smem + kd_tile",
+     "id": "kd_tile",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 178176,
+     "label": "arithmetic",
+     "per_cta_bytes": 41984,
+     "slack_bytes": 149504,
+     "static_bytes": 40960,
+     "static_within_cap": true,
+     "two_ctas_bytes": 83968,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 0,
+     "formula": "row_smem + a_fragments",
+     "id": "a_fragments",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 231424,
+     "label": "arithmetic_with_plan_estimate",
+     "per_cta_bytes": 15360,
+     "slack_bytes": 202752,
+     "static_bytes": 14336,
+     "static_within_cap": true,
+     "two_ctas_bytes": 30720,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 67584,
+     "formula": "row_smem + e_tile + a_fragments",
+     "id": "e_tile_a_fragments",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 96256,
+     "label": "arithmetic_with_plan_estimate",
+     "per_cta_bytes": 82944,
+     "slack_bytes": 67584,
+     "static_bytes": 14336,
+     "static_within_cap": true,
+     "two_ctas_bytes": 165888,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 67584,
+     "formula": "row_smem + e_tile + max(kd_tile, a_fragments)",
+     "id": "e_tile_kd_tile_aliased_with_a_fragments",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 43008,
+     "label": "arithmetic_with_plan_estimate",
+     "per_cta_bytes": 109568,
+     "slack_bytes": 14336,
+     "static_bytes": 40960,
+     "static_within_cap": true,
+     "two_ctas_bytes": 219136,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 67584,
+     "formula": "row_smem + e_tile + kd_tile + a_fragments",
+     "id": "e_tile_kd_tile_a_fragments_without_alias",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 30720,
+     "label": "arithmetic_with_plan_estimate",
+     "per_cta_bytes": 115712,
+     "slack_bytes": 2048,
+     "static_bytes": 47104,
+     "static_within_cap": true,
+     "two_ctas_bytes": 231424,
+     "two_ctas_fit": true
+    }
+   ],
+   "sm_103a": [
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "api",
+     "dynamic_bytes": 0,
+     "formula": "row_smem",
+     "id": "base",
+     "l1_after_measured_carveout_bytes": 196608,
+     "l1_after_measured_carveout_label": "model",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 243712,
+     "label": "compiler",
+     "per_cta_bytes": 9216,
+     "slack_bytes": 215040,
+     "static_bytes": 8192,
+     "static_within_cap": true,
+     "two_ctas_bytes": 18432,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 67584,
+     "formula": "row_smem + e_tile",
+     "id": "e_tile",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 108544,
+     "label": "arithmetic",
+     "per_cta_bytes": 76800,
+     "slack_bytes": 79872,
+     "static_bytes": 8192,
+     "static_within_cap": true,
+     "two_ctas_bytes": 153600,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 0,
+     "formula": "row_smem + kd_tile",
+     "id": "kd_tile",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 178176,
+     "label": "arithmetic",
+     "per_cta_bytes": 41984,
+     "slack_bytes": 149504,
+     "static_bytes": 40960,
+     "static_within_cap": true,
+     "two_ctas_bytes": 83968,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 0,
+     "formula": "row_smem + a_fragments",
+     "id": "a_fragments",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 231424,
+     "label": "arithmetic_with_plan_estimate",
+     "per_cta_bytes": 15360,
+     "slack_bytes": 202752,
+     "static_bytes": 14336,
+     "static_within_cap": true,
+     "two_ctas_bytes": 30720,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 67584,
+     "formula": "row_smem + e_tile + a_fragments",
+     "id": "e_tile_a_fragments",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 96256,
+     "label": "arithmetic_with_plan_estimate",
+     "per_cta_bytes": 82944,
+     "slack_bytes": 67584,
+     "static_bytes": 14336,
+     "static_within_cap": true,
+     "two_ctas_bytes": 165888,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 67584,
+     "formula": "row_smem + e_tile + max(kd_tile, a_fragments)",
+     "id": "e_tile_kd_tile_aliased_with_a_fragments",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 43008,
+     "label": "arithmetic_with_plan_estimate",
+     "per_cta_bytes": 109568,
+     "slack_bytes": 14336,
+     "static_bytes": 40960,
+     "static_within_cap": true,
+     "two_ctas_bytes": 219136,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 67584,
+     "formula": "row_smem + e_tile + kd_tile + a_fragments",
+     "id": "e_tile_kd_tile_a_fragments_without_alias",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 30720,
+     "label": "arithmetic_with_plan_estimate",
+     "per_cta_bytes": 115712,
+     "slack_bytes": 2048,
+     "static_bytes": 47104,
+     "static_within_cap": true,
+     "two_ctas_bytes": 231424,
+     "two_ctas_fit": true
+    }
+   ],
+   "sm_90a": [
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 0,
+     "formula": "row_smem",
+     "id": "base",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 244480,
+     "label": "compiler",
+     "per_cta_bytes": 8832,
+     "slack_bytes": 215808,
+     "static_bytes": 7808,
+     "static_within_cap": true,
+     "two_ctas_bytes": 17664,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 67584,
+     "formula": "row_smem + e_tile",
+     "id": "e_tile",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 109312,
+     "label": "arithmetic",
+     "per_cta_bytes": 76416,
+     "slack_bytes": 80640,
+     "static_bytes": 7808,
+     "static_within_cap": true,
+     "two_ctas_bytes": 152832,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 0,
+     "formula": "row_smem + kd_tile",
+     "id": "kd_tile",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 178944,
+     "label": "arithmetic",
+     "per_cta_bytes": 41600,
+     "slack_bytes": 150272,
+     "static_bytes": 40576,
+     "static_within_cap": true,
+     "two_ctas_bytes": 83200,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 0,
+     "formula": "row_smem + a_fragments",
+     "id": "a_fragments",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 232192,
+     "label": "arithmetic_with_plan_estimate",
+     "per_cta_bytes": 14976,
+     "slack_bytes": 203520,
+     "static_bytes": 13952,
+     "static_within_cap": true,
+     "two_ctas_bytes": 29952,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 67584,
+     "formula": "row_smem + e_tile + a_fragments",
+     "id": "e_tile_a_fragments",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 97024,
+     "label": "arithmetic_with_plan_estimate",
+     "per_cta_bytes": 82560,
+     "slack_bytes": 68352,
+     "static_bytes": 13952,
+     "static_within_cap": true,
+     "two_ctas_bytes": 165120,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 67584,
+     "formula": "row_smem + e_tile + max(kd_tile, a_fragments)",
+     "id": "e_tile_kd_tile_aliased_with_a_fragments",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 43776,
+     "label": "arithmetic_with_plan_estimate",
+     "per_cta_bytes": 109184,
+     "slack_bytes": 15104,
+     "static_bytes": 40576,
+     "static_within_cap": true,
+     "two_ctas_bytes": 218368,
+     "two_ctas_fit": true
+    },
+    {
+     "ctas_per_sm": 2,
+     "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
+     "dynamic_bytes": 67584,
+     "formula": "row_smem + e_tile + kd_tile + a_fragments",
+     "id": "e_tile_kd_tile_a_fragments_without_alias",
+     "l1_label": "arithmetic",
+     "l1_upper_bound_bytes": 31488,
+     "label": "arithmetic_with_plan_estimate",
+     "per_cta_bytes": 115328,
+     "slack_bytes": 2816,
+     "static_bytes": 46720,
+     "static_within_cap": true,
+     "two_ctas_bytes": 230656,
+     "two_ctas_fit": true
+    }
+   ]
+  },
+  "constants": {
+   "gate_ctas_per_sm": 2,
+   "gate_registers": 128,
+   "static_cap_bytes": {
+    "label": "plan",
+    "value": 49152
+   },
+   "threads_per_cta": 256,
+   "unified_l1_and_shared_bytes": {
+    "label": "model",
+    "value": 262144
+   }
+  },
+  "devices": {
+   "sm_100a": {
+    "commit": "e9cf008",
+    "device": "b200",
+    "label": "api",
+    "registers_per_sm": 65536,
+    "reserve_per_cta": 1024,
+    "shared_per_sm": 233472,
+    "sm_count": 148,
+    "threads_per_sm": 2048
+   },
+   "sm_103a": {
+    "commit": "800250b",
+    "device": "b300",
+    "label": "api",
+    "registers_per_sm": 65536,
+    "reserve_per_cta": 1024,
+    "shared_per_sm": 233472,
+    "sm_count": 148,
+    "threads_per_sm": 2048
+   },
+   "sm_90a": {
+    "commit": null,
+    "device": null,
+    "label": "plan",
+    "registers_per_sm": 65536,
+    "reserve_per_cta": 1024,
+    "shared_per_sm": 233472,
+    "sm_count": null,
+    "threads_per_sm": 2048
+   }
+  },
+  "lifetimes": {
+   "label": "plan",
+   "live_phases": {
+    "a_fragments": [
+     "akk_aqk",
+     "m_tiles",
+     "p1_p2"
+    ],
+    "e_tile": [
+     "prep",
+     "akk_aqk",
+     "m_tiles",
+     "ut_w_chain",
+     "p1_p2",
+     "u_o",
+     "chunk_end_sync"
+    ],
+    "kd_tile": [
+     "chunk_end_sync"
+    ],
+    "row_smem": [
+     "prep",
+     "akk_aqk",
+     "m_tiles",
+     "ut_w_chain",
+     "p1_p2",
+     "u_o",
+     "chunk_end_sync"
+    ]
+   },
+   "may_alias": [
+    [
+     "a_fragments",
+     "kd_tile"
+    ]
+   ],
+   "must_not_alias": [
+    [
+     "a_fragments",
+     "e_tile"
+    ],
+    [
+     "a_fragments",
+     "row_smem"
+    ],
+    [
+     "e_tile",
+     "kd_tile"
+    ],
+    [
+     "e_tile",
+     "row_smem"
+    ],
+    [
+     "kd_tile",
+     "row_smem"
+    ]
+   ],
+   "tested": false
+  },
+  "production": {
+   "b200": {
+    "arch": "sm_100a",
+    "base": {
+     "label": "compiler",
+     "registers": 128,
+     "same_as_conda": true,
+     "spill_loads": 4,
+     "spill_stores": 4,
+     "stack": 112,
+     "static_smem": 8192
+    },
+    "reference": {
+     "label": "compiler",
+     "registers": 40,
+     "same_as_conda": false,
+     "spill_loads": 0,
+     "spill_stores": 0,
+     "stack": 0,
+     "static_smem": 8192
+    }
+   },
+   "b300": {
+    "arch": "sm_103a",
+    "base": {
+     "label": "compiler",
+     "registers": 128,
+     "same_as_conda": true,
+     "spill_loads": 8,
+     "spill_stores": 12,
+     "stack": 112,
+     "static_smem": 8192
+    },
+    "reference": {
+     "label": "compiler",
+     "registers": 40,
+     "same_as_conda": false,
+     "spill_loads": 0,
+     "spill_stores": 0,
+     "stack": 0,
+     "static_smem": 8192
+    }
+   }
+  },
+  "source_facts": [
+   {
+    "commit": "7ebb5892843b556342652c753343e66f2289f66e",
+    "defines": [
+     "RowSmem"
+    ],
+    "floats": 1921,
+    "name": "row_smem_bytes",
+    "path": "csrc/cfbi/cfbi_rows.cuh",
+    "value": 7684
+   },
+   {
+    "commit": "3a3fdd50b7b99e7d19c22df0545935b01f99c930",
+    "defines": [
+     "ROWS_E_STRIDE",
+     "ROWS_DYN_SMEM_BYTES"
+    ],
+    "name": "e_tile_dynamic_bytes",
+    "path": "csrc/cfbi/cfbi_rows.cuh",
+    "value": 67584
+   },
+   {
+    "commit": "a5a930aed45605fcb1f62986b70e8b58b8c45f94",
+    "defines": [
+     "ROWS_KD_FRAGS"
+    ],
+    "name": "kd_tile_bytes",
+    "path": "csrc/cfbi/cfbi_rows.cuh",
+    "value": 32768
+   }
+  ],
+  "statements": [
+   "Registers, stack, spill and static shared memory of the prototypes are compile-only figures of the prototypes as committed, not of the steps as they will be implemented.",
+   "The dynamic shared memory of the staged tile and the size of the KD tile are read from the source constants; the size of the A-fragment tile is the plan's estimate and no compiled figure.",
+   "CTAs per SM are API figures for the base kernel on the two devices and arithmetic everywhere else; the arithmetic reproduces the API figures of the base and of the reference kernel.",
+   "The shared-memory carve-out is measured for the base kernel only and is never applied to another configuration: the L1 of the other configurations is an upper bound of a continuous model.",
+   "The static shared memory of the row engine is the compiler's figure, which is larger than the struct of the source by the padding of the allocation; the budgets use the compiler's figure.",
+   "The prototypes were compiled with the development toolchain only; the production toolchain has compiled the base and governs where the two differ.",
+   "The lifetimes of the tiles are the plan's, read from the phase structure of the sources: disjoint lifetimes are a design inference, no alias has been built or checked with the sanitizers, and an alias belongs to the step that needs it.",
+   "The Hopper architecture has no hardware evidence: its figures are arithmetic on the limits of the plan."
+  ],
+  "tiles": {
+   "a_fragments": {
+    "compiled": false,
+    "label": "plan_estimate",
+    "static_bytes": 6144
+   },
+   "e_tile": {
+    "dynamic_bytes": 67584,
+    "label": "source"
+   },
+   "kd_tile": {
+    "agrees_with_compiler": {
+     "sm_100a": true,
+     "sm_103a": true,
+     "sm_90a": true
+    },
+    "label": "source",
+    "static_bytes": 32768
+   },
+   "row_smem": {
+    "compiler_static_bytes": {
+     "sm_100a": 8192,
+     "sm_103a": 8192,
+     "sm_90a": 7808
+    },
+    "label": "source",
+    "source_bytes": 7684
+   }
+  }
+ },
+ "inputs": {
+  "compile": {
+   "base": {
+    "name": "codegen-compile-base-7ebb589.json",
+    "sha256": "d492812146ad452b0aed0270c89df4705f07ddf335d541367b31d244e6e1e6e0"
+   },
+   "chunk-end-row-offload": {
+    "name": "codegen-compile-proto-chunk-end-row-offload.json",
+    "sha256": "58a83bb0efffd64b1eee7ff64b08b8427893626a5a6385c3dc971af00dd8d30b"
+   },
+   "coalesced-state-access-path": {
+    "name": "codegen-compile-proto-coalesced-state-access-path.json",
+    "sha256": "7e0cd6929963272cd504e1a6068fd45165e8e78badf13499bef4652aa5d720f4"
+   },
+   "launch-chain-collapse": {
+    "name": "codegen-compile-proto-launch-chain-collapse.json",
+    "sha256": "f81d297a375a455546a758ae876edcb0de21061744a0068f1999dad753616b51"
+   },
+   "operand-swapped-mma-tiles": {
+    "name": "codegen-compile-proto-operand-swapped-mma-tiles.json",
+    "sha256": "d5b2852b8264a181c6ebba11d9a03eb77b1a0f860c20f9980d7d300c7e0e802c"
+   },
+   "row-critical-path-re-pipelining": {
+    "name": "codegen-compile-proto-row-critical-path-re-pipelining.json",
+    "sha256": "6485c6bea0b2492e5d5e9d512e8c1034bc495ed66ec4a99ffb476d52fd0f7e1b"
+   },
+   "value-split-decode-ctas": {
+    "name": "codegen-compile-proto-value-split-decode-ctas.json",
+    "sha256": "3ab5233340e4b562fab89034805425776c584894063718ab850ab56389d8b801"
+   }
+  },
+  "container": {
+   "b200": {
+    "name": "codegen-container-b200-19f6937.json",
+    "sha256": "af2d2480a3d54b8adc455bc30effa7454f37ed42866faad796652de4708b4ce6"
+   },
+   "b300": {
+    "name": "codegen-container-b300-19f6937.json",
+    "sha256": "d33cad0774e232a46440769195ba7e0ed0d98ae7ff2aa17f1638c2072c34caf3"
+   }
+  },
+  "launch_config": {
+   "name": "ncu-launch-config-r5.json",
+   "sha256": "142f382cd20626893e2c40d7610c06aaf831029a4701902966f1d6d7397b6c64"
+  },
+  "ncu": [
+   {
+    "name": "ncu-b200-19f6937-n1-pos49_cold.json",
+    "sha256": "67909225934ff0907d99609c8f3b1b2e95bebbbfa0a623c2609501fe4f134cbb"
+   },
+   {
+    "name": "ncu-b200-19f6937-n1-pos49_warm.json",
+    "sha256": "8b3199aeeacaac447ad494c800c4b78d9dd808be2661887367e48f084d2e2f26"
+   },
+   {
+    "name": "ncu-b200-19f6937-n1-pos63_cold.json",
+    "sha256": "a82305716c3c5c68c37fe05f90dca69a534dcaaa9bf3786786260533870fc79b"
+   },
+   {
+    "name": "ncu-b200-19f6937-n128-pos49_cold.json",
+    "sha256": "30b45047493efb237ec5e0ab25716c08c5aee0d81517df46eac4bb5606965e18"
+   },
+   {
+    "name": "ncu-b200-19f6937-n128-pos49_warm.json",
+    "sha256": "7f1e57d2d95198724a55f22fbe696eab9fe24202773e87437fc4a51f176ea5a6"
+   },
+   {
+    "name": "ncu-b200-19f6937-n128-pos63_cold.json",
+    "sha256": "8560fc37538875832fc0324d403be1c48c5fd876ee3b4ffd15cefbe236468da8"
+   },
+   {
+    "name": "ncu-b300-19f6937-n1-pos49_cold.json",
+    "sha256": "11b71356773c5f68c2008eaa9c5f4302f0b0fcdba45c1e0e23f09fc99bf1de21"
+   },
+   {
+    "name": "ncu-b300-19f6937-n1-pos49_warm.json",
+    "sha256": "e094df5f1b6ed5758cfed27714cb78a450749f417f243ac3688bb3fb0bccb6dc"
+   },
+   {
+    "name": "ncu-b300-19f6937-n1-pos63_cold.json",
+    "sha256": "0bb70b078274108dc2b32057852fb0c36043e17be28508ae8c38409aceb2061a"
+   },
+   {
+    "name": "ncu-b300-19f6937-n128-pos49_cold.json",
+    "sha256": "5752289e371d191f6a04a875d491606bed0498c80d66fa83c55017c88b4285f7"
+   },
+   {
+    "name": "ncu-b300-19f6937-n128-pos49_warm.json",
+    "sha256": "c781c9457b529a33a7676c45b6a0977ce5e7cebc9b4f4e3f0a05127ea99203d5"
+   },
+   {
+    "name": "ncu-b300-19f6937-n128-pos63_cold.json",
+    "sha256": "881f2fad82e9ac9ef3eb2ccb7fe838064348c654aa93881acd01ff7eb05f6e87"
+   }
+  ],
+  "occupancy": {
+   "b200": {
+    "name": "rows-occupancy-b200-e9cf008.json",
+    "sha256": "df406d5cb328114802109a4dfd869b06ef0f270ec6efcdd9c9a4d4ac71b13419"
+   },
+   "b300": {
+    "name": "rows-occupancy-b300-800250b.json",
+    "sha256": "7e5f14299681714df19f447b1c5c25a782c27e8e3e32f1521d1f588e943f35a4"
+   }
+  },
+  "profile": [
+   {
+    "name": "profile-b200-19f6937-r1.json",
+    "sha256": "7e57c2d2686259f6c42aefd793a69c1c3f9684cf296aafaf89d03587f16e5c9e"
+   },
+   {
+    "name": "profile-b200-19f6937-r2.json",
+    "sha256": "bbce0d06245779e13d05020cc9f95d97b864eb3783ec81978c12b67cc69040d6"
+   },
+   {
+    "name": "profile-b200-19f6937-r3.json",
+    "sha256": "0aa30c0420eae341b2b0eb0f6a6e2a7acb61eb0caf76f00ff0dc0675abded362"
+   },
+   {
+    "name": "profile-b300-19f6937-r1.json",
+    "sha256": "68a2d03e8f8a7b275fe4e88f1b9fb92acb33a2a586bf0395f6bcab4e2416b50b"
+   },
+   {
+    "name": "profile-b300-19f6937-r2.json",
+    "sha256": "4ae4d683c0e219ac5700bdb954cd5d922046de9519b5902721105127981671a3"
+   },
+   {
+    "name": "profile-b300-19f6937-r3.json",
+    "sha256": "75fd07cd8491b37b560f04b59a3ee7ec2618ac5b56156ad29f81cf706a92ee19"
+   }
+  ]
+ },
+ "meta": {
+  "base_commit": "7ebb5892843b556342652c753343e66f2289f66e",
+  "compile_toolchain": "Cuda compilation tools, release 13.1, V13.1.115 | x86_64-conda-linux-gnu-g++ (conda-forge gcc 14.3.0-18) 14.3.0",
+  "container_toolchain": {
+   "b200": "container NGC pytorch 26.08: nvcc 13.4.59, cuobjdump 13.4.49, production JIT flags",
+   "b300": "container NGC pytorch 26.08: nvcc 13.4.59, cuobjdump 13.4.49, production JIT flags"
+  },
+  "occupancy_commits": {
+   "b200": "e9cf008",
+   "b300": "800250b"
+  },
+  "profile": {
+   "heads": 12,
+   "phases": [
+    "prep",
+    "akk_aqk",
+    "m_tiles",
+    "ut_w_chain",
+    "p1_p2",
+    "u_o",
+    "chunk_end_sync"
+   ],
+   "positions": 64,
+   "processes_per_device": 3,
+   "shapes": [
+    1,
+    16,
+    128
+   ]
+  },
+  "profile_commit": "19f6937feb6c9f13e0560402ab53816b0fe90963",
+  "recorded_on": "fe0ac8a6b4aff8661a9b300384075bd06e227444"
+ },
+ "order_basis": {
+  "prototypes": {
+   "a_fragments": null,
+   "e_tile": "coalesced-state-access-path",
+   "trims": "row-critical-path-re-pipelining"
+  },
+  "statements": [
+   "The default order is kept: trims, then the staged E tile, then the once-per-row A fragments; no step is left out.",
+   "Every step changes phases that have a measured share of the row, and no measurement shows a step to be futile.",
+   "The A fragments rely on the registers that the staged E tile frees: a step may be left out but never moved before an earlier one.",
+   "The prototypes compiled as committed break the resource gate on Blackwell: this is an input to the repair of each step and not a reason to skip it, and no prototype has been run on a device.",
+   "Nothing in this record is a timing result of a step."
+  ],
+  "targets": {
+   "a_fragments": [
+    "akk_aqk",
+    "m_tiles",
+    "p1_p2"
+   ],
+   "e_tile": [
+    "p1_p2",
+    "chunk_end_sync"
+   ],
+   "trims": [
+    "prep",
+    "akk_aqk",
+    "p1_p2",
+    "chunk_end_sync"
+   ]
+  }
+ },
+ "phase_profile": {
+  "cells": [
+   {
+    "certain_part_percent": 27.778,
+    "device": "b200",
+    "epilogue_percent_of_kernel": 3.988,
+    "group": "regular",
+    "kernel_cycles": 17930.226,
+    "n": 1,
+    "phase_cycles": {
+     "akk_aqk": 4416.782,
+     "chunk_end_sync": 74.094,
+     "m_tiles": 2279.861,
+     "p1_p2": 5406.288,
+     "prep": 2809.142,
+     "u_o": 473.962,
+     "ut_w_chain": 440.118
+    },
+    "prefix_proxy_percent": 45.445,
+    "prologue_percent_of_kernel": 7.334,
+    "row_cycles": 15900.247,
+    "row_spread_percent": 0.023,
+    "rows": 756,
+    "share_max_percent": {
+     "akk_aqk": 27.79,
+     "chunk_end_sync": 0.467,
+     "m_tiles": 14.357,
+     "p1_p2": 34.015,
+     "prep": 17.696,
+     "u_o": 3.007,
+     "ut_w_chain": 2.775
+    },
+    "share_min_percent": {
+     "akk_aqk": 27.765,
+     "chunk_end_sync": 0.464,
+     "m_tiles": 14.328,
+     "p1_p2": 33.983,
+     "prep": 17.646,
+     "u_o": 2.963,
+     "ut_w_chain": 2.762
+    },
+    "share_percent": {
+     "akk_aqk": 27.778,
+     "chunk_end_sync": 0.466,
+     "m_tiles": 14.339,
+     "p1_p2": 34.001,
+     "prep": 17.667,
+     "u_o": 2.981,
+     "ut_w_chain": 2.768
+    }
+   },
+   {
+    "certain_part_percent": 12.83,
+    "device": "b200",
+    "epilogue_percent_of_kernel": 1.869,
+    "group": "chunk_end",
+    "kernel_cycles": 54966.75,
+    "n": 1,
+    "phase_cycles": {
+     "akk_aqk": 6736.861,
+     "chunk_end_sync": 31408.861,
+     "m_tiles": 4489.972,
+     "p1_p2": 5412.444,
+     "prep": 3497.917,
+     "u_o": 469.833,
+     "ut_w_chain": 491.944
+    },
+    "prefix_proxy_percent": 19.492,
+    "prologue_percent_of_kernel": 2.604,
+    "row_cycles": 52507.833,
+    "row_spread_percent": 0.397,
+    "rows": 12,
+    "share_max_percent": {
+     "akk_aqk": 12.835,
+     "chunk_end_sync": 59.886,
+     "m_tiles": 8.575,
+     "p1_p2": 10.365,
+     "prep": 6.746,
+     "u_o": 0.933,
+     "ut_w_chain": 0.986
+    },
+    "share_min_percent": {
+     "akk_aqk": 12.827,
+     "chunk_end_sync": 59.782,
+     "m_tiles": 8.52,
+     "p1_p2": 10.264,
+     "prep": 6.603,
+     "u_o": 0.866,
+     "ut_w_chain": 0.885
+    },
+    "share_percent": {
+     "akk_aqk": 12.83,
+     "chunk_end_sync": 59.817,
+     "m_tiles": 8.551,
+     "p1_p2": 10.308,
+     "prep": 6.662,
+     "u_o": 0.895,
+     "ut_w_chain": 0.937
+    }
+   },
+   {
+    "certain_part_percent": 27.034,
+    "device": "b200",
+    "epilogue_percent_of_kernel": 3.889,
+    "group": "all",
+    "kernel_cycles": 18508.921,
+    "n": 1,
+    "phase_cycles": {
+     "akk_aqk": 4453.033,
+     "chunk_end_sync": 563.7,
+     "m_tiles": 2314.394,
+     "p1_p2": 5406.385,
+     "prep": 2819.904,
+     "u_o": 473.898,
+     "ut_w_chain": 440.928
+    },
+    "prefix_proxy_percent": 44.153,
+    "prologue_percent_of_kernel": 7.114,
+    "row_cycles": 16472.241,
+    "row_spread_percent": 0.038,
+    "rows": 768,
+    "share_max_percent": {
+     "akk_aqk": 27.044,
+     "chunk_end_sync": 3.431,
+     "m_tiles": 14.068,
+     "p1_p2": 32.832,
+     "prep": 17.151,
+     "u_o": 2.901,
+     "ut_w_chain": 2.687
+    },
+    "share_min_percent": {
+     "akk_aqk": 27.02,
+     "chunk_end_sync": 3.412,
+     "m_tiles": 14.04,
+     "p1_p2": 32.809,
+     "prep": 17.095,
+     "u_o": 2.859,
+     "ut_w_chain": 2.672
+    },
+    "share_percent": {
+     "akk_aqk": 27.034,
+     "chunk_end_sync": 3.422,
+     "m_tiles": 14.05,
+     "p1_p2": 32.821,
+     "prep": 17.119,
+     "u_o": 2.877,
+     "ut_w_chain": 2.677
+    }
+   },
+   {
+    "certain_part_percent": 27.518,
+    "device": "b200",
+    "epilogue_percent_of_kernel": 3.527,
+    "group": "regular",
+    "kernel_cycles": 22536.975,
+    "n": 16,
+    "phase_cycles": {
+     "akk_aqk": 5520.241,
+     "chunk_end_sync": 82.714,
+     "m_tiles": 2890.061,
+     "p1_p2": 6492.286,
+     "prep": 3761.658,
+     "u_o": 590.103,
+     "ut_w_chain": 723.574
+    },
+    "prefix_proxy_percent": 46.269,
+    "prologue_percent_of_kernel": 7.461,
+    "row_cycles": 20060.637,
+    "row_spread_percent": 0.028,
+    "rows": 12096,
+    "share_max_percent": {
+     "akk_aqk": 27.519,
+     "chunk_end_sync": 0.413,
+     "m_tiles": 14.412,
+     "p1_p2": 32.372,
+     "prep": 18.758,
+     "u_o": 2.943,
+     "ut_w_chain": 3.614
+    },
+    "share_min_percent": {
+     "akk_aqk": 27.516,
+     "chunk_end_sync": 0.412,
+     "m_tiles": 14.402,
+     "p1_p2": 32.358,
+     "prep": 18.742,
+     "u_o": 2.94,
+     "ut_w_chain": 3.6
+    },
+    "share_percent": {
+     "akk_aqk": 27.518,
+     "chunk_end_sync": 0.412,
+     "m_tiles": 14.407,
+     "p1_p2": 32.363,
+     "prep": 18.751,
+     "u_o": 2.942,
+     "ut_w_chain": 3.607
+    }
+   },
+   {
+    "certain_part_percent": 13.275,
+    "device": "b200",
+    "epilogue_percent_of_kernel": 1.593,
+    "group": "chunk_end",
+    "kernel_cycles": 70817.786,
+    "n": 16,
+    "phase_cycles": {
+     "akk_aqk": 9026.55,
+     "chunk_end_sync": 39958.649,
+     "m_tiles": 5936.943,
+     "p1_p2": 6578.491,
+     "prep": 5013.293,
+     "u_o": 747.469,
+     "ut_w_chain": 734.231
+    },
+    "prefix_proxy_percent": 20.648,
+    "prologue_percent_of_kernel": 2.393,
+    "row_cycles": 67995.627,
+    "row_spread_percent": 0.312,
+    "rows": 192,
+    "share_max_percent": {
+     "akk_aqk": 13.317,
+     "chunk_end_sync": 58.8,
+     "m_tiles": 8.773,
+     "p1_p2": 9.707,
+     "prep": 7.411,
+     "u_o": 1.114,
+     "ut_w_chain": 1.106
+    },
+    "share_min_percent": {
+     "akk_aqk": 13.227,
+     "chunk_end_sync": 58.73,
+     "m_tiles": 8.692,
+     "p1_p2": 9.657,
+     "prep": 7.338,
+     "u_o": 1.091,
+     "ut_w_chain": 1.059
+    },
+    "share_percent": {
+     "akk_aqk": 13.275,
+     "chunk_end_sync": 58.766,
+     "m_tiles": 8.731,
+     "p1_p2": 9.675,
+     "prep": 7.373,
+     "u_o": 1.099,
+     "ut_w_chain": 1.08
+    }
+   },
+   {
+    "certain_part_percent": 26.791,
+    "device": "b200",
+    "epilogue_percent_of_kernel": 3.435,
+    "group": "all",
+    "kernel_cycles": 23291.363,
+    "n": 16,
+    "phase_cycles": {
+     "akk_aqk": 5575.027,
+     "chunk_end_sync": 705.775,
+     "m_tiles": 2937.669,
+     "p1_p2": 6493.633,
+     "prep": 3781.215,
+     "u_o": 592.562,
+     "ut_w_chain": 723.741
+    },
+    "prefix_proxy_percent": 44.961,
+    "prologue_percent_of_kernel": 7.22,
+    "row_cycles": 20809.621,
+    "row_spread_percent": 0.019,
+    "rows": 12288,
+    "share_max_percent": {
+     "akk_aqk": 26.792,
+     "chunk_end_sync": 3.397,
+     "m_tiles": 14.122,
+     "p1_p2": 31.211,
+     "prep": 18.177,
+     "u_o": 2.848,
+     "ut_w_chain": 3.483
+    },
+    "share_min_percent": {
+     "akk_aqk": 26.789,
+     "chunk_end_sync": 3.385,
+     "m_tiles": 14.114,
+     "p1_p2": 31.201,
+     "prep": 18.159,
+     "u_o": 2.846,
+     "ut_w_chain": 3.471
+    },
+    "share_percent": {
+     "akk_aqk": 26.791,
+     "chunk_end_sync": 3.392,
+     "m_tiles": 14.117,
+     "p1_p2": 31.205,
+     "prep": 18.171,
+     "u_o": 2.848,
+     "ut_w_chain": 3.478
+    }
+   },
+   {
+    "certain_part_percent": 25.073,
+    "device": "b200",
+    "epilogue_percent_of_kernel": 3.88,
+    "group": "regular",
+    "kernel_cycles": 29012.426,
+    "n": 128,
+    "phase_cycles": {
+     "akk_aqk": 6515.29,
+     "chunk_end_sync": 105.542,
+     "m_tiles": 3949.775,
+     "p1_p2": 7547.767,
+     "prep": 6370.657,
+     "u_o": 768.324,
+     "ut_w_chain": 727.764
+    },
+    "prefix_proxy_percent": 49.59,
+    "prologue_percent_of_kernel": 6.554,
+    "row_cycles": 25985.12,
+    "row_spread_percent": 0.121,
+    "rows": 96768,
+    "share_max_percent": {
+     "akk_aqk": 25.095,
+     "chunk_end_sync": 0.407,
+     "m_tiles": 15.201,
+     "p1_p2": 29.059,
+     "prep": 24.552,
+     "u_o": 2.972,
+     "ut_w_chain": 2.806
+    },
+    "share_min_percent": {
+     "akk_aqk": 25.045,
+     "chunk_end_sync": 0.405,
+     "m_tiles": 15.199,
+     "p1_p2": 29.029,
+     "prep": 24.472,
+     "u_o": 2.946,
+     "ut_w_chain": 2.796
+    },
+    "share_percent": {
+     "akk_aqk": 25.073,
+     "chunk_end_sync": 0.406,
+     "m_tiles": 15.2,
+     "p1_p2": 29.046,
+     "prep": 24.517,
+     "u_o": 2.957,
+     "ut_w_chain": 2.801
+    }
+   },
+   {
+    "certain_part_percent": 13.446,
+    "device": "b200",
+    "epilogue_percent_of_kernel": 2.039,
+    "group": "chunk_end",
+    "kernel_cycles": 94689.796,
+    "n": 128,
+    "phase_cycles": {
+     "akk_aqk": 12127.129,
+     "chunk_end_sync": 48110.904,
+     "m_tiles": 10053.981,
+     "p1_p2": 9096.545,
+     "prep": 8504.869,
+     "u_o": 1110.565,
+     "ut_w_chain": 1186.699
+    },
+    "prefix_proxy_percent": 22.876,
+    "prologue_percent_of_kernel": 2.712,
+    "row_cycles": 90190.692,
+    "row_spread_percent": 0.209,
+    "rows": 1536,
+    "share_max_percent": {
+     "akk_aqk": 13.458,
+     "chunk_end_sync": 53.397,
+     "m_tiles": 11.174,
+     "p1_p2": 10.109,
+     "prep": 9.467,
+     "u_o": 1.248,
+     "ut_w_chain": 1.352
+    },
+    "share_min_percent": {
+     "akk_aqk": 13.44,
+     "chunk_end_sync": 53.311,
+     "m_tiles": 11.129,
+     "p1_p2": 10.062,
+     "prep": 9.408,
+     "u_o": 1.214,
+     "ut_w_chain": 1.297
+    },
+    "share_percent": {
+     "akk_aqk": 13.446,
+     "chunk_end_sync": 53.344,
+     "m_tiles": 11.147,
+     "p1_p2": 10.086,
+     "prep": 9.43,
+     "u_o": 1.231,
+     "ut_w_chain": 1.316
+    }
+   },
+   {
+    "certain_part_percent": 24.466,
+    "device": "b200",
+    "epilogue_percent_of_kernel": 3.79,
+    "group": "all",
+    "kernel_cycles": 30038.635,
+    "n": 128,
+    "phase_cycles": {
+     "akk_aqk": 6602.975,
+     "chunk_end_sync": 855.626,
+     "m_tiles": 4045.154,
+     "p1_p2": 7571.967,
+     "prep": 6404.004,
+     "u_o": 773.672,
+     "ut_w_chain": 734.935
+    },
+    "prefix_proxy_percent": 48.195,
+    "prologue_percent_of_kernel": 6.365,
+    "row_cycles": 26988.332,
+    "row_spread_percent": 0.122,
+    "rows": 98304,
+    "share_max_percent": {
+     "akk_aqk": 24.487,
+     "chunk_end_sync": 3.171,
+     "m_tiles": 14.991,
+     "p1_p2": 28.07,
+     "prep": 23.764,
+     "u_o": 2.881,
+     "ut_w_chain": 2.73
+    },
+    "share_min_percent": {
+     "akk_aqk": 24.438,
+     "chunk_end_sync": 3.17,
+     "m_tiles": 14.987,
+     "p1_p2": 28.04,
+     "prep": 23.686,
+     "u_o": 2.857,
+     "ut_w_chain": 2.718
+    },
+    "share_percent": {
+     "akk_aqk": 24.466,
+     "chunk_end_sync": 3.17,
+     "m_tiles": 14.989,
+     "p1_p2": 28.056,
+     "prep": 23.729,
+     "u_o": 2.867,
+     "ut_w_chain": 2.723
+    }
+   },
+   {
+    "certain_part_percent": 27.434,
+    "device": "b300",
+    "epilogue_percent_of_kernel": 3.787,
+    "group": "regular",
+    "kernel_cycles": 18252.623,
+    "n": 1,
+    "phase_cycles": {
+     "akk_aqk": 4477.631,
+     "chunk_end_sync": 72.241,
+     "m_tiles": 2316.62,
+     "p1_p2": 5421.265,
+     "prep": 3115.756,
+     "u_o": 466.754,
+     "ut_w_chain": 451.22
+    },
+    "prefix_proxy_percent": 46.524,
+    "prologue_percent_of_kernel": 6.793,
+    "row_cycles": 16321.488,
+    "row_spread_percent": 0.201,
+    "rows": 756,
+    "share_max_percent": {
+     "akk_aqk": 27.448,
+     "chunk_end_sync": 0.443,
+     "m_tiles": 14.216,
+     "p1_p2": 33.247,
+     "prep": 19.141,
+     "u_o": 2.878,
+     "ut_w_chain": 2.766
+    },
+    "share_min_percent": {
+     "akk_aqk": 27.425,
+     "chunk_end_sync": 0.442,
+     "m_tiles": 14.171,
+     "p1_p2": 33.199,
+     "prep": 19.004,
+     "u_o": 2.85,
+     "ut_w_chain": 2.763
+    },
+    "share_percent": {
+     "akk_aqk": 27.434,
+     "chunk_end_sync": 0.443,
+     "m_tiles": 14.194,
+     "p1_p2": 33.216,
+     "prep": 19.09,
+     "u_o": 2.86,
+     "ut_w_chain": 2.765
+    }
+   },
+   {
+    "certain_part_percent": 12.861,
+    "device": "b300",
+    "epilogue_percent_of_kernel": 1.757,
+    "group": "chunk_end",
+    "kernel_cycles": 54933.611,
+    "n": 1,
+    "phase_cycles": {
+     "akk_aqk": 6768.0,
+     "chunk_end_sync": 31055.5,
+     "m_tiles": 4605.139,
+     "p1_p2": 5423.0,
+     "prep": 3793.222,
+     "u_o": 464.75,
+     "ut_w_chain": 514.472
+    },
+    "prefix_proxy_percent": 20.069,
+    "prologue_percent_of_kernel": 2.447,
+    "row_cycles": 52624.083,
+    "row_spread_percent": 0.464,
+    "rows": 12,
+    "share_max_percent": {
+     "akk_aqk": 12.894,
+     "chunk_end_sync": 59.098,
+     "m_tiles": 8.795,
+     "p1_p2": 10.312,
+     "prep": 7.214,
+     "u_o": 0.91,
+     "ut_w_chain": 1.004
+    },
+    "share_min_percent": {
+     "akk_aqk": 12.83,
+     "chunk_end_sync": 58.948,
+     "m_tiles": 8.707,
+     "p1_p2": 10.294,
+     "prep": 7.199,
+     "u_o": 0.861,
+     "ut_w_chain": 0.963
+    },
+    "share_percent": {
+     "akk_aqk": 12.861,
+     "chunk_end_sync": 59.014,
+     "m_tiles": 8.751,
+     "p1_p2": 10.305,
+     "prep": 7.208,
+     "u_o": 0.883,
+     "ut_w_chain": 0.978
+    }
+   },
+   {
+    "certain_part_percent": 26.724,
+    "device": "b300",
+    "epilogue_percent_of_kernel": 3.695,
+    "group": "all",
+    "kernel_cycles": 18825.764,
+    "n": 1,
+    "phase_cycles": {
+     "akk_aqk": 4513.418,
+     "chunk_end_sync": 556.354,
+     "m_tiles": 2352.378,
+     "p1_p2": 5421.292,
+     "prep": 3126.342,
+     "u_o": 466.723,
+     "ut_w_chain": 452.209
+    },
+    "prefix_proxy_percent": 45.236,
+    "prologue_percent_of_kernel": 6.595,
+    "row_cycles": 16888.716,
+    "row_spread_percent": 0.202,
+    "rows": 768,
+    "share_max_percent": {
+     "akk_aqk": 26.738,
+     "chunk_end_sync": 3.302,
+     "m_tiles": 13.952,
+     "p1_p2": 32.129,
+     "prep": 18.559,
+     "u_o": 2.781,
+     "ut_w_chain": 2.678
+    },
+    "share_min_percent": {
+     "akk_aqk": 26.716,
+     "chunk_end_sync": 3.286,
+     "m_tiles": 13.905,
+     "p1_p2": 32.085,
+     "prep": 18.429,
+     "u_o": 2.753,
+     "ut_w_chain": 2.677
+    },
+    "share_percent": {
+     "akk_aqk": 26.724,
+     "chunk_end_sync": 3.294,
+     "m_tiles": 13.929,
+     "p1_p2": 32.1,
+     "prep": 18.511,
+     "u_o": 2.764,
+     "ut_w_chain": 2.678
+    }
+   },
+   {
+    "certain_part_percent": 27.572,
+    "device": "b300",
+    "epilogue_percent_of_kernel": 3.665,
+    "group": "regular",
+    "kernel_cycles": 22429.881,
+    "n": 16,
+    "phase_cycles": {
+     "akk_aqk": 5533.927,
+     "chunk_end_sync": 83.033,
+     "m_tiles": 2864.018,
+     "p1_p2": 6539.347,
+     "prep": 3723.362,
+     "u_o": 594.199,
+     "ut_w_chain": 732.622
+    },
+    "prefix_proxy_percent": 46.124,
+    "prologue_percent_of_kernel": 6.854,
+    "row_cycles": 20070.508,
+    "row_spread_percent": 0.048,
+    "rows": 12096,
+    "share_max_percent": {
+     "akk_aqk": 27.582,
+     "chunk_end_sync": 0.414,
+     "m_tiles": 14.273,
+     "p1_p2": 32.598,
+     "prep": 18.57,
+     "u_o": 2.976,
+     "ut_w_chain": 3.657
+    },
+    "share_min_percent": {
+     "akk_aqk": 27.559,
+     "chunk_end_sync": 0.413,
+     "m_tiles": 14.264,
+     "p1_p2": 32.572,
+     "prep": 18.536,
+     "u_o": 2.941,
+     "ut_w_chain": 3.646
+    },
+    "share_percent": {
+     "akk_aqk": 27.572,
+     "chunk_end_sync": 0.414,
+     "m_tiles": 14.27,
+     "p1_p2": 32.582,
+     "prep": 18.551,
+     "u_o": 2.961,
+     "ut_w_chain": 3.65
+    }
+   },
+   {
+    "certain_part_percent": 13.366,
+    "device": "b300",
+    "epilogue_percent_of_kernel": 1.665,
+    "group": "chunk_end",
+    "kernel_cycles": 70330.179,
+    "n": 16,
+    "phase_cycles": {
+     "akk_aqk": 9034.979,
+     "chunk_end_sync": 39547.604,
+     "m_tiles": 5815.938,
+     "p1_p2": 6675.545,
+     "prep": 4983.012,
+     "u_o": 779.33,
+     "ut_w_chain": 759.993
+    },
+    "prefix_proxy_percent": 20.738,
+    "prologue_percent_of_kernel": 2.222,
+    "row_cycles": 67596.401,
+    "row_spread_percent": 0.017,
+    "rows": 192,
+    "share_max_percent": {
+     "akk_aqk": 13.395,
+     "chunk_end_sync": 58.562,
+     "m_tiles": 8.617,
+     "p1_p2": 9.957,
+     "prep": 7.391,
+     "u_o": 1.176,
+     "ut_w_chain": 1.146
+    },
+    "share_min_percent": {
+     "akk_aqk": 13.327,
+     "chunk_end_sync": 58.433,
+     "m_tiles": 8.578,
+     "p1_p2": 9.816,
+     "prep": 7.341,
+     "u_o": 1.11,
+     "ut_w_chain": 1.086
+    },
+    "share_percent": {
+     "akk_aqk": 13.366,
+     "chunk_end_sync": 58.505,
+     "m_tiles": 8.604,
+     "p1_p2": 9.876,
+     "prep": 7.372,
+     "u_o": 1.153,
+     "ut_w_chain": 1.124
+    }
+   },
+   {
+    "certain_part_percent": 26.852,
+    "device": "b300",
+    "epilogue_percent_of_kernel": 3.57,
+    "group": "all",
+    "kernel_cycles": 23178.323,
+    "n": 16,
+    "phase_cycles": {
+     "akk_aqk": 5588.631,
+     "chunk_end_sync": 699.667,
+     "m_tiles": 2910.142,
+     "p1_p2": 6541.475,
+     "prep": 3743.044,
+     "u_o": 597.092,
+     "ut_w_chain": 733.049
+    },
+    "prefix_proxy_percent": 44.836,
+    "prologue_percent_of_kernel": 6.635,
+    "row_cycles": 20813.1,
+    "row_spread_percent": 0.044,
+    "rows": 12288,
+    "share_max_percent": {
+     "akk_aqk": 26.861,
+     "chunk_end_sync": 3.365,
+     "m_tiles": 13.986,
+     "p1_p2": 31.443,
+     "prep": 18.003,
+     "u_o": 2.882,
+     "ut_w_chain": 3.529
+    },
+    "share_min_percent": {
+     "akk_aqk": 26.839,
+     "chunk_end_sync": 3.359,
+     "m_tiles": 13.977,
+     "p1_p2": 31.422,
+     "prep": 17.967,
+     "u_o": 2.851,
+     "ut_w_chain": 3.518
+    },
+    "share_percent": {
+     "akk_aqk": 26.852,
+     "chunk_end_sync": 3.362,
+     "m_tiles": 13.982,
+     "p1_p2": 31.43,
+     "prep": 17.984,
+     "u_o": 2.869,
+     "ut_w_chain": 3.522
+    }
+   },
+   {
+    "certain_part_percent": 24.715,
+    "device": "b300",
+    "epilogue_percent_of_kernel": 3.967,
+    "group": "regular",
+    "kernel_cycles": 29618.732,
+    "n": 128,
+    "phase_cycles": {
+     "akk_aqk": 6552.335,
+     "chunk_end_sync": 104.731,
+     "m_tiles": 3957.216,
+     "p1_p2": 7626.961,
+     "prep": 6774.093,
+     "u_o": 776.376,
+     "ut_w_chain": 720.34
+    },
+    "prefix_proxy_percent": 50.266,
+    "prologue_percent_of_kernel": 6.522,
+    "row_cycles": 26512.052,
+    "row_spread_percent": 0.224,
+    "rows": 96768,
+    "share_max_percent": {
+     "akk_aqk": 24.734,
+     "chunk_end_sync": 0.396,
+     "m_tiles": 14.932,
+     "p1_p2": 28.801,
+     "prep": 25.59,
+     "u_o": 2.936,
+     "ut_w_chain": 2.72
+    },
+    "share_min_percent": {
+     "akk_aqk": 24.69,
+     "chunk_end_sync": 0.394,
+     "m_tiles": 14.917,
+     "p1_p2": 28.748,
+     "prep": 25.486,
+     "u_o": 2.921,
+     "ut_w_chain": 2.714
+    },
+    "share_percent": {
+     "akk_aqk": 24.715,
+     "chunk_end_sync": 0.395,
+     "m_tiles": 14.926,
+     "p1_p2": 28.768,
+     "prep": 25.551,
+     "u_o": 2.928,
+     "ut_w_chain": 2.717
+    }
+   },
+   {
+    "certain_part_percent": 13.547,
+    "device": "b300",
+    "epilogue_percent_of_kernel": 2.109,
+    "group": "chunk_end",
+    "kernel_cycles": 95053.431,
+    "n": 128,
+    "phase_cycles": {
+     "akk_aqk": 12249.981,
+     "chunk_end_sync": 47784.36,
+     "m_tiles": 10077.431,
+     "p1_p2": 9151.445,
+     "prep": 8858.239,
+     "u_o": 1127.618,
+     "ut_w_chain": 1176.734
+    },
+    "prefix_proxy_percent": 23.343,
+    "prologue_percent_of_kernel": 2.76,
+    "row_cycles": 90425.809,
+    "row_spread_percent": 0.343,
+    "rows": 1536,
+    "share_max_percent": {
+     "akk_aqk": 13.604,
+     "chunk_end_sync": 52.94,
+     "m_tiles": 11.167,
+     "p1_p2": 10.139,
+     "prep": 9.858,
+     "u_o": 1.27,
+     "ut_w_chain": 1.335
+    },
+    "share_min_percent": {
+     "akk_aqk": 13.497,
+     "chunk_end_sync": 52.714,
+     "m_tiles": 11.128,
+     "p1_p2": 10.086,
+     "prep": 9.699,
+     "u_o": 1.211,
+     "ut_w_chain": 1.282
+    },
+    "share_percent": {
+     "akk_aqk": 13.547,
+     "chunk_end_sync": 52.844,
+     "m_tiles": 11.144,
+     "p1_p2": 10.12,
+     "prep": 9.796,
+     "u_o": 1.247,
+     "ut_w_chain": 1.301
+    }
+   },
+   {
+    "certain_part_percent": 24.141,
+    "device": "b300",
+    "epilogue_percent_of_kernel": 3.877,
+    "group": "all",
+    "kernel_cycles": 30641.149,
+    "n": 128,
+    "phase_cycles": {
+     "akk_aqk": 6641.361,
+     "chunk_end_sync": 849.725,
+     "m_tiles": 4052.844,
+     "p1_p2": 7650.781,
+     "prep": 6806.658,
+     "u_o": 781.864,
+     "ut_w_chain": 727.471
+    },
+    "prefix_proxy_percent": 48.883,
+    "prologue_percent_of_kernel": 6.34,
+    "row_cycles": 27510.704,
+    "row_spread_percent": 0.207,
+    "rows": 98304,
+    "share_max_percent": {
+     "akk_aqk": 24.161,
+     "chunk_end_sync": 3.093,
+     "m_tiles": 14.739,
+     "p1_p2": 27.842,
+     "prep": 24.776,
+     "u_o": 2.848,
+     "ut_w_chain": 2.646
+    },
+    "share_min_percent": {
+     "akk_aqk": 24.119,
+     "chunk_end_sync": 3.085,
+     "m_tiles": 14.722,
+     "p1_p2": 27.788,
+     "prep": 24.681,
+     "u_o": 2.837,
+     "ut_w_chain": 2.643
+    },
+    "share_percent": {
+     "akk_aqk": 24.141,
+     "chunk_end_sync": 3.089,
+     "m_tiles": 14.732,
+     "p1_p2": 27.81,
+     "prep": 24.742,
+     "u_o": 2.842,
+     "ut_w_chain": 2.644
+    }
+   }
+  ],
+  "phases": [
+   "prep",
+   "akk_aqk",
+   "m_tiles",
+   "ut_w_chain",
+   "p1_p2",
+   "u_o",
+   "chunk_end_sync"
+  ]
+ },
+ "row_engine_order": [
+  "trims",
+  "e_tile",
+  "a_fragments"
+ ],
+ "schema": "cfbi-decision-v1",
+ "skipped": {},
+ "value_split_inputs": {
+  "capacity": [
+   {
+    "ctas_per_sm": 2,
+    "device": "b200",
+    "max_nh_by_slices": [
+     {
+      "one_cta_per_sm": 74,
+      "resident_slots": 148,
+      "slices": 2
+     },
+     {
+      "one_cta_per_sm": 37,
+      "resident_slots": 74,
+      "slices": 4
+     },
+     {
+      "one_cta_per_sm": 18,
+      "resident_slots": 37,
+      "slices": 8
+     }
+    ],
+    "resident_slots": 296,
+    "sm_count": 148
+   },
+   {
+    "ctas_per_sm": 2,
+    "device": "b300",
+    "max_nh_by_slices": [
+     {
+      "one_cta_per_sm": 74,
+      "resident_slots": 148,
+      "slices": 2
+     },
+     {
+      "one_cta_per_sm": 37,
+      "resident_slots": 74,
+      "slices": 4
+     },
+     {
+      "one_cta_per_sm": 18,
+      "resident_slots": 37,
+      "slices": 8
+     }
+    ],
+    "resident_slots": 296,
+    "sm_count": 148
+   }
+  ],
+  "certain_part_phases": [
+   "akk_aqk"
+  ],
+  "draft": {
+   "gain_percent": [
+    10,
+    25
+   ],
+   "label": "draft_estimate_unprofiled",
+   "nh_up_to": 74
+  },
+  "matrix_nh": [
+   12,
+   48,
+   192,
+   768,
+   1536,
+   3072
+  ],
+  "matrix_nh_within_draft": [
+   12,
+   48
+  ],
+  "prefix_proxy_phases": [
+   "prep",
+   "akk_aqk"
+  ],
+  "profile_covers_matrix_within_draft": false,
+  "profile_nh": [
+   12,
+   192,
+   1536
+  ],
+  "profile_nh_within_draft": [
+   12
+  ],
+  "statements": [
+   "The share of the value-independent prefix cannot be separated exactly with the stamps of the profile: the first phase includes loads that depend on the value dimension and later phases mix independent and dependent work.",
+   "Two figures are given instead: the first two phases together as a proxy of the prefix, and the key-side product phase alone as the part that is certainly independent of the value dimension.",
+   "The draft's figure is an estimate of a gain that was never profiled: this record neither confirms nor excludes it.",
+   "The per-phase profile does not cover every matrix shape that lies inside the draft's range.",
+   "The capacity bound depends on the model: one CTA per SM (the policy of the prototype) or every resident slot."
+  ],
+  "strict_v_independent_share": null
+ }
+}
