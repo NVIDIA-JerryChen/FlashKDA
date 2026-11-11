@@ -864,6 +864,8 @@ def ledger_problems(ledger, repo=None, decision=None, require_all_steps=False, h
     in_unit = isinstance(unit, dict) and all(u in by_id and by_id[u].get("outcome") != "skipped" for u in UNIT)
     if unit is not None and not in_unit:
         problems.append("%s: the adoption unit names rows that are missing or skipped" % where)
+    elif unit is None and require_all_steps and all(u in by_id and by_id[u].get("outcome") != "skipped" for u in UNIT):
+        problems.append("%s: the E tile and the A fragments are one adoption unit: the ledger needs its three arms (unit)" % where)
     elif in_unit:
         wanted, why = unit_outcomes(unit)
         if wanted is None:
@@ -876,7 +878,8 @@ def ledger_problems(ledger, repo=None, decision=None, require_all_steps=False, h
             e_prev = unit.get("e_vs_t")
             f_prev = unit.get("f_vs_e") if unit.get("e_vs_t") == "pass" else unit.get("f_vs_t")
             for u, prev in zip(UNIT, (e_prev, f_prev)):
-                if (by_id[u].get("timing") or {}).get("vs_previous") != prev:
+                reached_timing = by_id[u].get("outcome") == "adopted" or by_id[u].get("failed_at") == "timing"      # an earlier failure has no timing to compare
+                if reached_timing and (by_id[u].get("timing") or {}).get("vs_previous") != prev:
                     problems.append("%s: the row of %s says %r against the previous accepted state, the arms say %r" % (where, u, (by_id[u].get("timing") or {}).get("vs_previous"), prev))
     for s in steps:
         problems.extend("%s: %s" % (where, p) for p in step_problems(s, unit_member=in_unit and isinstance(s, dict) and s.get("id") in UNIT))

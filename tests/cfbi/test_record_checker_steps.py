@@ -132,6 +132,12 @@ def test_the_arms_of_the_unit_must_be_complete_and_agree_with_the_rows():
             assert has(problems, expected), expected
     wrong_row = mutated(base, lambda l: l["steps"][3]["timing"].update(vs_previous="fail"))               # the F row says it did not beat E, the arms say it did
     assert has(rc.ledger_problems(wrong_row), "the row of a_fragments says 'fail' against the previous accepted state")
+    assert has(rc.ledger_problems(mutated(base, lambda l: l.pop("unit")), require_all_steps=True), "needs its three arms")           # a complete ledger names the arms
+    assert not has(rc.ledger_problems(mutated(base, lambda l: l.pop("unit"))), "three arms")                                         # an intermediate one need not yet
+    # a member that failed an earlier phase has no timing to agree with the arms
+    _, unit, _ = UNIT_CASES[3]
+    early = ledger(3, e_tile=not_adopted("e_tile", "exactness"))
+    assert rc.ledger_problems(early, require_all_steps=True) == []
     # without the unit the rows stand alone: an adopted E tile has to beat the previous state by its own row
     alone = mutated(base, lambda l: l.pop("unit"))
     alone["steps"][2]["timing"]["vs_previous"] = "fail"
