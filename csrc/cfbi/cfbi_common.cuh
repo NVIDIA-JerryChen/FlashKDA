@@ -41,6 +41,34 @@ static_assert(WS2_FLOATS <= WS_FLOATS_PER_CHUNK_HEAD, "workspace v2 must fit the
 static_assert((WS2_FLOATS * 4) % 16 == 0 && (WS2_AQD * 4) % 16 == 0 && (WS2_KD * 4) % 16 == 0, "16-byte alignment");
 constexpr int AQ_NFRAG = 12;                   // fragments of sub-blocks 1..3: s*(s-1)+ks, ks < 2s
 
+// The pos word of a state slot (one int32 per slot) holds the fill of the open chunk, 0 .. BT - 1, in its low bits; outside of a call it is exactly that number.
+// While the single-launch decode kernel (rows_kernel<true>, cfbi_rows.cuh) runs, the bits from POS_COUNT_SHIFT up count the head CTAs of the slot's sequence that have
+// arrived (read the word); the last one to arrive stores the plain new value.
+constexpr int POS_COUNT_SHIFT = 8;
+constexpr int POS_MASK = BT - 1;
+static_assert(POS_MASK < (1 << POS_COUNT_SHIFT), "the fill of the open chunk must fit below the arrival counter");
+
+// Token window and state slot of sequence n of a call: the integers the plan kernel and the single-launch decode kernel both start from (one function, so that the two
+// read the same values). slot < 0 (a padding entry of a fixed-shape batch) has no tokens and no state access.
+struct SeqWindow {
+    int tok0;   // first token of the sequence on the flattened token axis
+    int len;    // tokens in this call (0 for a padding entry)
+    int slot;   // state slot (index into E / rows / pos), -1 = skipped
+};
+__device__ __forceinline__ SeqWindow seq_window(const int64_t* cu, int fixed_len, const int* slot_ids, int n) {
+    SeqWindow w;
+    if (cu != nullptr) {
+        w.tok0 = (int)cu[n];
+        w.len = (int)(cu[n + 1] - cu[n]);
+    } else {
+        w.tok0 = n * fixed_len;
+        w.len = fixed_len;
+    }
+    w.slot = slot_ids != nullptr ? slot_ids[n] : n;
+    if (w.slot < 0) w.len = 0;   // padding entry of a fixed-shape batch: no tokens, no state access
+    return w;
+}
+
 // Per-sequence schedule, computed on the device by the plan kernel (no host sync).
 struct SeqPlan {
     int tok0;   // first token of the sequence on the flattened token axis
@@ -80,6 +108,10 @@ struct Params {
     // K1 stores the UT part of the workspace in 16-column slices whatever the tiles are.
     int tile_x32;
     int tile_bvb;
+    // The token windows of the call, for the single-launch decode kernel (rows_kernel<true>), which has no plan kernel in front of it: sequence n owns the tokens
+    // [cu_seqlens[n], cu_seqlens[n + 1]) or, without cu_seqlens, [n * fixed_len, (n + 1) * fixed_len) (the plan kernel's arguments). Appended last: no other offset moves.
+    const int64_t* cu_seqlens;
+    int fixed_len;
 };
 
 // 8 consecutive bf16 (16-byte aligned) -> 8 fp32 (exact).

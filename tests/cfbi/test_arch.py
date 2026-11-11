@@ -178,11 +178,12 @@ def test_resolve_impl_policy(ext):
 
 
 def test_every_impl_value_is_accepted_and_same_bits(ext):
-    """All 64 ``impl`` values (resolved per device) are accepted, except the ones that ask for the device-scheduled K2 (bit 4,
+    """All 128 ``impl`` values (resolved per device) are accepted, except the ones that ask for the device-scheduled K2 (bit 4,
     value 16) and for the old K2 kernels (bit 5, value 32) together, which are rejected; the accepted ones give the same bits for
     a call with state and for the training forward: optimised / reference / row-engine-only / UMMA K2 / device-scheduled K2 /
-    old K2 kernels are one program, including the combinations of bits 4 and 5 with the others. On Ampere they all resolve to
-    impl 7."""
+    old K2 kernels / the decode that keeps its plan kernel (bit 6, value 64: one program with the single-launch decode that the
+    row-engine-only schedule runs by default) are one program, including the combinations of bits 4 and 5 with the others. On
+    Ampere they all resolve to impl 7 (+ 64 where bit 6 was requested)."""
     H = 3
     lens = [150, 1, 64, 129, 33, 0, 70]
     case = make_case(sum(lens), H, "heavy_tail", seed=13)
@@ -191,7 +192,7 @@ def test_every_impl_value_is_accepted_and_same_bits(ext):
         cu.append(cu[-1] + L)
     cu_t = torch.tensor(cu, dtype=torch.int64, device="cuda")
     seen, results = set(), []
-    for impl in range(64):
+    for impl in range(128):
         if impl & 16 and impl & 32:                       # the two K2 choices exclude each other
             with pytest.raises((RuntimeError, ValueError)):
                 prefill(case["q"], case["k"], case["v"], case["g"], case["beta"], case["scale"], torch.zeros_like(case["q"]), case["A_log"], case["dt_bias"],

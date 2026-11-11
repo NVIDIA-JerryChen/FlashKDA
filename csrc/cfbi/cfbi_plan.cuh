@@ -6,7 +6,8 @@
 //   new pos = (pos + len) % 64
 // The chunk grid is anchored at the sequence start, so the head rows are exactly the rows that bring the
 // open chunk to its boundary; everything after them starts on a grid line.
-// mode 1 (decode) sends every row to the row engine.
+// mode 1 (decode) sends every row to the row engine; the optimised row engine derives its entry of this plan itself (seq_window, cfbi_common.cuh: the same
+// token window and slot; rows_kernel<true> in cfbi_rows.cuh) and runs without this kernel, see decode_single_launch in cfbi_launch.h.
 #pragma once
 
 #include <cub/block/block_scan.cuh>
@@ -29,16 +30,8 @@ plan_kernel(const int64_t* cu, int fixed_len, const int* pos_state, const int* s
         SeqPlan sp = {0, 0, 0, 0, 0, 0, 0, -1};
         int nch = 0;
         if (n < N) {
-            int tok0, len;
-            if (cu != nullptr) {
-                tok0 = (int)cu[n];
-                len = (int)(cu[n + 1] - cu[n]);
-            } else {
-                tok0 = n * fixed_len;
-                len = fixed_len;
-            }
-            const int slot = slot_ids != nullptr ? slot_ids[n] : n;
-            if (slot < 0) len = 0;   // padding entry of a fixed-shape batch: no tokens, no state access
+            const SeqWindow w = seq_window(cu, fixed_len, slot_ids, n);   // shared with the single-launch decode kernel (rows_kernel<true>)
+            const int tok0 = w.tok0, len = w.len, slot = w.slot;
             const int pos0 = (pos_state != nullptr && slot >= 0) ? pos_state[slot] : 0;
             int hrows, nfull, tail;
             if (all_rows) {

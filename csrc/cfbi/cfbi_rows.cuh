@@ -19,6 +19,9 @@
 //   * the cache append of khat / G2 and the reference-row copy no longer cost a barrier.
 // The cache planes (khat, G2, UT, W, U) and E live in global memory (fp32); plain (non-const, non-restrict)
 // pointers are used so the compiler never turns reads of freshly written rows into .nc loads.
+//
+// rows_kernel<false> runs behind the plan kernel (head rows of a prefill call, decode with IMPL_DECODE_PLAN); rows_kernel<true> is the same body for decode without
+// a plan kernel (one launch per decode call, cfbi_launch.h decode_single_launch): it derives its plan entry itself and advances pos by an arrival count, see rows_entry.
 #pragma once
 
 #include "cfbi/cfbi_common.cuh"
@@ -165,17 +168,74 @@ __device__ __forceinline__ void rows_m_tiles(RowSmem& S, const float* Rut, const
     }
 }
 
+// A relaxed (strong, device scope) store: the one store to a pos word that other CTAs of the call may be racing with (see rows_entry), so it must be a morally strong
+// operation like the atomics next to it.
+__device__ __forceinline__ void st_relaxed_gpu(int* ptr, int v) {
+    asm volatile("st.relaxed.gpu.global.b32 [%0], %1;" ::"l"(ptr), "r"(v) : "memory");
+}
+
+// The sequence entry (what the plan kernel writes to p.plan[n]) of this CTA.
+//
+// DECODE = false: the plan kernel ran in front of this kernel; read its entry.
+//
+// DECODE = true: single-launch decode (mode 1, cfbi_launch.h decode_single_launch): there is no plan kernel. The entry is derived here from the call's arguments:
+// seq_window is the function the plan kernel uses for the token window and the slot, and hrows = len (every row goes through the row engine). What the plan kernel
+// is also there for is the SNAPSHOT of pos: the H head CTAs of a sequence all start from the same fill of the open chunk, and one of them must not advance the
+// pos word before the others have read it. Here the word is read and COUNTED by one atomic: every CTA of a participating sequence starts with
+//     old = atomicAdd(&pos[slot], 1 << POS_COUNT_SHIFT)
+// whose result is the word as it was just before the add: the fill of the open chunk in the low bits (& POS_MASK: the counter is never part of it) and the number of CTAs
+// that arrived before this one above. All H CTAs of a sequence take the same decision (len and slot do not depend on the head), so either all of them arrive or none does.
+// The arrival that sees H - 1 before it is the last: every other CTA of the sequence has done its atomic, i.e. has read pos and will never touch the word again, so it stores
+// the plain new value (pos0 + len) % BT, which also clears the counter; the other CTAs leave the word alone. Between the first arrival and that store the word is not a plain
+// pos, and nothing may read it as one while the call runs (a precondition of the state anyway: the slots of a call are distinct and no other call works on the state
+// concurrently). Every access to the word is an atomic or a relaxed store (no data race in the memory model), and after the call it is plain again: pos, E and rows are
+// what the two-launch decode leaves, bit for bit. A skipped CTA (slot < 0, or an empty sequence) never touches the word.
+// Thread 0 does the atomic and the store (one access per CTA) and hands the fill to the CTA through shared memory; all threads call this function (it has a barrier), and
+// the early exit (len == 0) is uniform over the CTA.
+// Test builds only (the default build has none of these macros): CFBI_DECODE_TEST_DELAY_NS lets every CTA linger for 0 .. 3 x the delay before it arrives (the late starters
+// of a grid that does not fit one wave, on demand), and two wrong protocols that the harness must catch: CFBI_DECODE_TEST_EVERY_CTA_WRITES (no counting: every CTA reads the
+// word and stores the new value at the end of its row loop, the plan-less version of the two-launch scheme without its snapshot) and CFBI_DECODE_TEST_FIRST_ARRIVER (the
+// first CTA to arrive, not the last, stores).
+template <bool DECODE>
+__device__ __forceinline__ SeqPlan rows_entry(const Params& p, int n, int& pos_smem) {
+    if (!DECODE) return p.plan[n];
+    const SeqWindow w = seq_window(p.cu_seqlens, p.fixed_len, p.slot_ids, n);
+    if (w.len == 0) return SeqPlan{0, 0, 0, 0, 0, 0, 0, w.slot};   // padding entry or empty sequence (uniform over the CTA): no state access, the caller returns
+    if (threadIdx.x == 0) {
+#ifdef CFBI_DECODE_TEST_DELAY_NS
+        __nanosleep(static_cast<unsigned>(CFBI_DECODE_TEST_DELAY_NS) * ((blockIdx.x + blockIdx.y) & 3u));
+#endif
+#ifdef CFBI_DECODE_TEST_EVERY_CTA_WRITES
+        const int old = atomicAdd(p.pos + w.slot, 0);   // a plain read of the word (an add of zero): no counting
+        pos_smem = old & POS_MASK;
+#else
+        const int old = atomicAdd(p.pos + w.slot, 1 << POS_COUNT_SHIFT);
+        pos_smem = old & POS_MASK;
+#ifdef CFBI_DECODE_TEST_FIRST_ARRIVER
+        if ((old >> POS_COUNT_SHIFT) == 0) st_relaxed_gpu(p.pos + w.slot, (int)(((int64_t)(old & POS_MASK) + w.len) % BT));
+#else
+        if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(p.pos + w.slot, (int)(((int64_t)(old & POS_MASK) + w.len) % BT));
+#endif
+#endif
+    }
+    __syncthreads();
+    return SeqPlan{w.tok0, w.len, pos_smem, w.len, 0, 0, 0, w.slot};
+}
+
 #ifndef CFBI_ROWS_MINB
 #define CFBI_ROWS_MINB 2
 #endif
+// DECODE = false: the head rows / decode rows of a call whose plan kernel has run. DECODE = true: the single-launch decode, see rows_entry; same body, same arithmetic.
+template <bool DECODE>
 __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Params p) {
 #ifdef CFBI_ROWS_PROFILE
     const long long prof_entry = clock64();   // the profile starts at kernel entry: before the plan load and the rest of the prologue
 #endif
     ROWS_DELAY(0);   // test hook: kernel entry, before the plan load and the first loads
     __shared__ RowSmem S;
+    __shared__ int dec_pos0;   // DECODE only: the fill of the open chunk, from thread 0 (unused, hence not allocated, with DECODE = false)
     const int n = blockIdx.x, h = blockIdx.y, H = p.H;
-    const SeqPlan sp = p.plan[n];
+    const SeqPlan sp = rows_entry<DECODE>(p, n, dec_pos0);
     const int nrows = sp.hrows;
     if (nrows == 0) return;
     const int tid = threadIdx.x, warp = tid >> 5;
@@ -509,7 +569,14 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
         }
 #endif
     }
-    if (p.fuse_pos && tid == 0) p.pos[ROWS_POS_INDEX(sp.slot)] = (int)(((int64_t)sp.pos0 + sp.len) % BT);   // same value from every head CTA
+    if (DECODE) {
+        // single launch: the last CTA of the sequence to arrive has already advanced pos (rows_entry); nothing to store here
+#ifdef CFBI_DECODE_TEST_EVERY_CTA_WRITES
+        if (tid == 0) p.pos[sp.slot] = (int)(((int64_t)sp.pos0 + sp.len) % BT);   // negative control (tests only): every CTA stores, from the fill it read at its own start
+#endif
+    } else if (p.fuse_pos && tid == 0) {
+        p.pos[ROWS_POS_INDEX(sp.slot)] = (int)(((int64_t)sp.pos0 + sp.len) % BT);   // same value from every head CTA (sp.pos0 is the plan kernel's snapshot)
+    }
 #ifdef CFBI_ROWS_PROFILE
     if (threadIdx.x == 0 && prof_last >= 0 && n * H + h < ROWS_PROF_CTAS)
         g_rows_prof[prof_last][n * H + h][8] = (unsigned)(clock64() - prof_entry);   // after the last global store of the kernel

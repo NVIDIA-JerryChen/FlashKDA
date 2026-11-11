@@ -202,9 +202,9 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     TORCH_CHECK(dt_bias.dim() == 2 && dt_bias.size(0) == H && dt_bias.size(1) == 128, "dt_bias must be [H, 128]");
     TORCH_CHECK(mode == 0 || mode == 1, "mode must be 0 or 1");
     TORCH_CHECK(impl >= 0 && impl <= cfbi::IMPL_MAX,
-                "impl must be 0..63 (bit 0: reference row engine, bit 1: reference K1/K2, bit 2: row engine for every row, "
+                "impl must be 0..127 (bit 0: reference row engine, bit 1: reference K1/K2, bit 2: row engine for every row, "
                 "bit 3: UMMA K2, bit 4: K2 driven by a schedule built on the device, bit 5: the old K2 kernels also where the default routing "
-                "would choose the device-scheduled one)");
+                "would choose the device-scheduled one, bit 6: decode keeps the separate plan kernel instead of one launch of the row engine)");
     TORCH_CHECK(!((impl & cfbi::IMPL_K2_DYN) && (impl & cfbi::IMPL_K2_OLD)), "impl bits 4 (device-scheduled K2) and 5 (old K2 kernels) exclude each other");
     TORCH_CHECK(phase >= 1 && phase <= 3, "phase must be 1 (K1), 2 (K2) or 3 (both)");
     TORCH_CHECK(k2_bv == 0 || k2_bv == 8 || k2_bv == 16 || k2_bv == 32 || (k2_bv >= 1000 && k2_bv <= 1000 + 65536),
@@ -295,8 +295,11 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     // the capacity of the schedule builder runs the old K2 kernels and needs the plan entries only
     const bool dyn_runs = eff_mode == 0 && (eff_impl & cfbi::IMPL_K2_DYN) && N <= cfbi::k2_sched_capacity(H);
     const int64_t plan_need = (N + 1) * cfbi::PLAN_INTS_PER_SEQ + (dyn_runs ? cfbi::k2_sched_ints(N, H) : 0);
-    torch::Tensor plan = plan_in.has_value() ? *plan_in : torch::empty({plan_need}, q.options().dtype(torch::kInt32));
-    TORCH_CHECK(plan.is_cuda() && plan.dtype() == torch::kInt32 && plan.is_contiguous() && plan.numel() >= plan_need,
+    // decode on the optimised row engine is one kernel launch without a plan kernel (cfbi::decode_single_launch, the same call the launcher makes): no plan buffer is
+    // allocated for it (a caller's plan buffer is still checked and ignored)
+    const bool no_plan = cfbi::decode_single_launch(eff_mode, eff_impl, N, H, q.get_device());
+    torch::Tensor plan = plan_in.has_value() ? *plan_in : (no_plan ? torch::Tensor() : torch::empty({plan_need}, q.options().dtype(torch::kInt32)));
+    TORCH_CHECK(!plan.defined() || (plan.is_cuda() && plan.dtype() == torch::kInt32 && plan.is_contiguous() && plan.numel() >= plan_need),
                 "plan buffer: contiguous int32 CUDA, workspace_sizes(...)[1] entries ((N + 1) * 8 plan entries, plus the schedule of the device-scheduled K2)");
     torch::Tensor ws;
     if (eff_mode == 0) {
@@ -327,7 +330,7 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     a.rows = has_state ? rows->data_ptr<float>() : (tmp_rows.defined() ? tmp_rows.data_ptr<float>() : nullptr);
     a.pos = has_state ? pos->data_ptr<int>() : (tmp_pos.defined() ? tmp_pos.data_ptr<int>() : nullptr);
     a.slot_ids = slot_ptr;
-    a.plan = plan.data_ptr<int>();
+    a.plan = plan.defined() ? plan.data_ptr<int>() : nullptr;
     a.ws = eff_mode == 0 ? ws.data_ptr<float>() : nullptr;
     a.mode = eff_mode;
     a.impl = eff_impl;
@@ -339,7 +342,7 @@ void forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
 
 // Implementation bits that run for `impl` on `device` (< 0: the current one), see cfbi_launch.h.
 int64_t resolve_impl_py(int64_t impl, int64_t device) {
-    TORCH_CHECK(impl >= 0 && impl <= cfbi::IMPL_MAX, "impl must be 0..63");
+    TORCH_CHECK(impl >= 0 && impl <= cfbi::IMPL_MAX, "impl must be 0..127");
     return cfbi::resolve_impl((int)impl, (int)device);
 }
 
@@ -383,6 +386,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sched_capacity", [](int64_t H) { return cfbi::k2_sched_capacity(H); }, "most sequences the K2 schedule builder takes for H heads", py::arg("H"));
     m.def("k2_route", &cfbi::k2_dyn_default_route, "whether the default implementation (impl 0) runs the device-scheduled K2 for a cu_seqlens call of N sequences, "
           "H heads and T_total tokens on a device (< 0: the current one)", py::arg("N"), py::arg("H"), py::arg("T_total"), py::arg("device") = -1);
+    m.def("decode_single_launch", &cfbi::decode_single_launch, "whether a call that runs `mode` (1 = decode) with the resolved implementation bits `impl` for N sequences and H heads is one "
+          "kernel launch of the row engine, without the plan kernel, on a device (< 0: the current one)", py::arg("mode"), py::arg("impl"), py::arg("N"), py::arg("H"),
+          py::arg("device") = -1);
     m.def("probe_dot3", &probe_dot3, "dot3 tile probe", py::arg("A"), py::arg("B"), py::arg("reverse_k") = false);
     m.def("probe_transc", &probe_transc, "ex2/tanh/rsqrt approximations", py::arg("x"), py::arg("which"));
     m.def("probe_prep", &probe_prep, "per-token prep probe", py::arg("q"), py::arg("k"), py::arg("g"),

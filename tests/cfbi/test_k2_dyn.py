@@ -129,11 +129,11 @@ def test_resolve_impl_precedence(ext):
 
 def test_invalid_values_raise(ext):
     fn = lambda impl, bv=0: varlen_fn([100, 70], 2, impl, bv)()
-    for bad in (64, 63, DYN | OLD, -1):                # beyond bit 5, and the two K2 choices of bits 4 and 5 together
+    for bad in (128, 63, DYN | OLD, -1):               # beyond bit 6, and the two K2 choices of bits 4 and 5 together
         with pytest.raises((RuntimeError, ValueError)):
             fn(bad)
     with pytest.raises((RuntimeError, ValueError)):
-        ext.resolve_impl(64, -1)
+        ext.resolve_impl(128, -1)
     fn(OLD)                                          # the old K2 kernels, explicitly
     fn(OLD, 1003)                                    # ... which keep their test hook
     for bv in (1000, 1001, 1037):

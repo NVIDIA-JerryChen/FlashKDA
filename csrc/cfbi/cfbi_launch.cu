@@ -1,4 +1,5 @@
 // CF-BI KDA launcher: plan -> row engine -> K1 -> K2 -> pos update, all on one stream, no host sync.
+// (Decode on the optimised row engine is a single launch of the row engine without the plan kernel: decode_single_launch.)
 #include "cfbi/cfbi_common.cuh"
 #include "cfbi/cfbi_k1.cuh"
 #include "cfbi/cfbi_k2.cuh"
@@ -154,7 +155,7 @@ size_t k1_smem_bytes(int impl) { return (impl & IMPL_REF_CHUNK) ? ref::K1_SMEM_B
 
 int resolve_impl(int requested, int device) {
     const DeviceCaps c = device_caps(device);
-    int impl = requested & (IMPL_REF_ROWS | IMPL_REF_CHUNK | IMPL_ROWS_ONLY | IMPL_K2_UMMA | IMPL_K2_DYN);
+    int impl = requested & (IMPL_REF_ROWS | IMPL_REF_CHUNK | IMPL_ROWS_ONLY | IMPL_K2_UMMA | IMPL_K2_DYN | IMPL_DECODE_PLAN);
     // The tcgen05 K2 only exists in the sm_100a / sm_103a code (cfbi_tcgen05.cuh): drop the request everywhere else
     // (the mma.sync K2 computes the same bits).
     if (c.major != 10) impl &= ~IMPL_K2_UMMA;
@@ -196,6 +197,16 @@ bool k2_dyn_default_route(int64_t N, int64_t H, int64_t T_total, int device) {
     return (100 * (co - cd) - K2_ROUTE_OVERHEAD_PCT * co) * stage >= 100 * co * k2_route_builder_x10ns(N, nh);
 }
 
+// The rule is documented at the declaration (cfbi_launch.h). A failed device query keeps the plan kernel (the safe, old schedule).
+bool decode_single_launch(int mode, int impl, int64_t N, int64_t H, int device) {
+    if (mode != 1 || (impl & (IMPL_REF_ROWS | IMPL_DECODE_PLAN))) return false;
+    if (N < 1 || H < 1) return false;
+    if (device < 0) cudaGetDevice(&device);
+    int sms = 0;
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || sms <= 0) return false;
+    return N * H <= DECODE_SINGLE_MAX_CTAS_PER_SM * sms;
+}
+
 void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
     Params p;
     p.q = static_cast<const __nv_bfloat16*>(a.q);
@@ -219,15 +230,20 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
     p.ws = a.ws;
     p.tile_x32 = 0;
     p.tile_bvb = 16;
+    p.cu_seqlens = a.cu_seqlens;   // only the single-launch decode kernel reads these two (the plan kernel gets them as arguments)
+    p.fixed_len = a.fixed_len;
 
     const int mode = resolve_mode(a.mode, a.impl);   // the binding has already done this and supplied a state if needed
     p.fuse_pos = mode == 1 ? 1 : 0;
     const bool run_k1 = (a.phase & PHASE_K1) != 0, run_k2 = (a.phase & PHASE_K2) != 0;
-    if (run_k1) plan_kernel<<<1, PLAN_THREADS, 0, stream>>>(a.cu_seqlens, a.fixed_len, a.pos, a.slot_ids, a.N, mode == 1 ? 1 : 0, p.plan);
+    // decode on the optimised row engine: ONE kernel (no plan kernel, no plan buffer: a.plan may be null), see decode_single_launch
+    const bool one_kernel = run_k1 && run_k2 && a.E != nullptr && decode_single_launch(mode, a.impl, a.N, a.H);
+    if (run_k1 && !one_kernel) plan_kernel<<<1, PLAN_THREADS, 0, stream>>>(a.cu_seqlens, a.fixed_len, a.pos, a.slot_ids, a.N, mode == 1 ? 1 : 0, p.plan);
     if (run_k1 && run_k2 && a.E != nullptr) {
         // head rows (finishing the open chunk) or, in mode 1, every row
         if (a.impl & IMPL_REF_ROWS) ref::rows_kernel<<<dim3(a.N, a.H), NTHREADS, ROWS_DYNAMIC_SMEM, stream>>>(p);
-        else rows_kernel<<<dim3(a.N, a.H), NTHREADS, ROWS_DYNAMIC_SMEM, stream>>>(p);
+        else if (one_kernel) rows_kernel<true><<<dim3(a.N, a.H), NTHREADS, ROWS_DYNAMIC_SMEM, stream>>>(p);
+        else rows_kernel<false><<<dim3(a.N, a.H), NTHREADS, ROWS_DYNAMIC_SMEM, stream>>>(p);
     }
     if (mode == 0) {
         const int64_t max_chunks = (a.T_total + BT - 1) / BT + a.N;   // upper bound; extra CTAs exit at once
@@ -271,7 +287,9 @@ struct RowsInstance {
     const char* name;
     const void* fn;
 };
-const RowsInstance kRowsInstances[] = {{"cfbi::rows_kernel", reinterpret_cast<const void*>(&rows_kernel)}, {"cfbi::ref::rows_kernel", reinterpret_cast<const void*>(&ref::rows_kernel)}};
+// every instantiation of the row engine: behind the plan kernel (false), the single-launch decode (true: Lb0E / Lb1E in the machine-code dumps) and the frozen reference
+const RowsInstance kRowsInstances[] = {{"cfbi::rows_kernel<false>", reinterpret_cast<const void*>(&rows_kernel<false>)}, {"cfbi::rows_kernel<true>", reinterpret_cast<const void*>(&rows_kernel<true>)},
+                                       {"cfbi::ref::rows_kernel", reinterpret_cast<const void*>(&ref::rows_kernel)}};
 }  // namespace
 
 int rows_occupancy_device(RowsDevice* out) {

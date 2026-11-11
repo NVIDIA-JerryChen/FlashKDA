@@ -68,10 +68,18 @@ IEEE intrinsics, the extension is built without `--use_fast_math` and with `-fma
 | kernel | grid x block | smem / regs | work |
 |---|---|---|---|
 | `plan_kernel` | 1 x 1024 | 4 KiB / 64 | per sequence: `tok0, len, pos0`, head rows `h = 0 if pos0 == 0 else min(len, 64 - pos0)`, `nfull = (len-h)/64`, `tail = (len-h)%64`, exclusive prefix sum of the chunk counts (CUB). No host sync |
-| `rows_kernel` (row engine = decode) | (N, H) x 256 | 7 KiB / 48 | loops over the head rows of one (sequence, head): prep, Akk/Aqk row vs cached rows, UT/W row, `P1/P2 = dot3(W/GQ, E^T)`, `U`, `O`, append to the cache; at row 63 the chunk-end update of `E` |
+| `rows_kernel` (row engine = decode) | (N, H) x 256 | 7 KiB / 48 | loops over the head rows of one (sequence, head): prep, Akk/Aqk row vs cached rows, UT/W row, `P1/P2 = dot3(W/GQ, E^T)`, `U`, `O`, append to the cache; at row 63 the chunk-end update of `E`. `rows_kernel<true>` is the same body for **decode without a plan kernel** (one launch per decode call, see the note below the table) |
 | `k1_kernel` | (max chunks, H) x 256 | 218 KiB / 72 | E-independent part of a chunk: prep, cumsum, Akk/Aqk (`dot3` over K=128), block forward substitution for UT/W, then the workspace (WG, UT, Aqk, KD, GEND); a trailing partial chunk also stores khat, G2, UT, W of its rows in the cache |
 | `k2_kernel` | (8, N, H) x 256 | 26 KiB / 54 | serial scan of a sequence's chunks with a `[16 x 128]` E slice in smem: P1/P2, `U = UT - P1`, `O` (cross-sub-block `dot3` + FMA chain, bf16 store), chunk-end update; a partial chunk stores its `U` rows in the cache |
 | `finalize_pos_kernel` | N | - | `pos = (pos0 + len) % 64` (`pos` is per sequence but read by every head's CTA, so it is only advanced at the very end) |
+
+- **Decode is one launch** (mode 1 on the optimised row engine, `decode_single_launch` in `cfbi_launch.h`; `_impl` bit 6 = 64 keeps the plan kernel, the frozen
+  reference row engine and mode 0 always do, and so do grids of more than 8 CTAs per SM, `N * H > 8 * SMs`, a gate that is an estimate; written at
+  source level, not yet run on a GPU): `rows_kernel<true>` derives its plan entry itself with the plan kernel's own `seq_window` (token window and slot from
+  `cu_seqlens` / `fixed_len` and `slot_ids`) and replaces the plan kernel's `pos` snapshot by an arrival count in the high bits of the `pos` word: each head CTA of a
+  participating sequence starts with `old = atomicAdd(&pos[slot], 1 << 8)`, whose result carries the fill (`& 63`) and the number of CTAs that arrived before; the CTA
+  that sees `H - 1` is the last of the `H`, every other CTA has already read the word, so it stores the plain `(pos0 + len) % 64`. At rest `pos` is unchanged; skipped
+  CTAs (`slot < 0`, empty sequence) never touch it; the slots of a call must be distinct (already a precondition). No floating-point operation changed.
 
 - **Workspace** (K1 -> K2, fp32, per chunk and head, 144.5 KiB): `WG=[W;GQ]` 64 KiB, `UT` 32, `Aqk` 16, `KD` 32,
   `GEND` 0.5. One call allocates `(ceil(T/64) + N) * H * 144.5 KiB`; split very long calls yourself (any cut is bit-exact).
