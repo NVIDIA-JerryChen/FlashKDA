@@ -9,6 +9,7 @@ The grid is derived from the device (``helpers.decode_sequences``: SMs times the
 entries, which exit at once) fill at least ``WAVES`` waves of resident CTAs; extra padding and empty entries come on top.
 """
 import itertools
+import os
 import random
 
 import torch
@@ -30,6 +31,9 @@ def build_variant(name, defines, loader=None):
 
     if loader is None:
         from flash_kda.cfbi._ext import load_variant as loader
+    base = os.environ.get("FLASH_KDA_CFBI_BUILD_DIR")
+    if base:        # a variant builds in a directory of its own: it never rewrites the build.ninja of the default build (the next load of the default extension would rebuild it, which under a tool hangs)
+        os.environ["FLASH_KDA_CFBI_BUILD_DIR"] = os.path.join(base, "variants", name)
     try:
         return loader(name, tuple(defines))
     except Exception as e:   # the compiler's message is in the text of the exception (after the long command lines of the failed compilations)
@@ -37,6 +41,9 @@ def build_variant(name, defines, loader=None):
         errors = [ln.strip()[:300] for ln in lines[1:] if "error" in ln.lower()]      # the first line may be a whole command line
         detail = (lines[0][:150] + "\n" + "\n".join(errors[-12:])) if errors else "\n".join(lines)[-1500:]
         pytest.fail("the variant %s %s does not build: %s" % (name, tuple(defines), detail), pytrace=False)
+    finally:
+        if base:
+            os.environ["FLASH_KDA_CFBI_BUILD_DIR"] = base
 
 
 # ---- the inputs of a step -------------------------------------------------------------------------------------------------------------------------------
@@ -197,8 +204,16 @@ def run_arm(mod, impl, warm, step):
     return Outcome(out, out32, state)
 
 
+def assert_at_rest(state, what="state"):
+    """The at-rest invariant of every state comparison: every position lies in [0, 63] (a position of 64 would index a cache row that does not exist)."""
+    lo, hi = int(state.pos.min()), int(state.pos.max())
+    assert 0 <= lo and hi < BT, "%s: a position left [0, %d]: min %d, max %d" % (what, BT - 1, lo, hi)
+
+
 def mismatch(a, b):
-    """The counts of differing words between two outcomes: output, fp32 output, E, valid rows, pos (zero everywhere = bitwise equal)."""
+    """The counts of differing words between two outcomes: output, fp32 output, E, valid rows, pos (zero everywhere = bitwise equal). Every comparison asserts the at-rest invariant first."""
+    assert_at_rest(a.state, "first state")
+    assert_at_rest(b.state, "second state")
     m = {"out": n_diff(a.out, b.out), "out32": n_diff(a.out32, b.out32)}
     m.update(state_mismatch(a.state, b.state))
     return m

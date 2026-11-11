@@ -11,15 +11,14 @@ Variants are separate JIT builds of the extension with test macros (``load_varia
   bijection (negative control of the hook itself) must be caught.
 """
 import itertools
-import re
-from pathlib import Path
 
 import pytest
 import torch
 
 from flash_kda.cfbi import alloc_state, state_mismatch
 
-from helpers import make_case, n_diff
+from helpers import make_case, n_diff, skip_or_fail
+from rows_workload import build_variant
 from varlen_corpus import CORPUS_V
 
 REF, DYN = 3, 16
@@ -31,16 +30,10 @@ REPEATS = 5
 @pytest.fixture(autouse=True)
 def _dyn_runs_here(ext):
     if not ext.resolve_impl(DYN, -1) & DYN:
-        pytest.skip("the device cannot run the device-scheduled K2 (impl bit 16 is dropped here)")
+        skip_or_fail("the device cannot run the device-scheduled K2 (impl bit 16 is dropped here)")
 
 
-def build_variant(name, defines):
-    from flash_kda.cfbi._ext import load_variant
-
-    try:
-        return load_variant(name, tuple(defines))
-    except Exception as e:   # pragma: no cover - the variants need a JIT build
-        pytest.skip(f"cannot build the variant {name}: {e}")
+# a variant that does not build fails its test (rows_workload.build_variant): a skipped comparison proves nothing
 
 
 def run(mod, impl, lens, heads, k2_bv=0, seed=3):
@@ -68,14 +61,13 @@ def total(d):
 
 # ---- the default build has no test macro --------------------------------------------------------------------------------------------------------------
 def test_the_default_build_contains_no_test_macro():
+    """Every test-macro prefix (the K2 ones among them), not only CFBI_(DYN|K2)_TEST: the guard lives in test_rows_hooks.py with its planted-define controls."""
     from flash_kda.cfbi import _ext
+    from test_rows_hooks import macro_guard_problems, real_guard_inputs
 
     assert not any("TEST" in f for f in _ext.NVCC_FLAGS)
-    root = Path(__file__).resolve().parents[2] / "csrc" / "cfbi"
-    for f in root.rglob("*"):
-        if f.suffix in (".cu", ".cuh", ".h", ".cpp"):
-            for ln, line in enumerate(f.read_text().splitlines(), 1):
-                assert not re.match(r"\s*#\s*define\s+CFBI_(DYN|K2)_TEST", line), f"{f.name}:{ln}: a test macro must only come from a -D flag"
+    srcs, flags, nvcc = real_guard_inputs()
+    assert macro_guard_problems(srcs, flags, nvcc) == []
 
 
 def test_the_unmodified_build_equals_the_reference_on_the_variant_workload(ext):

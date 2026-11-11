@@ -98,7 +98,8 @@ def run_driver(tool, tmp_path, driver, extra=(), env=None, offset="S + %d" % OOB
     exe = sanitizer()
     script = tmp_path / "driver.py"
     script.write_text(driver.format(tests=str(TESTS), repo=str(REPO), done=DONE, offset=offset))
-    cmd = [exe, "--tool", tool, "--error-exitcode", "99", *extra, sys.executable, str(script)]
+    # application-only: the tool does not follow child processes (a driver that had to rebuild the extension would run ninja and nvcc under it, which hangs)
+    cmd = [exe, "--tool", tool, "--error-exitcode", "99", "--target-processes", "application-only", *extra, sys.executable, str(script)]
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT_S, env=dict(os.environ, **(env or {})))
     except subprocess.TimeoutExpired:

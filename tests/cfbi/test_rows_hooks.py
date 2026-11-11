@@ -32,15 +32,15 @@ TESTS = ROOT / "tests" / "cfbi"
 TEST_PREFIXES = ("CFBI_ROWS_PROFILE", "CFBI_ROWS_DELAY_NS", "CFBI_ROWS_TEST_", "CFBI_NEG_CONTROL", "CFBI_K1_PROFILE", "CFBI_K2_PROFILE", "CFBI_UMMA_PROFILE", "CFBI_DYN_TEST_",
                  "CFBI_K2_TEST_", "CFBI_UMMA_NEG_", "CFBI_UMMA_RACE_", "CFBI_CONV_NEG_", "CFBI_LIN_NEG_")
 TUNABLES = ("CFBI_ROWS_MINB", "CFBI_ROWS_PF_L1", "CFBI_K2_TILE_ONLY", "CFBI_HAVE_TCGEN05", "CFBI_CONV_UNROLL", "CFBI_CONV_THREADS", "CFBI_SRC_HASH")
-GPU_MODULES = ("test_rows_occupancy.py", "test_rows_decode_families.py", "test_rows_delay.py", "test_rows_sanitizer.py", "test_rows_graph.py", "test_rows_profile_gpu.py", "rows_workload.py")
+GPU_MODULES = ("test_rows_occupancy.py", "test_rows_decode_families.py", "test_rows_delay.py", "test_rows_sanitizer.py", "test_rows_graph.py", "test_rows_profile_gpu.py", "test_k2_dyn_variants.py", "rows_workload.py")
 
 
 def is_test_macro(name):
     return any(name.startswith(p) for p in TEST_PREFIXES)
 
 
-def sources():
-    return {str(f.relative_to(CSRC)): f.read_text() for f in sorted(CSRC.rglob("*")) if f.suffix in (".cu", ".cuh", ".h", ".cpp")}
+def sources(csrc=CSRC):
+    return {str(f.relative_to(csrc)): f.read_text() for f in sorted(csrc.rglob("*")) if f.suffix in (".cu", ".cuh", ".h", ".cpp")}
 
 
 @pytest.fixture(scope="module")
@@ -249,6 +249,20 @@ def test_a_planted_define_of_any_prefix_is_caught(macro):
     assert any(macro in p for p in macro_guard_problems(srcs, dict(flags, **{"_ext.py": flags["_ext.py"].replace('"-O3",', '"-O3", "-D%s=1",' % macro)}), nvcc))
 
 
+def test_planting_the_delay_define_in_a_temporary_copy_of_the_sources_fails_the_guard(tmp_path):
+    """The control as the acceptance criterion words it: a ``#define CFBI_ROWS_DELAY_NS`` in a copy of ``csrc/cfbi`` on disk, read back and judged by the guard."""
+    import shutil
+
+    copy = tmp_path / "cfbi"
+    shutil.copytree(CSRC, copy)
+    _, flags, nvcc = real_guard_inputs()
+    assert macro_guard_problems(sources(copy), flags, nvcc) == []                      # the copy is as clean as the original
+    target = copy / "cfbi_rows.cuh"
+    target.write_text("#define CFBI_ROWS_DELAY_NS 2000\n" + target.read_text())
+    probs = macro_guard_problems(sources(copy), flags, nvcc)
+    assert any("cfbi_rows.cuh:1 defines the test macro CFBI_ROWS_DELAY_NS" in p for p in probs), probs
+
+
 def test_a_tunable_is_no_test_macro_and_may_be_defined():
     srcs, flags, nvcc = real_guard_inputs()
     planted = dict(srcs)
@@ -324,3 +338,43 @@ def test_a_run_that_requires_a_gpu_fails_without_one_instead_of_skipping(tmp_pat
     assert soft.returncode == 0 and "1 skipped" in soft.stdout, soft.stdout[-800:]
     hard = subprocess.run(base, capture_output=True, text=True, env=dict(env, CFBI_REQUIRE_GPU="1"), cwd=str(ROOT))
     assert hard.returncode != 0 and "CFBI_REQUIRE_GPU=1" in hard.stdout and "1 error" in hard.stdout and "skipped" not in hard.stdout, hard.stdout[-800:]    # a failed fixture is an error
+
+
+def test_a_variant_builds_in_a_directory_of_its_own(monkeypatch):
+    """A variant that shares the build directory rewrites its build.ninja: the next load of the default extension rebuilds it (under a tool that hangs)."""
+    import os
+
+    seen = []
+
+    def loader(name, defines):
+        seen.append(os.environ.get("FLASH_KDA_CFBI_BUILD_DIR"))
+        return name
+
+    monkeypatch.setenv("FLASH_KDA_CFBI_BUILD_DIR", "/build/tree")
+    assert rw.build_variant("rowsx", ("A=1",), loader=loader) == "rowsx"
+    assert seen == ["/build/tree/variants/rowsx"] and os.environ["FLASH_KDA_CFBI_BUILD_DIR"] == "/build/tree"
+
+    def broken(name, defines):
+        raise RuntimeError("Error building\nx: error: boom")
+
+    with pytest.raises(pytest.fail.Exception):                       # a failing build restores the directory as well
+        rw.build_variant("rowsz", ("A=1",), loader=broken)
+    assert os.environ["FLASH_KDA_CFBI_BUILD_DIR"] == "/build/tree"
+
+    monkeypatch.delenv("FLASH_KDA_CFBI_BUILD_DIR")                    # no build directory set: nothing is set for the variant either
+    seen.clear()
+    rw.build_variant("rowsy", ("A=1",), loader=loader)
+    assert seen == [None] and "FLASH_KDA_CFBI_BUILD_DIR" not in os.environ
+
+
+def test_the_sanitizer_does_not_follow_child_processes(monkeypatch, tmp_path):
+    import subprocess
+    import types
+
+    import test_rows_sanitizer as ts
+
+    seen = []
+    monkeypatch.setattr(ts, "sanitizer", lambda: "compute-sanitizer")
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: seen.append(cmd) or types.SimpleNamespace(returncode=0, stdout="", stderr=""))
+    ts.run_driver("memcheck", tmp_path, ts.BOUNDED_DRIVER)
+    assert seen and "--target-processes" in seen[0] and seen[0][seen[0].index("--target-processes") + 1] == "application-only", seen
