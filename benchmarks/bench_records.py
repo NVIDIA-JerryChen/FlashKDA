@@ -487,7 +487,10 @@ def compare(base, cand, metric="k2_stage_us", tol_pct=1.0, mode="regress", expec
         base_k, cand_k = (base_rerun, cand_rerun) if judged_on == "rerun" else (base, cand)
         kind = cell_kind(base_k, key)
         cell_problems = []
-        for role, recs in (("baseline", base_k), ("candidate", cand_k)):
+        sets = [("baseline", base), ("candidate", cand)]
+        if judged_on == "rerun":                           # the first campaign of a re-run cell is evidence as well (it decided that the re-run was needed)
+            sets += [("baseline re-run", base_rerun), ("candidate re-run", cand_rerun)]
+        for role, recs in sets:
             for rec in recs:
                 cell_problems += ["%s record %s, cell %r (kind %s): %s" % (role, rec.get("_path", "?"), key, kind, p) for p in raw_sample_problems(rec, key, metric)]
             stamps = [(r.get("meta") or {}).get("timestamp") for r in recs]

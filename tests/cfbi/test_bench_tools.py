@@ -1317,6 +1317,14 @@ def test_a_defective_sample_makes_the_comparison_invalid_and_names_the_cell():
                 r["_path"] = orig["_path"] if "_path" in orig else "mem"
             res = br.compare(*((recs, cand) if side == "baseline" else (base, recs)), metric="gpu_graph_us")
             assert res["verdict"] == "INVALID" and any(k2 in p and side in p for p in res["problems"]) and not any(k1 in p for p in res["problems"]), (bad, side)
+    rbase, rcand = wall_sets([100.0, 100.05, 99.95], [100.0, 100.05, 99.95], keys=(k1, k2), hour="11", scale=3)
+    ok = br.compare(base, cand, metric="gpu_graph_us", base_rerun=rbase, cand_rerun=rcand)
+    assert ok["verdict"] == "PASS" and [r["judged_on"] for r in ok["rows"]] == ["rerun", "rerun"]
+    for bad in (float("nan"), 0.0):                                                                  # a defective sample of the FIRST campaign of a cell that was re-run counts too
+        first = json.loads(json.dumps(base, allow_nan=True))
+        first[2]["cells"][0]["samples"][1]["gpu_graph_us"] = bad
+        res = br.compare(first, cand, metric="gpu_graph_us", base_rerun=rbase, cand_rerun=rcand)
+        assert res["verdict"] == "INVALID" and any(k1 in p and "baseline record" in p for p in res["problems"]), bad
     nan_on_disk = os.path.join(tempfile.mkdtemp(), "nan")                                          # the file round trip keeps a NaN a NaN
     broken = [json.loads(json.dumps(r)) for r in cand]
     broken[0]["cells"][0]["samples"][0]["gpu_graph_us"] = float("nan")
