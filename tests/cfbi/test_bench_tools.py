@@ -1311,10 +1311,8 @@ def test_a_defective_sample_makes_the_comparison_invalid_and_names_the_cell():
     assert br.compare(base, cand, metric="gpu_graph_us")["verdict"] == "PASS"
     for bad in (float("nan"), float("inf"), float("-inf"), -3.0, 0.0, True):
         for side in ("baseline", "candidate"):
-            recs = json.loads(json.dumps((base if side == "baseline" else cand), allow_nan=True))
+            recs = json.loads(json.dumps(base if side == "baseline" else cand, allow_nan=True))
             recs[1]["cells"][1]["samples"][2]["gpu_graph_us"] = bad                                # one trial of one process of the second cell
-            for r, orig in zip(recs, base if side == "baseline" else cand):
-                r["_path"] = orig["_path"] if "_path" in orig else "mem"
             res = br.compare(*((recs, cand) if side == "baseline" else (base, recs)), metric="gpu_graph_us")
             assert res["verdict"] == "INVALID" and any(k2 in p and side in p for p in res["problems"]) and not any(k1 in p for p in res["problems"]), (bad, side)
     rbase, rcand = wall_sets([100.0, 100.05, 99.95], [100.0, 100.05, 99.95], keys=(k1, k2), hour="11", scale=3)
@@ -1325,12 +1323,10 @@ def test_a_defective_sample_makes_the_comparison_invalid_and_names_the_cell():
         first[2]["cells"][0]["samples"][1]["gpu_graph_us"] = bad
         res = br.compare(first, cand, metric="gpu_graph_us", base_rerun=rbase, cand_rerun=rcand)
         assert res["verdict"] == "INVALID" and any(k1 in p and "baseline record" in p for p in res["problems"]), bad
-    nan_on_disk = os.path.join(tempfile.mkdtemp(), "nan")                                          # the file round trip keeps a NaN a NaN
-    broken = [json.loads(json.dumps(r)) for r in cand]
+    d = tempfile.mkdtemp()                                                                         # the file round trip keeps a NaN a NaN
+    broken = json.loads(json.dumps(cand))
     broken[0]["cells"][0]["samples"][0]["gpu_graph_us"] = float("nan")
-    paths = write_records(os.path.dirname(nan_on_disk), "c", broken)
-    d = os.path.dirname(nan_on_disk)
-    assert compare_bench.main(["--base"] + write_records(d, "a", base) + ["--cand"] + paths + ["--metric", "gpu_graph_us"]) == 2
+    assert compare_bench.main(["--base"] + write_records(d, "a", base) + ["--cand"] + write_records(d, "c", broken) + ["--metric", "gpu_graph_us"]) == 2
     kernel = json.loads(json.dumps(cand))                                                           # a kernel metric: zero is a legitimate value of a vanished kernel
     for r in kernel:
         for s in r["cells"][0]["samples"]:
