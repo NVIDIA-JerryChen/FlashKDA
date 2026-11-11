@@ -65,6 +65,7 @@ __device__ __forceinline__ void rows_delay(int site) {
     if (c.warp >= 0 && (int)(threadIdx.x >> 5) != c.warp) return;
     if ((threadIdx.x & 31) == 0) atomicAdd(&g_rows_delay_hits, 1ull);
     __nanosleep(c.ns ? c.ns : (unsigned)CFBI_ROWS_DELAY_NS);
+    __threadfence_block();   // the loads that follow the site stay behind the sleep (the compiler may not hoist them above it)
 }
 #define ROWS_DELAY(n) rows_delay(n)
 #else

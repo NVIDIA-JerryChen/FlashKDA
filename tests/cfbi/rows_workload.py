@@ -146,12 +146,14 @@ FILLS = {
     "open": lambda rng: rng.choice([1, 2, 31, 58, 59, 60, 61, 62, 63]),               # every chunk is open (no empty one), the last positions are well covered
     "crossing": lambda rng: rng.choice([57, 58, 59, 60, 61, 62, 63]),                  # a multi-row step runs over the chunk end
     "boundary": lambda rng: rng.choice([0, 1, 62, 63]),
+    "sixty": lambda rng: 60,                                                           # every sequence of a five-row launch finishes its chunk at its fourth row and goes on
 }
+MUST_HAVE = {"mixed": [0, 1, 62, 63], "boundary": [0, 1, 62, 63], "open": [63, 62, 1], "crossing": [63]}    # positions that every draw contains at least once (when the pool is big enough)
 
 
 def draw_fills(rng, S, kind):
     fills = [FILLS[kind](rng) for _ in range(S)]
-    for i, must in enumerate([0, 1, 62, 63] if kind in ("mixed", "boundary") else ([63, 62, 1] if kind == "open" else [63])):
+    for i, must in enumerate(MUST_HAVE.get(kind, [])):
         if S > i:
             fills[i] = must
     rng.shuffle(fills)
@@ -316,3 +318,23 @@ def coverage(results):
                     c["chunk_end_rows"] += 1
                     c["rows_after_chunk_end"] += 1 if r < step.lens[n] - 1 else 0
     return c
+
+
+# ---- timing of a step ---------------------------------------------------------------------------------------------------------------------------------------
+def time_step(mod, impl, warm, step, reps):
+    """Milliseconds of ``reps`` launches of the step (CUDA events around ``mod.forward`` only; every launch starts from its own clone of the warm state), after one launch that is not timed."""
+    par = step.par
+    times = []
+    for i in range(reps + 1):
+        state = warm.clone()
+        out, out32 = outputs_like(step)
+        torch.cuda.synchronize()
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        mod.forward(step.q, step.k, step.v, step.g, step.beta, float(par["scale"]), out, par["A_log"], par["dt_bias"], float(par["lower_bound"]),
+                    state.E, state.rows, state.pos, step.cu, 1, out32, impl, step.slot_ids)
+        e1.record()
+        torch.cuda.synchronize()
+        if i:
+            times.append(e0.elapsed_time(e1))
+    return times
