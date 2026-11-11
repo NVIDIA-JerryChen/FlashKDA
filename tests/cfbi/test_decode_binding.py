@@ -9,6 +9,7 @@ headers) and shows that the check can fail. The other tests read the sources:
   documented API, and the control is no build option (no test macro);
 * the wrapper applies the control to the eligible part of the rule and nothing else.
 """
+import ast
 import re
 import subprocess
 import sys
@@ -23,7 +24,7 @@ sys.path.insert(0, str(ROOT / "benchmarks"))
 import codegen_gate as cg  # noqa: E402
 
 CSRC = ROOT / "csrc" / "cfbi"
-BINDING, LAUNCH, HEADER = CSRC / "cfbi_binding.cpp", CSRC / "cfbi_launch.cu", CSRC / "cfbi_launch.h"
+BINDING, LAUNCH, LAUNCH_H = CSRC / "cfbi_binding.cpp", CSRC / "cfbi_launch.cu", CSRC / "cfbi_launch.h"
 
 
 # ---- the binding compiles ---------------------------------------------------------------------------------------------------------------------------------
@@ -36,10 +37,9 @@ def cuda_include(nvcc):
     return None
 
 
-def syntax_check(source, cwd, fatal=False):
-    """``(exit status, output)`` of a syntax-only compile of ``source`` as the JIT build compiles the binding (the torch headers, the extension name), with the host compiler of the toolchain."""
+def syntax_check(tc, source, cwd, fatal=False):
+    """``(exit status, output)`` of a syntax-only compile of ``source`` as the JIT build compiles the binding (the torch headers, the extension name), with the host compiler of ``tc``."""
     torch_utils = pytest.importorskip("torch.utils.cpp_extension")
-    tc = cg.find_toolchain()
     include = cuda_include(tc["nvcc"])
     if include is None:
         pytest.skip("no CUDA include directory next to nvcc")
@@ -59,17 +59,16 @@ def _toolchain_or_skip():
 
 
 def test_the_binding_compiles_without_a_gpu(tmp_path):
-    _toolchain_or_skip()
-    rc, text = syntax_check(BINDING, tmp_path)
+    rc, text = syntax_check(_toolchain_or_skip(), BINDING, tmp_path)
     assert rc == 0, text[-3000:]
 
 
 def test_the_syntax_check_can_fail(tmp_path):
     """The control: the same command line rejects a binding that carries an error (a ``#error`` first, so the check stops at once)."""
-    _toolchain_or_skip()
+    tc = _toolchain_or_skip()
     broken = tmp_path / "broken.cpp"
     broken.write_text('#error planted\n' + BINDING.read_text())
-    rc, text = syntax_check(broken, tmp_path, fatal=True)
+    rc, text = syntax_check(tc, broken, tmp_path, fatal=True)
     assert rc != 0 and "planted" in text, text[-1500:]
 
 
@@ -118,15 +117,16 @@ def test_a_routed_k2_condition_that_does_not_mask_bit_64_is_caught(binding, name
     assert any(expect in p for p in routing_problems(mutate(binding, old, new))), name
 
 
-def exposure_problems(binding, launch, header):
+def exposure_problems(binding, launch, launch_h):
     probs = []
     for name in ("decode_single_launch", "decode_single_launch_policy", "decode_single_force"):
         if 'm.def("%s"' % name not in binding:
             probs.append("the binding does not expose %s" % name)
     fn = re.search(r"bool decode_single_launch_policy_py\([^)]*\) \{(.*?)\n\}", binding, re.S)
-    if fn is None or "cfbi::decode_single_launch_policy(" not in fn.group(1) or "cudaGetDevice" in fn.group(1) or "cudaDeviceGetAttribute" in fn.group(1):
+    pure = fn.group(1) if fn is not None else ""
+    if "cfbi::decode_single_launch_policy(" not in pure or "cudaGetDevice" in pure or "cudaDeviceGetAttribute" in pure:
         probs.append("the exposed policy is not the pure function (it must not read the device)")
-    if fn is not None and not all(a in fn.group(1) for a in ("sms", "cc")):
+    if fn is not None and not all(a in pure for a in ("sms", "cc")):
         probs.append("the exposed policy does not take the SM count and the compute capability")
     wrapper = re.search(r"bool decode_single_launch\(int mode, int impl, int64_t N, int64_t H, int device\) \{(.*?)\n\}", launch, re.S)
     if wrapper is None:
@@ -138,14 +138,14 @@ def exposure_problems(binding, launch, header):
             probs.append("the wrapper does not apply the eligible part first, then the control, then the device and the policy")
         if "return true" not in body[force:query]:
             probs.append("the control does not return true for an eligible call")
-    for text, name in ((launch, "cfbi_launch.cu"), (header, "cfbi_launch.h")):
+    for text, name in ((launch, "cfbi_launch.cu"), (launch_h, "cfbi_launch.h")):
         for m in re.finditer(r"#\s*(?:ifdef|ifndef|if)\b[^\n]*\bCFBI_\w*(?:FORCE|CALIBRAT)\w*", text):
             probs.append("%s: the calibration control is a build option (%s)" % (name, m.group(0).strip()))
     return probs
 
 
 def test_the_binding_exposes_the_policy_and_the_hidden_control(binding, launch):
-    assert exposure_problems(binding, launch, HEADER.read_text()) == []
+    assert exposure_problems(binding, launch, LAUNCH_H.read_text()) == []
 
 
 @pytest.mark.parametrize("which,name,old,new,expect", [
@@ -157,14 +157,13 @@ def test_the_binding_exposes_the_policy_and_the_hidden_control(binding, launch):
     ("launch", "the control after the device query", "    if (g_decode_single_force.load() != 0) return true;\n    if (device < 0", "    if (device < 0", "eligible part first"),
 ])
 def test_a_binding_without_the_pure_policy_or_the_control_in_its_place_is_caught(binding, launch, which, name, old, new, expect):
-    b, l = (mutate(binding, old, new), launch) if which == "binding" else (binding, mutate(launch, old, new))
-    assert any(expect in p for p in exposure_problems(b, l, HEADER.read_text())), name
+    texts = {"binding": binding, "launch": launch}
+    texts[which] = mutate(texts[which], old, new)
+    assert any(expect in p for p in exposure_problems(texts["binding"], texts["launch"], LAUNCH_H.read_text())), name
 
 
 def test_the_control_is_not_part_of_the_documented_api():
     """None of the hidden functions is exported by the package, and the documentation does not offer the control as an interface (the prose of ``_impl`` names the rule, the policy)."""
-    import ast
-
     init = (ROOT / "flash_kda" / "cfbi" / "__init__.py").read_text()
     exported = set()
     for node in ast.parse(init).body:
@@ -179,4 +178,4 @@ def test_the_control_is_not_part_of_the_documented_api():
 
 def test_a_control_compiled_in_by_a_macro_is_caught(binding, launch):
     planted = launch.replace("static std::atomic<int> g_decode_single_force{0};", "#ifdef CFBI_DECODE_FORCE\nstatic std::atomic<int> g_decode_single_force{0};\n#endif")
-    assert any("build option" in p for p in exposure_problems(binding, planted, HEADER.read_text()))
+    assert any("build option" in p for p in exposure_problems(binding, planted, LAUNCH_H.read_text()))

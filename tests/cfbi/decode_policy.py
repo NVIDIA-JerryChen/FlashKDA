@@ -39,7 +39,7 @@ def routed(cc, major=ROUTING_CC_MAJOR):
 
 def policy(mode, impl, N, H, sms, cc, per_sm=MAX_CTAS_PER_SM, slack=0, major=ROUTING_CC_MAJOR, blocked=IMPL_REF_ROWS | IMPL_DECODE_PLAN, modes=(1,)):
     """The specification. The keyword arguments are the knobs of the controls (a looser or tighter gate, another routing set, a missing exclusion, mode 0 allowed): the defaults are the rule."""
-    return (mode in modes and not impl & blocked and N >= 1 and H >= 1 and sms > 0 and routed(cc, major) and N * H <= per_sm * sms + slack)
+    return mode in modes and not impl & blocked and N >= 1 and H >= 1 and sms > 0 and routed(cc, major) and N * H <= per_sm * sms + slack
 
 
 def shape_matrix():
@@ -55,5 +55,5 @@ def shape_matrix():
             for mode, impl in ((0, 0), (0, 4), (1, 1), (1, 64), (1, 65), (1, 127), (1, 2), (1, 4), (1, 8), (1, 16), (1, 32), (1, 2 | 4 | 8 | 16 | 32), (1, 4 | 64)):
                 rows.append((mode, impl, 4, 12, sms, cc))
             rows += [(1, 0, 0, 12, sms, cc), (1, 0, -1, 12, sms, cc), (1, 0, 4, 0, sms, cc), (1, 0, 4, -3, sms, cc)]
-    rows += [(1, 0, 4, 12, 0, cc_number(cap)) for cap in CAPABILITIES] + [(1, 0, 4, 12, -1, cc_number(cap)) for cap in CAPABILITIES]
+    rows += [(1, 0, 4, 12, sms, cc_number(cap)) for sms in (0, -1) for cap in CAPABILITIES]
     return rows

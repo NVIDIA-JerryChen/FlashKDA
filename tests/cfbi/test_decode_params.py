@@ -12,6 +12,7 @@ constant bank, so a field appended to ``Params`` is another machine code for ker
 * control: a field added to ``Params`` (and a second pointer added to ``DecodeParams``) fails the build with the ``static_assert`` text.
 """
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -88,14 +89,15 @@ def mutate(text, old, new):
 # ---- Params ------------------------------------------------------------------------------------------------------------------------------------------------
 def params_problems(text):
     probs = []
-    names = tuple(n for t, n in struct_fields(text, "struct Params {"))
+    fields = struct_fields(text, "struct Params {")
+    names = tuple(n for t, n in fields)
     if names != FROZEN_PARAMS:
         probs.append("the fields of Params are %s, expected %s: a change of the argument block moves the arguments behind it in the kernels that take one" % (names, FROZEN_PARAMS))
     pin = re.search(r"static_assert\(sizeof\(Params\) == (\d+),", text)
     if pin is None:
         probs.append("no static_assert on sizeof(Params)")
-    elif int(pin.group(1)) != layout_size(struct_fields(text, "struct Params {")):
-        probs.append("static_assert(sizeof(Params) == %s) disagrees with the fields (%d)" % (pin.group(1), layout_size(struct_fields(text, "struct Params {"))))
+    elif int(pin.group(1)) != layout_size(fields):
+        probs.append("static_assert(sizeof(Params) == %s) disagrees with the fields (%d)" % (pin.group(1), layout_size(fields)))
     return probs
 
 
@@ -130,9 +132,8 @@ def decode_problems(common, rows, launch):
     entry = rows[rows.index("SeqPlan rows_entry("):rows.index("#ifndef CFBI_ROWS_MINB")]
     if "if constexpr (!DECODE) {\n        return p.plan[n];\n    } else {" not in entry:
         probs.append("rows_entry<false> is not the plan load behind an if constexpr (rows_entry<true> would not compile for Params)")
-    readers = [(f.name, i + 1) for f in sorted(CSRC.rglob("*")) if f.suffix in (".cu", ".cuh", ".h", ".cpp") for i, l in enumerate(strip_comments(f.read_text()).splitlines())
-               if re.search(r"\b(?:p|dp)\.(?:cu_seqlens|fixed_len)\b", l)]
-    where = {n for n, i in readers}
+    sources = [f for f in CSRC.rglob("*") if f.suffix in (".cu", ".cuh", ".h", ".cpp")]
+    where = {f.name for f in sources if re.search(r"\b(?:p|dp)\.(?:cu_seqlens|fixed_len)\b", strip_comments(f.read_text()))}
     if where - {"cfbi_rows.cuh", "cfbi_launch.cu"}:
         probs.append("the token windows of the decode arguments are read outside the row engine and the launcher: %s" % sorted(where))
     lines = strip_comments(launch).splitlines()
@@ -182,9 +183,6 @@ def _compile_header(tc, tree):
 
 def _tree_with(tmp, old=None, new=None):
     tree = Path(tempfile.mkdtemp(dir=str(tmp)))
-    (tree / "csrc").mkdir()
-    import shutil
-
     shutil.copytree(CSRC, tree / "csrc" / "cfbi")
     if old is not None:
         target = tree / "csrc" / "cfbi" / "cfbi_common.cuh"

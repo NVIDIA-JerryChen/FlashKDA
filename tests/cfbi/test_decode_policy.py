@@ -58,14 +58,18 @@ def test_the_specification_uses_the_numbers_of_the_header():
 PLAIN_CPP_BREAKERS = re.compile(r"#\s*include\s*[<\"](?:cuda|cub|cooperative_groups|nv|thrust)|__global__|__device__|__host__|__shared__|__CUDACC__|\bdim3\b|\bcuda[A-Z]\w*")
 
 
+def cuda_constructs(text):
+    """The CUDA headers, qualifiers and runtime names in ``text`` outside its comments."""
+    return PLAIN_CPP_BREAKERS.findall(re.sub(r"//[^\n]*", "", text))
+
+
 def test_the_header_is_plain_cpp():
-    text = re.sub(r"//[^\n]*", "", header_text())
-    assert PLAIN_CPP_BREAKERS.findall(text) == []
+    assert cuda_constructs(header_text()) == []
 
 
 @pytest.mark.parametrize("planted", ["#include <cuda_runtime_api.h>\n", "__host__ __device__ inline int f() { return 0; }\n", "inline cudaError_t e() { return cudaSuccess; }\n"])
 def test_a_cuda_construct_in_the_header_is_caught(planted):
-    assert PLAIN_CPP_BREAKERS.findall(re.sub(r"//[^\n]*", "", header_text() + planted))
+    assert cuda_constructs(header_text() + planted)
 
 
 def test_the_specification_on_hand_checked_points():
@@ -171,12 +175,14 @@ def need_problems(static_need, dynamic_need, figures):
     """``figures``: ``{arch: {kernel: SHARED of the machine-code dump}}`` (static shared memory plus the driver's reserve). The header's static plus dynamic need must be at least the
     compiler's static figure plus the dynamic constant on every architecture and for every instantiation; equality is not required."""
     out = []
+    need = static_need + dynamic_need
     for arch, kernels in sorted(figures.items()):
         if not kernels:
             out.append("%s: no row-engine figure" % arch)
         for key, shared in sorted(kernels.items()):
-            if static_need + dynamic_need < (shared - RESERVE) + dynamic_need:
-                out.append("%s %s: the header's need of %d B is below the compiler's static figure of %d B" % (arch, key, static_need + dynamic_need, shared - RESERVE + dynamic_need))
+            required = shared - RESERVE + dynamic_need
+            if need < required:
+                out.append("%s %s: the header's need of %d B is below the compiler's static figure of %d B" % (arch, key, need, required))
     return out
 
 

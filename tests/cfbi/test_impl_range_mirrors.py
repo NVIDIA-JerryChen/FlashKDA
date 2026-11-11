@@ -10,7 +10,6 @@ performance document, and a mirror that falls behind the header (a value that is
 """
 import math
 import re
-import sys
 from pathlib import Path
 
 import pytest
@@ -24,10 +23,6 @@ MIRRORS = {"binding": CSRC / "cfbi_binding.cpp", "api": ROOT / "flash_kda" / "cf
            "bench": ROOT / "benchmarks" / "bench_breakdown.py", "arch": ROOT / "tests" / "cfbi" / "test_arch.py", "invalid": ROOT / "tests" / "cfbi" / "test_k2_dyn.py",
            "perf": ROOT / "docs" / "20261103-cfbi-perf.md", "launch_h": CSRC / "cfbi_launch.h"}
 NOT_BITS = ("IMPL_MAX", "IMPL_ROWS_SWAP_RESERVED")
-
-
-def read_all():
-    return {name: p.read_text() for name, p in MIRRORS.items()}
 
 
 def header_ints(text):
@@ -117,12 +112,13 @@ def launch():
 
 @pytest.fixture(scope="module")
 def texts():
-    return read_all()
+    return {name: p.read_text() for name, p in MIRRORS.items()}
 
 
 def test_the_bits_of_the_header_are_assigned_once(header):
     assert bit_problems(header, csrc_sources()) == []
-    assert header_ints(header)["IMPL_DECODE_PLAN"] == 64 and header_ints(header)["IMPL_MAX"] == 127 and header_ints(header)["IMPL_ROWS_SWAP_RESERVED"] == 128
+    consts = header_ints(header)
+    assert consts["IMPL_DECODE_PLAN"] == 64 and consts["IMPL_MAX"] == 127 and consts["IMPL_ROWS_SWAP_RESERVED"] == 128
 
 
 def mutate(text, old, new):
@@ -174,9 +170,9 @@ def test_a_mirror_that_falls_behind_the_header_is_caught(header, launch, texts, 
     assert any(expect in p for p in mirror_problems(header, launch, mutated)), where
 
 
-def test_the_report_names_the_bits_that_resolve_impl_can_return(header, launch):
+def test_the_report_names_the_bits_that_resolve_impl_can_return(header, launch, texts):
     """A bit that ``resolve_impl`` starts to let through is a bit that the report must name: the mask is read from the source."""
     widened = mutate(launch, "IMPL_K2_DYN | IMPL_DECODE_PLAN);", "IMPL_K2_DYN | IMPL_DECODE_PLAN | IMPL_K2_OLD);")
     assert resolvable_bits(header, widened) == [1, 2, 4, 8, 16, 32, 64]
-    probs = mirror_problems(header, widened, read_all())
+    probs = mirror_problems(header, widened, texts)
     assert any("does not name bit 32" in p for p in probs), probs

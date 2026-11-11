@@ -115,6 +115,8 @@ def test_a_single_launch_allocates_no_plan_buffer(ext, forced):
     two()                                                                    # warm: attribute set-up and the first-call checks are behind us
     assert dict(kernel_counts(one, warm=False)) == {"rows_kernel<true>": 1}
     assert dict(kernel_counts(two, warm=False)) == {"plan_kernel": 1, "rows_kernel<false>": 1}
+    assert dict(launched(one, warm=False)) == {"rows_kernel": 1}                           # the helper of the K2 tests (template arguments stripped): one kernel, no plan kernel
+    assert dict(launched(two, warm=False)) == {"plan_kernel": 1, "rows_kernel": 1}
     assert (allocations(two), allocations(one)) == (1, 0), "the plan buffer is the one allocation that the single launch saves"
 
 
