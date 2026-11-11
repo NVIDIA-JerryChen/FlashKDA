@@ -1959,6 +1959,97 @@ def test_suite_record_merge_command_line():
     assert sr.main(["--complete", out] + common) == 0 and sr.main(["--complete", parts[0]] + common) == 1      # the part without the sanitizer file is not the suite
 
 
+# ---- suite record: totals, counts, lists, metadata and the selection contract are validated, and a baseline is only compared with a comparable run ------
+
+def mutated(rec, edit):
+    """A deep copy of ``rec`` after ``edit(copy)``."""
+    out = json.loads(json.dumps(rec))
+    edit(out)
+    return out
+
+
+def merged_suite_record():
+    main_part = merge_part(["test_a", "test_b[1]"], ignored=[SAN_FILE])
+    san = merge_part(["test_san[memcheck]", "test_san[initcheck]"], cls="tests.cfbi.test_k2_dyn_sanitizer", host="node8")
+    files = ["tests/cfbi/test_x.py", SAN_FILE]
+    ids = ["tests/cfbi/test_x.py::test_a", "tests/cfbi/test_x.py::test_b[1]", SAN_FILE + "::test_san[memcheck]", SAN_FILE + "::test_san[initcheck]"]
+    return sr.merge_records([main_part, san], [{"file": "a.json", "sha256": "1" * 64}, {"file": "b.json", "sha256": "2" * 64}], "full suite", files, ids, "tree + collection")
+
+
+@pytest.mark.parametrize("name,edit,expected", [
+    ("a total that is not the sum of the files", lambda r: r["totals"].update(passed=r["totals"]["passed"] + 1), "totals do not match"),
+    ("no totals", lambda r: r.pop("totals"), "malformed totals"),
+    ("a total that is a boolean", lambda r: r["totals"].update(failed=True), "malformed totals"),
+    ("a negative total", lambda r: r["totals"].update(skipped=-1), "malformed totals"),
+    ("an extra total", lambda r: r["totals"].update(extra=0), "malformed totals"),
+    ("a file count that is a boolean", lambda r: r["files"]["tests/cfbi/test_vs_ref.py"].update(passed=True), "malformed counts"),
+    ("a negative file count", lambda r: r["files"]["tests/cfbi/test_arch.py"].update(failed=-1, passed=3), "malformed counts"),
+    ("a fractional file count", lambda r: r["files"]["tests/cfbi/test_arch.py"].update(passed=2.0), "malformed counts"),
+    ("a failed id twice", lambda r: r["failed"].append(r["failed"][0]), "malformed list of failed tests"),
+    ("a failed list of the wrong length", lambda r: (r.pop("tests"), r["failed"].pop()), "the list of failed tests has 1 entries, the totals say 2"),
+    ("a skipped entry without reason", lambda r: r["skipped"][0].pop("reason"), "malformed list of skipped tests"),
+    ("a skipped id that is not a string", lambda r: r["skipped"][0].update(id=3), "malformed list of skipped tests"),
+    ("a skipped list of the wrong length", lambda r: r["skipped"].append({"id": "tests/cfbi/test_arch.py::test_a", "reason": ""}), "the totals say 1"),
+    ("a skipped id twice", lambda r: r["skipped"].append(dict(r["skipped"][0])), "holds an id twice"),
+    ("a skipped list that names a passed test", lambda r: r["skipped"][0].update(id="tests/cfbi/test_arch.py::test_a"), "skipped list"),
+])
+def test_suite_record_totals_counts_and_lists_are_validated(name, edit, expected):
+    rec = suite_record_of(JUNIT)
+    assert sr.structure_problems(rec) == []
+    assert any(expected in p for p in sr.structure_problems(mutated(rec, edit))), name
+
+
+@pytest.mark.parametrize("field,value", [("commit", "abc"), ("commit", "G" * 40), ("commit", "ABCDEF1234"), ("commit", 1234567), ("dirty", "False"), ("dirty", 0), ("gpu", ""), ("gpu", 7),
+                                         ("sm_count", True), ("sm_count", 0), ("sm_count", "148"), ("sm_count", 148.0), ("suite", "X"), ("env", ["CFBI_BIG=1"]), ("env", {"CFBI_BIG": 1}),
+                                         ("ignored", "tests/cfbi/x.py"), ("subset", "yes"), ("kind", "other"), ("tree", 3), ("torch", 2.14), ("hosts", "node7")])
+def test_suite_record_metadata_types_are_validated(field, value):
+    base = suite_record_of(JUNIT)
+    assert sr.structure_problems(base) == []
+    bad = mutated(base, lambda r: r["meta"].update({field: value}))
+    assert any("metadata field %r" % field in p for p in sr.structure_problems(bad)), (field, value)
+    for field_ok in ("tree", "env", "ignored", "subset", "kind", "torch"):          # a field that a record leaves out or leaves None is not a type error
+        assert sr.structure_problems(mutated(base, lambda r: r["meta"].update({field_ok: None}))) == []
+
+
+def test_suite_record_selection_contract_is_validated():
+    single = suite_record_of(JUNIT, ignored=["tests/cfbi/test_unrun.py"], subset=True, kind="single")
+    assert sr.structure_problems(single) == []
+    assert any("must say it is a subset" in p for p in sr.structure_problems(mutated(single, lambda r: r["meta"].update(subset=False))))       # ignoring files makes a subset
+    assert any("must say it is a subset" in p for p in sr.structure_problems(mutated(single, lambda r: r["meta"].pop("subset"))))
+    assert any("ignored and has results" in p for p in sr.structure_problems(mutated(single, lambda r: r["meta"].update(ignored=["tests/cfbi/test_arch.py"]))))
+    merged = merged_suite_record()
+    assert sr.structure_problems(merged) == []
+    for name, edit, expected in (
+            ("a merge that says it is a subset", lambda r: r["meta"].update(subset=True), "a merge is not a subset"),
+            ("a merge that ignores a file", lambda r: r["meta"].update(ignored=["tests/cfbi/test_unrun.py"]), "a merge ignores nothing"),
+            ("a merge without parts", lambda r: r["meta"].pop("parts"), "at least two parts"),
+            ("a merge of one part", lambda r: r["meta"].update(parts=r["meta"]["parts"][:1]), "at least two parts"),
+            ("parts that do not hold the tests of the record", lambda r: r["meta"]["parts"][0].update(tests=r["meta"]["parts"][0]["tests"] + 1), "the parts hold"),
+            ("a part without a hash", lambda r: r["meta"]["parts"][1].pop("sha256"), "has no sha256"),
+            ("an expected file count that is not the record's", lambda r: r["meta"]["expected"].update(files=r["meta"]["expected"]["files"] + 1), "expected files"),
+            ("an expected test count that is not the record's", lambda r: r["meta"]["expected"].update(tests=r["meta"]["expected"]["tests"] - 1), "expected tests")):
+        assert any(expected in p for p in sr.structure_problems(mutated(merged, edit))), name
+
+
+def test_suite_record_check_needs_a_comparable_run():
+    clean = JUNIT.replace('<failure message="boom">trace</failure>', "").replace('<error message="setup failed">trace</error>', "")
+    meta = {"python": "3.12.3", "torch": "2.14.0", "cuda": "13.4", "env": {"CFBI_BIG": "1"}}
+    base = suite_record_of(clean, **meta)
+    assert sr.check(base, suite_record_of(clean, **meta)) == []
+    for name, other, expected in (
+            ("another device", {"gpu": "NVIDIA B300 SXM6 AC"}, "not comparable: gpu"),
+            ("another SM count", {"sm_count": 160}, "not comparable: sm_count"),
+            ("another environment", {"env": {"CFBI_BIG": "0"}}, "not comparable: env"),
+            ("no environment", {"env": {}}, "not comparable: env"),
+            ("another torch", {"torch": "2.15.0"}, "not comparable: torch"),
+            ("another CUDA", {"cuda": "13.1"}, "not comparable: cuda"),
+            ("no python version", {"python": None}, "only one of the records says which python"),
+            ("a dirty candidate", {"dirty": True}, "candidate was run on a dirty tree")):
+        assert any(expected in p for p in sr.check(base, suite_record_of(clean, **dict(meta, **other)))), name
+    assert any("baseline was run on a dirty tree" in p for p in sr.check(suite_record_of(clean, **dict(meta, dirty=True)), suite_record_of(clean, **meta)))
+    assert sr.check(base, suite_record_of(clean, **dict(meta, host="other-node", label="x"))) == []                           # the host and the label do not matter
+
+
 # ---- the layer-chain graph benchmark: cells, node lists and the zero-free step (the measurement needs a GPU) -------------------------------------
 
 CHAIN_COUNTS = {"void cfbi::lin::linear_kernel<128, 2>(cfbi::lin::Args)": 6.0, "void cfbi::conv::conv_kernel<4>(cfbi::conv::Args)": 3.0,

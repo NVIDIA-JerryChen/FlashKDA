@@ -38,6 +38,10 @@ SCHEMA = "cfbi-suite-v1"
 COUNTS = ("passed", "failed", "skipped", "errors", "total")
 OUTCOMES = ("passed", "failed", "errors", "skipped")
 MERGE_SAME = ("suite", "commit", "dirty", "tree", "gpu", "sm_count", "env", "python", "torch", "cuda")   # what the parts of a merge must agree on
+SUITES = ("gate", "S", "Sd")
+KINDS = ("single", "merge")
+COMMIT_PATTERN = re.compile(r"^[0-9a-f]{7,40}$")   # a commit hash or an abbreviation of at least seven lowercase hexadecimal characters
+TOOLCHAIN = ("python", "torch", "cuda")            # versions that a baseline and the run compared with it must share
 
 
 def classname_to_file(classname):
@@ -100,6 +104,83 @@ def build_record(parsed, meta):
     return {"schema": SCHEMA, "meta": meta, "files": parsed["files"], "tests": parsed["tests"], "totals": totals, "failed": parsed["failed"], "skipped": parsed["skipped"]}
 
 
+def _count_ok(x):
+    return type(x) is int and x >= 0          # a boolean is not a count
+
+
+def _str_list(x):
+    return isinstance(x, list) and all(isinstance(e, str) for e in x)
+
+
+def metadata_problems(meta):
+    """Types and values of the metadata of a suite record (a field that is left out or None is only a problem for the required ones)."""
+    problems = []
+    for field in ("suite", "commit", "dirty", "gpu", "sm_count"):
+        if meta.get(field) is None:
+            problems.append("metadata field %r is missing" % field)
+    suite, commit, dirty, gpu, sms = (meta.get(f) for f in ("suite", "commit", "dirty", "gpu", "sm_count"))
+    if suite is not None and suite not in SUITES:
+        problems.append("metadata field 'suite' must be one of %s, got %r" % ("/".join(SUITES), suite))
+    if commit is not None and not (isinstance(commit, str) and COMMIT_PATTERN.match(commit)):
+        problems.append("metadata field 'commit' must be a lowercase hexadecimal commit hash of at least 7 characters, got %r" % (commit,))
+    if dirty is not None and type(dirty) is not bool:
+        problems.append("metadata field 'dirty' must be a boolean, got %r" % (dirty,))
+    if gpu is not None and not (isinstance(gpu, str) and gpu.strip()):
+        problems.append("metadata field 'gpu' must be a non-empty string, got %r" % (gpu,))
+    if sms is not None and not (type(sms) is int and sms > 0):
+        problems.append("metadata field 'sm_count' must be a positive integer, got %r" % (sms,))
+    for field in ("tree", "host", "label", "junit") + TOOLCHAIN:
+        if meta.get(field) is not None and not isinstance(meta[field], str):
+            problems.append("metadata field %r must be a string, got %r" % (field, meta[field]))
+    env = meta.get("env")
+    if env is not None and not (isinstance(env, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in env.items())):
+        problems.append("metadata field 'env' must map names to strings, got %r" % (env,))
+    for field in ("ignored", "hosts"):
+        if meta.get(field) is not None and not _str_list(meta[field]):
+            problems.append("metadata field %r must be a list of strings, got %r" % (field, meta[field]))
+    if meta.get("subset") is not None and type(meta["subset"]) is not bool:
+        problems.append("metadata field 'subset' must be a boolean, got %r" % (meta["subset"],))
+    if meta.get("kind") is not None and meta["kind"] not in KINDS:
+        problems.append("metadata field 'kind' must be one of %s, got %r" % ("/".join(KINDS), meta["kind"]))
+    return problems
+
+
+def selection_problems(rec):
+    """The selection contract of a record: which files its run left out (``ignored``), whether it says so (``subset``), and what a merge is made of."""
+    meta, files = rec.get("meta") or {}, rec.get("files")
+    ignored = meta.get("ignored") if _str_list(meta.get("ignored")) else []
+    problems = []
+    if meta.get("kind") == "merge":
+        if meta.get("subset") is not False:
+            problems.append("a merge is not a subset record (subset must be false)")
+        if ignored:
+            problems.append("a merge ignores nothing, this one ignores %s" % ", ".join(ignored))
+        parts = meta.get("parts")
+        if not isinstance(parts, list) or len(parts) < 2 or any(not isinstance(p, dict) for p in parts):
+            problems.append("a merge names at least two parts")
+        else:
+            for i, p in enumerate(parts):
+                h = p.get("sha256")
+                if not (isinstance(h, str) and re.match(r"^[0-9a-f]{64}$", h)):
+                    problems.append("part %d has no sha256 of its record" % i)
+            counts = [p.get("tests") for p in parts]
+            if all(_count_ok(c) for c in counts) and isinstance(rec.get("tests"), dict) and sum(counts) != len(rec["tests"]):
+                problems.append("the parts hold %d tests, the record %d" % (sum(counts), len(rec["tests"])))
+        expected = meta.get("expected")
+        if isinstance(expected, dict):
+            if _count_ok(expected.get("files")) and isinstance(files, dict) and expected["files"] != len(files):
+                problems.append("the record expected files %d but holds %d" % (expected["files"], len(files)))
+            if _count_ok(expected.get("tests")) and isinstance(rec.get("tests"), dict) and expected["tests"] != len(rec["tests"]):
+                problems.append("the record expected tests %d but holds %d" % (expected["tests"], len(rec["tests"])))
+    elif ignored and meta.get("subset") is not True:
+        problems.append("a record that ignores files must say it is a subset (subset: true)")
+    if isinstance(files, dict):
+        for f in ignored:
+            if f in files:
+                problems.append("the file %s is ignored and has results" % f)
+    return problems
+
+
 def structure_problems(rec):
     if not isinstance(rec, dict) or rec.get("schema") != SCHEMA:
         return ["not a %s record" % SCHEMA]
@@ -107,18 +188,46 @@ def structure_problems(rec):
     if not isinstance(rec.get("meta"), dict):
         problems.append("no metadata")
     else:
-        for field in ("suite", "commit", "dirty", "gpu", "sm_count"):
-            if rec["meta"].get(field) is None:
-                problems.append("metadata field %r is missing" % field)
+        problems.extend(metadata_problems(rec["meta"]))
     files = rec.get("files")
-    if not isinstance(files, dict) or not files:
+    files_ok = isinstance(files, dict) and bool(files)
+    if not files_ok:
         problems.append("no files")
     else:
         for f, c in files.items():
-            if not isinstance(c, dict) or any(not isinstance(c.get(k), int) for k in COUNTS):
-                problems.append("file %s: malformed counts" % f)
+            if not isinstance(c, dict) or any(not _count_ok(c.get(k)) for k in COUNTS):
+                problems.append("file %s: malformed counts (non-negative integers expected)" % f)
+                files_ok = False
             elif c["passed"] + c["failed"] + c["skipped"] + c["errors"] != c["total"]:
                 problems.append("file %s: the counts do not add up" % f)
+    totals = rec.get("totals")
+    if not isinstance(totals, dict) or sorted(totals) != sorted(COUNTS) or any(not _count_ok(v) for v in totals.values()):
+        problems.append("malformed totals (the counts %s as non-negative integers expected)" % ", ".join(COUNTS))
+        totals = None
+    elif files_ok and totals != dict((k, sum(c[k] for c in files.values())) for k in COUNTS):
+        problems.append("the totals do not match the per-file counts")
+    failed = rec.get("failed")
+    if not _str_list(failed) or len(set(failed)) != len(failed):
+        problems.append("malformed list of failed tests (unique ids expected)")
+    elif totals is not None and len(failed) != totals["failed"] + totals["errors"]:
+        problems.append("the list of failed tests has %d entries, the totals say %d" % (len(failed), totals["failed"] + totals["errors"]))
+    skipped = rec.get("skipped")
+    skipped_ids = None
+    if not isinstance(skipped, list) or any(not (isinstance(e, dict) and isinstance(e.get("id"), str) and isinstance(e.get("reason"), str)) for e in skipped):
+        problems.append("malformed list of skipped tests (an id and a reason each)")
+    else:
+        skipped_ids = [e["id"] for e in skipped]
+        if len(set(skipped_ids)) != len(skipped_ids):
+            problems.append("the list of skipped tests holds an id twice")
+        elif totals is not None and len(skipped_ids) != totals["skipped"]:
+            problems.append("the list of skipped tests has %d entries, the totals say %d" % (len(skipped_ids), totals["skipped"]))
+        if files_ok:
+            per_file = {}
+            for tid in skipped_ids:
+                per_file[tid.split("::", 1)[0]] = per_file.get(tid.split("::", 1)[0], 0) + 1
+            for f in sorted(set(per_file) | set(files)):
+                if per_file.get(f, 0) != files.get(f, {}).get("skipped", 0):
+                    problems.append("file %s: the skipped list has %d entries, the counts say %d" % (f, per_file.get(f, 0), files.get(f, {}).get("skipped", 0)))
     tests = rec.get("tests")
     if tests is not None:                                    # per-test outcomes must say what the per-file counts say
         if not isinstance(tests, dict) or any(v not in OUTCOMES for v in tests.values()):
@@ -131,8 +240,35 @@ def structure_problems(rec):
                 c["total"] += 1
             if derived != files:
                 problems.append("the per-file counts do not match the per-test outcomes")
-            if sorted(rec.get("failed") or []) != sorted(t for t, o in tests.items() if o in ("failed", "errors")):
+            if _str_list(failed) and sorted(failed) != sorted(t for t, o in tests.items() if o in ("failed", "errors")):
                 problems.append("the list of failed tests does not match the per-test outcomes")
+            if skipped_ids is not None and sorted(skipped_ids) != sorted(t for t, o in tests.items() if o == "skipped"):
+                problems.append("the skipped list does not match the per-test outcomes")
+    if isinstance(rec.get("meta"), dict):
+        problems.extend(selection_problems(rec))
+    return problems
+
+
+def comparability_problems(baseline, candidate):
+    """Why two structurally valid records are not runs of the same suite on the same device with the same toolchain and environment (empty: comparable)."""
+    b, c = baseline["meta"], candidate["meta"]
+    problems = []
+    if b["suite"] != c["suite"]:
+        problems.append("the records are of different suites (%s, %s)" % (b["suite"], c["suite"]))
+    for name, m in (("baseline", b), ("candidate", c)):
+        if m["dirty"] is not False:
+            problems.append("the %s was run on a dirty tree" % name)
+    for field in ("gpu", "sm_count"):
+        if b[field] != c[field]:
+            problems.append("the records are not comparable: %s %r against %r" % (field, b[field], c[field]))
+    if (b.get("env") or {}) != (c.get("env") or {}):
+        problems.append("the records are not comparable: env %r against %r" % (b.get("env") or {}, c.get("env") or {}))
+    for field in TOOLCHAIN:
+        bv, cv = b.get(field), c.get(field)
+        if (bv is None) != (cv is None):
+            problems.append("only one of the records says which %s it ran with (%r, %r)" % (field, bv, cv))
+        elif bv != cv:
+            problems.append("the records are not comparable: %s %r against %r" % (field, bv, cv))
     return problems
 
 
@@ -141,8 +277,7 @@ def check(baseline, candidate, allowed_failures=()):
     problems = ["baseline: %s" % p for p in structure_problems(baseline)] + ["candidate: %s" % p for p in structure_problems(candidate)]
     if problems:
         return problems
-    if baseline["meta"]["suite"] != candidate["meta"]["suite"]:
-        problems.append("the records are of different suites (%s, %s)" % (baseline["meta"]["suite"], candidate["meta"]["suite"]))
+    problems.extend(comparability_problems(baseline, candidate))
     for f, c in sorted(baseline["files"].items()):
         got = candidate["files"].get(f)
         if got is None:
