@@ -81,3 +81,30 @@ def require_impl(ext, impl):
     if impl & 16 and not ext.resolve_impl(impl, -1) & 16:
         import pytest
         pytest.skip("the device-scheduled K2 does not run on this device (impl bit 16 is dropped)")
+
+
+ROWS_OPTIMISED = "cfbi::rows_kernel"
+ROWS_REFERENCE = "cfbi::ref::rows_kernel"
+WAVES = 2.5                    # the decode families run on grids of at least this many times the CTAs that are resident at once
+
+
+def rows_instance(ext, name=ROWS_OPTIMISED):
+    """The occupancy record of one instantiation of the row engine from the hidden binding (``ext.rows_occupancy()``) and the device figures that go with it."""
+    occ = ext.rows_occupancy()
+    return next(i for i in occ["instances"] if i["name"] == name), occ["device"]
+
+
+def resident_ctas(ext, name=ROWS_OPTIMISED):
+    """CTAs of the row engine that are resident at once: SMs times the CTAs per SM that the occupancy API reports for the launch configuration in use (never a constant)."""
+    inst, dev = rows_instance(ext, name)
+    return dev["sm_count"] * inst["ctas_per_sm"]
+
+
+def sequences_beyond_waves(capacity, heads, waves=WAVES):
+    """The smallest number of sequences whose decode grid (one CTA per sequence and head) holds at least ``waves`` times ``capacity`` CTAs."""
+    return max(1, -(-int(math.ceil(waves * capacity)) // heads))
+
+
+def decode_sequences(ext, heads, waves=WAVES):
+    """The number of sequences of a decode call beyond ``waves`` resident waves on this device."""
+    return sequences_beyond_waves(resident_ctas(ext), heads, waves)

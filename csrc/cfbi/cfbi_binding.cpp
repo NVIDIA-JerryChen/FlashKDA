@@ -124,6 +124,57 @@ torch::Tensor rows_profile_read_py() {
     return t;
 }
 
+// Hidden test hook (not part of the documented API): the occupancy API's CTAs per SM for the launch configuration in use of every instantiation of the row engine on the current
+// device ("instances"), with the device figures an arithmetic cross-check needs ("device").
+py::dict rows_occupancy_py() {
+    cfbi::RowsDevice dev;
+    int err = cfbi::rows_occupancy_device(&dev);
+    TORCH_CHECK(err == 0, "rows_occupancy: device attributes: ", cudaGetErrorString((cudaError_t)err));
+    py::dict device;
+    device["sm_count"] = dev.sm_count;
+    device["regs_per_sm"] = dev.regs_per_sm;
+    device["smem_per_sm"] = dev.smem_per_sm;
+    device["smem_reserved_per_block"] = dev.smem_reserved_per_block;
+    device["max_threads_per_sm"] = dev.max_threads_per_sm;
+    py::list instances;
+    for (int i = 0; i < cfbi::rows_occupancy_count(); ++i) {
+        cfbi::RowsOccupancy r;
+        err = cfbi::rows_occupancy(i, &r);
+        TORCH_CHECK(err == 0, "rows_occupancy: instance ", i, ": ", cudaGetErrorString((cudaError_t)err));
+        py::dict d;
+        d["name"] = std::string(r.name);
+        d["threads"] = r.threads;
+        d["static_smem"] = r.static_smem;
+        d["dynamic_smem"] = r.dynamic_smem;
+        d["registers"] = r.registers;
+        d["ctas_per_sm"] = r.ctas_per_sm;
+        instances.append(d);
+    }
+    py::dict out;
+    out["device"] = device;
+    out["instances"] = instances;
+    return out;
+}
+
+// Hidden test hooks of the row-engine variants (see cfbi_launch.h): they raise in a build that was not compiled with the matching macro.
+void rows_test_check(int err, const char* what) {
+    TORCH_CHECK(err != (int)cudaErrorNotSupported, what, ": this build was not compiled with the macro of the variant (a test of a variant must run on the variant's build)");
+    TORCH_CHECK(err == 0, what, ": ", cudaGetErrorString((cudaError_t)err));
+}
+void rows_test_delay_config_py(int64_t ns, int warp, int cta_mod, int cta_rem, int64_t sites) {
+    TORCH_CHECK(ns >= 0 && ns <= 1000000 && sites >= 0 && sites < 256 && cta_mod >= 0 && warp >= -1 && warp < 8, "rows_test_delay_config: argument out of range");
+    rows_test_check(cfbi::rows_test_delay_config((unsigned)ns, warp, cta_mod, cta_rem, (unsigned)sites), "rows_test_delay_config");
+}
+int64_t rows_test_delay_hits_py() {
+    unsigned long long hits = 0;
+    rows_test_check(cfbi::rows_test_delay_hits(&hits), "rows_test_delay_hits");
+    return (int64_t)hits;
+}
+void rows_test_pos_offset_py(int64_t offset) {
+    TORCH_CHECK(offset >= INT32_MIN && offset <= INT32_MAX, "rows_test_pos_offset: offset out of range");
+    rows_test_check(cfbi::rows_test_pos_offset((int)offset), "rows_test_pos_offset");
+}
+
 // One entry point for prefill, the training forward and decode.
 //   q,k,v,g: bf16 [B,T,H,128]; beta: bf16 [B,T,H] (raw logits); out: bf16 [B,T,H,128] (written in place).
 //   State (E fp32 [N,H,128,128], rows fp32 [N,H,5,64,128], pos int32 [N]) is all-or-none: given => prefill/decode
@@ -321,6 +372,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "run the plan kernel and the K2 schedule builder (tests): fills `plan` (workspace_sizes(...)[1] ints); sms 0 = this device's SM count",
           py::arg("plan"), py::arg("H"), py::arg("N"), py::arg("fixed_len"), py::arg("cu_seqlens") = py::none(), py::arg("pos") = py::none(),
           py::arg("slot_ids") = py::none(), py::arg("sms") = 0, py::arg("k2_bv") = 0);
+    m.def("rows_occupancy", &rows_occupancy_py, "hidden: CTAs per SM from the occupancy API for every instantiation of the row engine on the current device (not part of the documented API)");
+    m.def("rows_test_delay_config", &rows_test_delay_config_py, "hidden (CFBI_ROWS_DELAY_NS builds): ns of a delay (0: compiled default), sleeping warp (-1: all), sleeping CTAs (cta % cta_mod == cta_rem, 0: all), site bit mask",
+          py::arg("ns"), py::arg("warp"), py::arg("cta_mod"), py::arg("cta_rem"), py::arg("sites"));
+    m.def("rows_test_delay_hits", &rows_test_delay_hits_py, "hidden (CFBI_ROWS_DELAY_NS builds): warps that slept since rows_test_delay_config");
+    m.def("rows_test_pos_offset", &rows_test_pos_offset_py, "hidden (CFBI_ROWS_TEST_POS_OOB builds): offset added to the slot of the fused position store", py::arg("offset"));
     m.def("rows_profile_read", &rows_profile_read_py, "row-engine profile stamps [row position, CTA, stamp] (profile build only)");
     m.def("rows_profile_clear", &cfbi::rows_profile_clear, "reset the row-engine profile buffer (profile build only)");
     m.def("dyn_start_log", &dyn_start_log, "(start ns, SM, [count]) of the first n CTAs of the last device-scheduled K2 (start-order probe build only)", py::arg("n"));

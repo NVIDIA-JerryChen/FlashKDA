@@ -191,6 +191,33 @@ void launch_probe_k2_schedule(const K2SchedProbeArgs& a, cudaStream_t stream);
 // launch of a build compiled with CFBI_DYN_TEST_START_LOG into the host arrays and returns n; any other build has no log and returns 0.
 int k2_dyn_test_log(unsigned long long* times, unsigned* smids, int n);
 
+// Hidden test hook (not part of the documented API): what the occupancy API reports for the launch configuration in use of every instantiation of the row engine on the current
+// device, and the device figures that an arithmetic cross-check needs. The grid sizing of the decode tests, the budget table and the resource gate use it. Every function returns
+// 0 or the CUDA error of the call that failed.
+struct RowsDevice {
+    int sm_count, regs_per_sm, smem_per_sm, smem_reserved_per_block, max_threads_per_sm;
+};
+struct RowsOccupancy {
+    const char* name;   // the kernel as the dumps and the ledgers name it
+    int threads;        // threads per CTA of the launch
+    int static_smem;    // bytes of static shared memory
+    int dynamic_smem;   // bytes of dynamic shared memory of the launch
+    int registers;      // registers per thread
+    int ctas_per_sm;    // cudaOccupancyMaxActiveBlocksPerMultiprocessor
+};
+int rows_occupancy_device(RowsDevice* out);
+int rows_occupancy_count();
+int rows_occupancy(int index, RowsOccupancy* out);
+
+// Row-engine test variants (cfbi_rows.cuh; tests only). rows_test_delay_config sets the delay hook of a build compiled with CFBI_ROWS_DELAY_NS: the length ``ns`` of a delay (0: the
+// compiled default), the ``warp`` that sleeps (-1: every warp), the CTAs that sleep (cta % cta_mod == cta_rem with cta = sequence * H + head; cta_mod 0: every CTA) and the delay
+// sites (bit n: site n; site 0 is the kernel entry, site n of 1 .. 7 is the barrier n of a row), and zeroes the hit counter; rows_test_delay_hits reads the counter (the number of warps
+// that slept since the configuration); rows_test_pos_offset sets the offset of the out-of-bounds control compiled with CFBI_ROWS_TEST_POS_OOB. Every function returns 0, the CUDA
+// error of the call that failed, or cudaErrorNotSupported in a build without the matching macro.
+int rows_test_delay_config(unsigned ns, int warp, int cta_mod, int cta_rem, unsigned sites);
+int rows_test_delay_hits(unsigned long long* hits);
+int rows_test_pos_offset(int offset);
+
 // Row-engine profile (cfbi_rows.cuh): the dimensions [row position][CTA][stamp] of the device buffer of a build compiled with CFBI_ROWS_PROFILE (all zero in any other
 // build), a copy of its first ``count`` unsigned words to the host (returns the number copied, 0 without a profile build) and a reset to zero.
 void rows_profile_dims(int* positions, int* ctas, int* stamps);

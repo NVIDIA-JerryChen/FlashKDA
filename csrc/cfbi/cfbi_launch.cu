@@ -15,6 +15,9 @@ namespace cfbi {
 
 int version() { return 1; }
 
+// Dynamic shared memory of the row-engine launch: the launch sites and the occupancy hook below read the same constant.
+constexpr size_t ROWS_DYNAMIC_SMEM = 0;
+
 // The tcgen05 (UMMA) K2: one CTA per (64 value columns, sequence, head); needs K1<16>'s workspace (16-column UT slices).
 static void launch_k2_umma(const Params& p, const ForwardArgs& a, cudaStream_t stream) {
     cudaFuncSetAttribute(k2u_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, KU_SMEM_BYTES);
@@ -223,8 +226,8 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
     if (run_k1) plan_kernel<<<1, PLAN_THREADS, 0, stream>>>(a.cu_seqlens, a.fixed_len, a.pos, a.slot_ids, a.N, mode == 1 ? 1 : 0, p.plan);
     if (run_k1 && run_k2 && a.E != nullptr) {
         // head rows (finishing the open chunk) or, in mode 1, every row
-        if (a.impl & IMPL_REF_ROWS) ref::rows_kernel<<<dim3(a.N, a.H), NTHREADS, 0, stream>>>(p);
-        else rows_kernel<<<dim3(a.N, a.H), NTHREADS, 0, stream>>>(p);
+        if (a.impl & IMPL_REF_ROWS) ref::rows_kernel<<<dim3(a.N, a.H), NTHREADS, ROWS_DYNAMIC_SMEM, stream>>>(p);
+        else rows_kernel<<<dim3(a.N, a.H), NTHREADS, ROWS_DYNAMIC_SMEM, stream>>>(p);
     }
     if (mode == 0) {
         const int64_t max_chunks = (a.T_total + BT - 1) / BT + a.N;   // upper bound; extra CTAs exit at once
@@ -260,6 +263,88 @@ void launch_probe_k2_schedule(const K2SchedProbeArgs& a, cudaStream_t stream) {
     SeqPlan* plan = reinterpret_cast<SeqPlan*>(a.plan);
     plan_kernel<<<1, PLAN_THREADS, 0, stream>>>(a.cu_seqlens, a.fixed_len, a.pos, a.slot_ids, a.N, 0, plan);
     k2_sched_build(plan, a.N, a.H, sms, a.k2_bv, a.cu_seqlens == nullptr, stream);
+}
+
+// ---- hidden occupancy hook (see cfbi_launch.h): every instantiation of the row engine that a launch can use --------------------------------------------------------------
+namespace {
+struct RowsInstance {
+    const char* name;
+    const void* fn;
+};
+const RowsInstance kRowsInstances[] = {{"cfbi::rows_kernel", reinterpret_cast<const void*>(&rows_kernel)}, {"cfbi::ref::rows_kernel", reinterpret_cast<const void*>(&ref::rows_kernel)}};
+}  // namespace
+
+int rows_occupancy_device(RowsDevice* out) {
+    int dev = 0;
+    cudaError_t e = cudaGetDevice(&dev);
+    if (e != cudaSuccess) return (int)e;
+    const struct { cudaDeviceAttr attr; int* dst; } wanted[] = {
+        {cudaDevAttrMultiProcessorCount, &out->sm_count}, {cudaDevAttrMaxRegistersPerMultiprocessor, &out->regs_per_sm},
+        {cudaDevAttrMaxSharedMemoryPerMultiprocessor, &out->smem_per_sm}, {cudaDevAttrReservedSharedMemoryPerBlock, &out->smem_reserved_per_block},
+        {cudaDevAttrMaxThreadsPerMultiProcessor, &out->max_threads_per_sm}};
+    for (const auto& w : wanted) {
+        e = cudaDeviceGetAttribute(w.dst, w.attr, dev);
+        if (e != cudaSuccess) return (int)e;
+    }
+    return 0;
+}
+
+int rows_occupancy_count() { return (int)(sizeof(kRowsInstances) / sizeof(kRowsInstances[0])); }
+
+int rows_occupancy(int index, RowsOccupancy* out) {
+    if (index < 0 || index >= rows_occupancy_count() || out == nullptr) return (int)cudaErrorInvalidValue;
+    const RowsInstance& r = kRowsInstances[index];
+    cudaFuncAttributes attr;
+    cudaError_t e = cudaFuncGetAttributes(&attr, r.fn);
+    if (e != cudaSuccess) return (int)e;
+    int blocks = 0;
+    e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, r.fn, NTHREADS, ROWS_DYNAMIC_SMEM);
+    if (e != cudaSuccess) return (int)e;
+    out->name = r.name;
+    out->threads = NTHREADS;
+    out->static_smem = (int)attr.sharedSizeBytes;
+    out->dynamic_smem = (int)ROWS_DYNAMIC_SMEM;
+    out->registers = attr.numRegs;
+    out->ctas_per_sm = blocks;
+    return 0;
+}
+
+// ---- row-engine test variants (see cfbi_rows.cuh and cfbi_launch.h): host access to the device configuration of the delay hook and to the position offset of the out-of-bounds control;
+// in a build without the matching macro every function returns cudaErrorNotSupported, so that a test that runs on the wrong build fails instead of passing vacuously ----------------
+int rows_test_delay_config(unsigned ns, int warp, int cta_mod, int cta_rem, unsigned sites) {
+#ifdef CFBI_ROWS_DELAY_NS
+    const RowsDelayConfig c = {ns, warp, cta_mod, cta_rem, sites};
+    cudaError_t e = cudaDeviceSynchronize();
+    if (e == cudaSuccess) e = cudaMemcpyToSymbol(g_rows_delay, &c, sizeof(c));
+    const unsigned long long zero = 0;
+    if (e == cudaSuccess) e = cudaMemcpyToSymbol(g_rows_delay_hits, &zero, sizeof(zero));
+    return (int)e;
+#else
+    (void)ns; (void)warp; (void)cta_mod; (void)cta_rem; (void)sites;
+    return (int)cudaErrorNotSupported;
+#endif
+}
+
+int rows_test_delay_hits(unsigned long long* hits) {
+#ifdef CFBI_ROWS_DELAY_NS
+    cudaError_t e = cudaDeviceSynchronize();
+    if (e == cudaSuccess) e = cudaMemcpyFromSymbol(hits, g_rows_delay_hits, sizeof(*hits));
+    return (int)e;
+#else
+    (void)hits;
+    return (int)cudaErrorNotSupported;
+#endif
+}
+
+int rows_test_pos_offset(int offset) {
+#ifdef CFBI_ROWS_TEST_POS_OOB
+    cudaError_t e = cudaDeviceSynchronize();
+    if (e == cudaSuccess) e = cudaMemcpyToSymbol(g_rows_test_pos_offset, &offset, sizeof(offset));
+    return (int)e;
+#else
+    (void)offset;
+    return (int)cudaErrorNotSupported;
+#endif
 }
 
 // ---- row-engine profile (see cfbi_rows.cuh and cfbi_launch.h): host access to the device buffer, inert in every build without CFBI_ROWS_PROFILE ----------------

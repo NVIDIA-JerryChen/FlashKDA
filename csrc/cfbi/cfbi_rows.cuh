@@ -40,6 +40,47 @@ __device__ unsigned g_rows_prof[ROWS_PROF_POS][ROWS_PROF_CTAS][ROWS_PROF_STAMPS]
 #define ROWS_TS(i) do {} while (0)
 #endif
 
+// Test hooks of the row engine (variant builds only: the default build defines none of these macros and compiles to the same machine code, which Gate X shows).
+// ROWS_SYNC(n) is barrier n of a row (1 .. 6) and ROWS_SYNC_END() the barrier that ends it (7); ROWS_DELAY(n) is delay site n: 0 = kernel entry, before the first loads, n = before
+// barrier n. CFBI_ROWS_DELAY_NS compiles the delay hook (its value is the default length of a delay in ns; the host chooses sites, warp and CTAs at run time through
+// rows_test_delay_config in cfbi_launch.cu and reads how many delays ran through rows_test_delay_hits). CFBI_ROWS_TEST_NO_END_BARRIER removes the barrier that ends a row (a racy
+// negative control: a delayed warp then lets the others start the next row), CFBI_ROWS_TEST_POS_OOB writes the fused position of a sequence at pos[slot + offset] (an
+// out-of-bounds control for memcheck; the host sets the offset through rows_test_pos_offset).
+#ifdef CFBI_ROWS_DELAY_NS
+struct RowsDelayConfig {
+    unsigned ns;           // length of a delay (0: CFBI_ROWS_DELAY_NS)
+    int warp;              // the warp that sleeps (-1: every warp)
+    int cta_mod, cta_rem;  // the CTAs that sleep: cta % cta_mod == cta_rem with cta = n * H + h (cta_mod 0: every CTA)
+    unsigned sites;        // bit n: delay site n is active
+};
+__device__ RowsDelayConfig g_rows_delay;
+__device__ unsigned long long g_rows_delay_hits;
+__device__ __forceinline__ void rows_delay(int site) {
+    const RowsDelayConfig c = g_rows_delay;
+    if (!((c.sites >> site) & 1u)) return;
+    const int cta = blockIdx.x * gridDim.y + blockIdx.y;
+    if (c.cta_mod > 0 && cta % c.cta_mod != c.cta_rem) return;
+    if (c.warp >= 0 && (int)(threadIdx.x >> 5) != c.warp) return;
+    if ((threadIdx.x & 31) == 0) atomicAdd(&g_rows_delay_hits, 1ull);
+    __nanosleep(c.ns ? c.ns : (unsigned)CFBI_ROWS_DELAY_NS);
+}
+#define ROWS_DELAY(n) rows_delay(n)
+#else
+#define ROWS_DELAY(n) do {} while (0)
+#endif
+#define ROWS_SYNC(n) do { ROWS_DELAY(n); __syncthreads(); } while (0)
+#ifdef CFBI_ROWS_TEST_NO_END_BARRIER
+#define ROWS_SYNC_END() ROWS_DELAY(7)
+#else
+#define ROWS_SYNC_END() ROWS_SYNC(7)
+#endif
+#ifdef CFBI_ROWS_TEST_POS_OOB
+__device__ int g_rows_test_pos_offset;
+#define ROWS_POS_INDEX(slot) ((slot) + g_rows_test_pos_offset)
+#else
+#define ROWS_POS_INDEX(slot) (slot)
+#endif
+
 struct RowSmem {
     float k[HEAD_K];      // khat of the current row
     float q[HEAD_K];      // qhat of the current row
@@ -125,6 +166,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
 #ifdef CFBI_ROWS_PROFILE
     const long long prof_entry = clock64();   // the profile starts at kernel entry: before the plan load and the rest of the prologue
 #endif
+    ROWS_DELAY(0);   // test hook: kernel entry, before the plan load and the first loads
     __shared__ RowSmem S;
     const int n = blockIdx.x, h = blockIdx.y, H = p.H;
     const SeqPlan sp = p.plan[n];
@@ -213,7 +255,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
             gref_pre = (b == pos) ? g2v : gref_pre;
         }
         if (tid == HEAD_K) S.beta = beta_act(bf16_to_f32(p.beta[tok * H + h]));
-        __syncthreads();
+        ROWS_SYNC(1);
         ROWS_TS(1);
 
         // ---- B. Akk / Aqk row against the cached rows (and the row itself): one 8-column tile per warp, ks and qs
@@ -266,7 +308,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
                 }
             }
         }
-        __syncthreads();
+        ROWS_SYNC(2);
         ROWS_TS(2);
 
         // ---- C. cross-sub-block products (UT, W rows for the recursion; U rows for O), then the UT / W row -------
@@ -274,7 +316,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
             if (s == 1) rows_m_tiles<2>(S, Rut, Rw, Ru, warp, L, slot);
             else if (s == 2) rows_m_tiles<4>(S, Rut, Rw, Ru, warp, L, slot);
             else rows_m_tiles<6>(S, Rut, Rw, Ru, warp, L, slot);
-            __syncthreads();
+            ROWS_SYNC(3);
         }
         ROWS_TS(3);
         float x_row = 0.f, u_row = 0.f;
@@ -303,7 +345,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
                 Rg[pos * HEAD_K + tid] = S.g2[tid];
             }
         }
-        __syncthreads();
+        ROWS_SYNC(4);
         ROWS_TS(4);
 
         // ---- D. P1 = dot3(W_t, E^T), P2 = dot3(GQ_t, E^T): W in A-row slot, GQ in slot ^ 8, two V tiles per warp ----
@@ -351,7 +393,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
                     }
             }
         }
-        __syncthreads();
+        ROWS_SYNC(5);
         ROWS_TS(5);
 
         // ---- E, F. U = UT - P1, O = P2 (+ M2) then the FMA chain over j = b..t -------------------------------
@@ -386,7 +428,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
         //         two batches of four k-steps in front of the MMAs --------------------------------------------------
         if (pos == BT - 1) {
             if (tid < HEAD_K) S.gend[tid] = ex2_ftz(S.g2[tid]);
-            __syncthreads();
+            ROWS_SYNC(6);
             for (int mt = 0; mt < 8; ++mt) {
                 float big[2][4], sml[2][4], eold[2][4];
 #pragma unroll
@@ -446,7 +488,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
         } else {
             pos += 1;
         }
-        __syncthreads();
+        ROWS_SYNC_END();
 #ifdef CFBI_ROWS_PROFILE
         ROWS_TS(7);
         prof_last = prof_pos;
@@ -460,7 +502,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Pa
         }
 #endif
     }
-    if (p.fuse_pos && tid == 0) p.pos[sp.slot] = (int)(((int64_t)sp.pos0 + sp.len) % BT);   // same value from every head CTA
+    if (p.fuse_pos && tid == 0) p.pos[ROWS_POS_INDEX(sp.slot)] = (int)(((int64_t)sp.pos0 + sp.len) % BT);   // same value from every head CTA
 #ifdef CFBI_ROWS_PROFILE
     if (threadIdx.x == 0 && prof_last >= 0 && n * H + h < ROWS_PROF_CTAS)
         g_rows_prof[prof_last][n * H + h][8] = (unsigned)(clock64() - prof_entry);   // after the last global store of the kernel
