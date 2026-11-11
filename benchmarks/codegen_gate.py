@@ -8,7 +8,8 @@ made from cuobjdump text that another toolchain produced (the node modes ``regs`
 
 usage:
   codegen_gate.py dump       --tree DIR --out FILE [--archs sm_90a sm_100a sm_103a] [--define NAME[=VALUE] ...] [--cache-dir DIR] [--keep-dir DIR]
-  codegen_gate.py dump-files --regs FILE --sass FILE --label TEXT --out FILE [--elf FILE] [--ptxas-log FILE]
+  codegen_gate.py manifest   --build-log FILE --tool-versions FILE --label TEXT --out FILE [--artifact SO] [--allow-non-production-flags]
+  codegen_gate.py dump-files --manifest FILE --regs FILE --sass FILE --elf FILE --ptxas-log FILE --out FILE
   codegen_gate.py compare    --base FILE --cand FILE [--prev FILE] [--mode identity|change] [--allow FILE] [--json FILE]
   codegen_gate.py gate       --base-tree DIR --cand-tree DIR [--prev-tree DIR] [--mode identity|change] [--cand-define NAME[=VALUE] ...] [--cache-dir DIR]
   codegen_gate.py matrix     --tree DIR [--archs ...]
@@ -30,6 +31,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -74,7 +76,10 @@ DEFAULT_ALLOW = os.path.join(os.path.dirname(os.path.abspath(__file__)), "codege
 _RESOURCE_FIELDS = ("reg", "stack", "shared", "local")
 _SPILL_FIELDS = ("spill_stores", "spill_loads")
 _ATTR_FIELDS = ("max_threads", "maxreg")
-_TOOLCHAIN_FIELDS = ("source", "label", "nvcc", "host_compiler", "flags", "std", "archs", "src_hash")
+_TOOLCHAIN_FIELDS = ("source", "label", "nvcc", "host_compiler", "cuobjdump", "ptxas", "flags", "std", "archs", "src_hash")
+_TOOLCHAIN_REQUIRED = ("source", "label", "nvcc", "host_compiler", "cuobjdump", "ptxas", "flags", "std", "archs")   # src_hash: a fixed constant (nvcc driver) or None (files)
+MANIFEST_SCHEMA = "cfbi-toolchain-v1"
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _EXT_PY = os.path.join("flash_kda", "cfbi", "_ext.py")      # relative to a tree
 
 
@@ -329,6 +334,15 @@ def kernel_table(regs_text, sass_text, ptxas_text=None, elf_text=None, unit=None
     sass = parse_sass_functions(sass_text)
     ptxas = parse_ptxas_log(ptxas_text) if ptxas_text else {}
     attrs = parse_elf_attributes(elf_text) if elf_text else {}
+    if not res or not sass:
+        raise Unusable("the resource dump or the SASS dump holds no function")
+    only_res, only_sass = sorted(set(res) - set(sass)), sorted(set(sass) - set(res))
+    if only_res or only_sass:
+        raise Unusable("the resource dump and the SASS dump list different functions (resource dump only: %s; SASS dump only: %s)"
+                       % (["%s %s" % k for k in only_res[:5]], ["%s %s" % k for k in only_sass[:5]]))
+    stray = sorted(set(ptxas) - set(res))
+    if stray:
+        raise Unusable("the ptxas log names functions that the resource dump does not have (a log of another build?): %s" % ["%s %s" % k for k in stray[:5]])
     by_arch = {}
     for (arch, name), r in res.items():
         s = sass.get((arch, name))
@@ -452,8 +466,12 @@ def find_toolchain(nvcc=None, ccbin=None):
                 return ln.strip()
         return lines[0].strip() if lines else "?"
 
+    ptxas = os.path.join(bindir, "ptxas")
+    if not os.path.exists(ptxas):
+        raise Unusable("ptxas not found next to nvcc (%s)" % ptxas)
     nvcc_version, host_version = version_line(nvcc, "release"), version_line(ccbin, "")
     return {"nvcc": nvcc, "ccbin": ccbin, "cuobjdump": cuobjdump, "nvcc_version": nvcc_version, "host_version": host_version,
+            "cuobjdump_version": version_line(cuobjdump, "release"), "ptxas_version": version_line(ptxas, "release"),
             "label": "%s | %s" % (nvcc_version, host_version)}
 
 
@@ -505,8 +523,8 @@ def dump_tree(tree, archs=GATE_ARCHS, defines=(), tc=None, jobs=None, cache_dir=
     units = units_of(tree)
     content = tree_content_hash(tree)
     commit = tree_commit(tree)
-    toolchain = {"source": "nvcc", "label": tc["label"], "nvcc": tc["nvcc_version"], "host_compiler": tc["host_version"],
-                 "flags": list(PRODUCTION_FLAGS), "std": STD, "archs": archs, "src_hash": FIXED_SRC_HASH}
+    toolchain = {"source": "nvcc", "label": tc["label"], "nvcc": tc["nvcc_version"], "host_compiler": tc["host_version"], "cuobjdump": tc["cuobjdump_version"],
+                 "ptxas": tc["ptxas_version"], "flags": list(PRODUCTION_FLAGS), "std": STD, "archs": archs, "src_hash": FIXED_SRC_HASH}
     key = cache_key(toolchain, defines, units, content)
     cache_file = os.path.join(cache_dir, "codegen-%s.json" % key) if cache_dir else None
     if cache_file and os.path.exists(cache_file):
@@ -542,6 +560,7 @@ def dump_tree(tree, archs=GATE_ARCHS, defines=(), tc=None, jobs=None, cache_dir=
                      "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "build_seconds": round(time.time() - t0, 1),
                      "cache": "miss" if cache_file else "off", "warnings": warnings + merge_warnings},
             "kernels": kernels}
+    check_dump(dump, tree)                           # an incomplete dump is never cached and never compared
     if cache_file:
         os.makedirs(cache_dir, exist_ok=True)
         tmp = cache_file + ".tmp%d" % os.getpid()
@@ -551,16 +570,151 @@ def dump_tree(tree, archs=GATE_ARCHS, defines=(), tc=None, jobs=None, cache_dir=
     return dump
 
 
-def dump_from_files(regs, sass, label, elf=None, ptxas_log=None, extra_meta=None):
-    """A dump from cuobjdump text of another toolchain (the container): ``label`` names that toolchain and must match between the two dumps compared."""
-    tables = kernel_table(read_text(regs), read_text(sass), read_text(ptxas_log) if ptxas_log else None, read_text(elf) if elf else None, unit=None)
+# ---- dumps of another toolchain (the container): the manifest ---------------------------------------------------------------------------------
+
+def parse_nvcc_command(line):
+    """The compile parameters of one nvcc command line of a torch JIT build log, or None when the line is not an nvcc compile of a source file.
+
+    Returns ``{"unit", "flags", "std", "archs", "src_hash", "variant_defines"}``. Include paths, dependency files, the output, the extension name and the per-tree
+    source hash are no toolchain parameters; the source hash and the ``CFBI_*`` source-variant defines are returned apart so that a change of the sources or of a
+    variant is never read as a change of the toolchain."""
+    try:
+        tokens = shlex.split(line)
+    except ValueError:
+        return None
+    start = next((i for i, t in enumerate(tokens) if os.path.basename(t) == "nvcc"), None)
+    if start is None:
+        return None
+    toks = tokens[start + 1:]
+    unit, flags, std, archs, src_hash, variants = None, [], None, [], None, []
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t in ("-MF", "-o", "-I", "-isystem"):
+            i += 2
+            continue
+        if t in ("-MD", "-c") or t.startswith("-I"):
+            if t == "-c" and i + 1 < len(toks) and not toks[i + 1].startswith("-"):
+                unit = toks[i + 1]
+                i += 1
+        elif t == "--compiler-options" and i + 1 < len(toks):
+            flags.append("--compiler-options " + toks[i + 1])
+            i += 1
+        elif t.startswith("-DTORCH_EXTENSION_NAME="):
+            pass
+        elif t.startswith("-DCFBI_SRC_HASH="):
+            src_hash = t.split("=", 1)[1]
+        elif t.startswith("-DCFBI_"):
+            variants.append(t[2:])
+        elif t.startswith("-std="):
+            std = t[5:]
+        elif t.startswith("-"):
+            flags.append(t)
+            m = re.match(r"^-gencode=arch=compute_\w+,code=(\S+)$", t)
+            if m:
+                archs += [c for c in m.group(1).split(",") if c.startswith("sm_")]
+        elif t.endswith((".cu", ".cpp", ".cc")):
+            unit = t
+        i += 1
+    if unit is None:
+        return None
+    return {"unit": unit, "flags": flags, "std": std, "archs": sorted(set(archs)), "src_hash": src_hash, "variant_defines": sorted(variants)}
+
+
+def parse_tool_versions(text):
+    """``{"nvcc", "ptxas", "cuobjdump", "host_compiler"}`` from the ``TOOLCHAIN <tool>: ...`` lines that ``toolchain_probe.py`` prints inside the container."""
+    out = {}
+    for line in text.splitlines():
+        m = re.match(r"^TOOLCHAIN (nvcc|ptxas|cuobjdump): (.*)$", line)
+        if m:
+            v = re.search(r"Cuda compilation tools, release (\d+\.\d+), V(\d+\.\d+\.\d+)", m.group(2))
+            if v:
+                out[m.group(1)] = "Cuda compilation tools, release %s, V%s" % v.groups()
+            continue
+        m = re.match(r"^TOOLCHAIN host: (.*)$", line)
+        if m and m.group(1).strip() and not m.group(1).startswith("unavailable"):
+            out["host_compiler"] = m.group(1).split(" | ")[0].strip()
+    return out
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def manifest_from_build(build_log, tool_versions, label, allow_non_production_flags=False, artifact=None):
+    """The toolchain manifest of a production build: the nvcc command lines of its build log (verbose torch JIT build) plus the probed tool versions.
+
+    The build log must contain the compile of at least one ``.cu`` file (the log of a cached build does not and is refused); every unit must have been compiled with
+    the same parameters; the production flags of ``_ext.py`` must all be present. The sha256 of the log is recorded so that the manifest names the build it describes;
+    ``artifact`` (the built extension that the resource / SASS / ELF dumps were taken from) is recorded with its sha256 as well."""
+    text, versions_text = read_text(build_log), read_text(tool_versions)
+    units = [c for c in (parse_nvcc_command(ln) for ln in text.splitlines()) if c and c["unit"].endswith(".cu")]
+    if not units:
+        raise Unusable("the build log %s holds no nvcc compile of a .cu file: it cannot describe a toolchain (the log of a cached build has none, rebuild with verbose output)" % build_log)
+    first = units[0]
+    for u in units[1:]:
+        for f in ("flags", "std", "archs", "src_hash", "variant_defines"):
+            if u[f] != first[f]:
+                raise Unusable("the units of the build were compiled with different %s: %s vs %s" % (f, first[f], u[f]))
+    if not first["std"] or not first["archs"]:
+        raise Unusable("the nvcc command line of the build log names no standard (%r) or no architecture (%r)" % (first["std"], first["archs"]))
+    missing = [f for f in PRODUCTION_FLAGS if f not in first["flags"]]
+    if missing and not allow_non_production_flags:
+        raise Unusable("the build did not use the production flags (missing %s)" % missing)
+    versions = parse_tool_versions(versions_text)
+    absent = [f for f in ("nvcc", "ptxas", "cuobjdump", "host_compiler") if not versions.get(f)]
+    if absent:
+        raise Unusable("the tool-version file %s has no %s" % (tool_versions, ", ".join(absent)))
+    manifest = {"schema": MANIFEST_SCHEMA, "label": label, "nvcc": versions["nvcc"], "host_compiler": versions["host_compiler"], "cuobjdump": versions["cuobjdump"],
+                "ptxas": versions["ptxas"], "std": first["std"], "flags": first["flags"], "archs": first["archs"], "variant_defines": first["variant_defines"],
+                "src_hash": first["src_hash"],
+                "build_log": {"sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "nvcc_compile_lines": len(units),
+                              "units": sorted(os.path.basename(u["unit"]) for u in units)},
+                "tool_versions_sha256": hashlib.sha256(versions_text.encode("utf-8")).hexdigest()}
+    if artifact:
+        manifest["artifact"] = {"path": os.path.abspath(artifact), "sha256": file_sha256(artifact), "mtime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.path.getmtime(artifact)))}
+    return manifest
+
+
+def validate_manifest(m, where="toolchain manifest"):
+    if not isinstance(m, dict) or m.get("schema") != MANIFEST_SCHEMA:
+        raise Unusable("%s: schema is not %s" % (where, MANIFEST_SCHEMA))
+    problems = toolchain_problems(dict(m, source="files"))
+    log = m.get("build_log")
+    if not isinstance(log, dict) or not (isinstance(log.get("sha256"), str) and _HEX64.match(log["sha256"])) or not log.get("nvcc_compile_lines"):
+        problems.append("build_log must carry the sha256 of the build log and the number of nvcc compile lines")
+    art = m.get("artifact")
+    if art is not None and not (isinstance(art, dict) and isinstance(art.get("sha256"), str) and _HEX64.match(art["sha256"])):
+        problems.append("artifact must carry the sha256 of the built extension")
+    if problems:
+        raise Unusable("%s: %s" % (where, "; ".join(problems)))
+    return m
+
+
+def dump_from_files(regs, sass, manifest, elf, ptxas_log, extra_meta=None):
+    """A dump from the cuobjdump text of another toolchain (the container), with the structured toolchain manifest of the build that produced it.
+
+    Every input is required: the resource dump, the SASS dump, the ELF attributes (launch bounds), the ``ptxas -v`` log of the build and the manifest; a dump that
+    cannot show spills and launch bounds, or whose toolchain is only a label, is not accepted as a gate input."""
+    if not (regs and sass and manifest and elf and ptxas_log):
+        raise Unusable("a dump of another toolchain needs the resource dump, the SASS dump, the ELF attributes, the ptxas log and the toolchain manifest")
+    m = validate_manifest(manifest if isinstance(manifest, dict) else _read_json(manifest, "toolchain manifest"))
+    tables = kernel_table(read_text(regs), read_text(sass), read_text(ptxas_log), read_text(elf), unit=None)
     archs = sorted(tables)
-    meta = {"toolchain": {"source": "files", "label": label, "nvcc": None, "host_compiler": None, "flags": None, "std": None, "archs": archs, "src_hash": None},
-            "variant": {"defines": []}, "tree": {"path": None, "commit": None, "content_hash": None, "units": []},
-            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "cache": "off", "warnings": []}
+    if archs != sorted(m["archs"]):
+        raise Unusable("the manifest names the architectures %s, the dumps hold %s" % (sorted(m["archs"]), archs))
+    meta = {"toolchain": {"source": "files", "label": m["label"], "nvcc": m["nvcc"], "host_compiler": m["host_compiler"], "cuobjdump": m["cuobjdump"], "ptxas": m["ptxas"],
+                          "flags": list(m["flags"]), "std": m["std"], "archs": archs, "src_hash": None},
+            "variant": {"defines": list(m.get("variant_defines", []))},
+            "tree": {"path": None, "commit": None, "content_hash": None, "src_hash": m.get("src_hash"), "units": list(m["build_log"].get("units", []))},
+            "build_log": dict(m["build_log"]), "artifact": m.get("artifact"), "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "cache": "off", "warnings": []}
     if extra_meta:
         meta["tree"].update(extra_meta)
-    return {"schema": SCHEMA, "meta": meta, "kernels": tables}
+    return check_dump({"schema": SCHEMA, "meta": meta, "kernels": tables}, "dump of files")
 
 
 def matrix_build(tree, archs=MATRIX_ARCHS, tc=None, jobs=None):
@@ -599,17 +753,56 @@ def load_dump(path):
     return check_dump(_read_json(path, "dump"), path)
 
 
+def _is_count(value):
+    return type(value) is int and value >= 0
+
+
+def kernel_record_problems(rec):
+    """Why one kernel record cannot be compared (an empty list means complete): every figure that a comparison reads must be present, an unknown is never an equality."""
+    if not isinstance(rec, dict):
+        return ["the record is not an object"]
+    out = ["%s is %r, not a non-negative integer" % (f, rec.get(f)) for f in _RESOURCE_FIELDS + _SPILL_FIELDS if not _is_count(rec.get(f))]
+    if not _is_count(rec.get("instructions")) or rec["instructions"] == 0:
+        out.append("no SASS instructions (%r)" % (rec.get("instructions"),))
+    out += ["%s is not a SHA-256 hex digest" % f for f in ("sass_hash", "sass_hash_strict") if not (isinstance(rec.get(f), str) and _HEX64.match(rec[f]))]
+    out += ["%s is %r, not a positive integer" % (f, rec[f]) for f in _ATTR_FIELDS if rec.get(f) is not None and (type(rec[f]) is not int or rec[f] <= 0)]
+    return out
+
+
+def toolchain_problems(toolchain):
+    """Why a toolchain description cannot prove that two dumps share a toolchain (missing or empty fields)."""
+    out = []
+    for f in _TOOLCHAIN_REQUIRED:
+        v = toolchain.get(f)
+        if v is None or v == "" or v == [] or (f in ("flags", "archs") and not (isinstance(v, list) and all(isinstance(x, str) and x for x in v))):
+            out.append("toolchain field %s is missing or empty (%r)" % (f, v))
+    return out
+
+
 def check_dump(dump, label="dump"):
+    """The dump itself, or ``Unusable``: a complete toolchain description and complete evidence for every kernel of every architecture."""
     if not isinstance(dump, dict) or dump.get("schema") != SCHEMA:
         raise Unusable("%s: schema is not %s" % (label, SCHEMA))
     if not isinstance(dump.get("kernels"), dict) or not isinstance(dump.get("meta"), dict) or not isinstance(dump["meta"].get("toolchain"), dict):
         raise Unusable("%s: malformed dump" % label)
+    problems = toolchain_problems(dump["meta"]["toolchain"])
     archs = dump["meta"]["toolchain"].get("archs") or []
     for arch in archs:
         if not dump["kernels"].get(arch):
             raise Unusable("%s: no kernels for %s (an empty kernel set would make every comparison vacuous)" % (label, arch))
     if not dump["kernels"]:
         raise Unusable("%s: no kernels at all" % label)
+    if sorted(dump["kernels"]) != sorted(archs):
+        problems.append("the kernels are listed for %s, the toolchain names %s" % (sorted(dump["kernels"]), sorted(archs)))
+    for arch in sorted(dump["kernels"]):
+        for key, rec in sorted(dump["kernels"][arch].items()):
+            problems += ["%s %s: %s" % (arch, key, p) for p in kernel_record_problems(rec)]
+            if isinstance(rec, dict) and family(key) in DEFAULT_OWNED:           # the row engine's launch bounds are what the resource gate compares
+                problems += ["%s %s: the launch-bound attribute %s of the row-engine family is missing (no ELF attributes in the dump?)" % (arch, key, f)
+                             for f in _ATTR_FIELDS if rec.get(f) is None]
+    if problems:
+        shown = problems[:12] + (["... and %d more" % (len(problems) - 12)] if len(problems) > 12 else [])
+        raise Unusable("%s: incomplete evidence, a missing figure is never taken as an equality:\n  %s" % (label, "\n  ".join(shown)))
     return dump
 
 
@@ -638,8 +831,8 @@ def _field_diffs(b, c):
         if b.get(f) != c.get(f):
             out.append("%s %s -> %s" % (f.upper(), b.get(f), c.get(f)))
     for f in _SPILL_FIELDS + _ATTR_FIELDS:
-        if b.get(f) is not None and c.get(f) is not None and b[f] != c[f]:
-            out.append("%s %s -> %s" % (f.upper(), b[f], c[f]))
+        if b.get(f) != c.get(f):
+            out.append("%s %s -> %s" % (f.upper(), b.get(f), c.get(f)))
     if b.get("sass_hash") != c.get("sass_hash"):
         out.append("normalised SASS differs")
     return out
@@ -647,20 +840,22 @@ def _field_diffs(b, c):
 
 def _gate_r(arch, key, rec, ref, owned):
     """Failures of the resource gate for one kernel (``rec``) against the base reference kernel ``ref``."""
+    if ref is None:
+        raise Unusable("%s %s: the base has no %s to bound the stack and spill figures, the resource gate cannot be evaluated" % (arch, key, GATE_R_REF))
     fails = []
     if rec["reg"] > REG_CAP:
         fails.append("%d registers (limit %d)" % (rec["reg"], REG_CAP))
-    if ref is None:
-        fails.append("no base %s on %s to bound the stack and spill figures" % (GATE_R_REF, arch))
-        return fails
     if rec["stack"] > ref["stack"]:
         fails.append("stack %d B above the base %d B" % (rec["stack"], ref["stack"]))
     for f in _SPILL_FIELDS:
-        if rec.get(f) is not None and ref.get(f) is not None and rec[f] > ref[f]:
+        if rec[f] > ref[f]:
             fails.append("%s %d B above the base %d B" % (f.replace("_", " "), rec[f], ref[f]))
     if family(key) in owned:
         for f in _ATTR_FIELDS:
-            if rec.get(f) is not None and ref.get(f) is not None and rec[f] != ref[f]:
+            if rec.get(f) is None or ref.get(f) is None:
+                raise Unusable("%s %s: the launch-bound attribute %s is missing (candidate %r, base reference %r), the resource gate cannot be evaluated"
+                               % (arch, key, f, rec.get(f), ref.get(f)))
+            if rec[f] != ref[f]:
                 fails.append("launch-bound attribute %s %d differs from the base %d" % (f, rec[f], ref[f]))
     return fails
 
@@ -840,13 +1035,22 @@ def main(argv=None):
     p.add_argument("--cache-dir", default=None)
     p.add_argument("--keep-dir", default=None)
 
-    p = sub.add_parser("dump-files")
-    p.add_argument("--regs", required=True)
-    p.add_argument("--sass", required=True)
+    p = sub.add_parser("manifest")
+    p.add_argument("--build-log", required=True)
+    p.add_argument("--tool-versions", required=True)
     p.add_argument("--label", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--elf", default=None)
-    p.add_argument("--ptxas-log", default=None)
+    p.add_argument("--allow-non-production-flags", action="store_true")
+    p.add_argument("--artifact", default=None, help="the built extension (.so) that the resource, SASS and ELF dumps were taken from; its sha256 is recorded")
+
+    p = sub.add_parser("dump-files")
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--regs", required=True)
+    p.add_argument("--sass", required=True)
+    p.add_argument("--elf", required=True)
+    p.add_argument("--ptxas-log", required=True)
+    p.add_argument("--commit", default=None, help="the commit of the source tree that was built (recorded as the tree identity of the dump)")
+    p.add_argument("--out", required=True)
 
     p = sub.add_parser("compare")
     p.add_argument("--base", required=True)
@@ -880,9 +1084,13 @@ def main(argv=None):
             _write_json(a.out, dump)
             print("dump of %s: %s (cache: %s)" % (a.tree, _kernel_summary(dump), dump["meta"].get("cache")))
             return 0
+        if a.cmd == "manifest":
+            m = validate_manifest(manifest_from_build(a.build_log, a.tool_versions, a.label, a.allow_non_production_flags, a.artifact))
+            _write_json(a.out, m)
+            print("manifest of %s: nvcc %s, host %s, %s, %d flags, %s" % (a.build_log, m["nvcc"], m["host_compiler"], m["std"], len(m["flags"]), ",".join(m["archs"])))
+            return 0
         if a.cmd == "dump-files":
-            dump = dump_from_files(a.regs, a.sass, a.label, a.elf, a.ptxas_log)
-            check_dump(dump, a.out)
+            dump = dump_from_files(a.regs, a.sass, a.manifest, a.elf, a.ptxas_log, {"commit": a.commit} if a.commit else None)
             _write_json(a.out, dump)
             print("dump of %s: %s" % (a.sass, _kernel_summary(dump)))
             return 0

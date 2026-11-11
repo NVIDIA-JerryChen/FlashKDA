@@ -24,11 +24,17 @@ file and the spread is taken over those values (at least three interleaved recor
 
 Rules enforced by ``compare``: a baseline record must carry the expected commit, a clean tree and the GPU / SM metadata; every record of a
 comparison comes from the same GPU model, SM count and host; each build has at least ``min_repeats`` record files that are interleaved in time;
-a metric that is absent or zero in a cell (a decode cell has no K2 stage) makes the comparison INVALID; a baseline cell whose spread exceeds 0.3 % is
-not accepted as a gate baseline (``invalid``), is judged on its worst repeat (``worst``) or is judged as noise-limited with the tolerance widened by the
-larger of the two spreads (``widen``); a candidate cell above that spread is judged on its worst repeat unless the widening mode is chosen.
+a metric that is absent or zero in a cell (a decode cell has no K2 stage) makes the comparison INVALID. The samples are validated per compared cell and metric,
+never by the number of files: cell keys are unique inside a file, every file of a side holds the same cells (the campaign cell set is not inferred from the
+first file), the two builds hold the same cells, every raw sample of the metric is finite (and positive for a derived or wall metric), a per-process-median
+record has at least ``MIN_TRIALS`` such trials per cell, and every cell has at least ``min_repeats`` distinct process samples per side; anything else is INVALID.
+A baseline cell whose spread exceeds 0.3 % is not accepted as a gate baseline (``invalid``), is judged on its worst repeat (``worst``) or, in the widening mode,
+needs a re-run: the gate is INVALID until re-run records prove three times the calls per trial (and profiled calls) of the first campaign for that cell on both
+sides from the same snapshot and configuration, after which the cell is judged on the re-run and, if it stays above 0.3 %, as noise-limited with the tolerance
+widened by the larger of the two spreads; the rows of a first campaign without re-run stay available as a diagnostic (``needs_rerun``) for the runner.
 """
 import json
+import math
 import os
 import statistics
 import subprocess
@@ -42,6 +48,8 @@ SUMMARY_METRICS = ("k1_us", "k2_stage_us", "total_us")  # default metrics of a p
 PROCESS_MEDIAN = "process_median"
 MIN_TRIALS = 5  # trials per cell and process of a process-median record
 UNSTABLE_POLICIES = ("invalid", "worst", "widen")
+RERUN_SCALE = 3  # calls per trial (and profiled calls) of a re-run relative to the first campaign
+RERUN_SAME_CONFIG = ("commit", "tree", "impl", "gpu", "sm_count", "host", "trials", "sample_stat")  # meta fields a re-run shares with its first campaign
 
 
 # ---- kernel names and stages ---------------------------------------------------------------------------------------------------------------
@@ -309,6 +317,77 @@ def _interleave_switches(base, cand):
 
 # ---- the comparison --------------------------------------------------------------------------------------------------------------------------
 
+def _finite(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def raw_sample_problems(rec, key, metric):
+    """Why the raw samples of cell ``key`` in record ``rec`` cannot enter a comparison of ``metric`` (an empty list means valid): every sample must carry the
+    metric, finite, and positive for a derived or wall metric (a kernel metric may be zero: the kernel may not exist in a build). Nothing is dropped silently;
+    one message per kind of defect with the number of samples that have it."""
+    strict = metric in DERIVED_METRICS or metric in WALL_METRICS
+    n = absent = bad = zero = 0
+    for cell in rec["cells"]:
+        if cell["key"] != key:
+            continue
+        for s in cell["samples"]:
+            n += 1
+            v = metric_value(s, metric)
+            if v is None:
+                absent += 1
+            elif not _finite(v) or v < 0:
+                bad += 1
+            elif strict and v == 0:
+                zero += 1
+    out = []
+    if absent:
+        out.append("%d of %d sample(s) carry no %s" % (absent, n, metric))
+    if bad:
+        out.append("%d of %d sample(s) have a non-finite or negative %s" % (bad, n, metric))
+    if zero:
+        out.append("%d of %d sample(s) have a zero %s (not defined for this kind of cell, or lost in this build)" % (zero, n, metric))
+    return out
+
+
+def campaign_cell_problems(records, role):
+    """``(problems, union of the cell keys)`` of the record files of one side: unique keys inside every file and the same cells in every file."""
+    problems, sets = [], []
+    for rec in records:
+        keys = [c["key"] for c in rec["cells"]]
+        dup = sorted(set(k for k in keys if keys.count(k) > 1))
+        if dup:
+            problems.append("%s record %s repeats the cell key(s) %s" % (role, rec.get("_path", "?"), dup))
+        sets.append(set(keys))
+    union = set().union(*sets) if sets else set()
+    for rec, keys in zip(records, sets):
+        if keys != union:
+            problems.append("%s record %s lacks the cell(s) %s that other records of the same side hold" % (role, rec.get("_path", "?"), sorted(union - keys)[:4]))
+    return problems, union
+
+
+def _arg_values(records, key, name):
+    return sorted(set(c.get("args", {}).get(name) for r in records for c in r["cells"] if c["key"] == key), key=lambda x: (x is None, x))
+
+
+def rerun_problems(first, rerun, side, key):
+    """Why the re-run records of ``side`` do not prove a three-times-calls re-run of cell ``key`` of the first campaign (an empty list means they do)."""
+    out = []
+    for name in ("calls_per_trial", "profile_calls"):
+        f, r = _arg_values(first, key, name), _arg_values(rerun, key, name)
+        if name == "profile_calls" and f == [None] and r == [None]:
+            continue                                               # a cell without a kernel-sum pass has nothing to scale
+        if len(f) != 1 or len(r) != 1 or f[0] is None or r[0] is None:
+            out.append("%s %s of cell %r is not recorded consistently (first campaign %s, re-run %s)" % (side, name, key, f, r))
+        elif r[0] != RERUN_SCALE * f[0]:
+            out.append("%s re-run of cell %r has %s = %s, not %d times the first campaign's %s" % (side, key, name, r[0], RERUN_SCALE, f[0]))
+    for field in RERUN_SAME_CONFIG:
+        a = set(json.dumps((x.get("meta") or {}).get(field), sort_keys=True) for x in first)
+        b = set(json.dumps((x.get("meta") or {}).get(field), sort_keys=True) for x in rerun)
+        if len(a) != 1 or a != b:
+            out.append("%s re-run does not come from the same snapshot / configuration as its first campaign (meta %s: %s vs %s)" % (side, field, sorted(a), sorted(b)))
+    return out
+
+
 def compare(base, cand, metric="k2_stage_us", tol_pct=1.0, mode="regress", expect_base_commit=None, require_clean_cand=False,
             min_repeats=3, require_interleaved=True, cells=None, baseline_unstable="invalid", base_rerun=None, cand_rerun=None):
     """Compare the record lists ``base`` (A) and ``cand`` (B).
@@ -373,29 +452,58 @@ def compare(base, cand, metric="k2_stage_us", tol_pct=1.0, mode="regress", expec
             if got < need:
                 problems.append("baseline and candidate records of the %s are not interleaved in time (%d variant switches, %d needed)" % (label, got, need))
 
-    base_keys = [c["key"] for c in base[0]["cells"]]
-    cand_keys = set(c["key"] for rec in cand for c in rec["cells"])
-    rerun_base_keys = set(c["key"] for rec in base_rerun for c in rec["cells"])
-    rerun_cand_keys = set(c["key"] for rec in cand_rerun for c in rec["cells"])
-    for key in sorted(rerun_base_keys ^ rerun_cand_keys):
-        problems.append("cell %r is in the re-run records of one side only" % key)
-    rerun_keys = rerun_base_keys & rerun_cand_keys
+    # ---- the campaign: unique keys, the same cells in every file of a side, the same cells in both builds, a consistent re-run set -----------------------------
+    sides = {}
+    for role, recs in (("baseline", base), ("candidate", cand), ("baseline re-run", base_rerun), ("candidate re-run", cand_rerun)):
+        if recs:
+            probs, union = campaign_cell_problems(recs, role)
+            problems.extend(probs)
+            sides[role] = union
+
+    def chosen(keys):
+        return set(k for k in keys if not cells or any(sub in k for sub in cells))
+
+    base_set, cand_set = chosen(sides["baseline"]), chosen(sides["candidate"])
+    if base_set - cand_set:
+        problems.append("cell(s) %s missing in the candidate records" % sorted(base_set - cand_set)[:4])
+    if cand_set - base_set:
+        problems.append("cell(s) %s missing in the baseline records" % sorted(cand_set - base_set)[:4])
+    rerun_keys = set()
+    if base_rerun and cand_rerun:
+        rb, rc = chosen(sides["baseline re-run"]), chosen(sides["candidate re-run"])
+        for key in sorted(rb ^ rc):
+            problems.append("cell %r is in the re-run records of one side only" % key)
+        for key in sorted((rb | rc) - base_set):
+            problems.append("cell %r is in the re-run records but not in the first campaign" % key)
+        rerun_keys = rb & rc & base_set
+    first_order = [c["key"] for c in base[0]["cells"]]
     rows = []
     unstable_base = False
     failed = False
-    for key in base_keys:
-        if cells and not any(s in key for s in cells):
-            continue
-        if key not in cand_keys:
-            problems.append("cell %r is missing in the candidate records" % key)
+    for key in first_order:
+        if key not in base_set or key not in cand_set:
             continue
         judged_on = "rerun" if key in rerun_keys else "first"
         base_k, cand_k = (base_rerun, cand_rerun) if judged_on == "rerun" else (base, cand)
-        bv, cv = pooled_values(base_k, key, metric), pooled_values(cand_k, key, metric)
         kind = cell_kind(base_k, key)
-        if not bv or not cv:
-            problems.append("metric %r is absent in cell %r (kind %s) of the %s records" % (metric, key, kind, "baseline" if not bv else "candidate"))
+        cell_problems = []
+        for role, recs in (("baseline", base_k), ("candidate", cand_k)):
+            for rec in recs:
+                cell_problems += ["%s record %s, cell %r (kind %s): %s" % (role, rec.get("_path", "?"), key, kind, p) for p in raw_sample_problems(rec, key, metric)]
+            stamps = [(r.get("meta") or {}).get("timestamp") for r in recs]
+            if None in stamps or len(set(stamps)) < min_repeats:
+                cell_problems.append("%s records of cell %r are fewer than %d distinct processes (timestamps %s)" % (role, key, min_repeats, sorted(str(x) for x in set(stamps))))
+        if cell_problems:
+            problems.extend(cell_problems[:6] + (["... and %d more problem(s) in cell %r" % (len(cell_problems) - 6, key)] if len(cell_problems) > 6 else []))
             continue
+        if judged_on == "rerun":
+            for role, first, rerun in (("baseline", base, base_rerun), ("candidate", cand, cand_rerun)):
+                problems.extend(rerun_problems(first, rerun, role, key))
+            fb, fc = _arg_values(base, key, "calls_per_trial"), _arg_values(cand, key, "calls_per_trial")
+            rb, rc = _arg_values(base_rerun, key, "calls_per_trial"), _arg_values(cand_rerun, key, "calls_per_trial")
+            if fb != fc or rb != rc:
+                problems.append("cell %r: the baseline and the candidate used different calls per trial (first %s vs %s, re-run %s vs %s)" % (key, fb, fc, rb, rc))
+        bv, cv = pooled_values(base_k, key, metric), pooled_values(cand_k, key, metric)
         med_b, med_c = statistics.median(bv), statistics.median(cv)
         if med_b == 0 or (med_c == 0 and (metric in DERIVED_METRICS or metric in WALL_METRICS)):
             problems.append("metric %r is zero in cell %r (kind %s): it is not defined for this kind of cell, name another metric" % (metric, key, kind))
@@ -403,15 +511,22 @@ def compare(base, cand, metric="k2_stage_us", tol_pct=1.0, mode="regress", expec
         sp_b, sp_c = spread_of(bv), spread_of(cv)
         ref_b, value_c = med_b, med_c
         notes = []
-        noise_limited = False
+        noise_limited = needs_rerun = False
         tol_eff = tol_pct
         if sp_b > UNSTABLE_SPREAD and baseline_unstable == "invalid":
             status = "UNSTABLE_BASELINE"
             notes.append("baseline spread %.2f %% exceeds %.1f %%: not accepted as a gate baseline" % (100 * sp_b, 100 * UNSTABLE_SPREAD))
             unstable_base = True
+        elif baseline_unstable == "widen" and judged_on == "first" and max(sp_b, sp_c) > UNSTABLE_SPREAD:
+            status = "NEEDS_RERUN"                          # the widened tolerance is only for a cell that stays unstable with three times the calls
+            needs_rerun = True
+            tol_eff = tol_pct + 100 * max(sp_b, sp_c)
+            problems.append("cell %r is above %.1f %% spread in the first campaign (%.2f %% / %.2f %%) and has no valid re-run with %d times the calls per trial" %
+                            (key, 100 * UNSTABLE_SPREAD, 100 * sp_b, 100 * sp_c, RERUN_SCALE))
+            notes.append("needs a re-run with %d times the calls per trial" % RERUN_SCALE)
         else:
             if baseline_unstable == "widen":
-                if max(sp_b, sp_c) > UNSTABLE_SPREAD:
+                if max(sp_b, sp_c) > UNSTABLE_SPREAD:      # judged on the re-run and still above 0.3 %
                     noise_limited = True
                     tol_eff = tol_pct + 100 * max(sp_b, sp_c)
                     notes.append("noise-limited: spread %.2f %% (baseline) / %.2f %% (candidate), tolerance widened to %.2f %%" % (100 * sp_b, 100 * sp_c, tol_eff))
@@ -431,7 +546,8 @@ def compare(base, cand, metric="k2_stage_us", tol_pct=1.0, mode="regress", expec
         rows.append({"key": key, "kind": kind, "metric": metric, "base_median": med_b, "base_reference": ref_b, "base_spread_pct": 100 * sp_b, "cand_median": med_c,
                      "cand_spread_pct": 100 * sp_c, "cand_judged": value_c, "delta_pct": 100.0 * (value_c / ref_b - 1.0),
                      "median_delta_pct": 100.0 * (med_c / med_b - 1.0), "status": status, "note": "; ".join(notes),
-                     "n_base": len(bv), "n_cand": len(cv), "noise_limited": noise_limited, "tol_pct_effective": tol_eff, "judged_on": judged_on})
+                     "n_base": len(bv), "n_cand": len(cv), "noise_limited": noise_limited, "needs_rerun": needs_rerun, "tol_pct_effective": tol_eff,
+                     "judged_on": judged_on})
     if not rows:
         problems.append("no comparable cells")
     if problems or unstable_base:
@@ -447,12 +563,16 @@ def classify_rows(result, tol_pct=None):
     """Which cells are slower, faster or noise-limited, read from the rows of a comparison (the ``--json`` rows of ``compare_bench.py``).
 
     A cell is *slower* when its median delta is above the tolerance and *faster* when it is at or below minus the tolerance; the plain tolerance is
-    used, not the widened one. A noise-limited cell (spread above 0.3 % after the re-run) is never *faster*: it cannot be the evidence of a gain."""
+    used, not the widened one. A noise-limited cell (spread above 0.3 % after the re-run) is never *faster*: it cannot be the evidence of a gain. A cell that
+    still needs its re-run (``needs_rerun``) is only listed as such: nothing is read from an unstable first campaign."""
     tol = result["tol_pct"] if tol_pct is None else tol_pct
-    out = {"slower": [], "faster": [], "noise_limited": [], "neutral": []}
+    out = {"slower": [], "faster": [], "noise_limited": [], "neutral": [], "needs_rerun": []}
     for r in result["rows"]:
         d = r.get("median_delta_pct", r.get("delta_pct"))
         if d is None:
+            continue
+        if r.get("needs_rerun"):
+            out["needs_rerun"].append(r["key"])
             continue
         if r.get("noise_limited"):
             out["noise_limited"].append(r["key"])

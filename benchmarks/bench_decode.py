@@ -11,7 +11,9 @@ Regimes (one cell per shape, the probe regime one cell per shape and position):
   probe      every sequence at ``pos`` p before every call (positions 0, 1, 15, 16, 31, 32, 47, 48, 62, 63 at N = 1 and N = 64 by default)
 
 One trial of a cell measures, with the same inputs, an eager loop (the call as a user makes it) and a replay of a CUDA graph that holds one call, and
-takes one profiled pass for the kernel sum. Per trial and cell the sample carries
+takes one profiled pass for the kernel sum (one warm-up call, then ``profile_calls`` calls, a whole number of 64-position cycles in the regimes whose position
+advances with the calls, so that every position phase enters the kernel sum equally often). ``--calls-scale S`` multiplies the (rounded) calls per trial AND
+the profiled calls, so that a re-run has exactly S times the calls of the first campaign in both; the cell records the effective counts. Per trial and cell the sample carries
   gpu_eager_us, gpu_graph_us   GPU-elapsed time per call from CUDA events. lockstep / staggered: one pair of events around a loop of calls (no helper runs in
                                between). cold / probe: one pair of events around every single call; the helper (eviction write, ``pos`` rewrite) is enqueued and
                                synchronised before the first event, so it is not in the metric.
@@ -43,6 +45,7 @@ import bench_records as records  # noqa: E402
 
 LB = -5.0
 STEPS = 64
+PROFILE_WARM = 1                                   # calls before the profiled pass; the positions are set right before them, so the first profiled call is at phase 1
 MATRIX_D = ((1, 12), (4, 12), (16, 12), (64, 12), (128, 12), (256, 12))
 PROBE_SHAPES = ((1, 12), (64, 12))
 PROBE_POSITIONS = (0, 1, 15, 16, 31, 32, 47, 48, 62, 63)
@@ -77,13 +80,23 @@ def select_cells(specs, substrings):
     return [s for s in specs if not substrings or any(sub in s["key"] for sub in substrings)]
 
 
+def cycles_up(n):
+    """``n`` rounded up to a whole number of 64-position cycles."""
+    return -(-int(n) // STEPS) * STEPS
+
+
 def calls_per_trial(regime, opts):
-    """Calls of one trial: a loop trial covers a whole number of 64-position cycles; the re-run scale multiplies the calls (never the trials)."""
+    """Calls of one trial: a loop trial covers a whole number of 64-position cycles, the probe regime (one position per call) any number. The re-run scale multiplies
+    the rounded calls, so that a re-run has exactly ``calls_scale`` times the calls of the first campaign (it never changes the number of trials)."""
     base = opts["calls"] if regime in LOOP_REGIMES else (opts["cold_calls"] if regime == "cold" else opts["probe_calls"])
-    calls = base * opts["calls_scale"]
-    if regime in LOOP_REGIMES or regime == "cold":
-        calls = -(-calls // STEPS) * STEPS
-    return calls
+    return (base if regime == "probe" else cycles_up(base)) * opts["calls_scale"]
+
+
+def profile_calls_of(regime, opts):
+    """Calls of the profiled pass of a trial (the kernel sum), after the warm-up call: the profile calls rounded up to whole 64-position cycles (the probe regime
+    holds one position per call: any number) times the re-run scale. The effective count is what the cell records."""
+    base = opts["profile_calls"]
+    return (base if regime == "probe" else cycles_up(base)) * opts["calls_scale"]
 
 
 def parse_shape(text):
@@ -119,7 +132,7 @@ def cell_line(spec, cell):
         vals = [x[m] for x in s if m in x]
         if vals:
             parts.append("%s %8.2f" % (m.replace("_us", ""), statistics.median(vals)))
-    return "%-44s %s   (%d trials, %d calls)" % (spec["key"], "  ".join(parts), len(s), cell["args"]["calls_per_trial"])
+    return "%-44s %s   (%d trials, %d calls, %d profiled)" % (spec["key"], "  ".join(parts), len(s), cell["args"]["calls_per_trial"], cell["args"]["profile_calls"])
 
 
 def run_meta(a, started, opts, device, torch_mod):
@@ -127,9 +140,8 @@ def run_meta(a, started, opts, device, torch_mod):
     return {"commit": commit, "dirty": dirty, "tree": tree, "gpu": device["name"], "sm_count": device["sm_count"], "cc": device["cc"], "host": socket.gethostname(),
             "torch": torch_mod.__version__, "cuda": torch_mod.version.cuda, "timestamp": started, "kind": "decode-wall", "sample_stat": records.PROCESS_MEDIAN,
             "impl": a.impl, "env_impl": os.environ.get("FLASH_KDA_CFBI_IMPL"), "regimes": list(a.regimes), "trials": opts["trials"],
-            "calls_per_trial": {"lockstep": calls_per_trial("lockstep", opts), "staggered": calls_per_trial("staggered", opts),
-                                "cold": calls_per_trial("cold", opts), "probe": calls_per_trial("probe", opts)},
-            "profile_calls": opts["profile_calls"], "calls_scale": opts["calls_scale"], "l2_cache_bytes": device["l2_bytes"], "eviction_bytes": device["eviction_bytes"],
+            "calls_per_trial": {r: calls_per_trial(r, opts) for r in REGIMES}, "profile_calls": {r: profile_calls_of(r, opts) for r in REGIMES},
+            "profile_calls_option": opts["profile_calls"], "calls_scale": opts["calls_scale"], "l2_cache_bytes": device["l2_bytes"], "eviction_bytes": device["eviction_bytes"],
             "cells_filter": a.cells, "label": a.label, "tag": os.environ.get("CFBI_BENCH_TAG"), "build_dir": os.environ.get("FLASH_KDA_CFBI_BUILD_DIR"),
             "src": str(ROOT), "argv": sys.argv[1:]}
 
@@ -226,7 +238,7 @@ def measure_cell(spec, env, opts, device, expected, evict_buf):
     from bench_breakdown import kernel_times
 
     env.set_positions(regime)
-    calls = calls_per_trial(regime, opts)
+    calls, profile_calls = calls_per_trial(regime, opts), profile_calls_of(regime, opts)
     if regime == "cold":
         def helper(i):
             evict_buf.fill_(float(i % 251 + 1))
@@ -268,7 +280,8 @@ def measure_cell(spec, env, opts, device, expected, evict_buf):
                 gpu_g = single_call_trial(torch, env.replay, helper, calls)
                 wall = trial_wall(gpu_e, gpu_g)
             env.set_positions(regime)
-            times, _ = kernel_times(profiled, iters=opts["profile_calls"], warm=1)
+            counter[0] = 0                                          # the data step of a call follows its position: both start at 0 in every trial
+            times, _ = kernel_times(profiled, iters=profile_calls, warm=PROFILE_WARM)
             runs.append(times)
             walls.append(wall)
             launched |= {records.kernel_base(n) for n in times if not records.is_helper_kernel(n)}
@@ -277,7 +290,9 @@ def measure_cell(spec, env, opts, device, expected, evict_buf):
     problem = check_expected_kernels(launched, expected)
     if problem:
         raise SystemExit("cell %s: %s" % (spec["key"], problem))
-    args = {"N": spec["N"], "H": spec["H"], "regime": regime, "pos": spec["pos"], "impl": env.impl, "calls_per_trial": calls, "profile_calls": opts["profile_calls"],
+    loop = regime != "probe"                                        # the positions of a loop regime advance with the calls: the profiled pass covers whole cycles
+    args = {"N": spec["N"], "H": spec["H"], "regime": regime, "pos": spec["pos"], "impl": env.impl, "calls_per_trial": calls, "profile_calls": profile_calls,
+            "profile_cycles": profile_calls // STEPS if loop else None, "profile_start_phase": PROFILE_WARM if loop else None, "calls_scale": opts["calls_scale"],
             "kernels": sorted(launched)}
     return records.make_cell("decode", spec["key"], args, runs, drop_helpers=True, wall=walls)
 
@@ -293,14 +308,19 @@ def main(argv=None):
     ap.add_argument("--calls", type=int, default=DEFAULTS["calls"], help="calls of a lock-step / staggered trial (rounded up to whole 64-position cycles)")
     ap.add_argument("--cold-calls", type=int, default=DEFAULTS["cold_calls"])
     ap.add_argument("--probe-calls", type=int, default=DEFAULTS["probe_calls"])
-    ap.add_argument("--profile-calls", type=int, default=DEFAULTS["profile_calls"], help="calls of the profiled pass of a trial (kernel sum)")
-    ap.add_argument("--calls-scale", type=int, default=DEFAULTS["calls_scale"], help="multiplier of the calls per trial (3 for the re-run of unstable cells)")
+    ap.add_argument("--profile-calls", type=int, default=DEFAULTS["profile_calls"],
+                    help="calls of the profiled pass of a trial (kernel sum), rounded up to whole 64-position cycles (the probe regime excepted)")
+    ap.add_argument("--calls-scale", type=int, default=DEFAULTS["calls_scale"],
+                    help="multiplier of the calls per trial AND of the profiled calls (3 for the re-run of unstable cells)")
     ap.add_argument("--cells", nargs="*", default=None, help="only cells whose key contains one of these substrings")
     ap.add_argument("--expect-kernels", default=None, help="comma-separated base names of the CF-BI kernels one decode call must launch")
     ap.add_argument("--json", default=None)
     ap.add_argument("--label", default="")
     ap.add_argument("--list-cells", action="store_true")
     a = ap.parse_args(argv)
+    for name in ("trials", "calls", "cold_calls", "probe_calls", "profile_calls", "calls_scale"):
+        if getattr(a, name) < 1:
+            ap.error("--%s must be at least 1" % name.replace("_", "-"))
     shapes = [parse_shape(s) for s in a.shapes] if a.shapes else list(MATRIX_D)
     probe_shapes = [parse_shape(s) for s in a.probe_shapes] if a.probe_shapes else list(PROBE_SHAPES)
     specs = select_cells(cell_specs(shapes, a.regimes, probe_shapes, a.positions), a.cells)

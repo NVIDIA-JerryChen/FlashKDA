@@ -7,10 +7,12 @@ candidate fails the 0.5 % protection gate, and a build with one more register or
 import argparse
 import ast
 import concurrent.futures
+import hashlib
 import json
 import os
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 import pytest
@@ -468,19 +470,47 @@ def cg_regs(functions, arch="sm_100a"):
     return "\n".join(out) + "\n"
 
 
+def cg_ptxas(functions, arch="sm_100a"):
+    """``ptxas -v`` lines of a build: ``{function: (stack, spill stores, spill loads, registers)}``."""
+    out = []
+    for name, (stack, stores, loads, regs) in functions.items():
+        out += ["ptxas info    : Compiling entry function '%s' for '%s'" % (name, arch), "ptxas info    : Function properties for %s" % name,
+                "    %d bytes stack frame, %d bytes spill stores, %d bytes spill loads" % (stack, stores, loads),
+                "ptxas info    : Used %d registers, used 1 barriers, 4096 bytes smem" % regs]
+    return "\n".join(out) + "\n"
+
+
+def cg_elf(functions, arch="sm_100a"):
+    """``cuobjdump -elf`` attribute blocks: ``{function: (maxreg, max threads or None)}``."""
+    out = ["", "Fatbin elf code:", "================", "arch = %s" % arch, ""]
+    for name, (maxreg, threads) in functions.items():
+        out += [".nv.info.%s" % name, "\t<0x4>", "\tAttribute:\tEIATTR_MAXREG_COUNT", "\tFormat:\tEIFMT_HVAL", "\tValue:\t0x%x" % maxreg]
+        if threads:
+            out += ["\t<0x12>", "\tAttribute:\tEIATTR_MAX_THREADS", "\tFormat:\tEIFMT_SVAL", "\tValue:\t0x%x 0x1 0x1 " % threads]
+        out.append("")
+    return "\n".join(out) + "\n"
+
+
 def cg_table(code=CODE, **kw):
-    return cg.kernel_table(cg_regs({ROWS: (128, 0), K1: (100, 0)}), cg_sass({ROWS: code, K1: ["EXIT"]}, **kw))
+    """A complete table (resources, SASS, spills, launch bounds) of two kernels."""
+    return cg.kernel_table(cg_regs({ROWS: (128, 0), K1: (100, 0)}), cg_sass({ROWS: code, K1: ["EXIT"]}, **kw),
+                           cg_ptxas({ROWS: (0, 0, 0, 128), K1: (0, 0, 0, 100)}), cg_elf({ROWS: (128, 256), K1: (128, 256)}))
+
+
+def cg_hash(tag):
+    """A SHA-256 hex digest of ``tag``: the kernel records hold digests, and an incomplete or malformed one is rejected by the gate."""
+    return hashlib.sha256(tag.encode("utf-8")).hexdigest()
 
 
 def cg_kernel(reg=128, stack=0, spill=(0, 0), sass="h0", ins=100, shared=0, local=0, maxthr=256, maxreg=128):
-    return {"name": "n", "unit": None, "reg": reg, "stack": stack, "shared": shared, "local": local, "instructions": ins, "sass_hash": sass,
-            "sass_hash_strict": sass, "spill_stores": spill[0], "spill_loads": spill[1], "max_threads": maxthr, "maxreg": maxreg}
+    return {"name": "n", "unit": None, "reg": reg, "stack": stack, "shared": shared, "local": local, "instructions": ins, "sass_hash": cg_hash(sass),
+            "sass_hash_strict": cg_hash(sass), "spill_stores": spill[0], "spill_loads": spill[1], "max_threads": maxthr, "maxreg": maxreg}
 
 
 def cg_dump(kernels, label="toolchain-A", defines=(), content="tree-1"):
     return {"schema": cg.SCHEMA,
-            "meta": {"toolchain": {"source": "nvcc", "label": label, "nvcc": "nvcc 13.1.115", "host_compiler": "g++ 14.3.0", "flags": list(cg.PRODUCTION_FLAGS),
-                                   "std": cg.STD, "archs": sorted(kernels), "src_hash": cg.FIXED_SRC_HASH},
+            "meta": {"toolchain": {"source": "nvcc", "label": label, "nvcc": "nvcc 13.1.115", "host_compiler": "g++ 14.3.0", "cuobjdump": "cuobjdump 13.1.115",
+                                   "ptxas": "ptxas 13.1.115", "flags": list(cg.PRODUCTION_FLAGS), "std": cg.STD, "archs": sorted(kernels), "src_hash": cg.FIXED_SRC_HASH},
                      "variant": {"defines": list(defines)}, "tree": {"path": None, "commit": None, "content_hash": content, "units": []}},
             "kernels": kernels}
 
@@ -576,15 +606,15 @@ def test_codegen_allow_list_aliases_and_allowed_differences():
     allow = {"aliases": {"cfbi::rows_kernel<Lb0E>": "cfbi::rows_kernel"}, "may_differ": []}
     rep = cg.compare_dumps(base, cand, allow)
     assert rep["exit"] == 0 and rep["added"] == []
-    changed = cg_edit(base, "sm_100a", "cfbi::k1_kernel<Li16E>", sass_hash="k1-new")
+    changed = cg_edit(base, "sm_100a", "cfbi::k1_kernel<Li16E>", sass_hash=cg_hash("k1-new"))
     assert cg.compare_dumps(base, changed)["exit"] == 1
     for entry in ("cfbi::k1_kernel<Li16E>", "cfbi::k1_kernel"):          # a changed kernel is tolerated only when it is on the allow-list (key or family)
         rep = cg.compare_dumps(base, changed, {"aliases": {}, "may_differ": [entry]})
         assert rep["exit"] == 0 and len(rep["allowed"]) == 1, entry
-    wide = cg_edit(base, "sm_100a", "cfbi::k2_kernel<Li16E>", reg=180, sass_hash="k2-new")        # a tolerated K2 change is not held to the row engine's register cap
+    wide = cg_edit(base, "sm_100a", "cfbi::k2_kernel<Li16E>", reg=180, sass_hash=cg_hash("k2-new"))        # a tolerated K2 change is not held to the row engine's register cap
     rep = cg.compare_dumps(base, wide, {"aliases": {}, "may_differ": ["cfbi::k2_kernel"]})
     assert rep["exit"] == 0 and rep["gate_r"]["failures"] == [] and len(rep["allowed"]) == 1
-    rows_bad = cg_edit(base, "sm_100a", "cfbi::rows_kernel", reg=129, sass_hash="rows-new")      # a tolerated row-engine change still has to pass the resource gate
+    rows_bad = cg_edit(base, "sm_100a", "cfbi::rows_kernel", reg=129, sass_hash=cg_hash("rows-new"))      # a tolerated row-engine change still has to pass the resource gate
     rep = cg.compare_dumps(base, rows_bad, {"aliases": {}, "may_differ": ["cfbi::rows_kernel"]})
     assert rep["exit"] == 1 and any("129 registers" in f for f in rep["gate_r"]["failures"]) and len(rep["allowed"]) == 1
     rep = cg.compare_dumps(base, base, {"aliases": {"cfbi::gone": "cfbi::rows_kernel"}, "may_differ": []})
@@ -616,7 +646,7 @@ def test_codegen_change_mode_lets_only_the_row_engine_change_and_gates_it():
     base = cg_base()
     rows_ok = cg_copy(base)
     for arch in rows_ok["kernels"]:
-        rows_ok["kernels"][arch]["cfbi::rows_kernel"].update(sass_hash="rows-new", instructions=90)
+        rows_ok["kernels"][arch]["cfbi::rows_kernel"].update(sass_hash=cg_hash("rows-new"), instructions=90)
     assert cg.compare_dumps(base, rows_ok)["exit"] == 1                  # identity mode: any change is a difference
     rep = cg.compare_dumps(base, rows_ok, mode="change")
     assert rep["exit"] == 0 and len(rep["allowed"]) == 2 and len(rep["gate_r"]["checked"]) >= 2
@@ -625,7 +655,7 @@ def test_codegen_change_mode_lets_only_the_row_engine_change_and_gates_it():
         rep = cg.compare_dumps(base, cg_edit(rows_ok, "sm_100a", "cfbi::rows_kernel", **fields), mode="change")
         assert rep["exit"] == 1 and any(text in f for f in rep["gate_r"]["failures"]), (fields, rep["gate_r"])
     for key in ("cfbi::k1_kernel<Li16E>", "cfbi::ref::rows_kernel", "cfbi::plan_kernel"):      # everything else, the frozen reference included, stays identical
-        rep = cg.compare_dumps(base, cg_edit(rows_ok, "sm_90a", key, sass_hash="changed"), mode="change")
+        rep = cg.compare_dumps(base, cg_edit(rows_ok, "sm_90a", key, sass_hash=cg_hash("changed")), mode="change")
         assert rep["exit"] == 1 and any(key in d for d in rep["differences"]), key
     assert cg.compare_dumps(base, base, mode="change")["gate_r"]["checked"]                   # the row engine is gated even when it equals the base
     rep = cg.compare_dumps(base, rows_ok, mode="change", prev=rows_ok)
@@ -636,8 +666,8 @@ def test_codegen_change_mode_lets_only_the_row_engine_change_and_gates_it():
 
 def test_codegen_refuses_dumps_of_different_toolchains_but_allows_different_variant_defines():
     base = cg_base()
-    for field, value in (("nvcc", "nvcc 13.4"), ("host_compiler", "g++ 8.5"), ("flags", ["-O2"]), ("label", "another toolchain"), ("source", "files"), ("std", "c++17"),
-                         ("src_hash", "0x1ull")):
+    for field, value in (("nvcc", "nvcc 13.4"), ("host_compiler", "g++ 8.5"), ("cuobjdump", "cuobjdump 13.4"), ("ptxas", "ptxas 13.4"), ("flags", ["-O2"]),
+                         ("label", "another toolchain"), ("source", "files"), ("std", "c++17"), ("src_hash", "0x1ull")):
         other = cg_copy(base)
         other["meta"]["toolchain"][field] = value
         with pytest.raises(cg.Unusable):
@@ -760,7 +790,211 @@ def test_codegen_ptxas_log_and_elf_attribute_parsers():
     assert e[("sm_100a", "_ZN4cfbi11plan_kernelEPKliPKiS3_iiPNS_7SeqPlanE")] == {"maxreg": 255}
 
 
+def cg_manifest(**over):
+    """A complete toolchain manifest of a production build (the values are made up; the real one is derived from the build log and the tool versions)."""
+    m = {"schema": cg.MANIFEST_SCHEMA, "label": "container toolchain", "nvcc": "Cuda compilation tools, release 13.4, V13.4.59", "host_compiler": "c++ (Ubuntu 13.3.0) 13.3.0",
+         "cuobjdump": "Cuda compilation tools, release 13.4, V13.4.49", "ptxas": "Cuda compilation tools, release 13.4, V13.4.59", "std": "c++20",
+         "flags": list(cg.PRODUCTION_FLAGS) + ["-gencode=arch=compute_100a,code=sm_100a"], "archs": ["sm_100a"], "variant_defines": [], "src_hash": "0x15ca577bf4da4848ull",
+         "build_log": {"sha256": cg_hash("build log"), "nvcc_compile_lines": 3, "units": ["a.cu", "b.cu", "c.cu"]}}
+    m.update(over)
+    return m
+
+
+class CgFiles:
+    """The text inputs of a dump of another toolchain, written to a temporary directory: resources, SASS, ptxas log, ELF attributes and the manifest."""
+
+    def __init__(self, code=CODE, manifest=None, regs=None, ptxas=None, elf=None, sass=None):
+        self.dir = tempfile.mkdtemp()
+        fns = {ROWS: (128, 112), K1: (100, 0)}
+        self.paths = {"regs": self.write("regs.txt", regs if regs is not None else cg_regs(fns)),
+                      "sass": self.write("sass.txt", sass if sass is not None else cg_sass({ROWS: code, K1: ["EXIT"]})),
+                      "ptxas": self.write("ptxas.txt", ptxas if ptxas is not None else cg_ptxas({ROWS: (112, 4, 4, 128), K1: (0, 0, 0, 100)})),
+                      "elf": self.write("elf.txt", elf if elf is not None else cg_elf({ROWS: (128, 256), K1: (128, 256)}))}
+        self.manifest = manifest if manifest is not None else cg_manifest()
+        self.paths["manifest"] = self.write("manifest.json", json.dumps(self.manifest))
+
+    def write(self, name, text):
+        path = os.path.join(self.dir, name)
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def dump(self):
+        p = self.paths
+        return cg.dump_from_files(p["regs"], p["sass"], p["manifest"], p["elf"], p["ptxas"])
+
+
 def test_codegen_dump_from_toolchain_text_files_and_the_operand_only_control():
+    base = CgFiles().dump()
+    rows = base["kernels"]["sm_100a"]["cfbi::rows_kernel"]
+    assert rows["reg"] == 128 and rows["spill_stores"] == 4 and rows["instructions"] == len(CODE)            # the spill figures come from the ptxas lines
+    assert rows["max_threads"] == 256 and rows["maxreg"] == 128                                              # the launch bounds come from the ELF attributes
+    assert base["meta"]["toolchain"]["host_compiler"] == "c++ (Ubuntu 13.3.0) 13.3.0" and base["meta"]["toolchain"]["flags"] == cg_manifest()["flags"]
+    assert cg.compare_dumps(base, base)["exit"] == 0
+    for idx, new in ((5, "FFMA R8, R2, R3, R4"), (2, "IMAD.WIDE.U32 R2, R5, 0x24, R2")):                  # operand only, immediate only: the gate must fail
+        code = list(CODE)
+        code[idx] = new
+        assert cg.compare_dumps(base, CgFiles(code=code).dump())["exit"] == 1, new
+    with pytest.raises(cg.Unusable):                                                                         # a dump built by nvcc here is another toolchain
+        cg.compare_dumps(base, cg_base())
+
+
+def test_codegen_every_missing_figure_of_a_kernel_is_unusable_never_an_equality():
+    base = cg_dump(cg_table())
+    cg.check_dump(base)
+    for field, bad in (("instructions", None), ("instructions", 0), ("sass_hash", None), ("sass_hash", "h0"), ("sass_hash", "A" * 64), ("sass_hash_strict", None),
+                       ("reg", None), ("stack", None), ("shared", None), ("local", None), ("spill_stores", None), ("spill_loads", None), ("spill_stores", -1), ("reg", True)):
+        broken = cg_edit(base, "sm_100a", "cfbi::k1_kernel<Li16E>", **{field: bad})
+        with pytest.raises(cg.Unusable):
+            cg.check_dump(broken)
+        for mode in ("identity", "change"):
+            with pytest.raises(cg.Unusable):
+                cg.compare_dumps(base, broken, mode=mode)
+            with pytest.raises(cg.Unusable):
+                cg.compare_dumps(broken, broken, mode=mode)                                                  # the same hole on both sides is not an equality either
+    d = tempfile.mkdtemp()
+    paths = {}
+    for name, dump in (("ok", base), ("hole", cg_edit(base, "sm_100a", "cfbi::k1_kernel<Li16E>", spill_loads=None))):
+        paths[name] = os.path.join(d, name + ".json")
+        with open(paths[name], "w") as f:
+            json.dump(dump, f)
+    assert cg.main(["compare", "--base", paths["ok"], "--cand", paths["ok"]]) == 0
+    assert cg.main(["compare", "--base", paths["ok"], "--cand", paths["hole"]]) == 2
+    assert cg.main(["compare", "--base", paths["ok"], "--cand", paths["hole"], "--mode", "change"]) == 2
+
+
+def test_codegen_review_counterexamples_are_exit_2():
+    """The two reproductions of the round-0 review: every SASS / spill / launch-bound figure cleared on both sides, and one spill figure of the candidate row engine."""
+    base = cg_dump(cg_table())
+    cleared = cg_copy(base)
+    for rec in cleared["kernels"]["sm_100a"].values():
+        rec.update(instructions=None, sass_hash=None, sass_hash_strict=None, spill_stores=None, spill_loads=None, max_threads=None, maxreg=None)
+    with pytest.raises(cg.Unusable):
+        cg.compare_dumps(cleared, cleared, mode="change")
+    with pytest.raises(cg.Unusable):
+        cg.compare_dumps(base, cg_edit(base, "sm_100a", "cfbi::rows_kernel", spill_stores=None), mode="change")
+
+
+def test_codegen_inconsistent_or_truncated_text_inputs_are_unusable():
+    fns = {ROWS: (128, 0), K1: (100, 0)}
+    ptx = {ROWS: (0, 0, 0, 128), K1: (0, 0, 0, 100)}
+    sass = cg_sass({ROWS: CODE, K1: ["EXIT"]})
+    assert sum(len(v) for v in cg.kernel_table(cg_regs(fns), sass, cg_ptxas(ptx), cg_elf({ROWS: (128, 256)})).values()) == 2
+    with pytest.raises(cg.Unusable):                                                                         # a function that the SASS dump lacks
+        cg.kernel_table(cg_regs(fns), cg_sass({ROWS: CODE}), cg_ptxas(ptx), cg_elf({ROWS: (128, 256)}))
+    with pytest.raises(cg.Unusable):                                                                         # a SASS function without a resource entry
+        cg.kernel_table(cg_regs({ROWS: (128, 0)}), sass, cg_ptxas(ptx), cg_elf({ROWS: (128, 256)}))
+    with pytest.raises(cg.Unusable):                                                                         # a ptxas log of another build
+        cg.kernel_table(cg_regs(fns), sass, cg_ptxas(dict(ptx, **{"_ZN4cfbi9other_kernelEv": (0, 0, 0, 8)})), cg_elf({ROWS: (128, 256)}))
+    for text in ("", "Fatbin elf code:\narch = sm_100a\n"):                                                   # empty dumps
+        with pytest.raises(cg.Unusable):
+            cg.kernel_table(text, sass, cg_ptxas(ptx), None)
+        with pytest.raises(cg.Unusable):
+            cg.kernel_table(cg_regs(fns), text, cg_ptxas(ptx), None)
+    truncated = cg.kernel_table(cg_regs(fns), sass, cg_ptxas({ROWS: (0, 0, 0, 128)}), cg_elf({ROWS: (128, 256)}))     # the log stops before K1: its spills are unknown
+    with pytest.raises(cg.Unusable):
+        cg.check_dump(cg_dump(truncated))
+    empty_body = cg.kernel_table(cg_regs(fns), cg_sass({ROWS: CODE, K1: []}), cg_ptxas(ptx), cg_elf({ROWS: (128, 256)}))   # a function with no instruction
+    with pytest.raises(cg.Unusable):
+        cg.check_dump(cg_dump(empty_body))
+    no_elf = cg.kernel_table(cg_regs(fns), sass, cg_ptxas(ptx), None)                                      # no launch-bound data for the row engine
+    with pytest.raises(cg.Unusable):
+        cg.check_dump(cg_dump(no_elf))
+
+
+def test_codegen_row_engine_family_and_new_kernels_need_launch_bound_and_reference_data():
+    base = cg_base()
+    changed = cg_copy(base)
+    for arch in changed["kernels"]:
+        changed["kernels"][arch]["cfbi::rows_kernel"].update(sass_hash=cg_hash("rows-new"), instructions=90)
+    assert cg.compare_dumps(base, changed, mode="change")["exit"] == 0
+    for field in ("max_threads", "maxreg"):
+        for side in ("cand", "base"):
+            b, c = cg_copy(base), cg_copy(changed)
+            target = c if side == "cand" else b
+            target["kernels"]["sm_100a"]["cfbi::rows_kernel"][field] = None
+            with pytest.raises(cg.Unusable):                                                                 # the row engine's launch bounds cannot be checked
+                cg.check_dump(target)
+    added = cg_copy(base)                                                                                    # a new kernel needs the base row engine as reference
+    added["kernels"]["sm_100a"]["cfbi::new_kernel"] = cg_kernel(reg=100, sass="new", maxreg=None, maxthr=None)
+    assert cg.compare_dumps(base, added)["exit"] == 0                                                        # attributes are only required for the row-engine family
+    no_ref = cg_copy(base)
+    no_ref["kernels"]["sm_100a"].pop("cfbi::rows_kernel")
+    with pytest.raises(cg.Unusable):
+        cg.compare_dumps(no_ref, cg_edit(added, "sm_100a", "cfbi::new_kernel", reg=100))
+
+
+def test_codegen_files_dump_needs_every_input_and_a_complete_manifest():
+    f = CgFiles()
+    p = f.paths
+    for missing in range(5):
+        args = [p["regs"], p["sass"], p["manifest"], p["elf"], p["ptxas"]]
+        args[missing] = None
+        with pytest.raises(cg.Unusable):
+            cg.dump_from_files(*args)
+    for field in ("label", "nvcc", "host_compiler", "cuobjdump", "ptxas", "std", "flags", "archs"):
+        for bad in (None, "", []):
+            m = cg_manifest()
+            m[field] = bad
+            with pytest.raises(cg.Unusable):
+                CgFiles(manifest=m).dump()
+        m = cg_manifest()
+        del m[field]
+        with pytest.raises(cg.Unusable):
+            CgFiles(manifest=m).dump()
+    for bad in ({"schema": "other"}, dict(cg_manifest(), build_log={"sha256": "x", "nvcc_compile_lines": 3}), dict(cg_manifest(), build_log=None),
+                dict(cg_manifest(), archs=["sm_90a"]), dict(cg_manifest(), flags=[1, 2])):
+        with pytest.raises(cg.Unusable):
+            CgFiles(manifest=bad).dump()
+
+
+def test_codegen_same_label_with_a_different_toolchain_is_refused_and_a_variant_or_source_change_is_not():
+    base = CgFiles().dump()
+    assert cg.compare_dumps(base, CgFiles().dump())["exit"] == 0
+    for field, value in (("host_compiler", "c++ (Ubuntu 11.4.0) 11.4.0"), ("nvcc", "Cuda compilation tools, release 12.9, V12.9.86"), ("cuobjdump", "Cuda compilation tools, release 13.4, V13.4.1"),
+                         ("ptxas", "Cuda compilation tools, release 13.4, V13.4.1"), ("std", "c++17"), ("flags", cg_manifest()["flags"] + ["-O0"]),
+                         ("flags", [x for x in cg_manifest()["flags"] if x != "-fmad=false"] + ["-fmad=true"])):
+        other = CgFiles(manifest=cg_manifest(**{field: value})).dump()
+        assert other["meta"]["toolchain"]["label"] == base["meta"]["toolchain"]["label"]                    # the label alone proves nothing
+        with pytest.raises(cg.Unusable):
+            cg.compare_dumps(base, other)
+    d = tempfile.mkdtemp()
+    paths = []
+    for i, m in enumerate((cg_manifest(), cg_manifest(host_compiler="c++ (Ubuntu 11.4.0) 11.4.0"))):
+        paths.append(os.path.join(d, "d%d.json" % i))
+        with open(paths[-1], "w") as fh:
+            json.dump(CgFiles(manifest=m).dump(), fh)
+    assert cg.main(["compare", "--base", paths[0], "--cand", paths[0]]) == 0
+    assert cg.main(["compare", "--base", paths[0], "--cand", paths[1]]) == 2
+    variant = CgFiles(manifest=cg_manifest(variant_defines=["CFBI_NEG_CONTROL=1"], src_hash="0xdeadbeefull")).dump()     # variants and the source hash are not the toolchain
+    rep = cg.compare_dumps(base, variant)
+    assert rep["exit"] == 0 and variant["meta"]["variant"]["defines"] == ["CFBI_NEG_CONTROL=1"] and variant["meta"]["tree"]["src_hash"] == "0xdeadbeefull"
+
+
+JIT_NVCC = ("[%d/5] /usr/local/cuda/bin/nvcc -MD -MF %s.cuda.o.d -DTORCH_EXTENSION_NAME=flash_kda_cfbi_C_jit -DTORCH_API_INCLUDE_EXTENSION_H "
+            "-D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr "
+            "-isystem /usr/lib/python3/torch/include -I/work/csrc -gencode=arch=compute_100a,code=sm_100a --compiler-options '-fPIC' -O3 -fmad=false -ftz=false "
+            "-prec-div=true -prec-sqrt=true --expt-relaxed-constexpr -lineinfo --ptxas-options=-v %s -std=c++20 -c /work/csrc/cfbi/%s.cu -o %s.cuda.o")
+TOOL_VERSIONS = """TOOLCHAIN python 3.12.3
+TOOLCHAIN torch 2.14.0 cuda 13.4
+TOOLCHAIN nvcc: nvcc: NVIDIA (R) Cuda compiler driver | Copyright (c) 2005-2026 NVIDIA Corporation | Built on Mon_Aug_03 | Cuda compilation tools, release 13.4, V13.4.59 | Build cuda_13.4
+TOOLCHAIN ptxas: ptxas: NVIDIA (R) Ptx optimizing assembler | Built on Mon_Aug_03 | Cuda compilation tools, release 13.4, V13.4.59 | Build cuda_13.4
+TOOLCHAIN cuobjdump: cuobjdump: NVIDIA (R) fat binary listing tool | Built on Thu_Jul_16 | Cuda compilation tools, release 13.4, V13.4.49 | Build cuda_13.4
+TOOLCHAIN host: c++ (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0 | Copyright (C) 2023 Free Software Foundation, Inc.
+"""
+
+
+def jit_log(units=("cfbi_probe", "cfbi_k2_dyn", "cfbi_launch"), extra=("-DCFBI_SRC_HASH=0x15ca577bf4da4848ull",), tweak=None):
+    lines = ["ninja: build started"]
+    for i, u in enumerate(units):
+        line = JIT_NVCC % (i + 1, u, " ".join(extra), u, u)
+        lines.append(tweak(i, line) if tweak else line)
+    lines += ["[4/5] c++ -MMD -MF cfbi_binding.o.d -DTORCH_EXTENSION_NAME=flash_kda_cfbi_C_jit -O3 -std=c++20 -c /work/csrc/cfbi/cfbi_binding.cpp -o cfbi_binding.o",
+              "ptxas info    : Compiling entry function '%s' for 'sm_100a'" % ROWS]
+    return "\n".join(lines) + "\n"
+
+
+def test_codegen_manifest_comes_from_the_build_log_and_the_probed_tool_versions():
     d = tempfile.mkdtemp()
 
     def write(name, text):
@@ -769,23 +1003,52 @@ def test_codegen_dump_from_toolchain_text_files_and_the_operand_only_control():
             f.write(text)
         return path
 
-    regs, ptx = write("a.regs.txt", cg_regs({ROWS: (128, 112), K1: (100, 0)})), write("a.ptxas.txt", PTXAS)
-    sass = write("a.sass.txt", cg_sass({ROWS: CODE, K1: ["EXIT"]}))
-    base = cg.dump_from_files(regs, sass, "container toolchain", ptxas_log=ptx)
-    cg.check_dump(base)
-    rows = base["kernels"]["sm_100a"]["cfbi::rows_kernel"]
-    assert rows["reg"] == 128 and rows["spill_stores"] == 4 and rows["instructions"] == len(CODE)     # the spill figures come from the ptxas lines
-    assert cg.compare_dumps(base, base)["exit"] == 0
-    for idx, new in ((5, "FFMA R8, R2, R3, R4"), (2, "IMAD.WIDE.U32 R2, R5, 0x24, R2")):          # operand only, immediate only: the gate must fail
-        code = list(CODE)
-        code[idx] = new
-        cand = cg.dump_from_files(regs, write("b.sass.txt", cg_sass({ROWS: code, K1: ["EXIT"]})), "container toolchain", ptxas_log=ptx)
-        assert cg.compare_dumps(base, cand)["exit"] == 1, new
-    other = cg.dump_from_files(regs, sass, "another toolchain", ptxas_log=ptx)
-    with pytest.raises(cg.Unusable):                                                                   # another toolchain label is not comparable
-        cg.compare_dumps(base, other)
-    with pytest.raises(cg.Unusable):                                                                   # and neither is a dump built by nvcc here
-        cg.compare_dumps(base, cg_base())
+    versions = write("versions.txt", TOOL_VERSIONS)
+    m = cg.manifest_from_build(write("build.log", jit_log()), versions, "container toolchain")
+    cg.validate_manifest(m)
+    assert m["nvcc"] == "Cuda compilation tools, release 13.4, V13.4.59" and m["cuobjdump"].endswith("V13.4.49") and m["ptxas"].endswith("V13.4.59")
+    assert m["host_compiler"] == "c++ (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0" and m["std"] == "c++20" and m["archs"] == ["sm_100a"]
+    assert all(f in m["flags"] for f in cg.PRODUCTION_FLAGS) and "-D__CUDA_NO_HALF_OPERATORS__" in m["flags"] and "--compiler-options -fPIC" in m["flags"]
+    assert not any(f.startswith(("-I", "-MF", "-MD", "-c", "-o", "-DTORCH_EXTENSION_NAME", "-DCFBI_SRC_HASH")) or f.endswith(".cu") for f in m["flags"]), m["flags"]
+    assert m["src_hash"] == "0x15ca577bf4da4848ull" and m["variant_defines"] == [] and m["build_log"]["nvcc_compile_lines"] == 3
+    assert m["build_log"]["units"] == ["cfbi_k2_dyn.cu", "cfbi_launch.cu", "cfbi_probe.cu"] and len(m["build_log"]["sha256"]) == 64
+    v = cg.manifest_from_build(write("variant.log", jit_log(extra=("-DCFBI_SRC_HASH=0x1ull", "-DCFBI_NEG_CONTROL=1"))), versions, "container toolchain")
+    assert v["variant_defines"] == ["CFBI_NEG_CONTROL=1"] and v["flags"] == m["flags"] and v["src_hash"] == "0x1ull"     # variant and source hash are kept out of the flags
+    with pytest.raises(cg.Unusable):                                                                         # the units of one build must share their parameters
+        cg.manifest_from_build(write("mixed.log", jit_log(tweak=lambda i, line: line.replace("-lineinfo", "") if i == 1 else line)), versions, "x")
+    with pytest.raises(cg.Unusable):                                                                         # not built with the production flags
+        cg.manifest_from_build(write("nonprod.log", jit_log(tweak=lambda i, line: line.replace("-fmad=false", "-fmad=true"))), versions, "x")
+    assert cg.manifest_from_build(write("nonprod.log", jit_log(tweak=lambda i, line: line.replace("-fmad=false", "-fmad=true"))), versions, "x", allow_non_production_flags=True)
+    with pytest.raises(cg.Unusable):                                                                         # the log of a cached build has no compile line
+        cg.manifest_from_build(write("cached.log", "ninja: no work to do.\n"), versions, "x")
+    with pytest.raises(cg.Unusable):                                                                         # no standard
+        cg.manifest_from_build(write("nostd.log", jit_log(tweak=lambda i, line: line.replace("-std=c++20", ""))), versions, "x")
+    for drop in ("host", "ptxas", "cuobjdump", "nvcc"):
+        text = "".join(ln + "\n" for ln in TOOL_VERSIONS.splitlines() if not ln.startswith("TOOLCHAIN %s" % drop))
+        with pytest.raises(cg.Unusable):
+            cg.manifest_from_build(write("build.log", jit_log()), write("partial.txt", text), "x")
+    so = write("ext.so", "binary stand-in")                                                                  # the built extension is named by its hash
+    with_art = cg.manifest_from_build(write("build.log", jit_log()), versions, "container toolchain", artifact=so)
+    assert with_art["artifact"]["sha256"] == hashlib.sha256(b"binary stand-in").hexdigest() and with_art["artifact"]["path"] == so
+    cg.validate_manifest(with_art)
+    with pytest.raises(cg.Unusable):
+        cg.validate_manifest(dict(with_art, artifact={"path": so, "sha256": "short"}))
+    assert CgFiles(manifest=with_art).dump()["meta"]["artifact"]["sha256"] == with_art["artifact"]["sha256"]
+    out = os.path.join(d, "manifest.json")                                                                   # the command line
+    assert cg.main(["manifest", "--build-log", os.path.join(d, "build.log"), "--tool-versions", versions, "--label", "container toolchain", "--out", out]) == 0
+    with open(out) as fh:
+        assert json.load(fh) == m
+    assert cg.main(["manifest", "--build-log", os.path.join(d, "cached.log"), "--tool-versions", versions, "--label", "x", "--out", out]) == 2
+    f = CgFiles(manifest=m)                                                                                   # and the manifest feeds a dump
+    dump_args = ["--regs", f.paths["regs"], "--sass", f.paths["sass"], "--elf", f.paths["elf"], "--ptxas-log", f.paths["ptxas"]]
+    assert cg.main(["dump-files", "--manifest", out] + dump_args + ["--out", os.path.join(d, "dump.json")]) == 0
+    with open(os.path.join(d, "dump.json")) as fh:
+        assert json.load(fh)["meta"]["tree"]["commit"] is None
+    assert cg.main(["dump-files", "--manifest", out] + dump_args + ["--commit", BASE_COMMIT, "--out", os.path.join(d, "dump1.json")]) == 0
+    with open(os.path.join(d, "dump1.json")) as fh:                                                           # the identity of the built source tree is recorded when it is given
+        assert json.load(fh)["meta"]["tree"]["commit"] == BASE_COMMIT
+    wrong = write("wrong.json", json.dumps(dict(m, archs=["sm_90a"])))                                          # a manifest of another architecture does not describe this dump
+    assert cg.main(["dump-files", "--manifest", wrong] + dump_args + ["--out", os.path.join(d, "dump2.json")]) == 2
 
 
 def test_codegen_reference_figures_are_a_warning_not_a_failure():
@@ -801,7 +1064,7 @@ def test_codegen_cli_exit_codes():
     d = tempfile.mkdtemp()
     base = cg_base()
     paths = {}
-    for name, dump in (("base", base), ("same", base), ("diff", cg_edit(base, "sm_100a", "cfbi::k1_kernel<Li16E>", sass_hash="x")),
+    for name, dump in (("base", base), ("same", base), ("diff", cg_edit(base, "sm_100a", "cfbi::k1_kernel<Li16E>", sass_hash=cg_hash("x"))),
                        ("other", cg_dump(base["kernels"], label="other-toolchain"))):
         paths[name] = os.path.join(d, name + ".json")
         with open(paths[name], "w") as f:
@@ -879,17 +1142,20 @@ FILL_K = "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunc
 WALL_KEY = "decode;N=1;H=12;regime=lockstep;"
 
 
-def wall_cell(key, vals, kind="decode"):
+CALLS, PROFILE_CALLS = 1536, 256                 # calls per trial and profiled calls of a lock-step decode cell (the defaults of the benchmark)
+
+
+def wall_cell(key, vals, kind="decode", scale=1):
     """A decode cell with one trial per value: ``gpu_graph_us`` = value, ``gpu_eager_us`` = value + 1, ``cpu_graph_us`` = value + 3; the kernels of a trial are
-    plan 2 us + rows 10 us and one helper kernel of 40 us that must stay out of the kernel sum."""
+    plan 2 us + rows 10 us and one helper kernel of 40 us that must stay out of the kernel sum. ``scale``: the factor of a re-run on the default calls."""
     runs = [{PLAN_K: 2.0, ROWS_K: 10.0, FILL_K: 40.0} for _ in vals]
     wall = [{"gpu_graph_us": v, "gpu_eager_us": v + 1.0, "cpu_graph_us": v + 3.0} for v in vals]
-    return br.make_cell(kind, key, {}, runs, drop_helpers=True, wall=wall)
+    return br.make_cell(kind, key, {"calls_per_trial": scale * CALLS, "profile_calls": scale * PROFILE_CALLS}, runs, drop_helpers=True, wall=wall)
 
 
-def wall_rec(commit, cells, ts, stat=br.PROCESS_MEDIAN, gpu="NVIDIA B200", sm=148, host="node1", dirty=False):
+def wall_rec(commit, cells, ts, stat=br.PROCESS_MEDIAN, gpu="NVIDIA B200", sm=148, host="node1", dirty=False, scale=1):
     meta = {"commit": commit, "dirty": dirty, "gpu": gpu, "sm_count": sm, "host": host, "timestamp": ts, "sample_stat": stat, "trials": 5}
-    return {"schema": br.SCHEMA, "meta": meta, "cells": [wall_cell(k, v) for k, v in cells.items()]}
+    return {"schema": br.SCHEMA, "meta": meta, "cells": [wall_cell(k, v, scale=scale) for k, v in cells.items()]}
 
 
 def trials(median, spread=0.0):
@@ -898,7 +1164,7 @@ def trials(median, spread=0.0):
 
 
 def wall_sets(base_meds, cand_meds, keys=(WALL_KEY,), hour="10", cand_commit="abc1234", **kw):
-    """Interleaved record lists (A B A B A B ...) with one per-process median per record file for each cell key."""
+    """Interleaved record lists (A B A B A B ...) with one per-process median per record file for each cell key (``scale=3`` for the records of a re-run)."""
     base = [wall_rec(BASE_COMMIT, {k: trials(m) for k in keys}, "2026-11-10T%s:0%d:00Z" % (hour, 2 * i), **kw) for i, m in enumerate(base_meds)]
     cand = [wall_rec(cand_commit, {k: trials(m) for k in keys}, "2026-11-10T%s:0%d:00Z" % (hour, 2 * i + 1), **kw) for i, m in enumerate(cand_meds)]
     return base, cand
@@ -952,17 +1218,25 @@ def test_wall_metric_regress_gate_passes_aa_fails_a_3_percent_slower_and_passes_
 
 def test_widening_mode_passes_an_unstable_aa_pair_that_the_worst_mode_fails_and_still_fails_a_slower_candidate():
     base, cand = wall_sets([100.0, 100.45, 100.9], [100.15, 100.6, 101.05])                      # 0.9 % spread on each side, offset by 0.15 %
+    rbase, rcand = wall_sets([100.0, 100.45, 100.9], [100.15, 100.6, 101.05], hour="11", scale=3)   # still above 0.3 % with three times the calls
     worst = br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="worst")
     assert worst["verdict"] == "FAIL" and 1.0 < worst["rows"][0]["delta_pct"] < 1.1              # fastest baseline repeat vs slowest candidate repeat
     assert br.compare(base, cand, metric="gpu_graph_us")["verdict"] == "INVALID"                  # the default does not accept an unstable baseline
-    wide = br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen")
+    first = br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen")              # no re-run yet: the widened tolerance is not granted
+    row = first["rows"][0]
+    assert first["verdict"] == "INVALID" and row["needs_rerun"] and row["status"] == "NEEDS_RERUN" and not row["noise_limited"]
+    assert any("no valid re-run" in p for p in first["problems"]) and "needs a re-run" in br.format_table(first)
+    wide = br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=rbase, cand_rerun=rcand)
     row = wide["rows"][0]
-    assert wide["verdict"] == "PASS" and row["noise_limited"] and abs(row["tol_pct_effective"] - 1.896) < 0.01 and row["median_delta_pct"] < 0.2
+    assert wide["verdict"] == "PASS" and row["noise_limited"] and row["judged_on"] == "rerun" and not row["needs_rerun"]
+    assert abs(row["tol_pct_effective"] - 1.896) < 0.01 and row["median_delta_pct"] < 0.2
     assert "noise-limited" in br.format_table(wide)
     _, slower = wall_sets([100.0, 100.45, 100.9], [103.2, 103.65, 104.1])
-    assert br.compare(base, slower, metric="gpu_graph_us", baseline_unstable="widen")["verdict"] == "FAIL"
-    stable_b, stable_c = wall_sets([100.0, 100.05, 99.95], [100.0, 100.05, 99.95])               # stable cells keep the plain tolerance
-    assert not br.compare(stable_b, stable_c, metric="gpu_graph_us", baseline_unstable="widen")["rows"][0]["noise_limited"]
+    _, rslower = wall_sets([100.0, 100.45, 100.9], [103.2, 103.65, 104.1], hour="11", scale=3)
+    assert br.compare(base, slower, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=rbase, cand_rerun=rslower)["verdict"] == "FAIL"
+    stable_b, stable_c = wall_sets([100.0, 100.05, 99.95], [100.0, 100.05, 99.95])               # stable cells keep the plain tolerance and need no re-run
+    stable = br.compare(stable_b, stable_c, metric="gpu_graph_us", baseline_unstable="widen")
+    assert stable["verdict"] == "PASS" and not stable["rows"][0]["noise_limited"] and not stable["rows"][0]["needs_rerun"]
     assert br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="bogus")["verdict"] == "INVALID"
 
 
@@ -986,7 +1260,7 @@ def test_process_median_samples_are_one_value_per_record_and_need_five_trials():
 def test_a_metric_that_is_zero_or_absent_in_a_cell_is_invalid_not_a_failure():
     base, cand = wall_sets([100.0, 100.05, 99.95], [100.0, 100.05, 99.95])
     res = br.compare(base, cand)                                                                  # the default metric k2_stage_us: a decode call has no K2 stage
-    assert res["verdict"] == "INVALID" and res["rows"] == [] and any("zero in cell" in p and "kind decode" in p for p in res["problems"])
+    assert res["verdict"] == "INVALID" and res["rows"] == [] and any("zero k2_stage_us" in p and "kind decode" in p for p in res["problems"])
     d = tempfile.mkdtemp()
     assert compare_bench.main(["--base"] + write_records(d, "a", base) + ["--cand"] + write_records(d, "b", cand)) == 2
     assert compare_bench.main(["--base"] + write_records(d, "a", base) + ["--cand"] + write_records(d, "b", cand) + ["--metric", "k2_main_us"]) == 2
@@ -998,7 +1272,7 @@ def test_a_metric_that_is_zero_or_absent_in_a_cell_is_invalid_not_a_failure():
             for s in cell["samples"]:
                 del s["gpu_graph_us"]
     res = br.compare(base, stripped, metric="gpu_graph_us")
-    assert res["verdict"] == "INVALID" and any("absent in cell" in p and "candidate" in p for p in res["problems"])
+    assert res["verdict"] == "INVALID" and any("carry no gpu_graph_us" in p and "candidate" in p for p in res["problems"])
     gone = [json.loads(json.dumps(r)) for r in cand]                                              # a derived metric that vanished in the candidate is not a speed-up
     for r in gone:
         for cell in r["cells"]:
@@ -1009,45 +1283,161 @@ def test_a_metric_that_is_zero_or_absent_in_a_cell_is_invalid_not_a_failure():
 
 def test_rerun_records_override_the_cells_they_contain():
     k1, k2 = br.cell_key("decode", N=1, H=12, regime="lockstep"), br.cell_key("decode", N=4, H=12, regime="lockstep")
-    base, cand = wall_sets([100.0, 100.45, 100.9], [100.15, 100.6, 101.05], keys=(k1, k2))       # both cells are noise-limited in the first campaign
-    rbase, rcand = wall_sets([100.0, 100.05, 99.95], [100.1, 100.15, 100.05], keys=(k1,), hour="11")
+    base, cand = wall_sets([100.0, 100.45, 100.9], [100.15, 100.6, 101.05], keys=(k1, k2))       # both cells are above 0.3 % in the first campaign
+    rbase, rcand = wall_sets([100.0, 100.05, 99.95], [100.1, 100.15, 100.05], keys=(k1,), hour="11", scale=3)
     res = br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=rbase, cand_rerun=rcand)
     rows = {r["key"]: r for r in res["rows"]}
-    assert res["verdict"] == "PASS" and rows[k1]["judged_on"] == "rerun" and not rows[k1]["noise_limited"] and "judged on the re-run" in rows[k1]["note"]
-    assert rows[k2]["judged_on"] == "first" and rows[k2]["noise_limited"]
-    assert br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=rbase)["verdict"] == "INVALID"      # one side only
-    _, rcand_other = wall_sets([100.0, 100.05, 99.95], [100.1, 100.15, 100.05], keys=(k2,), hour="11")
+    assert rows[k1]["judged_on"] == "rerun" and not rows[k1]["noise_limited"] and not rows[k1]["needs_rerun"] and "judged on the re-run" in rows[k1]["note"]
+    assert rows[k2]["judged_on"] == "first" and rows[k2]["needs_rerun"] and rows[k2]["status"] == "NEEDS_RERUN"
+    assert res["verdict"] == "INVALID" and any(k2 in p and "no valid re-run" in p for p in res["problems"])                 # the cell without a re-run holds the gate back
+    rbase2, rcand2 = wall_sets([100.0, 100.05, 99.95], [100.1, 100.15, 100.05], keys=(k1, k2), hour="11", scale=3)
+    res = br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=rbase2, cand_rerun=rcand2)
+    assert res["verdict"] == "PASS" and [r["judged_on"] for r in res["rows"]] == ["rerun", "rerun"]
+    assert br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=rbase2)["verdict"] == "INVALID"      # one side only
+    _, rcand_other = wall_sets([100.0, 100.05, 99.95], [100.1, 100.15, 100.05], keys=(k2,), hour="11", scale=3)
     res = br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=rbase, cand_rerun=rcand_other)
     assert res["verdict"] == "INVALID" and any("one side only" in p for p in res["problems"])
-    few = rbase[:2]
-    assert br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=few, cand_rerun=rcand[:2])["verdict"] == "INVALID"
+    few = rbase2[:2]
+    assert br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=few, cand_rerun=rcand2[:2])["verdict"] == "INVALID"
+    other = ("decode;N=2;H=12;regime=lockstep;",)                                                                              # a re-run cell that was never measured first
+    ob, oc = wall_sets([100.0, 100.05, 99.95], [100.1, 100.15, 100.05], keys=other, hour="11", scale=3)
+    res = br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=ob, cand_rerun=oc)
+    assert res["verdict"] == "INVALID" and any("not in the first campaign" in p for p in res["problems"])
+
+
+def test_a_defective_sample_makes_the_comparison_invalid_and_names_the_cell():
+    k1, k2 = br.cell_key("decode", N=1, H=12, regime="lockstep"), br.cell_key("decode", N=4, H=12, regime="lockstep")
+    base, cand = wall_sets([100.0, 100.05, 99.95], [100.0, 100.05, 99.95], keys=(k1, k2))
+    assert br.compare(base, cand, metric="gpu_graph_us")["verdict"] == "PASS"
+    for bad in (float("nan"), float("inf"), float("-inf"), -3.0, 0.0, True):
+        for side in ("baseline", "candidate"):
+            recs = json.loads(json.dumps((base if side == "baseline" else cand), allow_nan=True))
+            recs[1]["cells"][1]["samples"][2]["gpu_graph_us"] = bad                                # one trial of one process of the second cell
+            for r, orig in zip(recs, base if side == "baseline" else cand):
+                r["_path"] = orig["_path"] if "_path" in orig else "mem"
+            res = br.compare(*((recs, cand) if side == "baseline" else (base, recs)), metric="gpu_graph_us")
+            assert res["verdict"] == "INVALID" and any(k2 in p and side in p for p in res["problems"]) and not any(k1 in p for p in res["problems"]), (bad, side)
+    nan_on_disk = os.path.join(tempfile.mkdtemp(), "nan")                                          # the file round trip keeps a NaN a NaN
+    broken = [json.loads(json.dumps(r)) for r in cand]
+    broken[0]["cells"][0]["samples"][0]["gpu_graph_us"] = float("nan")
+    paths = write_records(os.path.dirname(nan_on_disk), "c", broken)
+    d = os.path.dirname(nan_on_disk)
+    assert compare_bench.main(["--base"] + write_records(d, "a", base) + ["--cand"] + paths + ["--metric", "gpu_graph_us"]) == 2
+    kernel = json.loads(json.dumps(cand))                                                           # a kernel metric: zero is a legitimate value of a vanished kernel
+    for r in kernel:
+        for s in r["cells"][0]["samples"]:
+            s["kernels"]["plan_kernel"] = 0.0
+    assert br.compare(base, kernel, metric="plan_kernel", cells=[k1])["verdict"] == "PASS"
+    assert br.compare(kernel, base, metric="plan_kernel", cells=[k1])["verdict"] == "INVALID"      # but a zero baseline has nothing to compare with
+
+
+def test_every_record_of_a_side_holds_the_same_unique_cells():
+    k1, k2 = br.cell_key("decode", N=1, H=12, regime="lockstep"), br.cell_key("decode", N=4, H=12, regime="lockstep")
+    base, cand = wall_sets([100.0, 100.05, 99.95], [100.0, 100.05, 99.95], keys=(k1, k2))
+    lost = json.loads(json.dumps(cand))
+    lost[1]["cells"] = lost[1]["cells"][:1]                                                        # one candidate record lost a cell the others hold
+    res = br.compare(base, lost, metric="gpu_graph_us")
+    assert res["verdict"] == "INVALID" and any("lacks the cell" in p and k2 in p for p in res["problems"])
+    first = json.loads(json.dumps(base))
+    first[0]["cells"] = first[0]["cells"][:1]                                                      # the first record does not define the campaign
+    assert any("lacks the cell" in p and k2 in p for p in br.compare(first, cand, metric="gpu_graph_us")["problems"])
+    dup = json.loads(json.dumps(base))
+    dup[0]["cells"].append(json.loads(json.dumps(dup[0]["cells"][0])))                            # one key twice in one record
+    res = br.compare(dup, cand, metric="gpu_graph_us")
+    assert res["verdict"] == "INVALID" and any("repeats the cell key" in p for p in res["problems"])
+    only = json.loads(json.dumps(cand))
+    for r in only:
+        r["cells"] = r["cells"][:1]                                                                # the candidate lost a cell everywhere
+    res = br.compare(base, only, metric="gpu_graph_us")
+    assert res["verdict"] == "INVALID" and any("missing in the candidate" in p and k2 in p for p in res["problems"])
+    assert br.compare(base, only, metric="gpu_graph_us", cells=[k1])["verdict"] == "PASS"         # a cell filter compares what it names
+
+
+def test_a_cell_needs_three_distinct_process_samples_per_side():
+    base, cand = wall_sets([100.0, 100.05, 99.95], [100.0, 100.05, 99.95])
+    same = json.loads(json.dumps(base))
+    for r in same:
+        r["meta"]["timestamp"] = "2026-11-10T10:00:00Z"                                            # three files of one process: one sample counted three times
+    res = br.compare(same, cand, metric="gpu_graph_us", require_interleaved=False)
+    assert res["verdict"] == "INVALID" and any("distinct process" in p and "baseline" in p for p in res["problems"])
+    nostamp = json.loads(json.dumps(cand))
+    for r in nostamp:
+        del r["meta"]["timestamp"]
+    assert any("distinct process" in p for p in br.compare(base, nostamp, metric="gpu_graph_us", require_interleaved=False)["problems"])
+    assert br.compare(base, cand, metric="gpu_graph_us", min_repeats=4)["verdict"] == "INVALID"   # a stricter minimum is honoured
+
+
+def test_a_rerun_proves_three_times_the_calls_of_the_same_configuration():
+    base, cand = wall_sets([100.0, 100.45, 100.9], [100.15, 100.6, 101.05])
+    good = wall_sets([100.0, 100.05, 99.95], [100.1, 100.15, 100.05], hour="11", scale=3)
+
+    def run(pair):
+        return br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=pair[0], cand_rerun=pair[1])
+    assert run(good)["verdict"] == "PASS"
+    for scale in (1, 2, 4):                                                                        # only exactly three times the calls is a re-run
+        res = run(wall_sets([100.0, 100.05, 99.95], [100.1, 100.15, 100.05], hour="11", scale=scale))
+        assert res["verdict"] == "INVALID" and any("not 3 times" in p for p in res["problems"]), scale
+
+    def edited(side, edit):
+        pair = json.loads(json.dumps(good))
+        for r in pair[0 if side == "baseline" else 1]:
+            edit(r)
+        return pair
+    half = edited("baseline", lambda r: r["cells"][0]["args"].update(profile_calls=PROFILE_CALLS))   # the profiled calls were not scaled
+    res = run(half)
+    assert res["verdict"] == "INVALID" and any("profile_calls" in p and "not 3 times" in p and "baseline" in p for p in res["problems"])
+    for field in ("calls_per_trial", "profile_calls"):                                             # a count that is not recorded cannot be proven
+        res = run(edited("candidate", lambda r: r["cells"][0]["args"].pop(field)))
+        assert res["verdict"] == "INVALID" and any(field in p and "not recorded consistently" in p for p in res["problems"]), field
+    for field, value in (("commit", "ffff000"), ("trials", 7), ("host", "node9"), ("impl", 1), ("sample_stat", "pooled")):
+        res = run(edited("candidate", lambda r: r["meta"].update({field: value})))                 # another snapshot, configuration or machine
+        assert res["verdict"] == "INVALID" and res["problems"], field
+    res = run(edited("candidate", lambda r: r["cells"][0]["args"].update(calls_per_trial=3 * CALLS + 64)))
+    assert res["verdict"] == "INVALID"
+    skewed_b, skewed_c = json.loads(json.dumps(base)), json.loads(json.dumps(cand))                # both sides re-run with 3x, but they started from different calls
+    for r in skewed_c:
+        r["cells"][0]["args"].update(calls_per_trial=1000, profile_calls=100)
+    res = br.compare(skewed_b, skewed_c, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=good[0], cand_rerun=good[1])
+    assert res["verdict"] == "INVALID" and any("not 3 times" in p or "different calls" in p for p in res["problems"])
 
 
 def test_classify_rows_reads_slower_faster_and_noise_limited_cells():
     rows = [{"key": "a", "median_delta_pct": 2.0, "noise_limited": False}, {"key": "b", "median_delta_pct": -2.0, "noise_limited": False},
             {"key": "c", "median_delta_pct": -2.0, "noise_limited": True}, {"key": "d", "median_delta_pct": 0.5, "noise_limited": False},
             {"key": "e", "median_delta_pct": -1.0, "noise_limited": False}, {"key": "f", "median_delta_pct": 1.0, "noise_limited": False},
-            {"key": "g", "median_delta_pct": 3.0, "noise_limited": True}]
+            {"key": "g", "median_delta_pct": 3.0, "noise_limited": True}, {"key": "h", "median_delta_pct": -5.0, "noise_limited": False, "needs_rerun": True}]
     out = br.classify_rows({"tol_pct": 1.0, "rows": rows})
     assert out["slower"] == ["a", "g"] and out["faster"] == ["b", "e"] and out["noise_limited"] == ["c", "g"] and out["neutral"] == ["d", "f"]
+    assert out["needs_rerun"] == ["h"]                                                              # nothing is read from an unstable first campaign
 
 
 def test_compare_bench_cli_widen_rerun_and_the_json_classification():
     d = tempfile.mkdtemp()
     base, cand = wall_sets([100.0, 100.45, 100.9], [97.0, 97.4, 97.8])                            # unstable and about 3 % faster
-    rbase, rcand = wall_sets([100.0, 100.05, 99.95], [97.0, 97.05, 96.95], hour="11")
+    rbase, rcand = wall_sets([100.0, 100.05, 99.95], [97.0, 97.05, 96.95], hour="11", scale=3)
+    nbase, ncand = wall_sets([100.0, 100.45, 100.9], [97.0, 97.4, 97.8], hour="12", scale=3)      # still above 0.3 % with three times the calls
+    ubase, ucand = wall_sets([100.0, 100.05, 99.95], [97.0, 97.05, 96.95], hour="13")             # a re-run with the same calls as the first campaign
     out = os.path.join(d, "out.json")
     common = ["--base"] + write_records(d, "a", base) + ["--cand"] + write_records(d, "b", cand) + ["--metric", "gpu_graph_us"]
+
+    def rerun(b, c, name):
+        return ["--rerun-base"] + write_records(d, name + "a", b) + ["--rerun-cand"] + write_records(d, name + "b", c)
+
+    def result():
+        with open(out) as f:
+            return json.load(f)[0]
     assert compare_bench.main(common) == 2                                                        # invalid: unstable baseline
-    assert compare_bench.main(common + ["--unstable-baseline", "widen", "--json", out]) == 0
-    with open(out) as f:
-        res = json.load(f)[0]
+    assert compare_bench.main(common + ["--unstable-baseline", "widen", "--json", out]) == 2      # invalid: the widening needs a valid re-run
+    res = result()
+    assert res["classification"]["needs_rerun"] == [WALL_KEY] and res["classification"]["faster"] == [] and res["classification"]["noise_limited"] == []
+    assert compare_bench.main(common + ["--unstable-baseline", "widen", "--json", out] + rerun(nbase, ncand, "n")) == 0
+    res = result()
     assert res["classification"]["noise_limited"] == [WALL_KEY] and res["classification"]["faster"] == []   # noise-limited: not the evidence of a gain
-    assert compare_bench.main(common + ["--unstable-baseline", "widen", "--rerun-base"] + write_records(d, "ra", rbase) +
-                              ["--rerun-cand"] + write_records(d, "rb", rcand) + ["--json", out]) == 0
-    with open(out) as f:
-        res = json.load(f)[0]
+    assert compare_bench.main(common + ["--unstable-baseline", "widen", "--json", out] + rerun(rbase, rcand, "r")) == 0
+    res = result()
     assert res["classification"]["faster"] == [WALL_KEY] and res["rows"][0]["judged_on"] == "rerun" and res["classification"]["noise_limited"] == []
+    assert compare_bench.main(common + ["--unstable-baseline", "widen", "--json", out] + rerun(ubase, ucand, "u")) == 2    # not three times the calls
+    assert any("not 3 times" in p for p in result()["problems"])
     assert compare_bench.main(common + ["--unstable-baseline", "widen", "--rerun-base"] + write_records(d, "ra", rbase)) == 2
 
 
@@ -1208,30 +1598,236 @@ def test_suite_record_cli_builds_checks_and_refuses_bad_input():
 
 # ---- the layer-chain graph benchmark: cells, node lists and the zero-free step (the measurement needs a GPU) -------------------------------------
 
-CHAIN_COUNTS = {"void cfbi::lin::linear_kernel<128, 2>(cfbi::lin::Args)": 6.0, "void cfbi::conv_kernel<4>(cfbi::Args)": 3.0,
+CHAIN_COUNTS = {"void cfbi::lin::linear_kernel<128, 2>(cfbi::lin::Args)": 6.0, "void cfbi::conv::conv_kernel<4>(cfbi::conv::Args)": 3.0,
                 "void cfbi::plan_kernel(long const*, int)": 1.0, "void cfbi::rows_kernel(cfbi::Params)": 1.0}
 
 
-def test_layer_chain_cells_and_the_expected_kernel_node_lists():
+TWO_LAUNCH = lc.CANONICAL_COMPUTE["two-launch"]
+LIN_K = "void cfbi::lin::linear_kernel<128, 2>(cfbi::lin::Args)"
+MEMSET = "Memset (Device)"
+ATEN_FILL = "void at::native::vectorized_elementwise_kernel<4, FillFunctor>"
+
+
+def test_layer_chain_cells_and_the_exact_kernel_node_mappings():
     specs = lc.cell_specs()
     assert [s["key"] for s in specs] == ["chain;N=1;H=12;Dm=2048;regime=lockstep;", "chain;N=64;H=12;Dm=2048;regime=lockstep;"]
     assert [s["N"] for s in lc.select_cells(specs, ["N=1;"])] == [1] and [s["N"] for s in lc.select_cells(specs, ["N=64;"])] == [64] and lc.select_cells(specs, ["N=6;"]) == []
     assert lc.calls_per_trial(dict(lc.DEFAULTS)) == 1536 and lc.calls_per_trial(dict(lc.DEFAULTS, calls_scale=3)) == 4608 and lc.calls_per_trial(dict(lc.DEFAULTS, calls=100)) == 128
+    assert lc.calls_per_trial(dict(lc.DEFAULTS, calls=100, calls_scale=3)) == 384                    # a re-run has exactly three times the rounded replays
+    assert lc.profile_calls_of(dict(lc.DEFAULTS)) == 64 and lc.profile_calls_of(dict(lc.DEFAULTS, calls_scale=3)) == 192            # one and three whole 64-position cycles
+    assert lc.profile_calls_of(dict(lc.DEFAULTS, profile_calls=16)) == 64 and lc.profile_calls_of(dict(lc.DEFAULTS, profile_calls=100, calls_scale=3)) == 384
     compute, aux = lc.split_nodes(CHAIN_COUNTS)
-    assert sum(compute.values()) == 11 and aux == {} and compute["rows_kernel"] == 1 and compute["plan_kernel"] == 1
-    assert lc.check_nodes(compute, aux, 11, []) is None and lc.check_nodes(compute, aux, None, None) is None
-    assert "expected 10" in lc.check_nodes(compute, aux, 10, [])                                   # the single-launch decode has one kernel less
-    single = {k: v for k, v in CHAIN_COUNTS.items() if "plan_kernel" not in k}
+    assert sum(compute.values()) == 11 and aux == {} and compute["rows_kernel"] == 1 and compute["plan_kernel"] == 1 and compute["lin::linear_kernel"] == 6
+    assert compute == TWO_LAUNCH
+    assert lc.check_nodes(compute, aux, TWO_LAUNCH, {}) is None and lc.check_nodes(compute, aux, None, None) is None
+    swapped = dict(CHAIN_COUNTS)                                                                     # still 11 compute kernels, but not the canonical ones
+    swapped[LIN_K], swapped["void cfbi::conv::conv_kernel<4>(cfbi::conv::Args)"] = 5.0, 4.0
+    c3, a3 = lc.split_nodes(swapped)
+    assert sum(c3.values()) == 11 and "expected" in lc.check_nodes(c3, a3, TWO_LAUNCH, {})
+    single = {k: v for k, v in CHAIN_COUNTS.items() if "plan_kernel" not in k}                       # the single-launch decode has one kernel less
     c1, a1 = lc.split_nodes(single)
-    assert lc.check_nodes(c1, a1, 10, []) is None and "launches 10 compute kernels" in lc.check_nodes(c1, a1, 11, [])
+    assert lc.check_nodes(c1, a1, {"conv::conv_kernel": 3, "lin::linear_kernel": 6, "rows_kernel": 1}, {}) is None and "expected" in lc.check_nodes(c1, a1, TWO_LAUNCH, {})
     noisy = dict(CHAIN_COUNTS)                                                                       # a graph with zero-fill and copy nodes: they are auxiliary nodes
-    noisy["Memset (Device)"], noisy["void at::native::vectorized_elementwise_kernel<4, FillFunctor>"] = 10.0, 2.0
+    noisy[MEMSET], noisy[ATEN_FILL] = 10.0, 2.0
     c2, a2 = lc.split_nodes(noisy)
-    assert sum(c2.values()) == 11 and sorted(a2) == ["Memset (Device)", "void at::native::vectorized_elementwise_kernel<4, FillFunctor>"]
-    msg = lc.check_nodes(c2, a2, 11, [])
-    assert "auxiliary nodes" in msg and "Memset (Device)" in msg
-    assert lc.check_nodes(c2, a2, 11, sorted(a2)) is None                                           # the explicit list of the auxiliary nodes that may remain
-    assert lc.check_nodes(c2, a2, 11, ["Memset (Device)"]) is not None
+    assert sum(c2.values()) == 11 and sorted(a2) == [MEMSET, ATEN_FILL]
+    msg = lc.check_nodes(c2, a2, TWO_LAUNCH, {})
+    assert "auxiliary nodes" in msg and MEMSET in msg
+    assert lc.check_nodes(c2, a2, TWO_LAUNCH, {MEMSET: 10, ATEN_FILL: 2}) is None                  # the exact mapping of the auxiliary nodes that may remain
+    assert lc.check_nodes(c2, a2, TWO_LAUNCH, {MEMSET: 9, ATEN_FILL: 2}) is not None and lc.check_nodes(c2, a2, TWO_LAUNCH, {MEMSET: 10}) is not None
+    frac = dict(CHAIN_COUNTS)
+    frac[LIN_K] = 5.984                                                                              # one launch missing from one replay of 64
+    c4, a4 = lc.split_nodes(frac)
+    assert "whole number" in lc.check_nodes(c4, a4, None, None)
+
+
+def test_layer_chain_node_mappings_are_parsed_strictly():
+    assert lc.parse_mapping("two-launch", lc.CANONICAL_COMPUTE) == TWO_LAUNCH and lc.parse_mapping("none") == {} and lc.parse_mapping("") == {}
+    assert lc.parse_mapping("conv::conv_kernel=3;lin::linear_kernel=6") == {"conv::conv_kernel": 3, "lin::linear_kernel": 6}
+    assert lc.parse_mapping("void at::native::vectorized_elementwise_kernel<4, FillFunctor>=2") == {"void at::native::vectorized_elementwise_kernel<4, FillFunctor>": 2}
+    for bad in ("11", "a", "=3", "a=0", "a=x", "a=1;a=2", "a=1;;b=2"):
+        with pytest.raises(ValueError):
+            lc.parse_mapping(bad)
+    for tool in (bd, lc):                                                                             # a bad option stops the tool before it touches the GPU
+        for argv in (["--calls-scale", "0"], ["--trials", "0"], ["--profile-calls", "-1"], ["--calls", "0"]):
+            with pytest.raises(SystemExit):
+                tool.main(argv)
+    for argv in (["--expect-compute", "11"], ["--expect-aux", "a=0"]):
+        with pytest.raises(SystemExit):
+            lc.main(argv)
+
+
+# ---- the measurement loops of the benchmarks driven by a fake device: how many calls and profiled calls really run -------------------------------
+
+class FakeEvent(object):
+    """A CUDA event of a fake device: ``elapsed_time`` is 0.01 ms per ``record`` that happened in between."""
+    clock = [0]
+
+    def __init__(self, enable_timing=False):
+        self.t = 0
+
+    def record(self):
+        FakeEvent.clock[0] += 1
+        self.t = FakeEvent.clock[0]
+
+    def elapsed_time(self, other):
+        return 0.01 * (other.t - self.t)
+
+
+class FakeTorch(object):
+    class cuda(object):
+        Event = FakeEvent
+
+        @staticmethod
+        def synchronize():
+            pass
+
+
+class FakeBuffer(object):
+    def fill_(self, value):
+        return self
+
+
+class FakeDecodeEnv(object):
+    """The ShapeEnv of bench_decode: counts the eager calls and graph replays and logs the position resets."""
+
+    def __init__(self, log):
+        self.torch, self.impl, self.log, self.calls = FakeTorch, 0, log, {"eager": 0, "replay": 0}
+        self.state = types.SimpleNamespace(pos=FakeBuffer())
+
+    def set_positions(self, regime):
+        self.log.append(("positions", regime))
+
+    def eager(self, i):
+        self.calls["eager"] += 1
+
+    def replay(self, i):
+        self.calls["replay"] += 1
+
+
+class FakeChainEnv(object):
+    def __init__(self, log):
+        self.torch, self.impl, self.log, self.replays = FakeTorch, 0, log, 0
+
+    def set_positions(self):
+        self.log.append(("positions",))
+
+    def replay(self, i=0):
+        self.replays += 1
+
+
+def fake_breakdown(log, kernels, counts_seq=None):
+    """A stand-in for ``bench_breakdown`` whose ``kernel_times`` calls ``fn`` warm + iters times, logs its arguments and returns the kernel times and the launch
+    counts per call of the n-th invocation (``counts_seq[n]``, the last one when there are fewer)."""
+    mod = types.ModuleType("bench_breakdown")
+    state = {"n": 0}
+
+    def kernel_times(fn, iters=5, warm=3):
+        log.append(("kernel_times", iters, warm))
+        for _ in range(warm + iters):
+            fn()
+        counts = counts_seq[min(state["n"], len(counts_seq) - 1)] if counts_seq else {k: 1.0 for k in kernels}
+        state["n"] += 1
+        return dict(kernels), dict(counts)
+    mod.kernel_times = kernel_times
+    return mod
+
+
+def run_decode_cell(monkeypatch, regime, scale, profile_calls=100):
+    log = []
+    monkeypatch.setitem(sys.modules, "bench_breakdown", fake_breakdown(log, {PLAN_K: 2.0, ROWS_K: 10.0}))
+    env = FakeDecodeEnv(log)
+    opts = dict(bd.DEFAULTS, trials=5, calls=100, cold_calls=100, probe_calls=70, profile_calls=profile_calls, calls_scale=scale)
+    spec = {"N": 4, "H": 12, "regime": regime, "pos": 5 if regime == "probe" else None, "key": "decode;N=4;H=12;regime=%s;" % regime}
+    return bd.measure_cell(spec, env, opts, {}, None, FakeBuffer()), env, log, opts
+
+
+def test_decode_profiled_pass_scales_with_the_rerun_and_covers_whole_position_cycles(monkeypatch):
+    for regime in bd.REGIMES:
+        loop = regime != "probe"
+        for scale in (1, 3):
+            cell, env, log, opts = run_decode_cell(monkeypatch, regime, scale)
+            want_calls = (128 if loop else 70) * scale                                           # 100 calls round up to two whole cycles, the probe calls stay
+            want_profiled = (128 if loop else 100) * scale
+            passes = [e for e in log if e[0] == "kernel_times"]
+            assert passes == [("kernel_times", want_profiled, 1)] * 5, (regime, scale)           # the profiler really ran that many calls after one warm-up call, in every trial
+            args = cell["args"]
+            assert args["profile_calls"] == want_profiled and args["calls_per_trial"] == want_calls and args["calls_scale"] == scale, (regime, scale)
+            if loop:
+                assert want_profiled % 64 == 0 and args["profile_cycles"] == want_profiled // 64 and args["profile_start_phase"] == 1
+            else:
+                assert args["profile_cycles"] is None and args["profile_start_phase"] is None
+            assert all(log[i - 1] == ("positions", regime) for i, e in enumerate(log) if e[0] == "kernel_times")   # every profiled pass starts from freshly set positions
+            assert env.calls["eager"] == 200 + 5 * (want_calls + 1 + want_profiled) and env.calls["replay"] == 50 + 5 * want_calls, (regime, scale)
+            assert len(cell["samples"]) == 5 and all(sample["total_us"] == 12.0 for sample in cell["samples"])
+
+
+def test_decode_reruns_prove_three_times_the_calls_and_the_profiled_calls_to_the_comparator(monkeypatch):
+    def as_records(cell):
+        return [{"meta": {"trials": 5, "sample_stat": br.PROCESS_MEDIAN, "commit": "c"}, "cells": [cell]}]
+    for regime in bd.REGIMES:
+        first, _, _, _ = run_decode_cell(monkeypatch, regime, 1)
+        rerun, _, _, _ = run_decode_cell(monkeypatch, regime, 3)
+        key = first["key"]
+        assert br.rerun_problems(as_records(first), as_records(rerun), "baseline", key) == [], regime
+        unscaled = json.loads(json.dumps(rerun))                                                  # a re-run whose profiled calls were not scaled is not a re-run
+        unscaled["args"]["profile_calls"] = first["args"]["profile_calls"]
+        assert any("profile_calls" in p and "not 3 times" in p for p in br.rerun_problems(as_records(first), as_records(unscaled), "baseline", key)), regime
+    odd, _, _, _ = run_decode_cell(monkeypatch, "lockstep", 1, profile_calls=65)                  # 65 calls are not a whole cycle: two cycles are profiled, and recorded
+    assert odd["args"]["profile_calls"] == 128 and odd["args"]["profile_cycles"] == 2
+
+
+def run_chain_cell(monkeypatch, counts_seq, expect_compute=TWO_LAUNCH, expect_aux={}, scale=1, trials=5):          # noqa: B006  (never modified)
+    log = []
+    monkeypatch.setitem(sys.modules, "bench_breakdown", fake_breakdown(log, {"conv::conv_kernel": 6.0, "lin::linear_kernel": 30.0, "plan_kernel": 2.0, "rows_kernel": 12.0},
+                                                                      counts_seq))
+    env = FakeChainEnv(log)
+    spec = lc.cell_specs((1,))[0]
+    opts = dict(lc.DEFAULTS, trials=trials, calls=100, calls_scale=scale)
+    return lc.measure_cell(spec, env, opts, expect_compute, expect_aux), env, log
+
+
+def test_layer_chain_cell_records_effective_calls_and_the_nodes_of_every_trial(monkeypatch):
+    for scale in (1, 3):
+        cell, env, log = run_chain_cell(monkeypatch, [CHAIN_COUNTS], scale=scale)
+        args = cell["args"]
+        profiled, replays = 64 * scale, 128 * scale
+        assert args["profile_calls"] == profiled and args["calls_per_trial"] == replays and args["profile_cycles"] == scale and args["profile_start_phase"] == 1
+        assert [e for e in log if e[0] == "kernel_times"] == [("kernel_times", profiled, 1)] * 5
+        assert all(log[i - 1] == ("positions",) for i, e in enumerate(log) if e[0] == "kernel_times")
+        assert env.replays == 100 + 5 * (replays + 1 + profiled)
+        assert args["compute_nodes"] == TWO_LAUNCH and args["aux_nodes"] == {} and args["compute_kernels"] == 11
+        assert [s["nodes"] for s in cell["samples"]] == [{"compute": TWO_LAUNCH, "aux": {}}] * 5
+        assert lc.cell_node_problems(cell, TWO_LAUNCH, {}) == [] and lc.cell_node_problems(cell) == []
+        tampered = json.loads(json.dumps(cell))                                                  # the record check finds a trial that carries another mapping
+        tampered["samples"][3]["nodes"]["compute"]["rows_kernel"] = 2
+        assert any("trial 3" in p for p in lc.cell_node_problems(tampered))
+        stripped = json.loads(json.dumps(cell))
+        del stripped["samples"][1]["nodes"]
+        assert any("trial 1 carries no node mapping" in p for p in lc.cell_node_problems(stripped))
+        assert lc.cell_node_problems(cell, {"rows_kernel": 1}, {}) != [] and lc.cell_node_problems(cell, TWO_LAUNCH, {MEMSET: 1}) != []
+        assert any("records no" in p for p in lc.cell_node_problems({"key": "k", "args": {}, "samples": cell["samples"]}))
+
+
+def test_layer_chain_asserts_the_node_mapping_in_every_trial_not_only_the_last(monkeypatch):
+    good = dict(CHAIN_COUNTS)
+    drifts = {"a launch missing": dict(good, **{LIN_K: 5.0}), "a launch missing from some replays": dict(good, **{LIN_K: 5.984}),
+              "a memset": dict(good, **{MEMSET: 1.0}), "another kernel": dict(good, **{"void cfbi::conv::conv_kernel<4>(cfbi::conv::Args)": 4.0})}
+    for what, bad in sorted(drifts.items()):
+        for bad_trial in (0, 2, 4):
+            seq = [good] * 5
+            seq[bad_trial] = bad
+            with pytest.raises(SystemExit) as e:
+                run_chain_cell(monkeypatch, seq)
+            assert "trial %d" % bad_trial in str(e.value), (what, bad_trial)
+    for bad_trial in (1, 2, 4):                                                                    # without an expectation the trials must still agree with each other
+        seq = [good] * 5
+        seq[bad_trial] = drifts["a memset"]
+        with pytest.raises(SystemExit) as e:
+            run_chain_cell(monkeypatch, seq, expect_compute=None, expect_aux=None)
+        assert "trial %d" % bad_trial in str(e.value) and "differ" in str(e.value)
+    cell, _, _ = run_chain_cell(monkeypatch, [dict(good, **{MEMSET: 10.0})], expect_aux={MEMSET: 10})   # an exactly asserted auxiliary mapping is recorded
+    assert cell["args"]["aux_nodes"] == {MEMSET: 10} and lc.cell_node_problems(cell, TWO_LAUNCH, {MEMSET: 10}) == []
 
 
 def test_layer_chain_step_has_no_zero_fill_or_fp32_side_output_call():

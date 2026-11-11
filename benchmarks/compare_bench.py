@@ -102,8 +102,9 @@ def main(argv=None):
         if res["rows"]:
             classification = br.classify_rows(res)
             res["classification"] = classification
-            print("beyond the %.2f %% tolerance: %d slower, %d faster, %d noise-limited cell(s)" % (
-                res["tol_pct"], len(classification["slower"]), len(classification["faster"]), len(classification["noise_limited"])))
+            print("beyond the %.2f %% tolerance: %d slower, %d faster, %d noise-limited cell(s); %d cell(s) still need their re-run" % (
+                res["tol_pct"], len(classification["slower"]), len(classification["faster"]), len(classification["noise_limited"]),
+                len(classification["needs_rerun"])))
             for kind, keys in sorted(classification.items()):
                 if keys and kind != "neutral":
                     print("  %s: %s" % (kind, ", ".join(keys)))
