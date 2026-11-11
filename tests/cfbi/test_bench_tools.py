@@ -4,6 +4,7 @@ Plain Python: no GPU and no torch are needed (run them without the package conft
 where torch is not installed). The negative cases show that the gates can fail: a wrong, dirty or unstable baseline is refused, a 1 % slower
 candidate fails the 0.5 % protection gate, and a build with one more register or a spill is reported as different.
 """
+import argparse
 import ast
 import concurrent.futures
 import json
@@ -19,6 +20,7 @@ for _p in (_ROOT / "benchmarks", _ROOT / "tests" / "cfbi"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+import bench_decode as bd  # noqa: E402
 import bench_records as br  # noqa: E402
 import codegen_gate as cg  # noqa: E402
 import compare_bench  # noqa: E402
@@ -1037,3 +1039,75 @@ def test_compare_bench_cli_widen_rerun_and_the_json_classification():
         res = json.load(f)[0]
     assert res["classification"]["faster"] == [WALL_KEY] and res["rows"][0]["judged_on"] == "rerun" and res["classification"]["noise_limited"] == []
     assert compare_bench.main(common + ["--unstable-baseline", "widen", "--rerun-base"] + write_records(d, "ra", rbase)) == 2
+
+
+# ---- the decode wall-time benchmark: cells, calls per trial, assertions (the measurement itself needs a GPU) ------------------------------------------
+
+def test_decode_cells_cover_matrix_d_the_regimes_and_the_probe_positions():
+    specs = bd.cell_specs()
+    keys = [s["key"] for s in specs]
+    assert len(keys) == len(set(keys)) and all(k.startswith("decode;") and k.endswith(";") for k in keys)
+    for regime in ("lockstep", "staggered", "cold"):
+        assert [(s["N"], s["H"]) for s in specs if s["regime"] == regime] == [(1, 12), (4, 12), (16, 12), (64, 12), (128, 12), (256, 12)]
+    probe = [s for s in specs if s["regime"] == "probe"]
+    assert sorted({s["N"] for s in probe}) == [1, 64] and sorted({s["pos"] for s in probe}) == [0, 1, 15, 16, 31, 32, 47, 48, 62, 63] and len(probe) == 20
+    assert len(specs) == 3 * 6 + 20
+    shapes = [(s["N"], s["H"]) for s in specs]
+    assert shapes == sorted(shapes)                                       # grouped by shape: one input / state / graph set per shape
+    assert [s["regime"] for s in specs if (s["N"], s["H"]) == (1, 12)][:3] == ["lockstep", "staggered", "cold"]
+    only = bd.cell_specs(shapes=[(4, 3)], regimes=["lockstep", "probe"], probe_shapes=[(2, 3)], positions=[5])
+    assert [s["key"] for s in only] == ["decode;N=2;H=3;regime=probe;pos=5;", "decode;N=4;H=3;regime=lockstep;"]
+    with pytest.raises(ValueError):
+        bd.cell_specs(regimes=["warm"])
+
+
+def test_decode_cell_filter_uses_the_delimited_keys():
+    specs = bd.cell_specs()
+    n1 = bd.select_cells(specs, ["N=1;"])
+    assert n1 and {s["N"] for s in n1} == {1} and not any("N=16;" in s["key"] for s in n1)
+    assert {s["N"] for s in bd.select_cells(specs, ["N=16;"])} == {16}
+    assert len(bd.select_cells(specs, ["regime=probe;pos=63;"])) == 2 and len(bd.select_cells(specs, None)) == len(specs) == len(bd.select_cells(specs, []))
+    assert bd.select_cells(specs, ["N=2;"]) == []
+
+
+def test_decode_calls_per_trial_cover_whole_position_cycles_and_scale_for_the_rerun():
+    opts = dict(bd.DEFAULTS)
+    assert [bd.calls_per_trial(r, opts) for r in bd.REGIMES] == [1536, 1536, 256, 256]
+    assert bd.calls_per_trial("lockstep", dict(opts, calls=100)) == 128                       # rounded up to whole 64-position cycles
+    assert bd.calls_per_trial("probe", dict(opts, probe_calls=100)) == 100                     # probe calls are independent of the position cycle
+    scaled = dict(opts, calls_scale=3)
+    assert [bd.calls_per_trial(r, scaled) for r in bd.REGIMES] == [3 * 1536, 3 * 1536, 3 * 256, 3 * 256]
+
+
+def test_decode_expected_kernel_set_is_asserted_and_trials_carry_the_wall_metrics():
+    assert bd.check_expected_kernels({"plan_kernel", "rows_kernel"}, ["rows_kernel", "plan_kernel"]) is None
+    assert bd.check_expected_kernels({"anything"}, None) is None
+    assert "launched ['rows_kernel']" in bd.check_expected_kernels({"rows_kernel"}, ["plan_kernel", "rows_kernel"])
+    assert "expected ['rows_kernel']" in bd.check_expected_kernels({"plan_kernel", "rows_kernel"}, ["rows_kernel"])
+    assert bd.trial_wall(14.0, 13.0, 18.0, 9.0) == {"gpu_eager_us": 14.0, "gpu_graph_us": 13.0, "cpu_eager_us": 18.0, "cpu_graph_us": 9.0}
+    assert bd.trial_wall(14.0, 13.0) == {"gpu_eager_us": 14.0, "gpu_graph_us": 13.0}
+    cell = wall_cell(WALL_KEY, [14.0, 14.2, 14.1, 14.0, 14.3])
+    cell["args"]["calls_per_trial"] = 1536
+    line = bd.cell_line({"key": WALL_KEY}, cell)
+    assert WALL_KEY in line and "gpu_graph" in line and "total" in line and "5 trials, 1536 calls" in line
+
+
+def test_decode_run_meta_carries_the_fields_of_a_usable_record():
+    class FakeTorch:
+        __version__ = "2.14.0"
+
+        class version:
+            cuda = "13.4"
+
+    a = argparse.Namespace(impl=0, regimes=list(bd.REGIMES), cells=None, label="x")
+    device = {"name": "NVIDIA B200", "sm_count": 148, "cc": "10.0", "l2_bytes": 126 * 2 ** 20, "eviction_bytes": 2 * 126 * 2 ** 20 + 2 ** 20}
+    meta = bd.run_meta(a, "2026-11-10T10:00:00Z", dict(bd.DEFAULTS), device, FakeTorch)
+    for field in br.REQUIRED_META + ("tree", "impl", "regimes", "trials", "calls_per_trial", "profile_calls", "sample_stat", "calls_scale", "host", "timestamp"):
+        assert field in meta, field
+    assert meta["sample_stat"] == br.PROCESS_MEDIAN and meta["eviction_bytes"] >= 2 * meta["l2_cache_bytes"] and meta["trials"] >= br.MIN_TRIALS
+    assert meta["calls_per_trial"] == {"lockstep": 1536, "staggered": 1536, "cold": 256, "probe": 256}
+    meta.update(commit=BASE_COMMIT, dirty=False)                          # the identity of the tree running the test is not what is checked here
+    rec = {"schema": br.SCHEMA, "meta": meta, "cells": [wall_cell(WALL_KEY, [14.0] * 5)]}
+    assert br.validate_record(rec, "baseline", expect_commit=BASE_COMMIT) == []
+    rec["cells"] = [wall_cell(WALL_KEY, [14.0] * 4)]                      # fewer trials than a per-process median needs
+    assert any("at least 5 are required" in p for p in br.validate_record(rec, "baseline"))
