@@ -581,6 +581,12 @@ def test_codegen_allow_list_aliases_and_allowed_differences():
     for entry in ("cfbi::k1_kernel<Li16E>", "cfbi::k1_kernel"):          # a changed kernel is tolerated only when it is on the allow-list (key or family)
         rep = cg.compare_dumps(base, changed, {"aliases": {}, "may_differ": [entry]})
         assert rep["exit"] == 0 and len(rep["allowed"]) == 1, entry
+    wide = cg_edit(base, "sm_100a", "cfbi::k2_kernel<Li16E>", reg=180, sass_hash="k2-new")        # a tolerated K2 change is not held to the row engine's register cap
+    rep = cg.compare_dumps(base, wide, {"aliases": {}, "may_differ": ["cfbi::k2_kernel"]})
+    assert rep["exit"] == 0 and rep["gate_r"]["failures"] == [] and len(rep["allowed"]) == 1
+    rows_bad = cg_edit(base, "sm_100a", "cfbi::rows_kernel", reg=129, sass_hash="rows-new")      # a tolerated row-engine change still has to pass the resource gate
+    rep = cg.compare_dumps(base, rows_bad, {"aliases": {}, "may_differ": ["cfbi::rows_kernel"]})
+    assert rep["exit"] == 1 and any("129 registers" in f for f in rep["gate_r"]["failures"]) and len(rep["allowed"]) == 1
     rep = cg.compare_dumps(base, base, {"aliases": {"cfbi::gone": "cfbi::rows_kernel"}, "may_differ": []})
     assert any("matches no candidate kernel" in n for n in rep["notes"])  # an unused alias is reported, never silently ignored
     both = cg_copy(cand)
@@ -674,17 +680,17 @@ def test_codegen_tree_helpers():
     d = tempfile.mkdtemp()
     os.makedirs(os.path.join(d, "csrc", "cfbi"))
     os.makedirs(os.path.join(d, "flash_kda", "cfbi"))
-    open(os.path.join(d, "csrc", "cfbi", "x.cuh"), "w").write("a")
-    open(os.path.join(d, "flash_kda", "cfbi", "_ext.py"), "w").write('_SOURCES = ("b.cpp", "u1.cu", "u2.cu")\nNVCC_FLAGS = ["-O3", "-lineinfo"]\n')
+    Path(d, "csrc", "cfbi", "x.cuh").write_text("a")
+    Path(d, "flash_kda", "cfbi", "_ext.py").write_text('_SOURCES = ("b.cpp", "u1.cu", "u2.cu")\nNVCC_FLAGS = ["-O3", "-lineinfo"]\n')
     assert cg.units_of(d) == ["csrc/cfbi/u1.cu", "csrc/cfbi/u2.cu"] and cg.ext_flags_of(d) == ["-O3", "-lineinfo"]
     h = cg.tree_content_hash(d)
-    open(os.path.join(d, "README"), "w").write("outside the build inputs")
+    Path(d, "README").write_text("outside the build inputs")
     assert cg.tree_content_hash(d) == h
-    open(os.path.join(d, "csrc", "cfbi", "x.cuh"), "w").write("b")
+    Path(d, "csrc", "cfbi", "x.cuh").write_text("b")
     assert cg.tree_content_hash(d) != h
     empty = tempfile.mkdtemp()
     assert cg.units_of(empty) == list(cg.DEFAULT_UNITS) and cg.ext_flags_of(empty) is None
-    open(os.path.join(empty, "SNAPSHOT_COMMIT"), "w").write("abc123\n")
+    Path(empty, "SNAPSHOT_COMMIT").write_text("abc123\n")
     assert cg.tree_commit(empty) == "abc123"
 
 
@@ -764,7 +770,8 @@ def test_codegen_dump_from_toolchain_text_files_and_the_operand_only_control():
         return path
 
     regs, ptx = write("a.regs.txt", cg_regs({ROWS: (128, 112), K1: (100, 0)})), write("a.ptxas.txt", PTXAS)
-    base = cg.dump_from_files(regs, write("a.sass.txt", cg_sass({ROWS: CODE, K1: ["EXIT"]})), "container toolchain", ptxas_log=ptx)
+    sass = write("a.sass.txt", cg_sass({ROWS: CODE, K1: ["EXIT"]}))
+    base = cg.dump_from_files(regs, sass, "container toolchain", ptxas_log=ptx)
     cg.check_dump(base)
     rows = base["kernels"]["sm_100a"]["cfbi::rows_kernel"]
     assert rows["reg"] == 128 and rows["spill_stores"] == 4 and rows["instructions"] == len(CODE)     # the spill figures come from the ptxas lines
@@ -774,7 +781,7 @@ def test_codegen_dump_from_toolchain_text_files_and_the_operand_only_control():
         code[idx] = new
         cand = cg.dump_from_files(regs, write("b.sass.txt", cg_sass({ROWS: code, K1: ["EXIT"]})), "container toolchain", ptxas_log=ptx)
         assert cg.compare_dumps(base, cand)["exit"] == 1, new
-    other = cg.dump_from_files(regs, write("a.sass.txt", cg_sass({ROWS: CODE, K1: ["EXIT"]})), "another toolchain", ptxas_log=ptx)
+    other = cg.dump_from_files(regs, sass, "another toolchain", ptxas_log=ptx)
     with pytest.raises(cg.Unusable):                                                                   # another toolchain label is not comparable
         cg.compare_dumps(base, other)
     with pytest.raises(cg.Unusable):                                                                   # and neither is a dump built by nvcc here
@@ -939,7 +946,8 @@ def test_wall_metric_regress_gate_passes_aa_fails_a_3_percent_slower_and_passes_
                 ["--mode", "regress", "--tol", "1", "--metric", "gpu_graph_us", "--min-repeats", "3", "--expect-base-commit", BASE_COMMIT, "--require-clean-cand"])
         assert compare_bench.main(args) == code, cand_meds
     base, cand = wall_sets([100.0, 100.05, 99.95], [100.0, 100.05, 99.95])                       # the kernel sum of the same records gates as well
-    assert br.compare(base, cand, metric="total_us")["verdict"] == "PASS" and br.compare(base, cand, metric="total_us")["rows"][0]["base_median"] == 12.0
+    res = br.compare(base, cand, metric="total_us")
+    assert res["verdict"] == "PASS" and res["rows"][0]["base_median"] == 12.0
 
 
 def test_widening_mode_passes_an_unstable_aa_pair_that_the_worst_mode_fails_and_still_fails_a_slower_candidate():

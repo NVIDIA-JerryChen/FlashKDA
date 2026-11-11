@@ -49,16 +49,16 @@ def parse_junit(path):
         counts = files.setdefault(f, dict.fromkeys(COUNTS, 0))
         tid = "%s::%s" % (f, case.get("name", ""))
         counts["total"] += 1
+        skip = case.find("skipped")
         if case.find("error") is not None:
             counts["errors"] += 1
             failed.append(tid)
         elif case.find("failure") is not None:
             counts["failed"] += 1
             failed.append(tid)
-        elif case.find("skipped") is not None:
+        elif skip is not None:
             counts["skipped"] += 1
-            sk = case.find("skipped")
-            skipped.append({"id": tid, "reason": (sk.get("message") or "")[:200]})
+            skipped.append({"id": tid, "reason": (skip.get("message") or "")[:200]})
         else:
             counts["passed"] += 1
     return {"files": files, "failed": failed, "skipped": skipped}

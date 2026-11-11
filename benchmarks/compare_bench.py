@@ -100,10 +100,13 @@ def main(argv=None):
             return 2
         print(br.format_table(res))
         if res["rows"]:
-            res["classification"] = br.classify_rows(res)
-            print("beyond the %.2f %% tolerance: %d slower, %d faster, %d noise-limited cell(s)%s" % (
-                res["tol_pct"], len(res["classification"]["slower"]), len(res["classification"]["faster"]), len(res["classification"]["noise_limited"]),
-                "".join("\n  %s: %s" % (k, ", ".join(v)) for k, v in sorted(res["classification"].items()) if v and k != "neutral")))
+            classification = br.classify_rows(res)
+            res["classification"] = classification
+            print("beyond the %.2f %% tolerance: %d slower, %d faster, %d noise-limited cell(s)" % (
+                res["tol_pct"], len(classification["slower"]), len(classification["faster"]), len(classification["noise_limited"])))
+            for kind, keys in sorted(classification.items()):
+                if keys and kind != "neutral":
+                    print("  %s: %s" % (kind, ", ".join(keys)))
         print()
         results.append(res)
     if a.json:

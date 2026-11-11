@@ -75,6 +75,7 @@ _RESOURCE_FIELDS = ("reg", "stack", "shared", "local")
 _SPILL_FIELDS = ("spill_stores", "spill_loads")
 _ATTR_FIELDS = ("max_threads", "maxreg")
 _TOOLCHAIN_FIELDS = ("source", "label", "nvcc", "host_compiler", "flags", "std", "archs", "src_hash")
+_EXT_PY = os.path.join("flash_kda", "cfbi", "_ext.py")      # relative to a tree
 
 
 class Unusable(Exception):
@@ -136,6 +137,11 @@ def split_mangled(name):
                 i += 1
         raise ValueError
 
+    def template_args(i):
+        """The text inside the template-argument group that opens at ``s[i]`` and the index after the group."""
+        j = skip_group(i)
+        return s[i + 1:j - 1], j
+
     try:
         i, path, targs = 2, [], ""
         if s[i] == "N":
@@ -145,9 +151,7 @@ def split_mangled(name):
                     ident, i = source_name(i)
                     path.append(ident)
                 elif s[i] == "I":
-                    j = skip_group(i)
-                    targs = s[i + 1:j - 1]
-                    i = j
+                    targs, i = template_args(i)
                 else:
                     return None
             i += 1
@@ -155,9 +159,7 @@ def split_mangled(name):
             ident, i = source_name(i)
             path.append(ident)
             if i < n and s[i] == "I":
-                j = skip_group(i)
-                targs = s[i + 1:j - 1]
-                i = j
+                targs, i = template_args(i)
         else:
             return None
         return tuple(path), targs, s[i:]
@@ -368,14 +370,21 @@ def read_text(path):
         return f.read()
 
 
+def _ext_assignment(tree, name):
+    """The value expression of the first module-level assignment to ``name`` in the tree's ``flash_kda/cfbi/_ext.py`` (parsed, not imported), or None."""
+    mod = ast.parse(read_text(os.path.join(tree, _EXT_PY)))
+    for node in mod.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            return node.value
+    return None
+
+
 def units_of(tree):
     """The CUDA translation units of the extension: the ``.cu`` entries of ``_SOURCES`` in ``flash_kda/cfbi/_ext.py`` (parsed, not imported)."""
-    path = os.path.join(tree, "flash_kda", "cfbi", "_ext.py")
     try:
-        mod = ast.parse(read_text(path))
-        for node in mod.body:
-            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "_SOURCES" for t in node.targets):
-                return ["csrc/cfbi/" + s for s in ast.literal_eval(node.value) if s.endswith(".cu")]
+        sources = _ext_assignment(tree, "_SOURCES")
+        if sources is not None:
+            return ["csrc/cfbi/" + s for s in ast.literal_eval(sources) if s.endswith(".cu")]
     except (OSError, SyntaxError, ValueError):
         pass
     return list(DEFAULT_UNITS)
@@ -384,13 +393,10 @@ def units_of(tree):
 def ext_flags_of(tree):
     """``NVCC_FLAGS`` of the tree's ``flash_kda/cfbi/_ext.py`` (parsed, not imported), or None."""
     try:
-        mod = ast.parse(read_text(os.path.join(tree, "flash_kda", "cfbi", "_ext.py")))
+        flags = _ext_assignment(tree, "NVCC_FLAGS")
     except (OSError, SyntaxError):
         return None
-    for node in mod.body:
-        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "NVCC_FLAGS" for t in node.targets):
-            return list(ast.literal_eval(node.value))
-    return None
+    return None if flags is None else list(ast.literal_eval(flags))
 
 
 def tree_content_hash(tree):
@@ -399,7 +405,7 @@ def tree_content_hash(tree):
     paths = []
     for base, _, files in os.walk(os.path.join(tree, "csrc")):
         paths.extend(os.path.join(base, f) for f in files)
-    ext = os.path.join(tree, "flash_kda", "cfbi", "_ext.py")
+    ext = os.path.join(tree, _EXT_PY)
     if os.path.exists(ext):
         paths.append(ext)
     for p in sorted(paths):
@@ -437,18 +443,18 @@ def find_toolchain(nvcc=None, ccbin=None):
     if not os.path.exists(cuobjdump):
         raise Unusable("cuobjdump not found next to nvcc (%s)" % cuobjdump)
 
-    def first(cmd, pick):
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    def version_line(binary, pick):
+        """The first non-empty line of ``binary --version`` that contains ``pick``, else its first non-empty line."""
+        r = subprocess.run([binary, "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
         lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
         for ln in lines:
             if pick in ln:
                 return ln.strip()
         return lines[0].strip() if lines else "?"
 
-    return {"nvcc": nvcc, "ccbin": ccbin, "cuobjdump": cuobjdump,
-            "nvcc_version": first([nvcc, "--version"], "release"),
-            "host_version": first([ccbin, "--version"], ""),
-            "label": "%s | %s" % (first([nvcc, "--version"], "release"), first([ccbin, "--version"], ""))}
+    nvcc_version, host_version = version_line(nvcc, "release"), version_line(ccbin, "")
+    return {"nvcc": nvcc, "ccbin": ccbin, "cuobjdump": cuobjdump, "nvcc_version": nvcc_version, "host_version": host_version,
+            "label": "%s | %s" % (nvcc_version, host_version)}
 
 
 def _run(cmd, cwd=None):
@@ -508,10 +514,10 @@ def dump_tree(tree, archs=GATE_ARCHS, defines=(), tc=None, jobs=None, cache_dir=
             dump = json.load(f)
         dump["meta"]["cache"] = "hit"
         return dump
-    drift = ext_flags_of(tree)
+    tree_flags = ext_flags_of(tree)
     warnings = []
-    if drift is not None and drift != PRODUCTION_FLAGS:
-        warnings.append("NVCC_FLAGS of the tree differ from the flags of this tool: %s" % drift)
+    if tree_flags is not None and tree_flags != PRODUCTION_FLAGS:
+        warnings.append("NVCC_FLAGS of the tree differ from the flags of this tool: %s" % tree_flags)
     work = keep_dir or tempfile.mkdtemp(prefix="codegen-")
     os.makedirs(work, exist_ok=True)
     t0 = time.time()
@@ -581,13 +587,16 @@ def matrix_build(tree, archs=MATRIX_ARCHS, tc=None, jobs=None):
 
 # ---- comparison -------------------------------------------------------------------------------------------------------------------------------
 
-def load_dump(path):
+def _read_json(path, what):
     try:
         with open(path, encoding="utf-8") as f:
-            dump = json.load(f)
+            return json.load(f)
     except (OSError, ValueError) as e:
-        raise Unusable("cannot read the dump %s: %s" % (path, e))
-    return check_dump(dump, path)
+        raise Unusable("cannot read the %s %s: %s" % (what, path, e))
+
+
+def load_dump(path):
+    return check_dump(_read_json(path, "dump"), path)
 
 
 def check_dump(dump, label="dump"):
@@ -607,11 +616,7 @@ def check_dump(dump, label="dump"):
 def load_allow(path):
     if path is None:
         return {"aliases": {}, "may_differ": []}
-    try:
-        with open(path, encoding="utf-8") as f:
-            allow = json.load(f)
-    except (OSError, ValueError) as e:
-        raise Unusable("cannot read the allow-list %s: %s" % (path, e))
+    allow = _read_json(path, "allow-list")
     if allow.get("schema") != ALLOW_SCHEMA:
         raise Unusable("%s: schema is not %s" % (path, ALLOW_SCHEMA))
     allow.setdefault("aliases", {})
@@ -673,11 +678,16 @@ def compare_dumps(base, cand, allow=None, mode="identity", prev=None, owned=DEFA
     if prev is not None:
         check_dump(prev, "previous")
         require_same_toolchain(base, prev, "the base and the previous accepted state")
-    aliases, may, owned = dict(allow.get("aliases", {})), set(allow.get("may_differ", [])), set(owned)
+    aliases, may_differ, owned = dict(allow.get("aliases", {})), set(allow.get("may_differ", [])), set(owned)
     diffs, allowed, added, gate, notes = [], [], [], {"checked": [], "failures": []}, []
     compared = 0
-    if base["meta"]["tree"].get("content_hash") and base["meta"]["tree"].get("content_hash") == cand["meta"]["tree"].get("content_hash") \
-            and base["meta"].get("variant") == cand["meta"].get("variant"):
+
+    def check_gate_r(arch, ckey, rec, ref):
+        gate["checked"].append((arch, ckey))
+        gate["failures"].extend("%s %s: %s" % (arch, ckey, why) for why in _gate_r(arch, ckey, rec, ref, owned))
+
+    base_content = base["meta"]["tree"].get("content_hash")
+    if base_content and base_content == cand["meta"]["tree"].get("content_hash") and base["meta"].get("variant") == cand["meta"].get("variant"):
         notes.append("the candidate tree and the base tree have the same content and variant: an A/A comparison")
     used_alias = set()
     for arch in sorted(base["kernels"]):
@@ -700,39 +710,43 @@ def compare_dumps(base, cand, allow=None, mode="identity", prev=None, owned=DEFA
                 diffs.append("%s %s: missing in the candidate" % (arch, bkey))
                 continue
             compared += 1
-            fd = _field_diffs(bk[bkey], ck[ckey])
-            if not fd:
+            changes = _field_diffs(bk[bkey], ck[ckey])
+            if not changes:
                 if bk[bkey].get("sass_hash_strict") != ck[ckey].get("sass_hash_strict"):
                     notes.append("%s %s: instructions equal, encodings or control words differ (scheduling only)" % (arch, bkey))
                 continue
-            ok = (bkey in may or family(bkey) in may) or (mode == "change" and family(bkey) in owned)
-            (allowed if ok else diffs).append("%s %s: %s" % (arch, bkey, ", ".join(fd)))
-            if ok:
-                gate["checked"].append((arch, ckey))
-                for why in _gate_r(arch, ckey, ck[ckey], ref, owned):
-                    gate["failures"].append("%s %s: %s" % (arch, ckey, why))
+            entry = "%s %s: %s" % (arch, bkey, ", ".join(changes))
+            tolerated = bkey in may_differ or family(bkey) in may_differ or (mode == "change" and family(bkey) in owned)
+            if tolerated:
+                allowed.append(entry)
+                if family(bkey) in owned:                    # the resource gate binds the row-engine family and new kernels, not every tolerated change (K2 needs more than 128 registers)
+                    check_gate_r(arch, ckey, ck[ckey], ref)
+            else:
+                diffs.append(entry)
         for ckey in sorted(ck):
             if aliases.get(ckey, ckey) in bk:
                 continue
             added.append("%s %s" % (arch, ckey))
-            gate["checked"].append((arch, ckey))
-            for why in _gate_r(arch, ckey, ck[ckey], ref, owned):
-                gate["failures"].append("%s %s: %s" % (arch, ckey, why))
+            check_gate_r(arch, ckey, ck[ckey], ref)
         if mode == "change":                                          # the owned family is gated even when it did not change against the base
             for ckey in sorted(ck):
                 if family(ckey) in owned and (arch, ckey) not in gate["checked"]:
-                    gate["checked"].append((arch, ckey))
-                    for why in _gate_r(arch, ckey, ck[ckey], ref, owned):
-                        gate["failures"].append("%s %s: %s" % (arch, ckey, why))
+                    check_gate_r(arch, ckey, ck[ckey], ref)
     for ckey in sorted(set(aliases) - used_alias):
         notes.append("allow-list alias %s matches no candidate kernel" % ckey)
     if prev is not None and mode == "change":
         for arch in sorted(cand["kernels"]):
             for ckey, rec in sorted(cand["kernels"][arch].items()):
-                if family(ckey) in owned:
-                    p = prev["kernels"].get(arch, {}).get(aliases.get(ckey, ckey))
-                    state = "new" if p is None else ("unchanged" if not _field_diffs(p, rec) else "changed")
-                    notes.append("%s %s: %s against the previous accepted state" % (arch, ckey, state))
+                if family(ckey) not in owned:
+                    continue
+                prev_rec = prev["kernels"].get(arch, {}).get(aliases.get(ckey, ckey))
+                if prev_rec is None:
+                    state = "new"
+                elif _field_diffs(prev_rec, rec):
+                    state = "changed"
+                else:
+                    state = "unchanged"
+                notes.append("%s %s: %s against the previous accepted state" % (arch, ckey, state))
     if compared == 0:
         raise Unusable("no kernel of the base was compared")
     exit_code = 1 if (diffs or gate["failures"]) else 0
@@ -754,6 +768,9 @@ def literal_check(dump):
 
 
 def format_report(rep, base=None):
+    def figures(pairs):
+        return ", ".join("%s %s" % (f.replace("_", " "), v) for f, v in pairs)
+
     lines = []
     for d in rep["differences"]:
         lines.append("DIFF: %s" % d)
@@ -769,9 +786,9 @@ def format_report(rep, base=None):
         for arch in sorted(LITERALS):
             rec = base["kernels"].get(arch, {}).get(GATE_R_REF)
             if rec is not None:
-                lines.append("CROSS-CHECK %s %s: %s (recorded: %s)" % (
-                    arch, GATE_R_REF, ", ".join("%s %s" % (f.replace("_", " "), rec.get(f)) for f in sorted(LITERALS[arch])),
-                    ", ".join("%s %s" % (f.replace("_", " "), v) for f, v in sorted(LITERALS[arch].items()))))
+                recorded = sorted(LITERALS[arch].items())
+                measured = [(f, rec.get(f)) for f, _ in recorded]
+                lines.append("CROSS-CHECK %s %s: %s (recorded: %s)" % (arch, GATE_R_REF, figures(measured), figures(recorded)))
         for w in literal_check(base):
             lines.append("WARNING: %s" % w)
     lines.append("kernels compared: %d, differences: %d, allowed: %d, added: %d, gate R checked: %d, gate R failures: %d"
@@ -789,17 +806,22 @@ def _write_json(path, obj):
         f.write("\n")
 
 
+def _kernel_summary(dump):
+    return "%d kernels on %s" % (sum(len(v) for v in dump["kernels"].values()), ", ".join(sorted(dump["kernels"])))
+
+
 def _compare_and_print(base, cand, a, prev=None):
-    allow = load_allow(a.allow if a.allow else (DEFAULT_ALLOW if os.path.exists(DEFAULT_ALLOW) else None))
-    rep = compare_dumps(base, cand, allow, a.mode, prev=prev)
+    if a.allow:
+        allow_path = a.allow
+    elif os.path.exists(DEFAULT_ALLOW):
+        allow_path = DEFAULT_ALLOW
+    else:
+        allow_path = None
+    rep = compare_dumps(base, cand, load_allow(allow_path), a.mode, prev=prev)
     print(format_report(rep, base))
-    if getattr(a, "json", None):
+    if a.json:
         _write_json(a.json, rep)
     return rep["exit"]
-
-
-def _toolchain(a):
-    return find_toolchain(getattr(a, "nvcc", None), getattr(a, "ccbin", None))
 
 
 def main(argv=None):
@@ -854,21 +876,20 @@ def main(argv=None):
         return 2
     try:
         if a.cmd == "dump":
-            dump = dump_tree(a.tree, a.archs or GATE_ARCHS, a.define, _toolchain(a), a.jobs, a.cache_dir, a.keep_dir)
+            dump = dump_tree(a.tree, a.archs or GATE_ARCHS, a.define, find_toolchain(a.nvcc, a.ccbin), a.jobs, a.cache_dir, a.keep_dir)
             _write_json(a.out, dump)
-            print("dump of %s: %d kernels on %s (cache: %s)" % (a.tree, sum(len(v) for v in dump["kernels"].values()), ", ".join(sorted(dump["kernels"])),
-                                                              dump["meta"].get("cache")))
+            print("dump of %s: %s (cache: %s)" % (a.tree, _kernel_summary(dump), dump["meta"].get("cache")))
             return 0
         if a.cmd == "dump-files":
             dump = dump_from_files(a.regs, a.sass, a.label, a.elf, a.ptxas_log)
             check_dump(dump, a.out)
             _write_json(a.out, dump)
-            print("dump of %s: %d kernels on %s" % (a.sass, sum(len(v) for v in dump["kernels"].values()), ", ".join(sorted(dump["kernels"]))))
+            print("dump of %s: %s" % (a.sass, _kernel_summary(dump)))
             return 0
         if a.cmd == "compare":
             return _compare_and_print(load_dump(a.base), load_dump(a.cand), a, load_dump(a.prev) if a.prev else None)
         if a.cmd == "gate":
-            tc, archs = _toolchain(a), a.archs or GATE_ARCHS
+            tc, archs = find_toolchain(a.nvcc, a.ccbin), a.archs or GATE_ARCHS
             base = dump_tree(a.base_tree, archs, a.base_define, tc, a.jobs, a.cache_dir)
             cand = dump_tree(a.cand_tree, archs, a.cand_define, tc, a.jobs, None)
             prev = dump_tree(a.prev_tree, archs, a.base_define, tc, a.jobs, a.cache_dir) if a.prev_tree else None
@@ -876,7 +897,7 @@ def main(argv=None):
             print("base: %s (cache %s), candidate: %s" % (base["meta"]["tree"].get("commit"), base["meta"].get("cache"), cand["meta"]["tree"].get("commit")))
             return _compare_and_print(base, cand, a, prev)
         if a.cmd == "matrix":
-            res = matrix_build(a.tree, a.archs or MATRIX_ARCHS, _toolchain(a), a.jobs)
+            res = matrix_build(a.tree, a.archs or MATRIX_ARCHS, find_toolchain(a.nvcc, a.ccbin), a.jobs)
             bad = [r for r in res if not r[2]]
             for unit, arch, ok, msg in res:
                 print("%-4s %s %s" % ("OK" if ok else "FAIL", arch, unit))
