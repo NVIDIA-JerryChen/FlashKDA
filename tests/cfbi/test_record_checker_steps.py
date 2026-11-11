@@ -302,6 +302,23 @@ def test_ledger_commits_are_checked_against_the_repository(steps_repo_rw):
     assert has(rc.ledger_problems(mutated(ok, lambda l: l["steps"][0].update(commit=off)), repo=repo), "is not an ancestor")
 
 
+def test_the_ledger_and_decision_command_lines(steps_repo, tmp_path, capsys):
+    rec = ledger(0)
+    rec.pop("_path")
+    good, bad, dec = tmp_path / "ledger.json", tmp_path / "ledger-bad.json", tmp_path / "decision.json"
+    good.write_text(json.dumps(rec))
+    e, f = unit_rows(UNIT_CASES[1][1], ("adopted", "adopted"))                               # F kept although it did not beat E
+    bad.write_text(json.dumps(dict(ledger(1, e_tile=e, a_fragments=f), _path=None)))
+    dec.write_text(json.dumps(decision()))
+    assert rc.main(["ledger", "--ledger", str(good), "--require-all-steps"]) == 0
+    assert rc.main(["ledger", "--ledger", str(good), "--decision", str(dec), "--require-all-steps"]) == 0
+    assert rc.main(["decision", "--record", str(dec)]) == 0
+    assert rc.main(["ledger", "--ledger", str(bad)]) == 1
+    assert "the three-arm rule prescribes not_adopted for a_fragments" in capsys.readouterr().out
+    assert rc.main(["ledger", "--ledger", str(good), "--repo", str(steps_repo["repo"])]) == 1      # the commits of the synthetic ledger are not in this repository
+    assert "does not have" in capsys.readouterr().out
+
+
 # ---- markers ---------------------------------------------------------------------------------------------------------------------------------
 def make_tree(root, files):
     for rel, body in files.items():
