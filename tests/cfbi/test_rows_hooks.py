@@ -14,6 +14,7 @@ has none of this, nor that a barrier added later has a delay site, so the rules 
 * policy: the new GPU test modules never ``pytest.skip`` (a skipped test proves nothing): conditions that would skip fail on B200 / B300 (``helpers.skip_or_fail``), a variant that does not
   build fails (``rows_workload.build_variant``).
 """
+import json
 import re
 from pathlib import Path
 
@@ -32,7 +33,7 @@ TESTS = ROOT / "tests" / "cfbi"
 TEST_PREFIXES = ("CFBI_ROWS_PROFILE", "CFBI_ROWS_DELAY_NS", "CFBI_ROWS_TEST_", "CFBI_NEG_CONTROL", "CFBI_K1_PROFILE", "CFBI_K2_PROFILE", "CFBI_UMMA_PROFILE", "CFBI_DYN_TEST_",
                  "CFBI_K2_TEST_", "CFBI_UMMA_NEG_", "CFBI_UMMA_RACE_", "CFBI_CONV_NEG_", "CFBI_LIN_NEG_")
 TUNABLES = ("CFBI_ROWS_MINB", "CFBI_ROWS_PF_L1", "CFBI_K2_TILE_ONLY", "CFBI_HAVE_TCGEN05", "CFBI_CONV_UNROLL", "CFBI_CONV_THREADS", "CFBI_SRC_HASH")
-GPU_MODULES = ("test_rows_occupancy.py", "test_rows_decode_families.py", "test_rows_delay.py", "test_rows_sanitizer.py", "test_rows_graph.py", "test_rows_profile_gpu.py", "test_k2_dyn_variants.py", "rows_workload.py")
+GPU_MODULES = ("test_rows_occupancy.py", "test_rows_decode_families.py", "test_rows_delay.py", "test_rows_sanitizer.py", "test_rows_graph.py", "test_rows_profile_gpu.py", "test_k2_dyn_variants.py", "rows_workload.py", "rows_bounded.py")
 
 
 def is_test_macro(name):
@@ -378,3 +379,62 @@ def test_the_sanitizer_does_not_follow_child_processes(monkeypatch, tmp_path):
     monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: seen.append(cmd) or types.SimpleNamespace(returncode=0, stdout="", stderr=""))
     ts.run_driver("memcheck", tmp_path, ts.BOUNDED_DRIVER)
     assert seen and "--target-processes" in seen[0] and seen[0][seen[0].index("--target-processes") + 1] == "application-only", seen
+
+
+# ---- the bounded racecheck workload executes what it claims (no GPU) ---------------------------------------------------------------------------------------
+def test_the_bounded_racecheck_workload_covers_every_position_the_chunk_end_and_the_rows_after_it():
+    import test_rows_sanitizer as ts
+
+    cov = rw.launch_coverage(ts.BOUNDED_LAUNCHES, ts.BOUNDED_H)
+    assert rw.coverage_problems(cov) == []
+    assert cov["positions"] == list(range(64)) and cov["chunk_end_rows"] == 1 and cov["rows_after_chunk_end"] == 2 and cov["cross_subblock_rows"] >= 48
+    assert cov["final_pos"] == {0: 6, 3: 2, 7: 3} and cov["live_ctas"] == [3 * ts.BOUNDED_H, 3 * ts.BOUNDED_H]
+
+
+def bounded_mutants():
+    import test_rows_sanitizer as ts
+
+    (lens1, slots1), launch2 = ts.BOUNDED_LAUNCHES
+    return [
+        ("the round-3 workload: the 66-row sequence sits on a padding slot", [([1, 66, 3, 5], [3, -1, 5, 0]), ([1, 1, 1], [5, 3, 0])], "positions only"),
+        ("the long sequence of the current workload is remapped to padding", [(lens1, [slots1[0], -1] + slots1[2:]), launch2], "positions only"),
+        ("a long sequence that stops before the chunk end", [([1, 40, 3, 5], slots1), launch2], "no row finishes a chunk"),
+        ("a chunk end that is the last row of its launch", [([1, 64, 3, 5], slots1), launch2], "no row follows a chunk end inside its launch"),
+        ("a launch of padding entries only", [(lens1, slots1), ([1, 1, 1], [-1, -1, -1])], "no live CTA"),
+        ("one row per sequence", [([1, 1, 1, 1], slots1), launch2], "positions only"),
+    ]
+
+
+@pytest.mark.parametrize("name,launches,expect", bounded_mutants(), ids=[m[0] for m in bounded_mutants()])
+def test_a_bounded_workload_that_does_not_reach_the_phases_is_rejected(name, launches, expect):
+    import test_rows_sanitizer as ts
+
+    probs = rw.coverage_problems(rw.launch_coverage(launches, ts.BOUNDED_H))
+    assert any(expect in p for p in probs), (name, probs)
+
+
+def driver_prefix(launches):
+    """The part of the bounded driver that runs before it needs the device: it plans, prints the coverage and asserts it."""
+    import test_rows_sanitizer as ts
+
+    script = ts.BOUNDED_DRIVER.format(tests=str(TESTS), repo=str(ROOT), done=ts.DONE, offset="0", heads=ts.BOUNDED_H, pool=ts.BOUNDED_POOL, launches=repr(launches))
+    assert script.count("ext = load_ext()") == 1
+    return script.split("ext = load_ext()")[0]
+
+
+def test_the_driver_asserts_the_coverage_of_its_plan_before_it_needs_the_device(capsys):
+    import test_rows_sanitizer as ts
+
+    exec(compile(driver_prefix(ts.BOUNDED_LAUNCHES), "bounded_driver_prefix", "exec"), {})
+    printed_line = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("ROWS_SANITIZER_COVERAGE ")]
+    assert len(printed_line) == 1 and json.loads(printed_line[0].split(" ", 1)[1]) == json.loads(json.dumps(rw.launch_coverage(ts.BOUNDED_LAUNCHES, ts.BOUNDED_H), sort_keys=True))
+    for name, launches, expect in bounded_mutants():
+        with pytest.raises(AssertionError, match="does not cover the row engine"):
+            exec(compile(driver_prefix(launches), "bounded_driver_prefix", "exec"), {})
+
+
+def test_the_driver_compares_the_final_positions_with_its_plan():
+    import test_rows_sanitizer as ts
+
+    script = ts.BOUNDED_DRIVER
+    assert "ROWS_SANITIZER_FINAL_POS" in script and 'cov["final_pos"]' in script and "assert final == expected" in script

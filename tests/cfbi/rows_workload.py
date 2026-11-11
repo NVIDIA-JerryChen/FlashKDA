@@ -355,3 +355,58 @@ def time_step(mod, impl, warm, step, reps):
         if i:
             times.append(e0.elapsed_time(e1))
     return times
+
+
+# ---- what a bounded sanitizer workload executes, from its plan alone (no GPU) ---------------------------------------------------------------------------------
+def launch_coverage(launches, heads, start_pos=None):
+    """What the mode-1 launches of a workload execute, derived from their lens and slots and the start positions of the slots: ``launches`` is a list of ``(lens, slots)`` (``slots[n]``
+    = -1 is a padding entry that the launch skips, a length of 0 an empty sequence), ``start_pos`` the position of every slot before the first launch (default 0). A row at position p
+    runs the phases of the row engine that its position selects: the cross-sub-block products (phase C) from position 16 on, the chunk-end phase (G, behind the barrier that the end of
+    a row protects) at position 63, the carried registers of the next row when more rows of the sequence follow. Returns the live CTAs of every launch, the executed rows, the positions
+    covered, the rows per phase class, the rows that follow a chunk end inside the same launch and the final position of every slot that ran."""
+    pos = dict(start_pos or {})
+    cov = {"launches": len(launches), "live_ctas": [], "rows": 0, "positions": set(), "cross_subblock_rows": 0, "chunk_end_rows": 0, "rows_after_chunk_end": 0, "rows_with_next_row": 0}
+    for lens, slots in launches:
+        assert len(lens) == len(slots)
+        live = 0
+        for n, (length, slot) in enumerate(zip(lens, slots)):
+            if slot < 0 or length <= 0:
+                continue
+            live += 1
+            p0 = pos.get(slot, 0)
+            for r in range(length):
+                p = (p0 + r) % BT
+                cov["rows"] += 1
+                cov["positions"].add(p)
+                cov["cross_subblock_rows"] += 1 if p >= 16 else 0
+                if r + 1 < length:
+                    cov["rows_with_next_row"] += 1
+                if p == BT - 1:
+                    cov["chunk_end_rows"] += 1
+                    cov["rows_after_chunk_end"] += length - r - 1
+            pos[slot] = (p0 + length) % BT
+        cov["live_ctas"].append(live * heads)
+    cov["positions"] = sorted(cov["positions"])
+    cov["final_pos"] = {slot: p for slot, p in sorted(pos.items())}
+    return cov
+
+
+def coverage_problems(cov):
+    """What a bounded racecheck workload must have executed to count as covering the row engine: every position 0 .. 63 (so every sub-block and the chunk end), at least one chunk-end row,
+    at least one row after it in the same launch (the window that the barrier ending a row protects), rows beyond the first sub-block (phase C) and rows with a next row (the carried
+    registers); and CTAs that really run. Returns the list of what is missing (empty: covered)."""
+    probs = []
+    if cov["positions"] != list(range(BT)):
+        missing = sorted(set(range(BT)) - set(cov["positions"]))
+        probs.append("the workload executes rows at %d of the 64 positions only (missing %s ..)" % (len(cov["positions"]), missing[:6]))
+    if cov["chunk_end_rows"] < 1:
+        probs.append("no row finishes a chunk (position 63): the chunk-end phase is not executed")
+    if cov["rows_after_chunk_end"] < 1:
+        probs.append("no row follows a chunk end inside its launch: the window of the barrier that ends a row is not executed")
+    if cov["cross_subblock_rows"] < 1:
+        probs.append("no row at a position of 16 or more: the cross-sub-block phase is not executed")
+    if cov["rows_with_next_row"] < 1:
+        probs.append("no sequence has a next row: the carried registers are not executed")
+    if not cov["live_ctas"] or min(cov["live_ctas"]) < 1:
+        probs.append("a launch has no live CTA (every entry is a padding or empty entry)")
+    return probs
