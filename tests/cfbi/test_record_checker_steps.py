@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ for _p in (_ROOT / "benchmarks", _ROOT / "tests" / "cfbi"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+import codegen_gate as cg  # noqa: E402
 import record_checker as rc  # noqa: E402
 import test_bench_tools as tbt  # noqa: E402
 from test_record_checker import commit_file, git, has, mutated  # noqa: E402
@@ -27,22 +29,72 @@ CELL = "decode;N=1;H=12;regime=lockstep;"
 
 
 # ---- the ledger ------------------------------------------------------------------------------------------------------------------------------
-def codegen_figures(verdict="PASS", toolchains=rc.TOOLCHAINS):
-    return dict((t, {"verdict": verdict, "compared": 54, "differences": 0}) for t in toolchains)
+DUMPS = tempfile.mkdtemp(prefix="rc-ledger-dumps-")             # the dumps that the rows of the synthetic ledgers are bound to
+BASE = "b" * 40                                                  # the base commit of the synthetic loop
+META = {"base": BASE, "head": C5}
+LABELS = {"conda": "Cuda compilation tools, release 13.1 | conda gcc 14.3", "container_b200": "container NGC pytorch 26.08: nvcc 13.4.59", "container_b300": "container NGC pytorch 26.08: nvcc 13.4.59"}
+SPILLS = {"sm_100a": (4, 4), "sm_103a": (12, 8), "sm_90a": (428, 172)}      # (stores, loads) of the base row engine
+ROWS = "cfbi::rows_kernel"
+_dumps = {}
 
 
-def resource_figures(toolchains=rc.TOOLCHAINS):
-    return dict((t, {"reg": 128, "spill_loads": 4, "spill_stores": 4, "stack": 112}) for t in toolchains)
+def dump_file(key, commit, role="cand", rows=None, others=None, extra=None, label=None):
+    """The path of a synthetic dump for the comparison ``key``: the base of the loop (role base) or a candidate of ``commit``. ``rows`` edits the figures of the row engine of a candidate,
+    ``others`` those of other kernels (kernel -> figures), ``extra`` adds kernels (kernel -> arguments of ``cg_kernel``)."""
+    sig = json.dumps([key, commit, role, rows, others, extra, label], sort_keys=True)
+    if sig not in _dumps:
+        kernels = {}
+        for arch in rc.COMPARISON_ARCHS[key]:
+            k = {ROWS: tbt.cg_kernel(reg=128, stack=112, spill=SPILLS[arch], sass="rows" if role == "base" else "rows-" + commit[:7]),
+                 "cfbi::ref::rows_kernel": tbt.cg_kernel(reg=48, sass="ref-rows", maxreg=None, maxthr=None),
+                 "cfbi::k2_kernel<Li16E>": tbt.cg_kernel(reg=172, sass="k2"), "cfbi::plan_kernel": tbt.cg_kernel(reg=40, sass="plan")}
+            if role != "base":
+                k[ROWS].update(rows or {})
+                for name, fig in (others or {}).items():
+                    k[name].update(fig)
+                for name, args in (extra or {}).items():
+                    k[name] = tbt.cg_kernel(**args)
+            kernels[arch] = k
+        dump = tbt.cg_dump(kernels, label=label or LABELS[key])
+        dump["meta"]["tree"]["commit"] = BASE if role == "base" else commit
+        path = os.path.join(DUMPS, "%s-%d.json" % (role, len(_dumps)))
+        with open(path, "w") as f:
+            json.dump(dump, f)
+        _dumps[sig] = path
+    return _dumps[sig]
+
+
+def comparison(key, commit, instantiations=(ROWS,), **kw):
+    """The honest ledger entry of the comparison ``key`` for a candidate of ``commit`` (``kw`` edits the candidate dump) and the resource figures of its row engine."""
+    base, cand = dump_file(key, BASE, "base"), dump_file(key, commit, "cand", **kw)
+    bd, cd = cg.load_dump(base), cg.load_dump(cand)
+    report = cg.compare_dumps(bd, cd, None, "change")
+    entry = {"base_dump": base, "cand_dump": cand, "prev_dump": None, "allow": None, "mode": "change", "instantiations": list(instantiations),
+             "verdict": "PASS" if report["exit"] == 0 else "FAIL", "compared": report["compared"], "differences": len(report["differences"])}
+    figures = dict((arch, dict((i, dict((f, cd["kernels"][arch][i][f]) for f in rc.RESOURCE_FIGURES)) for i in instantiations)) for arch in rc.COMPARISON_ARCHS[key])
+    return entry, figures
+
+
+def gate_evidence(commit, keys=rc.COMPARISONS, **kw):
+    codegen, resources = {}, {}
+    for key in keys:
+        codegen[key], resources[key] = comparison(key, commit, **kw)
+    return codegen, resources
 
 
 def ab_figures(devices=rc.DEVICES):
     return dict((d, {"medians": {CELL: {"base": 14.0, "cand": 13.2}}, "noise_limited": []}) for d in devices)
 
 
-def adopted(sid, commit=C1, markers=("none",), vs_previous="pass", vs_base="pass", chain="not_applicable"):
+def chain_of(sid):
+    return "pass" if sid in rc.CHAIN_STEPS else "not_applicable"
+
+
+def adopted(sid, commit=C1, markers=("none",), vs_previous="pass", vs_base="pass", chain=None, **cand_kw):
+    codegen, resources = gate_evidence(commit, **cand_kw)
     return {"id": sid, "outcome": "adopted", "commit": commit, "revert_commit": None, "markers": list(markers), "failed_at": None, "reason": "",
-            "gates": {"exactness": True, "codegen": True}, "timing": {"vs_previous": vs_previous, "vs_base": vs_base, "chain": chain},
-            "codegen_gate": codegen_figures(), "resource_gate": resource_figures(), "ab": ab_figures()}
+            "gates": {"exactness": True, "codegen": True}, "timing": {"vs_previous": vs_previous, "vs_base": vs_base, "chain": chain or chain_of(sid)},
+            "codegen_gate": codegen, "resource_gate": resources, "ab": ab_figures()}
 
 
 def not_adopted(sid, failed_at, commit=None, revert=None, markers=("none",), timing=None):
@@ -50,12 +102,13 @@ def not_adopted(sid, failed_at, commit=None, revert=None, markers=("none",), tim
     step = {"id": sid, "outcome": "not_adopted", "commit": commit, "revert_commit": revert, "markers": list(markers), "failed_at": failed_at, "reason": "the %s phase failed" % failed_at,
             "gates": {"exactness": None if reached < 1 else reached > 1, "codegen": None if reached < 2 else reached > 2}, "timing": None,
             "codegen_gate": None, "resource_gate": None, "ab": None}
-    if reached >= 2:
-        step["codegen_gate"] = codegen_figures("FAIL" if failed_at == "codegen" else "PASS", rc.TOOLCHAINS if reached == 3 else ("conda",))
-        step["resource_gate"] = resource_figures(rc.TOOLCHAINS if reached == 3 else ("conda",))
+    candidate = commit or "e" * 40
+    if reached == 2:                                                      # the resource gate failed on the conda toolchain: 129 registers
+        step["codegen_gate"], step["resource_gate"] = gate_evidence(candidate, keys=("conda",), rows={"reg": 129})
     if reached == 3:
+        step["codegen_gate"], step["resource_gate"] = gate_evidence(candidate)
         step["ab"] = ab_figures()
-        step["timing"] = timing or {"vs_previous": "fail", "vs_base": "pass", "chain": "not_applicable"}
+        step["timing"] = timing or {"vs_previous": "fail", "vs_base": "pass", "chain": chain_of(sid)}
     return step
 
 
@@ -64,12 +117,17 @@ def skipped(sid, markers=("none",)):
             "gates": None, "timing": None, "codegen_gate": None, "resource_gate": None, "ab": None}
 
 
+def step_check(step, waiver=None):
+    return rc.step_problems(step, waiver, META)
+
+
 UNIT_CASES = [
     ("E passes against T and F beats E", {"e_vs_t": "pass", "f_vs_e": "pass", "f_vs_t": "not_run"}, ("adopted", "adopted")),
     ("E passes against T and F does not beat E", {"e_vs_t": "pass", "f_vs_e": "fail", "f_vs_t": "not_run"}, ("adopted", "not_adopted")),
     ("E fails against T and F beats T", {"e_vs_t": "fail", "f_vs_e": "not_run", "f_vs_t": "pass"}, ("adopted", "adopted")),
     ("E fails against T and F does not beat T", {"e_vs_t": "fail", "f_vs_e": "not_run", "f_vs_t": "fail"}, ("not_adopted", "not_adopted")),
 ]
+E_ROW, F_ROW = 2, 3                                                      # the positions of the two members of the unit in a ledger
 
 
 def unit_rows(unit, outcomes, e_marker=("e_tile_marker",), f_marker=("a_fragments_marker",)):
@@ -79,7 +137,7 @@ def unit_rows(unit, outcomes, e_marker=("e_tile_marker",), f_marker=("a_fragment
     rows = []
     for sid, outcome, prev, markers, commit in (("e_tile", outcomes[0], prev_e, e_marker, C2), ("a_fragments", outcomes[1], prev_f, f_marker, C3)):
         if outcome == "adopted":
-            rows.append(adopted(sid, commit, markers, vs_previous=prev, chain="pass"))
+            rows.append(adopted(sid, commit, markers, vs_previous=prev))
         else:
             rows.append(not_adopted(sid, "timing", commit, C4, markers, {"vs_previous": prev, "vs_base": "pass", "chain": "pass"}))
     return rows
@@ -91,7 +149,7 @@ def ledger(unit_case=0, **overrides):
     steps = {"single_launch": adopted("single_launch", C1, ("single_launch_marker",)), "trims": adopted("trims", C5), "e_tile": e, "a_fragments": f,
              "kd_tile": not_adopted("kd_tile", "exactness")}
     steps.update(overrides)
-    return {"schema": rc.LEDGER_SCHEMA, "meta": {"base": C1, "head": C5}, "steps": [steps[s] for s in rc.STEP_IDS], "unit": dict(unit), "_path": "mem"}
+    return {"schema": rc.LEDGER_SCHEMA, "meta": dict(META), "steps": [steps[s] for s in rc.STEP_IDS], "unit": dict(unit), "_path": "mem"}
 
 
 def test_a_complete_ledger_passes_for_every_branch_of_the_three_arm_rule():
@@ -130,31 +188,168 @@ def test_the_arms_of_the_unit_must_be_complete_and_agree_with_the_rows():
         problems = rc.ledger_problems(mutated(base, edit))
         if expected:
             assert has(problems, expected), expected
-    wrong_row = mutated(base, lambda l: l["steps"][3]["timing"].update(vs_previous="fail"))               # the F row says it did not beat E, the arms say it did
+    wrong_row = mutated(base, lambda l: l["steps"][F_ROW]["timing"].update(vs_previous="fail"))            # the F row says it did not beat E, the arms say it did
     assert has(rc.ledger_problems(wrong_row), "the row of a_fragments says 'fail' against the previous accepted state")
     assert has(rc.ledger_problems(mutated(base, lambda l: l.pop("unit")), require_all_steps=True), "needs its three arms")           # a complete ledger names the arms
     assert not has(rc.ledger_problems(mutated(base, lambda l: l.pop("unit"))), "three arms")                                         # an intermediate one need not yet
-    # a member that failed an earlier phase has no timing to agree with the arms
-    _, unit, _ = UNIT_CASES[3]
-    early = ledger(3, e_tile=not_adopted("e_tile", "exactness"))
+    early = ledger(3, e_tile=not_adopted("e_tile", "exactness"))                                          # a member that failed an earlier phase has no timing to agree with the arms
     assert rc.ledger_problems(early, require_all_steps=True) == []
-    # without the unit the rows stand alone: an adopted E tile has to beat the previous state by its own row
-    alone = mutated(base, lambda l: l.pop("unit"))
-    alone["steps"][2]["timing"]["vs_previous"] = "fail"
-    assert has(rc.ledger_problems(alone), "beats the previous accepted state")
+    alone = mutated(base, lambda l: l.pop("unit"))                                                         # without the unit the rows stand alone: E has to beat the previous state itself
+    alone["steps"][E_ROW]["timing"]["vs_previous"] = "fail"
+    assert has(rc.ledger_problems(alone), "beat the previous accepted state")
+
+
+# ---- B9: the selected state passes the cumulative and chain gates, the figures are those of the dumps ---------------------------------------------
+def timing_edit(row, **fields):
+    return lambda l: l["steps"][row]["timing"].update(fields)
+
+
+@pytest.mark.parametrize("row,fields", [
+    (E_ROW, {"vs_base": "fail"}), (E_ROW, {"vs_base": "not_run"}), (E_ROW, {"chain": "fail"}), (E_ROW, {"chain": "not_run"}), (E_ROW, {"chain": "not_applicable"}),
+    (F_ROW, {"vs_base": "fail", "chain": "fail"}), (F_ROW, {"vs_base": "fail"}), (F_ROW, {"chain": "fail"}), (F_ROW, {"chain": "not_applicable"}), (F_ROW, {"vs_base": "not_run"})])
+def test_both_adopted_members_of_the_unit_pass_the_cumulative_and_the_chain_gates(row, fields):
+    """The review's counterexamples on the ledger where E passes against T and F beats E (both adopted): each of the two rows must pass them by itself."""
+    good = ledger(0)
+    assert rc.ledger_problems(good, require_all_steps=True) == []
+    assert rc.ledger_problems(mutated(good, timing_edit(row, **fields)), require_all_steps=True) != [], (row, fields)
+
+
+def test_when_only_the_e_tile_is_kept_it_is_the_selected_state_and_passes_everything_itself():
+    good = ledger(1)
+    assert rc.ledger_problems(good, require_all_steps=True) == []
+    for fields in ({"vs_base": "fail"}, {"chain": "fail"}, {"vs_base": "not_run"}, {"vs_previous": "fail"}):
+        assert rc.ledger_problems(mutated(good, timing_edit(E_ROW, **fields)), require_all_steps=True) != [], fields
+
+
+def test_the_e_tile_that_the_a_fragments_rescued_is_waived_and_the_selected_a_fragments_are_not():
+    """E fails against T and F beats T (both adopted): E need not pass the gain, the cumulative or the chain gate on its own, F (the selected state) must pass all of them."""
+    good = ledger(2)
+    assert rc.ledger_problems(good, require_all_steps=True) == []
+    waived = mutated(good, timing_edit(E_ROW, vs_base="fail", chain="fail"))
+    assert rc.ledger_problems(waived, require_all_steps=True) == []
+    assert has(rc.ledger_problems(mutated(good, timing_edit(E_ROW, vs_base="not_run")), require_all_steps=True), "measured")                  # waived, still a measurement
+    assert has(rc.ledger_problems(mutated(good, timing_edit(E_ROW, vs_previous="pass")), require_all_steps=True), "the arms say 'fail'")      # the row must agree with the arms
+    for fields in ({"vs_base": "fail"}, {"chain": "fail"}, {"vs_base": "fail", "chain": "fail"}, {"chain": "not_applicable"}):
+        assert rc.ledger_problems(mutated(good, timing_edit(F_ROW, **fields)), require_all_steps=True) != [], fields
+
+
+@pytest.mark.parametrize("sid", ["e_tile", "a_fragments", "kd_tile"])
+def test_the_layer_chain_is_measured_for_the_steps_that_change_the_shared_memory_requirement(sid):
+    assert step_check(adopted(sid)) == []
+    for chain in ("not_applicable", "not_run", "fail"):
+        assert step_check(adopted(sid, chain=chain)) != [], chain
+    assert has(step_check(adopted(sid, chain="not_applicable")), "layer chain is measured")
+    assert has(step_check(adopted(sid, chain="fail")), "keep the layer chain")
+
+
+@pytest.mark.parametrize("sid", ["single_launch", "trims"])
+def test_the_layer_chain_is_not_applicable_to_the_other_steps(sid):
+    assert step_check(adopted(sid)) == []
+    assert has(step_check(adopted(sid, chain="pass")), "not applicable to this step")
+    assert has(step_check(adopted(sid, chain="fail")), "not applicable to this step")
+
+
+def edit_entry(key, **fields):
+    return lambda s: s["codegen_gate"][key].update(fields)
+
+
+def edit_figure(key, arch, **fields):
+    return lambda s: s["resource_gate"][key][arch][ROWS].update(fields)
+
+
+def swap_dump(key, field, **dump_kw):
+    """The row with the dump of one comparison replaced by another dump (``dump_kw`` of ``dump_file``)."""
+    def edit(s):
+        s["codegen_gate"][key][field] = dump_file(dump_kw.pop("dump_key", key), dump_kw.pop("commit"), dump_kw.pop("role", "cand"), **dump_kw)
+    return edit
+
+
+CODEGEN_MUTANTS = [
+    # the figures that the ledger declares are the ones of the dumps
+    ("a resource figure the dump does not have: 129 registers", edit_figure("container_b200", "sm_100a", reg=129), "says"),
+    ("a stack figure the dump does not have", edit_figure("conda", "sm_90a", stack=0), "says"),
+    ("a spill figure the dump does not have", edit_figure("container_b300", "sm_103a", spill_loads=0), "says"),
+    ("a resource figure that is a boolean", edit_figure("conda", "sm_100a", reg=True), "says"),
+    ("a resource figure that is missing", edit_figure("conda", "sm_100a", spill_stores=None), "says"),
+    ("no resource figures for an architecture", lambda s: s["resource_gate"]["conda"].pop("sm_90a"), "must give the resource figures of the row engine"),
+    ("a verdict that the dumps contradict", edit_entry("container_b200", verdict="FAIL"), "the comparison of the dumps says PASS"),
+    ("100 differences that the dumps do not have", edit_entry("container_b300", verdict="PASS", differences=100), "differences = 100"),
+    ("a number of kernels compared that the dumps do not have", edit_entry("conda", compared=1), "compared = 1"),
+    ("an instantiation that the ledger leaves out", edit_entry("conda", instantiations=[]), "names the instantiations"),
+    ("an instantiation that the dump does not have", edit_entry("conda", instantiations=[ROWS, "cfbi::rows_kernel<Lb1E>"]), "names the instantiations"),
+    ("the mode identity", edit_entry("conda", mode="identity"), "the mode of a step's comparison is change"),
+    ("no base dump", lambda s: s["codegen_gate"]["conda"].pop("base_dump"), "needs base_dump"),
+    ("a dump that cannot be read", edit_entry("container_b200", cand_dump="/nonexistent/dump.json"), "cannot be used"),
+    # the dumps are those of the row's commit, of the base of the loop, of the toolchain and the architectures of the comparison
+    ("a candidate dump of another commit", swap_dump("conda", "cand_dump", commit="d" * 40), "the candidate dump is of commit"),
+    ("a base dump that is not the base of the loop", swap_dump("conda", "base_dump", commit="d" * 40), "the base dump is of commit"),
+    ("a candidate dump of another toolchain", swap_dump("conda", "cand_dump", commit=C1, label=LABELS["container_b200"]), "is not the conda toolchain"),
+    ("a candidate dump for another architecture", swap_dump("container_b200", "cand_dump", dump_key="container_b300", commit=C1), "the candidate dump is for"),
+]
+
+
+@pytest.mark.parametrize("name,edit,expected", CODEGEN_MUTANTS, ids=[m[0] for m in CODEGEN_MUTANTS])
+def test_the_figures_of_a_row_are_those_of_the_dumps_it_is_bound_to(name, edit, expected):
+    good = adopted("kd_tile")
+    assert step_check(good) == []
+    assert has(step_check(mutated(good, edit)), expected), (name, step_check(mutated(good, edit))[:3])
+
+
+def test_the_ledger_names_the_base_commit_that_the_base_dumps_are_bound_to():
+    assert has(rc.ledger_problems(mutated(ledger(0), lambda l: l["meta"].pop("base"))), "names no base commit")
+    assert has(rc.ledger_problems(mutated(ledger(0), lambda l: l["meta"].update(base="c" * 40))), "the base dump is of commit")
+
+
+@pytest.mark.parametrize("name,cand_kw", [
+    ("129 registers", {"rows": {"reg": 129}}),
+    ("stack above the base", {"rows": {"stack": 113}}),
+    ("spill stores above the base", {"rows": {"spill_stores": 5}}),
+    ("spill loads above the base", {"rows": {"spill_loads": 5}}),
+    ("a launch bound that differs", {"rows": {"max_threads": 512}}),
+    ("another kernel that is no longer identical", {"others": {"cfbi::plan_kernel": {"sass_hash": tbt.cg_hash("plan2"), "sass_hash_strict": tbt.cg_hash("plan2")}}}),
+    ("a new instantiation of the row engine with 129 registers", {"extra": {"cfbi::rows_kernel<Lb1E>": {"reg": 129, "sass": "x"}}}),
+])
+def test_a_resource_or_identity_failure_of_the_dumps_rejects_an_adopted_row_whatever_the_ledger_says(name, cand_kw):
+    """The review's 129 registers, and the base-relative stack and spill: the comparison of the dumps decides, an honest ledger that declares the failure is rejected too."""
+    honest = adopted("trims", **cand_kw) if name != "a new instantiation of the row engine with 129 registers" else None
+    if honest is None:                                           # a second instantiation of the family is declared in the ledger by the honest row
+        codegen, resources = {}, {}
+        for key in rc.COMPARISONS:
+            codegen[key], resources[key] = comparison(key, C1, instantiations=(ROWS, "cfbi::rows_kernel<Lb1E>"), **cand_kw)
+        honest = adopted("trims")
+        honest["codegen_gate"], honest["resource_gate"] = codegen, resources
+    problems = step_check(honest)
+    assert has(problems, "the comparison of the dumps fails"), (name, problems[:3])
+    dishonest = mutated(honest, lambda s: [e.update(verdict="PASS", differences=0) for e in s["codegen_gate"].values()])
+    assert has(step_check(dishonest), "the comparison of the dumps says FAIL") or has(step_check(dishonest), "differences ="), name
+
+
+def test_a_dump_without_a_launch_bound_of_the_row_engine_is_unusable_evidence_not_an_equality():
+    row = adopted("trims")
+    row["codegen_gate"]["conda"]["cand_dump"] = dump_file("conda", C1, "cand", rows={"max_threads": None})
+    assert has(step_check(row), "cannot be used") and has(step_check(row), "launch-bound attribute max_threads")
+
+
+def test_a_second_instantiation_of_the_row_engine_is_bound_and_gated_like_the_first():
+    codegen, resources = {}, {}
+    for key in rc.COMPARISONS:
+        codegen[key], resources[key] = comparison(key, C1, instantiations=(ROWS, "cfbi::rows_kernel<Lb1E>"), extra={"cfbi::rows_kernel<Lb1E>": {"reg": 128, "sass": "dec"}})
+    row = adopted("trims")
+    row["codegen_gate"], row["resource_gate"] = codegen, resources
+    assert step_check(row) == []
+    hidden = mutated(row, lambda s: [e.update(instantiations=[ROWS]) for e in s["codegen_gate"].values()])
+    assert has(step_check(hidden), "names the instantiations")
 
 
 ADOPTED_MUTANTS = [
     ("no gates", lambda s: s.update(gates=None), "passes the exactness and the code-generation gate"),
     ("a failed exactness gate", lambda s: s["gates"].update(exactness=False), "passes the exactness"),
     ("a failed code-generation gate", lambda s: s["gates"].update(codegen=False), "passes the exactness"),
-    ("no code-generation figures", lambda s: s.update(codegen_gate=None), "codegen_gate must give figures per toolchain"),
-    ("code-generation figures for one toolchain only", lambda s: s["codegen_gate"].pop("container"), "has no figures for the container toolchain"),
-    ("a code-generation gate that did not pass", lambda s: s["codegen_gate"]["conda"].update(verdict="FAIL"), "an adopted step passes the gate"),
-    ("code-generation figures without the kernels compared", lambda s: s["codegen_gate"]["conda"].pop("compared"), "the number of kernels compared"),
-    ("no resource figures", lambda s: s.update(resource_gate=None), "resource_gate must give figures per toolchain"),
-    ("a resource figure that is missing", lambda s: s["resource_gate"]["container"].pop("spill_stores"), "spill_stores"),
-    ("a resource figure that is negative", lambda s: s["resource_gate"]["conda"].update(reg=-1), "non-negative integers"),
+    ("no code-generation evidence", lambda s: s.update(codegen_gate=None), "codegen_gate must give one comparison of dumps per toolchain"),
+    ("code-generation evidence for one toolchain only", lambda s: s["codegen_gate"].pop("container_b300"), "codegen_gate has no comparison for container_b300"),
+    ("an entry that is not an object", lambda s: s["codegen_gate"].update(conda="PASS"), "is not an object"),
+    ("no resource evidence", lambda s: s.update(resource_gate=None), "resource_gate must give the resource figures per toolchain"),
+    ("an unknown toolchain", lambda s: s["codegen_gate"].update(unknown={}), "one comparison of dumps per toolchain"),
     ("no A/B medians", lambda s: s.update(ab=None), "ab must give the A/B medians"),
     ("A/B medians for one device only", lambda s: s["ab"].pop("b300"), "ab must give the A/B medians"),
     ("an A/B median that is zero", lambda s: s["ab"]["b200"]["medians"][CELL].update(cand=0), "positive numbers"),
@@ -163,60 +358,72 @@ ADOPTED_MUTANTS = [
     ("a commit that is not a hash", lambda s: s.update(commit="HEAD"), "hexadecimal"),
     ("a revert commit", lambda s: s.update(revert_commit=C4), "no revert commit"),
     ("a step that says where it failed", lambda s: s.update(failed_at="timing"), "failed at nothing"),
-    ("a step that does not beat the previous state", lambda s: s["timing"].update(vs_previous="fail"), "beats the previous accepted state"),
-    ("a step that regresses against the base", lambda s: s["timing"].update(vs_base="fail"), "does not regress against the base"),
-    ("a step that breaks the layer chain", lambda s: s["timing"].update(chain="fail"), "keeps the layer chain"),
-    ("a timing that was not run", lambda s: s["timing"].update(vs_base="not_run"), "does not regress against the base"),
+    ("a step that does not beat the previous state", lambda s: s["timing"].update(vs_previous="fail"), "beat the previous accepted state"),
+    ("a step that regresses against the base", lambda s: s["timing"].update(vs_base="fail"), "not regress against the base"),
+    ("a step that breaks the layer chain", lambda s: s["timing"].update(chain="fail"), "keep the layer chain"),
+    ("a timing that was not run", lambda s: s["timing"].update(vs_base="not_run"), "measured"),
+    ("no timing", lambda s: s.update(timing=None), "has timing results"),
     ("no markers", lambda s: s.update(markers=[]), "markers must be a non-empty list"),
 ]
 
 
 @pytest.mark.parametrize("name,edit,expected", ADOPTED_MUTANTS, ids=[m[0] for m in ADOPTED_MUTANTS])
 def test_an_adopted_row_with_missing_or_failing_evidence_is_rejected(name, edit, expected):
-    good = adopted("trims")
-    assert rc.step_problems(good) == []
-    assert has(rc.step_problems(mutated(good, edit)), expected), name
+    good = adopted("kd_tile")
+    assert step_check(good) == []
+    assert has(step_check(mutated(good, edit)), expected), (name, step_check(mutated(good, edit))[:3])
 
 
 @pytest.mark.parametrize("failed_at", rc.GATE_PHASES)
 def test_a_step_that_was_not_adopted_carries_the_evidence_of_the_phases_it_reached(failed_at):
     good = not_adopted("kd_tile", failed_at)
-    assert rc.step_problems(good) == []
-    assert rc.step_problems(not_adopted("kd_tile", failed_at, C2, C3)) == []                       # committed and reverted
-    assert has(rc.step_problems(mutated(good, lambda s: s.update(reason=""))), "carries a reason")
-    assert has(rc.step_problems(mutated(good, lambda s: s.update(commit=C2))), "is not reverted")
-    assert has(rc.step_problems(mutated(good, lambda s: s.update(failed_at="later"))), "says where it failed")
-    assert has(rc.step_problems(mutated(good, lambda s: s["gates"].update(exactness="x"))), "gate is")
+    assert step_check(good) == []
+    assert step_check(not_adopted("kd_tile", failed_at, C2, C3)) == []                              # committed and reverted
+    assert has(step_check(mutated(good, lambda s: s.update(reason=""))), "carries a reason")
+    assert has(step_check(mutated(good, lambda s: s.update(commit=C2))), "is not reverted")
+    assert has(step_check(mutated(good, lambda s: s.update(failed_at="later"))), "says where it failed")
+    assert has(step_check(mutated(good, lambda s: s["gates"].update(exactness="x"))), "gate is")
 
 
 def test_the_measurements_a_step_never_reached_are_not_run_and_cannot_be_invented():
-    """compile / exactness: no figures at all; codegen: figures but no timing; timing: everything and at least one failing result."""
+    """compile / exactness: no evidence at all; codegen: dumps but no timing; timing: everything and at least one failing result."""
+    codegen_evidence = not_adopted("kd_tile", "codegen")
     compiled = not_adopted("kd_tile", "compile")
-    assert has(rc.step_problems(mutated(compiled, lambda s: s.update(codegen_gate=codegen_figures()))), "never reached")
+    assert has(step_check(mutated(compiled, lambda s: s.update(codegen_gate=codegen_evidence["codegen_gate"]))), "never reached")
     exactness = not_adopted("kd_tile", "exactness")
-    assert has(rc.step_problems(mutated(exactness, lambda s: s.update(resource_gate=resource_figures()))), "never reached")
-    assert has(rc.step_problems(mutated(exactness, lambda s: s["gates"].update(exactness=True))), "the exactness gate is False")
-    assert has(rc.step_problems(mutated(exactness, lambda s: s.update(timing={"vs_previous": "fail", "vs_base": "pass", "chain": "pass"}))), "no timing was measured")
-    codegen = not_adopted("kd_tile", "codegen")
-    assert has(rc.step_problems(mutated(codegen, lambda s: s.update(ab=ab_figures()))), "never reached")
-    assert has(rc.step_problems(mutated(codegen, lambda s: s.update(codegen_gate=None, resource_gate=None))), "must give figures per toolchain")
-    assert has(rc.step_problems(mutated(codegen, lambda s: s["gates"].update(codegen=True))), "the codegen gate is False")
+    assert has(step_check(mutated(exactness, lambda s: s.update(resource_gate=codegen_evidence["resource_gate"]))), "never reached")
+    assert has(step_check(mutated(exactness, lambda s: s["gates"].update(exactness=True))), "the exactness gate is False")
+    assert has(step_check(mutated(exactness, lambda s: s.update(timing={"vs_previous": "fail", "vs_base": "pass", "chain": "pass"}))), "no timing was measured")
+    assert has(step_check(mutated(codegen_evidence, lambda s: s.update(ab=ab_figures()))), "never reached")
+    assert has(step_check(mutated(codegen_evidence, lambda s: s.update(codegen_gate=None, resource_gate=None))), "one comparison of dumps per toolchain")
+    assert has(step_check(mutated(codegen_evidence, lambda s: s["gates"].update(codegen=True))), "the codegen gate is False")
     timing = not_adopted("kd_tile", "timing")
-    assert has(rc.step_problems(mutated(timing, lambda s: s.update(ab=None))), "ab must give the A/B medians")
-    assert has(rc.step_problems(mutated(timing, lambda s: s["codegen_gate"].pop("container"))), "has no figures for the container toolchain")
-    assert has(rc.step_problems(mutated(timing, lambda s: s.update(timing={"vs_previous": "pass", "vs_base": "pass", "chain": "pass"}))), "a step that passes every gate is adopted")
-    assert has(rc.step_problems(mutated(timing, lambda s: s.update(timing={"vs_previous": "slow", "vs_base": "pass", "chain": "pass"}))), "timing needs vs_previous")
+    assert has(step_check(mutated(timing, lambda s: s.update(ab=None))), "ab must give the A/B medians")
+    assert has(step_check(mutated(timing, lambda s: s["codegen_gate"].pop("container_b200"))), "no comparison for container_b200")
+    assert has(step_check(mutated(timing, lambda s: s.update(timing={"vs_previous": "pass", "vs_base": "pass", "chain": "pass"}))), "a step that passes every gate is adopted")
+    assert has(step_check(mutated(timing, lambda s: s.update(timing={"vs_previous": "slow", "vs_base": "pass", "chain": "pass"}))), "measured (pass or fail)")
+    assert has(step_check(mutated(timing, lambda s: s.update(timing={"vs_previous": "fail", "vs_base": "not_run", "chain": "pass"}))), "measured (pass or fail)")
     for results in ({"vs_previous": "fail", "vs_base": "pass", "chain": "pass"}, {"vs_previous": "pass", "vs_base": "fail", "chain": "pass"}, {"vs_previous": "pass", "vs_base": "pass", "chain": "fail"}):
-        assert rc.step_problems(mutated(timing, lambda s: s.update(timing=results))) == [], results
+        assert step_check(mutated(timing, lambda s: s.update(timing=results))) == [], results
+
+
+def test_a_step_that_failed_at_the_code_generation_fails_a_comparison_of_its_dumps():
+    failed = not_adopted("kd_tile", "codegen")
+    assert step_check(failed) == []                                                 # 129 registers on the conda toolchain: the dumps say FAIL, the row says FAIL
+    passing = not_adopted("kd_tile", "codegen")
+    passing["codegen_gate"], passing["resource_gate"] = gate_evidence("e" * 40, keys=("conda",))
+    assert has(step_check(passing), "failed at the code generation, but every comparison of the dumps passes")
+    lying = mutated(failed, lambda s: s["codegen_gate"]["conda"].update(verdict="PASS"))
+    assert has(step_check(lying), "the comparison of the dumps says FAIL")
 
 
 def test_a_skipped_step_has_a_reason_and_no_evidence():
-    assert rc.step_problems(skipped("trims")) == []
-    assert has(rc.step_problems(mutated(skipped("trims"), lambda s: s.update(reason=""))), "carries the reason")
-    assert has(rc.step_problems(mutated(skipped("trims"), lambda s: s.update(commit=C1))), "has no commit")
-    assert has(rc.step_problems(mutated(skipped("trims"), lambda s: s.update(ab=ab_figures()))), "has no ab")
-    assert has(rc.step_problems(skipped("single_launch")), "only a row-engine step can be skipped")
-    assert has(rc.step_problems(skipped("kd_tile")), "only a row-engine step can be skipped")
+    assert step_check(skipped("trims")) == []
+    assert has(step_check(mutated(skipped("trims"), lambda s: s.update(reason=""))), "carries the reason")
+    assert has(step_check(mutated(skipped("trims"), lambda s: s.update(commit=C1))), "has no commit")
+    assert has(step_check(mutated(skipped("trims"), lambda s: s.update(ab=ab_figures()))), "has no ab")
+    assert has(step_check(skipped("single_launch")), "only a row-engine step can be skipped")
+    assert has(step_check(skipped("kd_tile")), "only a row-engine step can be skipped")
 
 
 def test_the_ledger_has_one_valid_row_per_step():
@@ -257,8 +464,8 @@ def test_the_decision_record_has_its_three_keys_and_an_order_that_only_skips():
 def test_the_ledger_and_the_decision_record_agree_on_the_steps_that_were_skipped():
     d = decision(order=("trims", "a_fragments"), skipped={"e_tile": "the tile does not fit"})
     _, unit, _ = UNIT_CASES[0]
-    good = {"schema": rc.LEDGER_SCHEMA, "meta": {}, "steps": [adopted("single_launch", C1), adopted("trims", C5), skipped("e_tile"), adopted("a_fragments", C3, vs_previous="pass"),
-                                                              not_adopted("kd_tile", "exactness")], "_path": "mem"}
+    good = {"schema": rc.LEDGER_SCHEMA, "meta": dict(META), "steps": [adopted("single_launch", C1), adopted("trims", C5), skipped("e_tile"), adopted("a_fragments", C3, vs_previous="pass"),
+                                                                       not_adopted("kd_tile", "exactness")], "_path": "mem"}
     assert rc.ledger_problems(good, decision=d, require_all_steps=True) == []
     assert has(rc.ledger_problems(good, decision=decision()), "e_tile is skipped in the ledger, the decision record keeps it")
     assert has(rc.ledger_problems(good, decision=decision(order=("trims",), skipped={"e_tile": "x", "a_fragments": "y"})), "leaves a_fragments out, the ledger says adopted")
@@ -292,7 +499,7 @@ def steps_repo_rw(tmp_path):
 def test_ledger_commits_are_checked_against_the_repository(steps_repo_rw):
     repo, h = steps_repo_rw["repo"], steps_repo_rw
     row = lambda **kw: adopted("trims", h["base"], **kw)
-    ok = {"schema": rc.LEDGER_SCHEMA, "meta": {}, "steps": [row()], "_path": "mem"}
+    ok = {"schema": rc.LEDGER_SCHEMA, "meta": dict(META), "steps": [row()], "_path": "mem"}
     assert rc.ledger_problems(ok, repo=repo) == []
     assert has(rc.ledger_problems(mutated(ok, lambda l: l["steps"][0].update(commit="0" * 40)), repo=repo), "does not have")
     side = steps_repo_rw["repo"]
@@ -317,6 +524,17 @@ def test_the_ledger_and_decision_command_lines(steps_repo, tmp_path, capsys):
     assert "the three-arm rule prescribes not_adopted for a_fragments" in capsys.readouterr().out
     assert rc.main(["ledger", "--ledger", str(good), "--repo", str(steps_repo["repo"])]) == 1      # the commits of the synthetic ledger are not in this repository
     assert "does not have" in capsys.readouterr().out
+    # the review's counterexamples through the command line: the selected F row regressing against the base, 129 registers in the dump of a row, 100 differences that are none
+    cases = (("regressing", lambda l: l["steps"][F_ROW]["timing"].update(vs_base="fail", chain="fail"), "not regress against the base"),
+             ("e-chain", lambda l: l["steps"][E_ROW]["timing"].update(chain="not_run"), "layer chain is measured"),
+             ("differences", lambda l: l["steps"][E_ROW]["codegen_gate"]["container_b200"].update(differences=100), "differences = 100"),
+             ("figure", lambda l: l["steps"][F_ROW]["resource_gate"]["container_b200"]["sm_100a"][ROWS].update(reg=129), "resource_gate (container_b200, sm_100a, cfbi::rows_kernel) says"))
+    for name, edit, expected in cases:
+        path = tmp_path / ("ledger-%s.json" % name)
+        path.write_text(json.dumps(mutated(rec, edit)))
+        capsys.readouterr()
+        assert rc.main(["ledger", "--ledger", str(path), "--require-all-steps"]) == 1, name
+        assert expected in capsys.readouterr().out, name
 
 
 # ---- markers ---------------------------------------------------------------------------------------------------------------------------------

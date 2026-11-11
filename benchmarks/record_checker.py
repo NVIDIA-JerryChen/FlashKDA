@@ -35,9 +35,15 @@ markers  the step ledger names for every step the identifiers that only that ste
          is an ancestor of HEAD and no later revert commit names it, a step that was not adopted or skipped has no commit or its revert commit is an ancestor of HEAD and names it.
 ledger   ``cfbi-step-ledger-v1``: one row for each step (``single_launch``, ``trims``, ``e_tile``, ``a_fragments``, ``kd_tile``) with its outcome (``adopted``, ``not_adopted``, ``skipped`` by the
          decision record), commit, markers and the evidence of the phases the step reached (compile, exactness, codegen, timing; the measurements it never reached are null and the row
-         carries a reason). An adopted row must carry all of it; the E tile and the A fragments are one adoption unit decided on three arms (T the previous accepted state, E, F) by a
-         table (E passes against T and F beats E: both adopted; E passes and F does not beat E: E only; E fails against T and F beats T: both; neither: none) and a ledger that
-         contradicts the table is rejected. ``--decision`` cross-checks the skipped steps with the decision record.
+         carries a reason). The code-generation and resource evidence is not a summary that the row writes about itself: for the conda toolchain and for the production container
+         toolchain on each device the row names the base dump and the candidate dump, and the checker runs ``codegen_gate.compare_dumps`` on them and recomputes the verdict, the kernels
+         compared, the differences, the instantiations of the row engine and their registers, stack and spill; the dumps must be of the base commit of the ledger and of the commit of the
+         row, of the toolchain and the architectures of the comparison, and the ledger's figures must be the dumps'. An adopted row passes every comparison and all of timing (beats the
+         previous accepted state, does not regress against the base, keeps the layer chain where the step changes the shared-memory requirement of the row kernel: ``e_tile``,
+         ``a_fragments``, ``kd_tile``, the type of the step decides); the E tile and the A fragments are one adoption unit decided on three arms (T the previous accepted state, E, F)
+         by a table (E passes against T and F beats E: both adopted; E passes and F does not beat E: E only; E fails against T and F beats T: both; neither: none): the table only changes
+         against which state the gain is judged, so every adopted row passes everything itself, except the E tile that F rescued, which the selected state E + F stands in for. A ledger
+         that contradicts the table is rejected. ``--decision`` cross-checks the skipped steps with the decision record.
 decision a decision record has the keys ``row_engine_order`` (the steps of the row engine in their default order, a step may only be left out, never moved), ``value_split_inputs`` and ``budget_table``.
 handoff  ``cfbi-handoff-v1``: the value-split and the operand-swap hand-offs (branch of the form ``explore/<run>/<topic>``, commit, both existing in the repository, the probe test on the branch,
          the next free implementation bit: 128 when single-launch decode took 64, else 64) and the known-limit section of the performance document (topics named without plan identifiers).
@@ -55,6 +61,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bench_decode as bd  # noqa: E402
 import bench_records as br  # noqa: E402
+import codegen_gate as cg  # noqa: E402
 import ncu_record as nr  # noqa: E402
 import rows_profile_record as rpr  # noqa: E402
 import suite_record as sr  # noqa: E402
@@ -684,9 +691,15 @@ SKIPPABLE = ROW_ENGINE_ORDER
 UNIT = ("e_tile", "a_fragments")                              # adopted or reverted together by the three-arm rule
 OUTCOMES = ("adopted", "not_adopted", "skipped")
 GATE_PHASES = ("compile", "exactness", "codegen", "timing")   # the order of the step gate protocol; a step that failed ends at one of them
-TOOLCHAINS = ("conda", "container")
+# the code-generation evidence of a row is one comparison of a base dump and a candidate dump for each of these: the conda toolchain of the login node (the three architectures) and the
+# production container toolchain on each device (one architecture each)
+COMPARISONS = ("conda", "container_b200", "container_b300")
+TOOLCHAINS = COMPARISONS
+COMPARISON_ARCHS = {"conda": ("sm_100a", "sm_103a", "sm_90a"), "container_b200": ("sm_100a",), "container_b300": ("sm_103a",)}
+CHAIN_STEPS = ("e_tile", "a_fragments", "kd_tile")            # the steps that change the shared-memory requirement of the row kernel (the E tile unit, the chunk-end KD tile): the layer chain is judged too
 DEVICES = ("b200", "b300")
 RESOURCE_FIGURES = ("reg", "spill_loads", "spill_stores", "stack")
+MEASURED = ("pass", "fail")                                   # a timing result of a step that reached the timing phase
 TIMING_RESULTS = ("pass", "fail", "not_run")
 CHAIN_RESULTS = ("pass", "fail", "not_applicable", "not_run")
 
@@ -714,31 +727,134 @@ def unit_outcomes(unit):
     return None, "e_vs_t must be pass or fail, got %r" % (e_t,)
 
 
-def _figure_problems(step, where, reached_codegen, reached_timing, both_required):
+def unit_waivers(unit):
+    """What the three-arm rule changes in the checks of the two rows of the adoption unit, and nothing else: the gain is judged against another state than the previous accepted one.
+    When E fails against T and F rescues it (both adopted), E is not selected on its own: its own gain against the previous state may be a failure and it need not pass the cumulative
+    and chain checks by itself, because the selected state is E plus F and F passes all of them. Every other adopted row (also E when it passed against T) passes everything itself."""
+    outcomes, _ = unit_outcomes(unit)
+    if outcomes == ("adopted", "adopted") and isinstance(unit, dict) and unit.get("e_vs_t") == "fail":
+        return {"e_tile": "rescued"}
+    return {}
+
+
+def toolchain_class(label):
+    low = str(label).lower()
+    return "container" if "container" in low else ("conda" if "conda" in low else None)
+
+
+def commit_matches(a, b):
+    return isinstance(a, str) and isinstance(b, str) and bool(a) and bool(b) and (a.startswith(b) or b.startswith(a))
+
+
+def _first_line(exc):
+    """The first two lines of an exception's message (the gate's ``Unusable`` names its reason on the second)."""
+    return " ".join(x.strip() for x in str(exc).split("\n")[:2])
+
+
+def _load_dump(path, what):
+    try:
+        return cg.load_dump(path), None
+    except (cg.Unusable, OSError, ValueError) as e:
+        return None, "%s %s cannot be used: %s" % (what, path, _first_line(e))
+
+
+def comparison_problems(row, key, entry, resources, meta, where):
+    """One code-generation comparison of a row bound to its dumps, and what the comparison says. Returns ``(problems, report)``; ``report`` is the result of
+    ``codegen_gate.compare_dumps`` (None when the dumps cannot be used). The ledger declares a verdict, the kernels compared, the differences, the instantiations of the row engine and the
+    resource figures; every one of them is recomputed from the dumps (the base dump is the base of the loop, the candidate dump the commit of the row, both of the toolchain and the
+    architectures that ``key`` names) and a declared figure that is not the recomputed one is a problem. The recomputed Gate R (registers, base-relative stack and spill, launch bounds)
+    is the comparison's own result, never the ledger's."""
+    w = "%s: codegen_gate (%s)" % (where, key)
+    if not isinstance(entry, dict):
+        return ["%s is not an object" % w], None
+    problems = ["%s needs %s (the path of a dump)" % (w, f) for f in ("base_dump", "cand_dump") if not text(entry.get(f))]
+    if entry.get("mode") != "change":
+        problems.append("%s: the mode of a step's comparison is change (the row engine differs from the base), got %r" % (w, entry.get("mode")))
+    if problems:
+        return problems, None
+    base, e1 = _load_dump(entry["base_dump"], "the base dump")
+    cand, e2 = _load_dump(entry["cand_dump"], "the candidate dump")
+    prev, e3, allow = None, None, None
+    if entry.get("prev_dump"):
+        prev, e3 = _load_dump(entry["prev_dump"], "the previous accepted dump")
+    if entry.get("allow"):
+        try:
+            allow = cg.load_allow(entry["allow"])
+        except (cg.Unusable, OSError, ValueError) as e:
+            e3 = e3 or "the allow-list %s cannot be used: %s" % (entry["allow"], _first_line(e))
+    errors = [e for e in (e1, e2, e3) if e]
+    if errors:
+        return ["%s: %s" % (w, e) for e in errors], None
+    cclass = toolchain_class(cand["meta"]["toolchain"].get("label"))
+    if cclass != key.split("_")[0]:
+        problems.append("%s: the candidate dump was made with the toolchain %r, which is not the %s toolchain" % (w, cand["meta"]["toolchain"].get("label"), key.split("_")[0]))
+    if sorted(cand["meta"]["toolchain"].get("archs") or []) != sorted(COMPARISON_ARCHS[key]):
+        problems.append("%s: the candidate dump is for %s, the comparison is for %s" % (w, sorted(cand["meta"]["toolchain"].get("archs") or []), sorted(COMPARISON_ARCHS[key])))
+    base_commit = (meta or {}).get("base")
+    if not hexcommit(base_commit):
+        problems.append("%s: the ledger names no base commit (meta.base) that the base dump could be bound to" % w)
+    elif not commit_matches(base["meta"]["tree"].get("commit"), base_commit):
+        problems.append("%s: the base dump is of commit %s, the ledger's base is %s" % (w, base["meta"]["tree"].get("commit"), base_commit))
+    if row.get("commit") is not None and not commit_matches(cand["meta"]["tree"].get("commit"), row["commit"]):
+        problems.append("%s: the candidate dump is of commit %s, the row names commit %s" % (w, cand["meta"]["tree"].get("commit"), row["commit"]))
+    try:
+        report = cg.compare_dumps(base, cand, allow, "change", prev)
+    except cg.Unusable as e:
+        return problems + ["%s: the dumps cannot be compared: %s" % (w, _first_line(e))], None
+    passed = report["exit"] == 0
+    if entry.get("verdict") != ("PASS" if passed else "FAIL"):
+        problems.append("%s: the ledger says %r, the comparison of the dumps says %s (%d difference(s), %d resource failure(s))" % (
+            w, entry.get("verdict"), "PASS" if passed else "FAIL", len(report["differences"]), len(report["gate_r"]["failures"])))
+    for field, got in (("compared", report["compared"]), ("differences", len(report["differences"]))):
+        if entry.get(field) != got or type(entry.get(field)) is bool:
+            problems.append("%s: the ledger says %s = %r, the comparison of the dumps says %r" % (w, field, entry.get(field), got))
+    owned = dict((arch, sorted(k for k in cand["kernels"].get(arch, {}) if cg.family(k) in cg.DEFAULT_OWNED)) for arch in COMPARISON_ARCHS[key])
+    declared = entry.get("instantiations")
+    if not (isinstance(declared, list) and all(isinstance(x, str) for x in declared)) or any(sorted(declared) != found for found in owned.values()):
+        problems.append("%s: the ledger names the instantiations %r of the row engine, the dump has %s" % (w, declared, "; ".join("%s %s" % (a, v) for a, v in sorted(owned.items()))))
+    figures = resources.get(key) if isinstance(resources, dict) else None
+    if not isinstance(figures, dict) or sorted(figures) != sorted(COMPARISON_ARCHS[key]):
+        problems.append("%s: resource_gate (%s) must give the resource figures of the row engine for %s" % (where, key, ", ".join(sorted(COMPARISON_ARCHS[key]))))
+    else:
+        for arch in COMPARISON_ARCHS[key]:
+            for inst in owned[arch]:
+                got = dict((f, cand["kernels"][arch][inst].get(f)) for f in RESOURCE_FIGURES)
+                say = figures[arch].get(inst) if isinstance(figures[arch], dict) else None
+                if not isinstance(say, dict) or any(say.get(f) != got[f] or type(say.get(f)) is bool for f in RESOURCE_FIGURES):
+                    problems.append("%s: resource_gate (%s, %s, %s) says %r, the dump has %r" % (where, key, arch, inst, say, got))
+    return problems, report
+
+
+def _codegen_problems(step, where, reached_codegen, both_required, meta):
+    """The code-generation and resource evidence of a row: none before the phase was reached, a bound comparison for every toolchain of the gate when the step passed it (or went on to
+    the timing), at least one when it failed there; and the recomputed result decides: an adopted row passes every comparison, a row that failed at the code generation fails at least one.
+    Returns ``(problems, results)`` with the recomputed pass / fail of the comparisons that could be made."""
+    entries, resources = step.get("codegen_gate"), step.get("resource_gate")
+    if not reached_codegen:
+        return ["%s: %s has figures for a phase the step never reached" % (where, key) for key, v in (("codegen_gate", entries), ("resource_gate", resources)) if v not in (None, {})], []
+    if not isinstance(entries, dict) or any(k not in COMPARISONS for k in entries):
+        return ["%s: codegen_gate must give one comparison of dumps per toolchain (%s)" % (where, ", ".join(COMPARISONS))], []
+    if not isinstance(resources, dict) or any(k not in COMPARISONS for k in resources):
+        return ["%s: resource_gate must give the resource figures per toolchain (%s)" % (where, ", ".join(COMPARISONS))], []
+    needed = list(COMPARISONS) if both_required else [k for k in COMPARISONS if k in entries][:1]
+    if not needed:
+        return ["%s: codegen_gate has no comparison for any toolchain" % where], []
+    problems, results = [], []
+    for key in needed:
+        if key not in entries:
+            problems.append("%s: codegen_gate has no comparison for %s" % (where, key))
+            continue
+        probs, report = comparison_problems(step, key, entries[key], resources, meta, where)
+        problems.extend(probs)
+        if report is not None:
+            results.append(report["exit"] == 0)
+    if both_required and step.get("outcome") == "adopted" and results and not all(results):
+        problems.append("%s: the comparison of the dumps fails (code generation or resources): an adopted step passes it on every toolchain" % where)
+    return problems, results
+
+
+def _ab_problems(step, where, reached_timing):
     problems = []
-    for key, fields in (("codegen_gate", None), ("resource_gate", RESOURCE_FIGURES)):
-        entry = step.get(key)
-        if not reached_codegen:
-            if entry not in (None, {}):
-                problems.append("%s: %s has figures for a phase the step never reached" % (where, key))
-            continue
-        if not isinstance(entry, dict) or any(t not in TOOLCHAINS for t in entry):
-            problems.append("%s: %s must give figures per toolchain (%s)" % (where, key, ", ".join(TOOLCHAINS)))
-            continue
-        needed = TOOLCHAINS if both_required else [t for t in TOOLCHAINS if t in entry][:1]
-        if not needed:
-            problems.append("%s: %s has no figures for any toolchain" % (where, key))
-        for t in needed:
-            fig = entry.get(t)
-            if not isinstance(fig, dict):
-                problems.append("%s: %s has no figures for the %s toolchain" % (where, key, t))
-            elif fields is None:
-                if not (text(fig.get("verdict")) and count(fig.get("compared"), 1) and count(fig.get("differences"))):
-                    problems.append("%s: codegen_gate (%s) needs a verdict, the number of kernels compared and of differences" % (where, t))
-                elif both_required and step.get("outcome") == "adopted" and fig["verdict"] != "PASS":
-                    problems.append("%s: codegen_gate (%s) is %s: an adopted step passes the gate" % (where, t, fig["verdict"]))
-            elif any(not count(fig.get(f)) for f in fields):
-                problems.append("%s: resource_gate (%s) needs %s as non-negative integers" % (where, t, ", ".join(fields)))
     ab = step.get("ab")
     if not reached_timing:
         if ab not in (None, {}):
@@ -755,8 +871,42 @@ def _figure_problems(step, where, reached_codegen, reached_timing, both_required
     return problems
 
 
-def step_problems(step, unit_member=False):
-    """One row of the ledger. The evidence required depends on the outcome and on the phases of the gate protocol that the step reached."""
+def _timing_problems(step, where, adopted, waiver):
+    """The timing phase of a row: every result is measured (no not_run once the phase was reached), the layer chain is measured for the steps that change the shared-memory requirement
+    and for no other (the type of the step decides, a row cannot call it not applicable), an adopted row passes all three (beats the previous accepted state, no regression against the
+    base, keeps the chain) except where the three-arm rule waives them, and a row that failed here has a failing result."""
+    timing = step.get("timing")
+    if not isinstance(timing, dict):
+        return ["%s: a step that reached the timing phase has timing results (vs_previous, vs_base, chain)" % where]
+    sid, problems = step.get("id"), []
+    chain_expected = "measured" if sid in CHAIN_STEPS else "not_applicable"
+    if timing.get("vs_previous") not in MEASURED or timing.get("vs_base") not in MEASURED:
+        problems.append("%s: vs_previous and vs_base are measured (pass or fail) once the timing phase was reached, got %r" % (where, timing))
+    if chain_expected == "measured" and timing.get("chain") not in MEASURED:
+        problems.append("%s: the step changes the shared-memory requirement of the row kernel, so the layer chain is measured (pass or fail), got %r" % (where, timing.get("chain")))
+    if chain_expected == "not_applicable" and timing.get("chain") != "not_applicable":
+        problems.append("%s: the layer chain is not applicable to this step, got %r" % (where, timing.get("chain")))
+    if problems:
+        return problems
+    results = [timing["vs_previous"], timing["vs_base"], timing["chain"]]
+    if adopted:
+        needed = {"vs_previous": "beat the previous accepted state", "vs_base": "not regress against the base"}
+        if chain_expected == "measured":
+            needed["chain"] = "keep the layer chain"
+        waived = {"vs_previous", "vs_base", "chain"} if waiver == "rescued" else set()
+        if waiver == "rescued" and timing["vs_previous"] != "fail":
+            problems.append("%s: waived as the E tile that F rescued, so it says it failed against the previous accepted state, got %r" % (where, timing["vs_previous"]))
+        for field, what in sorted(needed.items()):
+            if timing[field] != "pass" and field not in waived:
+                problems.append("%s: an adopted step must %s (timing %s: %r)" % (where, what, field, timing))
+    elif "fail" not in results:
+        problems.append("%s: failed at timing, but no timing result is a failure (%r): a step that passes every gate is adopted" % (where, timing))
+    return problems
+
+
+def step_problems(step, waiver=None, meta=None):
+    """One row of the ledger. The evidence required depends on the outcome and on the phases of the gate protocol that the step reached; ``waiver`` is what the three-arm rule changes for
+    the row (``unit_waivers``), ``meta`` the ledger's metadata (the base commit that the base dumps are bound to)."""
     sid = step.get("id") if isinstance(step, dict) else None
     where = "step %s" % sid
     if not isinstance(step, dict) or sid not in STEP_IDS:
@@ -773,7 +923,7 @@ def step_problems(step, unit_member=False):
     markers = step.get("markers")
     if not (isinstance(markers, list) and markers and all(isinstance(m, str) for m in markers)):
         problems.append("%s: markers must be a non-empty list of identifiers, or [\"none\"] for a step that adds no symbol" % where)
-    gates, timing = step.get("gates") or {}, step.get("timing") or {}
+    gates = step.get("gates") or {}
     if outcome == "skipped":
         if step.get("commit") is not None or step.get("revert_commit") is not None:
             problems.append("%s: a skipped step has no commit" % where)
@@ -792,10 +942,8 @@ def step_problems(step, unit_member=False):
             problems.append("%s: an adopted step failed at nothing (failed_at %r)" % (where, step.get("failed_at")))
         if gates.get("exactness") is not True or gates.get("codegen") is not True:
             problems.append("%s: an adopted step passes the exactness and the code-generation gate (gates %r)" % (where, gates))
-        problems.extend(_figure_problems(step, where, True, True, True))
-        if not unit_member:
-            if timing.get("vs_previous") != "pass" or timing.get("vs_base") != "pass" or timing.get("chain") not in ("pass", "not_applicable"):
-                problems.append("%s: an adopted step beats the previous accepted state, does not regress against the base and keeps the layer chain (timing %r)" % (where, timing))
+        probs, _ = _codegen_problems(step, where, True, True, meta)
+        problems.extend(probs + _ab_problems(step, where, True) + _timing_problems(step, where, True, waiver))
         return problems
     # not adopted: the evidence stops at the phase where it failed
     failed_at = step.get("failed_at")
@@ -810,16 +958,16 @@ def step_problems(step, unit_member=False):
     for g in ("exactness", "codegen"):
         if gates.get(g) is not expected_gates[g]:
             problems.append("%s: failed at %s, so the %s gate is %r, got %r" % (where, failed_at, g, expected_gates[g], gates.get(g)))
-    problems.extend(_figure_problems(step, where, reached >= 2, reached == 3, reached == 3))
+    probs, results = _codegen_problems(step, where, reached >= 2, reached == 3, meta)
+    problems.extend(probs + _ab_problems(step, where, reached == 3))
+    if failed_at == "codegen" and results and all(results):
+        problems.append("%s: failed at the code generation, but every comparison of the dumps passes" % where)
     if reached < 3:
-        if timing not in ({}, None) and any(v not in ("not_run", None) for v in timing.values()):
+        timing = step.get("timing")
+        if timing not in ({}, None) and any(v not in ("not_run", None) for v in (timing.values() if isinstance(timing, dict) else [timing])):
             problems.append("%s: failed at %s, so no timing was measured (timing %r)" % (where, failed_at, timing))
     else:
-        results = [timing.get("vs_previous"), timing.get("vs_base"), timing.get("chain")]
-        if timing.get("vs_previous") not in TIMING_RESULTS or timing.get("vs_base") not in TIMING_RESULTS or timing.get("chain") not in CHAIN_RESULTS:
-            problems.append("%s: timing needs vs_previous and vs_base (pass, fail, not_run) and chain (pass, fail, not_applicable, not_run), got %r" % (where, timing))
-        elif "fail" not in results:
-            problems.append("%s: failed at timing, but no timing result is a failure (%r): a step that passes every gate is adopted" % (where, timing))
+        problems.extend(_timing_problems(step, where, False, waiver))
     return problems
 
 
@@ -881,8 +1029,10 @@ def ledger_problems(ledger, repo=None, decision=None, require_all_steps=False, h
                 reached_timing = by_id[u].get("outcome") == "adopted" or by_id[u].get("failed_at") == "timing"      # an earlier failure has no timing to compare
                 if reached_timing and (by_id[u].get("timing") or {}).get("vs_previous") != prev:
                     problems.append("%s: the row of %s says %r against the previous accepted state, the arms say %r" % (where, u, (by_id[u].get("timing") or {}).get("vs_previous"), prev))
+    waivers = unit_waivers(unit) if in_unit else {}
+    meta = ledger.get("meta") if isinstance(ledger.get("meta"), dict) else {}
     for s in steps:
-        problems.extend("%s: %s" % (where, p) for p in step_problems(s, unit_member=in_unit and isinstance(s, dict) and s.get("id") in UNIT))
+        problems.extend("%s: %s" % (where, p) for p in step_problems(s, waivers.get(s.get("id")) if isinstance(s, dict) else None, meta))
     if decision is not None:
         problems.extend(decision_problems(decision))
         order = decision.get("row_engine_order") if isinstance(decision, dict) else None
