@@ -7,7 +7,9 @@
   with a plan buffer that is too small (empty or one int short) is an error, with the right size it runs;
 * bit 64 changes no launch of a prefill call (with ``cu_seqlens``, where the default routing may choose the device-scheduled K2, and with a fixed length), and no prefill call launches
   ``rows_kernel<true>`` even with the control on;
-* ``resolve_impl`` precedence: bit 64 is a request of its own (no bit clears it, it clears no other bit), and neither it nor the control brings the reference row engine to the single launch.
+* ``resolve_impl`` precedence: bit 64 is a request of its own (no bit clears it, it clears no other bit), and neither it nor the control brings the reference row engine to the single launch;
+* the environment of Suite Sd: with ``FLASH_KDA_CFBI_IMPL=64`` a decode call that passes no ``_impl`` is the request for two launches that the control does not override, and an explicit
+  ``_impl=0`` in the same process is one launch.
 """
 import pytest
 import torch
@@ -16,7 +18,7 @@ import decode_policy as dp
 from helpers import make_case
 from flash_kda.cfbi import alloc_state
 from test_decode_policy import CONTROLS
-from test_decode_single_launch import _cc, _sms, kernel_counts
+from test_decode_single_launch import _cc, _sms, decode_fn, kernel_counts
 from test_k2_dyn import fixed_fn, launched, varlen_fn
 
 REF_ROWS, REF, ROWS_ONLY, DECODE_PLAN = 1, 3, 4, 64
@@ -171,3 +173,15 @@ def test_resolve_impl_keeps_bit_64_a_request_of_its_own(ext):
 def test_the_reference_row_engine_keeps_its_plan_kernel_whatever_else_is_requested(ext, forced, impl):
     assert dict(kernel_counts(decode_call(ext, 4, 6, impl))) == {"plan_kernel": 1, "ref::rows_kernel": 1}
     assert not ext.decode_single_launch(1, ext.resolve_impl(impl, -1), 4, 6)           # not even with the control on (it is the fixture here)
+
+
+def test_under_suite_sds_environment_a_call_without_impl_stays_two_launches_even_with_the_control_on(ext, forced, monkeypatch):
+    """Suite Sd is Suite S with ``FLASH_KDA_CFBI_IMPL=64``: a decode call that names no ``_impl`` is then the request for the two launches (the plan kernel and ``rows_kernel<false>``) and the
+    control, which makes every eligible call one launch, does not override it; an explicit ``_impl=0`` in the same process is one launch; without the variable the call that names no ``_impl``
+    is one launch under the control."""
+    N, H = 4, 6
+    monkeypatch.setenv("FLASH_KDA_CFBI_IMPL", str(DECODE_PLAN))
+    assert dict(kernel_counts(decode_fn(N, H, None))) == {"plan_kernel": 1, "rows_kernel<false>": 1}
+    assert dict(kernel_counts(decode_fn(N, H, 0))) == {"rows_kernel<true>": 1}
+    monkeypatch.delenv("FLASH_KDA_CFBI_IMPL")
+    assert dict(kernel_counts(decode_fn(N, H, None))) == {"rows_kernel<true>": 1}

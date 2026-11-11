@@ -16,12 +16,41 @@ import torch
 
 from flash_kda.cfbi import alloc_state, state_mismatch
 
-from helpers import WAVES, bits, make_case, n_diff, resident_ctas, sequences_beyond_waves
+from helpers import ROWS_DECODE, ROWS_OPTIMISED, ROWS_REFERENCE, WAVES, bits, make_case, n_diff, recording, resident_ctas, sequences_beyond_waves
 
 BT = 64
 NAN = float("nan")
 OPTIMISED, REFERENCE = 0, 3       # the _impl of the arm under test and of the oracle
+DECODE_PLAN = 64                  # impl bit 64: the request for the plan kernel in front of the row engine (the two-launch decode)
 POOL_SPARE = 19                   # slots of a pool that no sequence of the call uses
+
+
+# ---- the paths of a launch: what ran is asserted, never assumed ----------------------------------------------------------------------------------------
+class Path:
+    """One way in which a mode-1 launch runs: the ``_impl`` it is requested with, the row-engine instantiation whose occupancy sizes its grid and the kernels that it must launch. The single
+    launch is ``_impl=0`` with the hidden calibration control on (one ``rows_kernel<true>``, no plan kernel), the two launches are bit 64 (the plan kernel, then ``rows_kernel<false>``) and the
+    oracle is the frozen reference (``_impl=3``: the plan kernel and the reference row engine). Every call that a test makes on a path is run under the profiler and must launch exactly those
+    kernels (``launched_exactly``), so a comparison of a path with itself (a routing default, a device, an environment variable) fails its own assertion."""
+
+    def __init__(self, name, impl, instance, launches):
+        self.name, self.impl, self.instance, self.launches = name, impl, instance, dict(launches)
+
+    def __repr__(self):
+        return self.name
+
+
+SINGLE = Path("single", OPTIMISED, ROWS_DECODE, {"rows_kernel<true>": 1})
+TWO_LAUNCH = Path("two_launch", DECODE_PLAN, ROWS_OPTIMISED, {"plan_kernel": 1, "rows_kernel<false>": 1})
+ORACLE = Path("oracle", REFERENCE, ROWS_REFERENCE, {"plan_kernel": 1, "ref::rows_kernel": 1})
+PATHS = {p.name: p for p in (SINGLE, TWO_LAUNCH, ORACLE)}
+
+
+def launched_exactly(path, fn):
+    """Run ``fn()`` once under the profiler, assert that it launched exactly the kernels of ``path`` and return its value."""
+    with recording() as rec:
+        value = fn()
+    assert dict(rec.counts) == path.launches, "the %s path (_impl=%d) launched %s, expected %s" % (path.name, path.impl, dict(rec.counts), path.launches)
+    return value
 
 
 # ---- variant builds: a build that fails is an error of the test, never a skip ---------------------------------------------------------------------------
@@ -140,10 +169,11 @@ def warm_pool(mod, S, H, fills, par, seed, chunks=None):
 # ---- the families: how a step is drawn ------------------------------------------------------------------------------------------------------------------
 class Family:
     """``fixed``: rows per sequence of a fixed-length step (None: ``cu_seqlens`` with ``lens``, drawn from the choices); ``pool``: a pool with permuted slots (False: a compact state);
-    ``pad``: padding entries (slot -1) per live sequence; ``empty``: empty sequences per live sequence (``cu_seqlens`` only); ``fills``: the positions of the open chunks of a warm slot."""
+    ``pad``: padding entries (slot -1) per live sequence; ``empty``: empty sequences per live sequence (``cu_seqlens`` only); ``fills``: the positions of the open chunks of a warm slot;
+    ``min_live``: at least this many live sequences, whatever the grid (the ``phases`` families need 64, one per position)."""
 
-    def __init__(self, name, fixed=None, lens=None, pool=False, pad=0.0, empty=0.0, fills="mixed", steps=3):
-        self.name, self.fixed, self.lens, self.pool, self.pad, self.empty, self.fills, self.steps = name, fixed, lens, pool, pad, empty, fills, steps
+    def __init__(self, name, fixed=None, lens=None, pool=False, pad=0.0, empty=0.0, fills="mixed", steps=3, min_live=0):
+        self.name, self.fixed, self.lens, self.pool, self.pad, self.empty, self.fills, self.steps, self.min_live = name, fixed, lens, pool, pad, empty, fills, steps, min_live
 
     def __repr__(self):
         return self.name
@@ -160,18 +190,22 @@ MUST_HAVE = {"mixed": [0, 1, 62, 63], "boundary": [0, 1, 62, 63], "open": [63, 6
 
 
 def draw_fills(rng, S, kind):
-    fills = [FILLS[kind](rng) for _ in range(S)]
-    for i, must in enumerate(MUST_HAVE.get(kind, [])):
-        if S > i:
-            fills[i] = must
+    if kind == "phases":                  # not drawn: the positions n mod 64 of the S slots (in a shuffled order), so a compact state of at least 64 sequences holds every position
+        assert S >= BT, "the phases need one slot per position"
+        fills = [n % BT for n in range(S)]
+    else:
+        fills = [FILLS[kind](rng) for _ in range(S)]
+        for i, must in enumerate(MUST_HAVE.get(kind, [])):
+            if S > i:
+                fills[i] = must
     rng.shuffle(fills)
     return fills
 
 
-def draw_step(ext, fam, H, par, rng, seed, pool_size=None):
-    """A step of the family on a grid whose live CTAs fill at least ``WAVES`` resident waves of the optimised row engine (the padding and the empty entries come on top of them);
-    returns ``(step, S)`` with the pool size (``pool_size`` if given, else N plus the spare slots; N for a compact state)."""
-    live = sequences_beyond_waves(resident_ctas(ext), H)
+def draw_step(ext, fam, H, par, rng, seed, pool_size=None, instance=ROWS_OPTIMISED):
+    """A step of the family on a grid whose live CTAs fill at least ``WAVES`` resident waves of the row-engine instantiation ``instance`` (the one that the path under test launches; the
+    padding and the empty entries come on top of them); returns ``(step, S)`` with the pool size (``pool_size`` if given, else N plus the spare slots; N for a compact state)."""
+    live = max(sequences_beyond_waves(resident_ctas(ext, instance), H), fam.min_live)
     n_pad, n_empty = int(live * fam.pad), int(live * fam.empty)
     assert not (n_pad and not fam.pool) and not (n_empty and fam.fixed is not None), "padding entries need a pool, empty sequences need cu_seqlens"
     N = live + n_pad + n_empty
@@ -197,9 +231,13 @@ class Outcome:
         self.out, self.out32, self.state = out, out32, state
 
 
-def run_arm(mod, impl, warm, step):
+def run_arm(mod, arm, warm, step):
+    """One launch of ``step`` from a clone of ``warm``. ``arm`` is an ``_impl`` (no assertion) or a ``Path``: then the launch must show exactly the kernels of that path."""
     state = warm.clone()
-    out, out32 = run_step(mod, impl, state, step)
+    if isinstance(arm, Path):
+        out, out32 = launched_exactly(arm, lambda: run_step(mod, arm.impl, state, step))
+    else:
+        out, out32 = run_step(mod, arm, state, step)
     torch.cuda.synchronize()
     return Outcome(out, out32, state)
 
@@ -252,10 +290,11 @@ def at_rest_problems(step, warm, outcome):
     return probs
 
 
-def check_step(ext, mod, step, warm):
-    """Both arms from the same warm state: ``(optimised outcome, reference outcome)``; asserts the at-rest invariants on the optimised arm and bitwise equality with the oracle."""
-    opt = run_arm(mod, OPTIMISED, warm, step)
-    ref = run_arm(ext, REFERENCE, warm, step)
+def check_step(ext, mod, step, warm, path=None):
+    """Both arms from the same warm state: ``(optimised outcome, reference outcome)``; asserts the at-rest invariants on the optimised arm and bitwise equality with the oracle. With a ``path``
+    the optimised arm runs on it and the reference arm on the oracle path, each launch asserting its own kernels."""
+    opt = run_arm(mod, OPTIMISED if path is None else path, warm, step)
+    ref = run_arm(ext, REFERENCE if path is None else ORACLE, warm, step)
     probs = at_rest_problems(step, warm, opt)
     assert not probs, "; ".join(probs[:6])
     m = mismatch(opt, ref)
@@ -263,21 +302,23 @@ def check_step(ext, mod, step, warm):
     return opt, ref
 
 
-def run_family(ext, fam, H, seed, mod=None):
+def run_family(ext, fam, H, seed, mod=None, path=None):
     """Warm a state, then run ``fam.steps`` successive steps on it through both arms; every step is compared before the next one (the state evolves, positions wrap).
+    ``path``: the ``Path`` of the optimised arm (None: ``_impl=0`` as the device routes it, no launch assertion); the grid is then sized from that path's row-engine instantiation.
     Returns the list of ``(step, opt, ref, warm)``."""
     mod = ext if mod is None else mod
+    instance = ROWS_OPTIMISED if path is None else path.instance
     rng = random.Random(seed * 1000 + H)
     par = make_params(H, seed)
     results = []
-    step, S = draw_step(ext, fam, H, par, rng, seed * 10)
+    step, S = draw_step(ext, fam, H, par, rng, seed * 10, instance=instance)
     warm = warm_pool(ext, S, H, draw_fills(rng, S, fam.fills), par, seed)
     for i in range(fam.steps):
         if i:
-            step, S2 = draw_step(ext, fam, H, par, rng, seed * 10 + i)
+            step, S2 = draw_step(ext, fam, H, par, rng, seed * 10 + i, instance=instance)
             assert S2 == S
-        assert step.live_ctas() >= WAVES * resident_ctas(ext), "the live grid is not beyond %.1f resident waves" % WAVES
-        opt, ref = check_step(ext, mod, step, warm)
+        assert step.live_ctas() >= WAVES * resident_ctas(ext, instance), "the live grid is not beyond %.1f resident waves of %s" % (WAVES, instance)
+        opt, ref = check_step(ext, mod, step, warm, path)
         results.append((step, opt, ref, warm))
         warm = ref.state.clone()     # the oracle's state continues (both arms agree, asserted above)
     return results
@@ -312,9 +353,9 @@ def corrupt(outcome, what, slot=None):
 def coverage(results):
     """The counts of what the steps of a family reached, for the assertions that keep a family from being vacuous: the largest grid and live grid (CTAs), padding and empty entries,
     rows that finished a chunk (position 63), rows that follow such a row in the same launch, slots of the pool that no sequence used, whether the slots came in a permuted order,
-    sequences that continued an open chunk (position != 0) and the most rows of one sequence."""
+    sequences that continued an open chunk (position != 0), the most rows of one sequence and the positions (0 .. 63) at which a row ran, derived from the executed steps."""
     c = {"steps": len(results), "grid_ctas": 0, "live_ctas": 10 ** 9, "padding": 0, "empty": 0, "chunk_end_rows": 0, "rows_after_chunk_end": 0, "pool_unused": 0, "permuted": False,
-         "open_chunk_sequences": 0, "live_sequences": 0, "max_rows": 0}
+         "open_chunk_sequences": 0, "live_sequences": 0, "max_rows": 0, "positions": set()}
     for step, opt, ref, warm in results:
         pos0 = warm.pos.cpu().tolist()
         c["grid_ctas"] = max(c["grid_ctas"], step.N * step.H)
@@ -331,9 +372,12 @@ def coverage(results):
             c["open_chunk_sequences"] += 1 if pos0[step.slot(n)] != 0 else 0
             c["max_rows"] = max(c["max_rows"], step.lens[n])
             for r in range(step.lens[n]):
-                if (pos0[step.slot(n)] + r) % BT == BT - 1:
+                p = (pos0[step.slot(n)] + r) % BT
+                c["positions"].add(p)
+                if p == BT - 1:
                     c["chunk_end_rows"] += 1
                     c["rows_after_chunk_end"] += 1 if r < step.lens[n] - 1 else 0
+    c["positions"] = sorted(c["positions"])
     return c
 
 

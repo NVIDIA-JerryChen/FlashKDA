@@ -1,8 +1,11 @@
 """Shared helpers of the CF-BI tests."""
+import collections
+import contextlib
 import math
 
 import torch
 import torch.nn.functional as F
+from torch.profiler import ProfilerActivity, profile
 
 D = 128
 REGIMES = ["authors", "unit", "heavy_tail", "long_memory", "no_decay", "eps_dominated", "saturated", "one_hot"]
@@ -87,6 +90,37 @@ ROWS_OPTIMISED = "cfbi::rows_kernel<false>"        # the optimised row engine be
 ROWS_DECODE = "cfbi::rows_kernel<true>"           # the single-launch decode (no plan kernel in front of it)
 ROWS_REFERENCE = "cfbi::ref::rows_kernel"
 WAVES = 2.5                    # the decode families run on grids of at least this many times the CTAs that are resident at once
+
+
+# ---- observing the launches: one profiler session around a block of calls --------------------------------------------------------------------------------
+def launch_counts(prof):
+    """The CF-BI kernels of a finished profiler session: name (``cfbi::`` and the argument list removed, the template arguments kept: ``rows_kernel<true>`` and ``rows_kernel<false>`` are two
+    names) -> launches."""
+    cnt = collections.Counter()
+    for ev in prof.events():
+        if ev.device_type == torch.autograd.DeviceType.CUDA and "cfbi::" in ev.name:
+            name = ev.name.split("(")[0].strip()
+            if name.startswith("void "):
+                name = name[5:]
+            cnt[name.replace("cfbi::", "", 1)] += 1
+    return cnt
+
+
+class Recording:
+    """``counts`` is set when the ``recording()`` block ends."""
+    counts = None
+
+
+@contextlib.contextmanager
+def recording():
+    """``with recording() as rec: ...`` then ``rec.counts``: the CF-BI kernels that every call inside the block launched (see ``launch_counts``). The block is one profiler session, so a whole
+    chain of calls is observed at once: a call in the middle that took another path shows in the counts."""
+    rec = Recording()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        yield rec
+        torch.cuda.synchronize()
+    rec.counts = launch_counts(prof)
 
 
 def rows_instance(ext, name=ROWS_OPTIMISED):
