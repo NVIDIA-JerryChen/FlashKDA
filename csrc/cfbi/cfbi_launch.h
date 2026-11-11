@@ -2,6 +2,8 @@
 // cfbi_probe.cu and are called from cfbi_binding.cpp).
 #pragma once
 
+#include "cfbi/cfbi_policy.h"   // the implementation bits, the shared-memory need of the row engine and the pure decode policy: plain C++
+
 #include <cstdint>
 #include <cuda_runtime_api.h>
 
@@ -87,30 +89,7 @@ struct ForwardArgs {
     int impl;          // IMPL_* bits as returned by resolve_impl (the launcher does not re-resolve)
 };
 
-// Implementation selector: the frozen v1 kernels in csrc/cfbi/ref/ are the bitwise oracle of the optimised ones.
-// K1 and K2 share one bit because their workspace layouts differ between the implementations. 0 = the optimised
-// kernels where the device can run them (see resolve_impl: otherwise the reference kernels are used).
-constexpr int IMPL_REF_ROWS = 1;    // row engine (decode, head rows)
-constexpr int IMPL_REF_CHUNK = 2;   // K1 + K2 (prefill / training forward)
-constexpr int IMPL_ROWS_ONLY = 4;   // no K1/K2: every row goes through the row engine (mode 1 semantics even for mode 0)
-constexpr int IMPL_K2_UMMA = 8;     // optimised K1<16> + the tcgen05 (UMMA) K2 (Blackwell sm_100/103 only; ignored with IMPL_REF_CHUNK)
-// optimised K1<16> + a K2 driven by a schedule that a builder kernel makes on the device from the plan (cfbi_k2_dyn.cu): the order of the K2 CTAs
-// (longest sequence first) and the value-tile width of every (sequence, head) pair (8, 16 or 32 columns) follow the sequence lengths, which the host
-// does not know (no host synchronisation). Bit-identical to the other K2 kernels (every (pair, value slice) is still one CTA, chunk by chunk, with
-// the same arithmetic). Requested explicitly it runs for every call; impl 0 sets it only for the calls that k2_dyn_default_route selects (below).
-// Dropped (resolve_impl clears it) with IMPL_REF_CHUNK, IMPL_ROWS_ONLY, IMPL_K2_UMMA (the UMMA K2 wins when both are requested) and below sm_90;
-// ignored by mode 1 (decode never runs K2) and, for calls beyond k2_sched_capacity(H) sequences, by the launcher (the old K2 kernels run).
-// k2_bv 8 / 16 / 32 forces that width for every pair (the device ordering stays), 0 = the device policy.
-constexpr int IMPL_K2_DYN = 16;
-// The old K2 kernels (natural grid order, tile widths from the host rule), also where the default routing would run the device-scheduled K2: what a
-// comparison against the old behaviour asks for. It changes nothing else (resolve_impl drops it) and excludes IMPL_K2_DYN.
-constexpr int IMPL_K2_OLD = 32;
-// Decode (mode 1) on the optimised row engine is ONE kernel launch (rows_kernel<true>, see decode_single_launch below): no plan kernel runs, every head CTA derives its
-// sequence's token window, slot and open-chunk fill itself, and the head CTA that is the last of a sequence's H CTAs to arrive advances pos. This bit keeps the former
-// two launches instead (plan kernel, then the row engine fed by the plan): the A/B of the benchmark and a differential test target. It changes no bit of any result and is
-// ignored by every call that is not a decode call of the optimised row engine (mode 0 prefill / training forward, IMPL_REF_ROWS).
-constexpr int IMPL_DECODE_PLAN = 64;
-constexpr int IMPL_MAX = 127;       // largest accepted impl value (all bits above)
+// The implementation bits (IMPL_*, IMPL_MAX) are defined in cfbi_policy.h.
 
 // Default routing (impl 0, nothing else requested): a variable-length (cu_seqlens) prefill call on a Blackwell device (compute capability 10: the cost model
 // of the schedule policy was measured on B200 / B300; Hopper and older run the old kernels unless impl 16 is requested) runs the device-scheduled K2 when it is
@@ -151,14 +130,10 @@ int resolve_impl(int requested, int device = -1);
 // Schedule that runs: mode 0 becomes mode 1 (row engine for every row) when IMPL_ROWS_ONLY is set.
 inline int resolve_mode(int mode, int impl) { return (mode == 0 && (impl & IMPL_ROWS_ONLY)) ? 1 : mode; }
 
-// Whether a call that runs mode 1 (`mode` and `impl` as resolve_mode / resolve_impl return them) of N sequences and H heads is ONE kernel launch of the optimised
-// row engine (rows_kernel<true>, cfbi_rows.cuh) instead of the plan kernel followed by the row engine. The plan kernel costs 2.25 - 3.45 us (measured, B200, H = 12, N = 1 .. 256:
-// 17 % of the call at N = 1, 2 % at N = 256) plus the launch gap behind it; what the single launch pays instead (expected, not measured) is one more dependent global access per CTA (slot_ids, then the pos
-// word) that every CTA of a multi-wave grid repeats, so the rule keeps the plan kernel for grids of more than DECODE_SINGLE_MAX_CTAS_PER_SM CTAs per SM (N * H CTAs; four waves
-// of the two CTAs per SM that fit: an estimate, to be calibrated by an interleaved A/B with IMPL_DECODE_PLAN). Never for mode 0, IMPL_REF_ROWS (the frozen oracle keeps the plan
-// kernel; resolve_impl sets it below sm_90, where the optimised kernels cannot run) or IMPL_DECODE_PLAN. The binding uses the answer to skip the plan allocation, the launcher
-// to skip the plan kernel: both call this function with the same arguments. device < 0: the current device.
-constexpr int64_t DECODE_SINGLE_MAX_CTAS_PER_SM = 8;
+// Whether a call that runs mode 1 of N sequences and H heads is ONE kernel launch of the optimised row engine (rows_kernel<true>) instead of the plan kernel followed by the row
+// engine: decode_single_launch_policy (cfbi_policy.h) with the SM count and the compute capability of `device` (< 0: the current one), `mode` and `impl` as resolve_mode /
+// resolve_impl return them. The binding uses the answer to skip the plan allocation, the launcher to skip the plan kernel: both call this function with the same arguments. A failed
+// device query keeps the plan kernel.
 bool decode_single_launch(int mode, int impl, int64_t N, int64_t H, int device = -1);
 // Dynamic shared memory per CTA of the K1 kernel of the implementation selected by `impl`.
 size_t k1_smem_bytes(int impl);

@@ -103,6 +103,10 @@ struct RowSmem {
     float akk[BT], aqk[BT];
     float beta;
 };
+// The static shared memory of rows_kernel is this structure plus, for rows_kernel<true>, one int (the fill of the open chunk). The need that cfbi_policy.h states is the compiler's
+// figure for it: at least the layout, and less than one allocation unit (1 KiB) more.
+static_assert(sizeof(RowSmem) + sizeof(int) <= ROWS_STATIC_SMEM_BYTES, "ROWS_STATIC_SMEM_BYTES (cfbi_policy.h) must cover the static shared memory of the row engine");
+static_assert(ROWS_STATIC_SMEM_BYTES - (sizeof(RowSmem) + sizeof(int)) < 1024, "ROWS_STATIC_SMEM_BYTES (cfbi_policy.h) is more than an allocation unit above the layout: take the compiler's figure");
 
 __device__ __forceinline__ void prefetch_l2(const void* ptr) { asm volatile("prefetch.global.L2 [%0];" ::"l"(ptr)); }
 __device__ __forceinline__ void prefetch_l1(const void* ptr) { asm volatile("prefetch.global.L1 [%0];" ::"l"(ptr)); }

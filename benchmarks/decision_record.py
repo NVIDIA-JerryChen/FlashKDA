@@ -293,12 +293,18 @@ def source_facts(repo, base_commit, e_commit, kd_commit):
 
 # ---- the checks of the evidence ---------------------------------------------------------------------------------------------------------------
 LAUNCH_SOURCE, PRIMITIVES_SOURCE = "csrc/cfbi/cfbi_launch.cu", "csrc/cfbi/cfbi_primitives.cuh"
+POLICY_SOURCE = "csrc/cfbi/cfbi_policy.h"     # the CUDA-free header: where the launcher's shared-memory constant is defined once the header exists
 
 
 def launch_constants(repo, commit):
     """The threads and the dynamic shared memory of the row-engine launch at a commit, as the sources define them: the thread count of the kernels and the launcher's constant that its
-    launch sites and its occupancy hook both read."""
-    resolve = constants_of(source_text(repo, commit, PRIMITIVES_SOURCE), source_text(repo, commit, LAUNCH_SOURCE))
+    launch sites and its occupancy hook both read (a number, or the constant of the CUDA-free header that the launcher takes it from; the header is absent at the earlier commits)."""
+    texts = [source_text(repo, commit, PRIMITIVES_SOURCE), source_text(repo, commit, LAUNCH_SOURCE)]
+    try:
+        texts.append(source_text(repo, commit, POLICY_SOURCE))
+    except ValueError:
+        pass                                                                    # no header at this commit: a constant of the launcher that names one is then not defined (an error below)
+    resolve = constants_of(*texts)
     return {"threads": resolve("NTHREADS"), "dynamic_smem": resolve("ROWS_DYNAMIC_SMEM")}
 
 

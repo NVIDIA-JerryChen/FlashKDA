@@ -16,8 +16,8 @@ namespace cfbi {
 
 int version() { return 1; }
 
-// Dynamic shared memory of the row-engine launch: the launch sites and the occupancy hook below read the same constant.
-constexpr size_t ROWS_DYNAMIC_SMEM = 0;
+// Dynamic shared memory of the row-engine launch: the launch sites and the occupancy hook below read the same constant (defined once, in cfbi_policy.h).
+constexpr size_t ROWS_DYNAMIC_SMEM = ROWS_DYNAMIC_SMEM_BYTES;
 
 // The tcgen05 (UMMA) K2: one CTA per (64 value columns, sequence, head); needs K1<16>'s workspace (16-column UT slices).
 static void launch_k2_umma(const Params& p, const ForwardArgs& a, cudaStream_t stream) {
@@ -197,14 +197,15 @@ bool k2_dyn_default_route(int64_t N, int64_t H, int64_t T_total, int device) {
     return (100 * (co - cd) - K2_ROUTE_OVERHEAD_PCT * co) * stage >= 100 * co * k2_route_builder_x10ns(N, nh);
 }
 
-// The rule is documented at the declaration (cfbi_launch.h). A failed device query keeps the plan kernel (the safe, old schedule).
+// The rule is decode_single_launch_policy (cfbi_policy.h), documented at the declaration (cfbi_launch.h); this reads the device. A failed device query keeps the plan kernel (the
+// safe, old schedule): the SM count then is not positive and the capability is 0.
 bool decode_single_launch(int mode, int impl, int64_t N, int64_t H, int device) {
-    if (mode != 1 || (impl & (IMPL_REF_ROWS | IMPL_DECODE_PLAN))) return false;
-    if (N < 1 || H < 1) return false;
-    if (device < 0) cudaGetDevice(&device);
+    if (!decode_single_launch_eligible(mode, impl, N, H)) return false;
+    if (device < 0 && cudaGetDevice(&device) != cudaSuccess) return false;
     int sms = 0;
-    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || sms <= 0) return false;
-    return N * H <= DECODE_SINGLE_MAX_CTAS_PER_SM * sms;
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) return false;
+    const DeviceCaps c = device_caps(device);
+    return decode_single_launch_policy(mode, impl, N, H, sms, 10 * c.major + c.minor);
 }
 
 void launch_forward(const ForwardArgs& a, cudaStream_t stream) {

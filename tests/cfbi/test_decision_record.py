@@ -619,6 +619,28 @@ def test_a_source_that_changes_moves_the_tile_sizes_and_an_unreadable_source_is_
         dr.source_facts(elsewhere, world["commits"]["base"], world["commits"]["e"], world["commits"]["kd"])
 
 
+HEADER_NEED = "constexpr int ROWS_STATIC_SMEM_BYTES = 8192;\nconstexpr int ROWS_DYNAMIC_SMEM_BYTES = %d;\nconstexpr int ROWS_SMEM_NEED_BYTES = ROWS_STATIC_SMEM_BYTES + ROWS_DYNAMIC_SMEM_BYTES;\n"
+LAUNCH_FROM_HEADER = "constexpr size_t ROWS_DYNAMIC_SMEM = ROWS_DYNAMIC_SMEM_BYTES;   // read from the CUDA-free header\n"
+
+
+def test_the_launch_constants_follow_the_launcher_into_the_header(tmp_path):
+    """The launcher may name the header's constant instead of a number: the dynamic shared memory is then the header's at that commit, and a launcher that names a constant that the
+    commit does not define cannot be read (never read as zero)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    commit_file(repo, "csrc/cfbi/cfbi_primitives.cuh", PRIMITIVES, "the sizes of a head")
+    literal = commit_file(repo, "csrc/cfbi/cfbi_launch.cu", LAUNCH, "a launcher with a number")
+    aliased = commit_file(repo, "csrc/cfbi/cfbi_launch.cu", LAUNCH_FROM_HEADER, "a launcher that names the header's constant, no header yet")
+    zero = commit_file(repo, "csrc/cfbi/cfbi_policy.h", HEADER_NEED % 0, "the header")
+    four = commit_file(repo, "csrc/cfbi/cfbi_policy.h", HEADER_NEED % 4096, "the header with dynamic shared memory")
+    assert dr.launch_constants(repo, literal) == {"threads": 256, "dynamic_smem": 0}                                    # the earlier commits read as before
+    with pytest.raises(ValueError, match="ROWS_DYNAMIC_SMEM_BYTES is not defined"):
+        dr.launch_constants(repo, aliased)
+    assert dr.launch_constants(repo, zero) == {"threads": 256, "dynamic_smem": 0}
+    assert dr.launch_constants(repo, four) == {"threads": 256, "dynamic_smem": 4096}                                    # nothing is hard-coded to 0
+
+
 # ---- the command lines -----------------------------------------------------------------------------------------------------------------------------
 def test_the_command_lines_build_render_and_check(world, tmp_path, capsys):
     out, doc = tmp_path / "record.json", tmp_path / "perf.md"
