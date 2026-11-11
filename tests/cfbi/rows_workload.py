@@ -33,9 +33,10 @@ def build_variant(name, defines, loader=None):
     try:
         return loader(name, tuple(defines))
     except Exception as e:   # the compiler's message is in the text of the exception (after the long command lines of the failed compilations)
-        text = str(e)
-        errors = [ln.strip() for ln in text.splitlines() if "error" in ln.lower()]
-        pytest.fail("the variant %s %s does not build: %s" % (name, tuple(defines), "\n".join(errors[-12:]) if errors else text[-2000:]), pytrace=False)
+        lines = str(e).splitlines()
+        errors = [ln.strip()[:300] for ln in lines[1:] if "error" in ln.lower()]      # the first line may be a whole command line
+        detail = (lines[0][:150] + "\n" + "\n".join(errors[-12:])) if errors else "\n".join(lines)[-1500:]
+        pytest.fail("the variant %s %s does not build: %s" % (name, tuple(defines), detail), pytrace=False)
 
 
 # ---- the inputs of a step -------------------------------------------------------------------------------------------------------------------------------
@@ -160,9 +161,9 @@ def draw_fills(rng, S, kind):
     return fills
 
 
-def draw_step(ext, fam, H, par, rng, seed):
+def draw_step(ext, fam, H, par, rng, seed, pool_size=None):
     """A step of the family on a grid whose live CTAs fill at least ``WAVES`` resident waves of the optimised row engine (the padding and the empty entries come on top of them);
-    returns ``(step, S)`` with the pool size (N for a compact state)."""
+    returns ``(step, S)`` with the pool size (``pool_size`` if given, else N plus the spare slots; N for a compact state)."""
     live = sequences_beyond_waves(resident_ctas(ext), H)
     n_pad, n_empty = int(live * fam.pad), int(live * fam.empty)
     assert not (n_pad and not fam.pool) and not (n_empty and fam.fixed is not None), "padding entries need a pool, empty sequences need cu_seqlens"
@@ -173,7 +174,8 @@ def draw_step(ext, fam, H, par, rng, seed):
         lens = [fam.fixed] * N
     else:
         lens = [0 if n in empties else rng.choice([x for x in fam.lens if x > 0]) for n in range(N)]
-    S = N + POOL_SPARE if fam.pool else N
+    S = (pool_size or N + POOL_SPARE) if fam.pool else N
+    assert S >= N
     if fam.pool:
         slots = rng.sample(range(S), N)
         slots = [-1 if n in pads else slots[n] for n in range(N)]

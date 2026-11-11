@@ -13,7 +13,7 @@ import torch
 
 from flash_kda.cfbi import alloc_state, state_mismatch
 
-from helpers import make_case, n_diff
+from helpers import make_case, n_diff, skip_or_fail
 from test_vs_ref import _call_inputs, _cu
 
 PROFILE = ("CFBI_ROWS_PROFILE=1",)
@@ -25,9 +25,9 @@ CALL_KEYS = ("q", "k", "v", "g", "beta")
 
 @pytest.fixture(autouse=True)
 def _optimised_kernels_run_here(ext):
-    """Below sm_90 ``_impl=0`` resolves to the reference kernels, which carry no profile: skip instead of comparing a build with itself."""
+    """Below sm_90 ``_impl=0`` resolves to the reference kernels, which carry no profile: skip (fail on B200 / B300) instead of comparing a build with itself."""
     if ext.resolve_impl(0, -1) == ext.resolve_impl(3, -1):
-        pytest.skip("the optimised kernels do not run on this device (_impl=0 resolves to the reference kernels)")
+        skip_or_fail("the optimised kernels do not run on this device (_impl=0 resolves to the reference kernels)")
 
 
 @pytest.fixture(scope="module")

@@ -15,6 +15,8 @@ for p in (str(_TESTS), str(_TESTS.parent)):
 @pytest.fixture(scope="session")
 def ext():
     if not torch.cuda.is_available():
+        if os.environ.get("CFBI_REQUIRE_GPU", "0") == "1":     # set by the runs on allocated nodes: no device there is an error of the run, not a skipped test
+            pytest.fail("CUDA is required here (CFBI_REQUIRE_GPU=1) and no CUDA device is available", pytrace=False)
         pytest.skip("CUDA required")
     from flash_kda.cfbi import load_ext
 
