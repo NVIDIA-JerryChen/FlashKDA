@@ -23,22 +23,17 @@ import pytest
 import helpers
 import rows_workload as rw
 import test_rows_profile as trp
+from protocol_source import TEST_PREFIXES, default_text, is_test_macro, macros_in  # noqa: F401
 from test_rows_profile import mutate
 
 ROOT = Path(__file__).resolve().parents[2]
 CSRC = ROOT / "csrc" / "cfbi"
 TESTS = ROOT / "tests" / "cfbi"
 
-# the macros of the variant builds, by prefix (the first three are the hooks of the row engine), and the build-time tunables that are no test macros
-TEST_PREFIXES = ("CFBI_ROWS_PROFILE", "CFBI_ROWS_DELAY_NS", "CFBI_ROWS_TEST_", "CFBI_NEG_CONTROL", "CFBI_K1_PROFILE", "CFBI_K2_PROFILE", "CFBI_UMMA_PROFILE", "CFBI_DYN_TEST_",
-                 "CFBI_K2_TEST_", "CFBI_UMMA_NEG_", "CFBI_UMMA_RACE_", "CFBI_CONV_NEG_", "CFBI_LIN_NEG_", "CFBI_DECODE_TEST_")
+# the macros of the variant builds, by prefix (the first three are the hooks of the row engine): protocol_source.TEST_PREFIXES, the one list that the reader of the pins uses too
 TUNABLES = ("CFBI_ROWS_MINB", "CFBI_ROWS_PF_L1", "CFBI_K2_TILE_ONLY", "CFBI_HAVE_TCGEN05", "CFBI_CONV_UNROLL", "CFBI_CONV_THREADS", "CFBI_SRC_HASH")
 GPU_MODULES = ("test_rows_occupancy.py", "test_rows_decode_families.py", "test_rows_delay.py", "test_rows_sanitizer.py", "test_rows_graph.py", "test_rows_profile_gpu.py", "test_k2_dyn_variants.py", "rows_workload.py", "rows_bounded.py",
-               "test_decode_single_launch.py", "test_decode_single_launch_variants.py", "test_decode_policy_device.py")
-
-
-def is_test_macro(name):
-    return any(name.startswith(p) for p in TEST_PREFIXES)
+               "test_decode_single_launch.py", "test_decode_single_launch_variants.py", "test_decode_policy_device.py", "sanitizer_workloads.py")
 
 
 def sources(csrc=CSRC):
@@ -114,47 +109,11 @@ def test_site_0_after_the_plan_load_is_caught(rows_text):
 
 
 # ---- the default build ------------------------------------------------------------------------------------------------------------------------------------
-def macros_in(texts):
-    """The macro names of the variants that some text tests (derived, not listed): every ``#ifdef`` / ``#ifndef`` / ``defined()`` of a name with a test prefix."""
-    found = set()
-    for t in texts:
-        found |= set(re.findall(r"#\s*(?:ifdef|ifndef)\s+(CFBI_\w+)", t)) | set(re.findall(r"defined\s*\(?\s*(CFBI_\w+)", t))
-    return {m for m in found if is_test_macro(m)}
+VARIANT_NAMES = re.compile(r"\bg_rows_delay\w*|\brows_delay\b|\brows_delay_arrived\b|\bRowsDelayConfig\b|\bg_rows_test_pos_\w+|\bld_relaxed_gpu\b|__nanosleep|__threadfence_block|^\s*#\s*error\b", re.M)
 
 
-def default_text(text, macros):
-    """The text as a build that defines none of ``macros`` reads it: the branch of ``#ifdef M`` is dropped and its ``#else`` branch kept (``#ifndef M`` the other way round), the
-    directive lines of those conditionals are dropped, every other line stays."""
-    out, stack = [], []
-    for line in text.splitlines():
-        m = re.match(r"^\s*#\s*(ifdef|ifndef|if|elif|else|endif)\b\s*(\w+)?", line)
-        skipping = any(f[1] for f in stack)
-        if m:
-            d, name = m.group(1), m.group(2)
-            if d in ("ifdef", "ifndef") and name in macros:
-                stack.append(["test", d == "ifdef"])
-                continue
-            if d in ("ifdef", "ifndef", "if"):
-                stack.append(["other", False])
-            elif d == "endif":
-                if stack.pop()[0] == "test":
-                    continue
-            elif d == "else" and stack and stack[-1][0] == "test":
-                stack[-1][1] = not stack[-1][1]
-                continue
-            elif d == "elif" and stack and stack[-1][0] == "test":
-                raise ValueError("#elif of a conditional on a test macro is not read by this preprocessor")
-        if not skipping:
-            out.append(line)
-    assert not stack, "unbalanced preprocessor conditionals"
-    return "\n".join(out)
-
-
-VARIANT_NAMES = re.compile(r"\bg_rows_delay\w*|\brows_delay\b|\bRowsDelayConfig\b|\bg_rows_test_pos_offset\b|__nanosleep|__threadfence_block|^\s*#\s*error\b", re.M)
-
-
-DECODE_ENTRY = ("atomicAdd(p.pos + w.slot, 1 << POS_COUNT_SHIFT)", "if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(p.pos + w.slot,")
-DECODE_WRONG = ("atomicAdd(p.pos + w.slot, 0)", "if ((old >> POS_COUNT_SHIFT) == 0) st_relaxed_gpu(", "p.pos[sp.slot] =")
+DECODE_ENTRY = ("atomicAdd(p.pos + ROWS_POS_INDEX(POS_ACCESS_ARRIVAL, w.slot), 1 << POS_COUNT_SHIFT)", "if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE, w.slot),")
+DECODE_WRONG = ("POS_ACCESS_ARRIVAL, w.slot), 0)", "if ((old >> POS_COUNT_SHIFT) == 0) st_relaxed_gpu(", "p.pos[sp.slot] =", "ld_relaxed_gpu")
 
 
 def default_build_problems(rows_text, launch_text):
@@ -163,7 +122,7 @@ def default_build_problems(rows_text, launch_text):
     launch = default_text(launch_text, macros)
     probs = []
     for want in ("#define ROWS_DELAY(n) do {} while (0)", "#define ROWS_SYNC(n) do { ROWS_DELAY(n); __syncthreads(); } while (0)", "#define ROWS_SYNC_END() ROWS_SYNC(7)",
-                 "#define ROWS_POS_INDEX(slot) (slot)"):
+                 "#define ROWS_POS_INDEX(access, slot) (slot)", "#define ROWS_DECODE_ARRIVED(old, heads) do {} while (0)"):
         if want not in rows:
             probs.append("the default build does not read %r" % want)
     for m in VARIANT_NAMES.finditer(rows):
@@ -186,7 +145,8 @@ def default_build_problems(rows_text, launch_text):
 def test_the_variant_macros_of_the_row_engine_are_found(rows_text, launch_text):
     found = macros_in([rows_text, launch_text])
     assert {"CFBI_ROWS_DELAY_NS", "CFBI_ROWS_TEST_NO_END_BARRIER", "CFBI_ROWS_TEST_POS_OOB", "CFBI_ROWS_TEST_COMPILE_ERROR", "CFBI_ROWS_PROFILE", "CFBI_NEG_CONTROL"} <= found
-    assert {"CFBI_DECODE_TEST_DELAY_NS", "CFBI_DECODE_TEST_EVERY_CTA_WRITES", "CFBI_DECODE_TEST_FIRST_ARRIVER", "CFBI_DECODE_TEST_NO_ELECTED_STORE"} <= found      # the hooks of the single-launch decode entry
+    assert {"CFBI_DECODE_TEST_EVERY_CTA_WRITES", "CFBI_DECODE_TEST_FIRST_ARRIVER", "CFBI_DECODE_TEST_SNAPSHOT_AFTER_ARRIVAL", "CFBI_DECODE_TEST_NO_ELECTED_STORE"} <= found      # the wrong protocols of the single-launch decode entry
+    assert "CFBI_DECODE_TEST_DELAY_NS" not in found      # retired: the delays of the decode entry are the sites 9 .. 12 of the row-engine delay hook
 
 
 def test_the_default_build_of_the_hooks_is_the_unhooked_kernel(rows_text, launch_text):
@@ -194,17 +154,19 @@ def test_the_default_build_of_the_hooks_is_the_unhooked_kernel(rows_text, launch
 
 
 @pytest.mark.parametrize("name,where,old,new,expect", [
-    ("the delay hook compiled in", "rows", "#else\n#define ROWS_DELAY(n) do {} while (0)\n#endif", "#else\n#define ROWS_DELAY(n) rows_delay(n)\n#endif", "ROWS_DELAY(n) do {}"),
+    ("the delay hook compiled in", "rows", "#else\n#define ROWS_DELAY(n) do {} while (0)\n#define ROWS_DECODE_ARRIVED(old, heads) do {} while (0)\n#endif", "#else\n#define ROWS_DELAY(n) rows_delay(n)\n#define ROWS_DECODE_ARRIVED(old, heads) do {} while (0)\n#endif", "ROWS_DELAY(n) do {}"),
+    ("the arrival delays compiled in", "rows", "#else\n#define ROWS_DELAY(n) do {} while (0)\n#define ROWS_DECODE_ARRIVED(old, heads) do {} while (0)\n#endif", "#else\n#define ROWS_DELAY(n) do {} while (0)\n#define ROWS_DECODE_ARRIVED(old, heads) rows_delay_arrived(old, heads)\n#endif", "ROWS_DECODE_ARRIVED(old, heads) do {}"),
     ("the end barrier removed by default", "rows", "#else\n#define ROWS_SYNC_END() ROWS_SYNC(7)\n#endif", "#else\n#define ROWS_SYNC_END() ROWS_DELAY(7)\n#endif", "ROWS_SYNC_END() ROWS_SYNC(7)"),
-    ("the position offset compiled in", "rows", "#else\n#define ROWS_POS_INDEX(slot) (slot)\n#endif", "#else\n#define ROWS_POS_INDEX(slot) ((slot) + 1)\n#endif", "ROWS_POS_INDEX(slot) (slot)"),
+    ("the position offset compiled in", "rows", "#else\n#define ROWS_POS_INDEX(access, slot) (slot)\n#endif", "#else\n#define ROWS_POS_INDEX(access, slot) ((slot) + 1)\n#endif", "ROWS_POS_INDEX(access, slot) (slot)"),
     ("a sleep outside the macro", "rows", "    ROWS_DELAY(0);   // test hook", "    __nanosleep(1);\n    ROWS_DELAY(0);   // test hook", "__nanosleep"),
     ("the first-arriver election by default", "rows", "#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(", "#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == 0) st_relaxed_gpu(", "== p.H - 1) st_relaxed_gpu"),
     ("the elected store missing by default", "rows", "#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(", "#ifdef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(", "== p.H - 1) st_relaxed_gpu"),
-    ("the non-counting read by default", "rows", "#else\n            const int old = atomicAdd(p.pos + w.slot, 1 << POS_COUNT_SHIFT);", "#else\n            const int old = atomicAdd(p.pos + w.slot, 0);", "1 << POS_COUNT_SHIFT"),
+    ("the non-counting read by default", "rows", "#else\n            const int old = atomicAdd(p.pos + ROWS_POS_INDEX(POS_ACCESS_ARRIVAL, w.slot), 1 << POS_COUNT_SHIFT);", "#else\n            const int old = atomicAdd(p.pos + ROWS_POS_INDEX(POS_ACCESS_ARRIVAL, w.slot), 0);", "1 << POS_COUNT_SHIFT"),
+    ("the snapshot read by default", "rows", "#ifdef CFBI_DECODE_TEST_SNAPSHOT_AFTER_ARRIVAL\n            pos_smem = ld_relaxed_gpu(", "#if 1\n            pos_smem = ld_relaxed_gpu(", "ld_relaxed_gpu"),
     ("the every-CTA store by default", "rows", "#ifdef CFBI_DECODE_TEST_EVERY_CTA_WRITES\n        if (tid == 0) p.pos[sp.slot]", "#if 1\n        if (tid == 0) p.pos[sp.slot]", "wrong protocol"),
-    ("a sleep of the decode entry outside its macro", "rows", "#ifdef CFBI_DECODE_TEST_DELAY_NS\n            __nanosleep(", "#if 1\n            __nanosleep(", "__nanosleep"),
+    ("a sleep of the decode entry outside its macro", "rows", "            ROWS_DELAY(9);   // test hook", "            __nanosleep(1);\n            ROWS_DELAY(9);   // test hook", "__nanosleep"),
     ("the compile error outside its macro", "rows", "#ifdef CFBI_ROWS_TEST_COMPILE_ERROR\n#error", "#if 1\n#error", "#error"),
-    ("a setter that works by default", "launch", "    (void)offset;\n    return (int)cudaErrorNotSupported;", "    return (int)cudaMemcpyToSymbol(g_rows_test_pos_offset, &offset, sizeof(offset));", "rows_test_pos_offset"),
+    ("a setter that works by default", "launch", "    (void)offset; (void)accesses;\n    return (int)cudaErrorNotSupported;", "    return (int)cudaMemcpyToSymbol(g_rows_test_pos_offset, &offset, sizeof(offset));", "rows_test_pos_offset"),
 ])
 def test_a_hook_that_leaks_into_the_default_build_is_caught(rows_text, launch_text, name, where, old, new, expect):
     r, l = (mutate(rows_text, old, new), launch_text) if where == "rows" else (rows_text, mutate(launch_text, old, new))
@@ -258,7 +220,7 @@ def test_the_default_build_defines_no_test_macro_of_any_prefix():
 
 @pytest.mark.parametrize("macro", ["CFBI_ROWS_DELAY_NS", "CFBI_ROWS_TEST_NO_END_BARRIER", "CFBI_ROWS_TEST_POS_OOB", "CFBI_ROWS_TEST_COMPILE_ERROR", "CFBI_ROWS_TEST_ANYTHING_NEW",
                                    "CFBI_ROWS_PROFILE", "CFBI_NEG_CONTROL", "CFBI_DYN_TEST_SKIP_ITEM", "CFBI_UMMA_RACE_DELAY_NS", "CFBI_CONV_NEG_CONTROL",
-                                   "CFBI_DECODE_TEST_DELAY_NS", "CFBI_DECODE_TEST_EVERY_CTA_WRITES", "CFBI_DECODE_TEST_FIRST_ARRIVER", "CFBI_DECODE_TEST_NO_ELECTED_STORE",
+                                   "CFBI_DECODE_TEST_SNAPSHOT_AFTER_ARRIVAL", "CFBI_DECODE_TEST_EVERY_CTA_WRITES", "CFBI_DECODE_TEST_FIRST_ARRIVER", "CFBI_DECODE_TEST_NO_ELECTED_STORE",
                                    "CFBI_DECODE_TEST_ANYTHING_NEW"])
 def test_a_planted_define_of_any_prefix_is_caught(macro):
     srcs, flags, nvcc = real_guard_inputs()
@@ -437,7 +399,7 @@ def driver_prefix(launches):
     """The part of the bounded driver that runs before it needs the device: it plans, prints the coverage and asserts it."""
     import test_rows_sanitizer as ts
 
-    script = ts.BOUNDED_DRIVER.format(tests=str(TESTS), repo=str(ROOT), done=ts.DONE, offset="0", heads=ts.BOUNDED_H, pool=ts.BOUNDED_POOL, launches=repr(launches))
+    script = ts.BOUNDED_DRIVER.format(tests=str(TESTS), repo=str(ROOT), done=ts.DONE, path="single", heads=ts.BOUNDED_H, pool=ts.BOUNDED_POOL, launches=repr(launches))
     assert script.count("ext = load_ext()") == 1
     return script.split("ext = load_ext()")[0]
 

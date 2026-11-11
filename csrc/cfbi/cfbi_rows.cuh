@@ -46,17 +46,20 @@ __device__ unsigned g_rows_prof[ROWS_PROF_POS][ROWS_PROF_CTAS][ROWS_PROF_STAMPS]
 // Test hooks of the row engine (variant builds only: the default build defines none of these macros and compiles to the same machine code, which Gate X shows).
 // ROWS_SYNC(n) is barrier n of a row (1 .. 6) and ROWS_SYNC_END() the barrier that ends it (7); ROWS_DELAY(n) is delay site n: 0 = kernel entry, before the first loads, 1 .. 7 = before
 // barrier n, 8 = right after barrier 6 (the start of the chunk-end phase, which reads S.g2 and S.gend: the window that the barrier ending the row protects against the prologue of the
-// next row). CFBI_ROWS_DELAY_NS compiles the delay hook (its value is the default length of a delay in ns; the host chooses sites, warp and CTAs at run time through
-// rows_test_delay_config in cfbi_launch.cu and reads how many delays ran through rows_test_delay_hits). CFBI_ROWS_TEST_NO_END_BARRIER removes the barrier that ends a row (a racy
-// negative control: a warp that sleeps in the chunk-end phase (site 8) then lets the others start the next row and rewrite S.g2 under it), CFBI_ROWS_TEST_POS_OOB writes the fused
-// position of a sequence at pos[slot + offset] (an out-of-bounds control for memcheck; the host sets the offset through rows_test_pos_offset) and CFBI_ROWS_TEST_COMPILE_ERROR stops
-// the compilation (the control that shows that a variant that does not build fails its test).
+// next row), and the four sites of the arrival protocol of the single-launch decode (rows_entry, thread 0 of every participating CTA): 9 = before the arrival, 10 = after the arrival of the
+// FIRST CTA of its sequence to arrive, 11 = after the arrival of the LAST one and before it stores the new fill, 12 = after the arrival of every CTA (ROWS_DECODE_ARRIVED: the first and the last
+// are told by the count that the arrival atomic returned, never by the head). CFBI_ROWS_DELAY_NS compiles the delay hook (its value is the default length of a delay in ns; the host chooses
+// sites, warp and CTAs at run time through rows_test_delay_config in cfbi_launch.cu and reads how many delays ran through rows_test_delay_hits). CFBI_ROWS_TEST_NO_END_BARRIER removes the
+// barrier that ends a row (a racy negative control: a warp that sleeps in the chunk-end phase (site 8) then lets the others start the next row and rewrite S.g2 under it),
+// CFBI_ROWS_TEST_POS_OOB moves the accesses to a pos word that the host selects (rows_test_pos_offset takes an offset and an access mask: bit POS_ACCESS_FUSED_STORE = the fused store of the
+// two-launch row engine, POS_ACCESS_ARRIVAL = the arrival atomic and POS_ACCESS_ELECTED_STORE = the elected store of the single launch) to pos[slot + offset] (out-of-bounds controls for
+// memcheck) and CFBI_ROWS_TEST_COMPILE_ERROR stops the compilation (the control that shows that a variant that does not build fails its test).
 #ifdef CFBI_ROWS_DELAY_NS
 struct RowsDelayConfig {
     unsigned ns;           // length of a delay (0: CFBI_ROWS_DELAY_NS)
     int warp;              // the warp that sleeps (-1: every warp)
     int cta_mod, cta_rem;  // the CTAs that sleep: cta % cta_mod == cta_rem with cta = n * H + h (cta_mod 0: every CTA)
-    unsigned sites;        // bit n: delay site n is active (n = 0 .. 8)
+    unsigned sites;        // bit n: delay site n is active (n = 0 .. 12)
 };
 __device__ RowsDelayConfig g_rows_delay;
 __device__ unsigned long long g_rows_delay_hits;
@@ -70,9 +73,18 @@ __device__ __forceinline__ void rows_delay(int site) {
     __nanosleep(c.ns ? c.ns : (unsigned)CFBI_ROWS_DELAY_NS);
     __threadfence_block();   // the loads that follow the site stay behind the sleep (the compiler may not hoist them above it)
 }
+// The delays after the arrival of the single-launch decode (rows_entry): site 12 for every CTA, site 10 for the first CTA of its sequence to arrive and site 11 for the last. ``old`` is the word
+// that the arrival atomic returned (the number of CTAs of the sequence that arrived before this one is above POS_COUNT_SHIFT).
+__device__ __forceinline__ void rows_delay_arrived(int old, int heads) {
+    rows_delay(12);
+    if ((old >> POS_COUNT_SHIFT) == 0) rows_delay(10);
+    if ((old >> POS_COUNT_SHIFT) == heads - 1) rows_delay(11);
+}
 #define ROWS_DELAY(n) rows_delay(n)
+#define ROWS_DECODE_ARRIVED(old, heads) rows_delay_arrived(old, heads)
 #else
 #define ROWS_DELAY(n) do {} while (0)
+#define ROWS_DECODE_ARRIVED(old, heads) do {} while (0)
 #endif
 #define ROWS_SYNC(n) do { ROWS_DELAY(n); __syncthreads(); } while (0)
 #ifdef CFBI_ROWS_TEST_NO_END_BARRIER
@@ -83,11 +95,15 @@ __device__ __forceinline__ void rows_delay(int site) {
 #ifdef CFBI_ROWS_TEST_COMPILE_ERROR
 #error "CFBI_ROWS_TEST_COMPILE_ERROR: a deliberate compile error (the control that shows that a variant that does not build fails its test)"
 #endif
+// The accesses to a pos word that the out-of-bounds control can move (bit n of the access mask of rows_test_pos_offset): the fused store of the two-launch row engine, and the arrival atomic and
+// the elected store of the single launch.
+constexpr int POS_ACCESS_FUSED_STORE = 0, POS_ACCESS_ARRIVAL = 1, POS_ACCESS_ELECTED_STORE = 2;
 #ifdef CFBI_ROWS_TEST_POS_OOB
 __device__ int g_rows_test_pos_offset;
-#define ROWS_POS_INDEX(slot) ((slot) + g_rows_test_pos_offset)
+__device__ unsigned g_rows_test_pos_accesses;
+#define ROWS_POS_INDEX(access, slot) ((slot) + (((g_rows_test_pos_accesses >> (access)) & 1u) ? g_rows_test_pos_offset : 0))
 #else
-#define ROWS_POS_INDEX(slot) (slot)
+#define ROWS_POS_INDEX(access, slot) (slot)
 #endif
 
 struct RowSmem {
@@ -177,6 +193,13 @@ __device__ __forceinline__ void rows_m_tiles(RowSmem& S, const float* Rut, const
 __device__ __forceinline__ void st_relaxed_gpu(int* ptr, int v) {
     asm volatile("st.relaxed.gpu.global.b32 [%0], %1;" ::"l"(ptr), "r"(v) : "memory");
 }
+#ifdef CFBI_DECODE_TEST_SNAPSHOT_AFTER_ARRIVAL
+__device__ __forceinline__ int ld_relaxed_gpu(const int* ptr) {   // a wrong protocol (tests only): a read of the pos word of its own
+    int v;
+    asm volatile("ld.relaxed.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(ptr) : "memory");
+    return v;
+}
+#endif
 
 // The sequence entry (what the plan kernel writes to p.plan[n]) of this CTA.
 //
@@ -190,17 +213,21 @@ __device__ __forceinline__ void st_relaxed_gpu(int* ptr, int v) {
 // whose result is the word as it was just before the add: the fill of the open chunk in the low bits (& POS_MASK: the counter is never part of it) and the number of CTAs
 // that arrived before this one above. All H CTAs of a sequence take the same decision (len and slot do not depend on the head), so either all of them arrive or none does.
 // The arrival that sees H - 1 before it is the last: every other CTA of the sequence has done its atomic, i.e. has read pos and will never touch the word again, so it stores
-// the plain new value (pos0 + len) % BT, which also clears the counter; the other CTAs leave the word alone. Between the first arrival and that store the word is not a plain
-// pos, and nothing may read it as one while the call runs (a precondition of the state anyway: the slots of a call are distinct and no other call works on the state
-// concurrently). Every access to the word is an atomic or a relaxed store (no data race in the memory model), and after the call it is plain again: pos, E and rows are
-// what the two-launch decode leaves, bit for bit. A skipped CTA (slot < 0, or an empty sequence) never touches the word.
-// Thread 0 does the atomic and the store (one access per CTA) and hands the fill to the CTA through shared memory; all threads call this function (it has a barrier), and
-// the early exit (len == 0) is uniform over the CTA.
-// Test builds only (the default build has none of these macros): CFBI_DECODE_TEST_DELAY_NS lets every CTA linger for 0 .. 3 x the delay before it arrives (the late starters
-// of a grid that does not fit one wave, on demand), and two wrong protocols that the harness must catch: CFBI_DECODE_TEST_EVERY_CTA_WRITES (no counting: every CTA reads the
-// word and stores the new value at the end of its row loop, the plan-less version of the two-launch scheme without its snapshot) and CFBI_DECODE_TEST_FIRST_ARRIVER (the
-// first CTA to arrive, not the last, stores), and CFBI_DECODE_TEST_NO_ELECTED_STORE (the elected CTA does not store: every arrival bit stays in the word after the call, which the at-rest
-// check of the harness must see).
+// the plain new value (pos0 + len) % BT, which also clears the counter; the other CTAs leave the word alone. The last CTA to ARRIVE is not the last to FINISH: the others may still be
+// in their row loops when it stores, and the store is not a completion signal for E, rows or the output (nothing reads pos to learn that the call is done; the next call reads it after
+// this kernel, in the same stream or behind an event). Between the first arrival and that store the word is not a plain pos, and nothing may read it as one while the call runs (a
+// precondition of the state anyway: the slots of a call are distinct and no other call works on the state concurrently). A plain pos at rest is not a proof that a call finished
+// either: an interrupted call can leave arrival bits in the word, or a plain pos with half updated E and rows. Every access to the word is an atomic or a relaxed store (no data
+// race in the memory model), and after a call that ran to the end it is plain again: pos, E and rows are what the two-launch decode leaves, bit for bit. A skipped CTA (slot < 0, or an
+// empty sequence) never touches the word.
+// Thread 0 does one arrival atomic per participating CTA, and the elected CTA one store per sequence; it hands the fill to the CTA through shared memory; all threads call this function
+// (it has a barrier), and the early exit (len == 0) is uniform over the CTA.
+// Test builds only (the default build has none of these macros): the delay sites 9 .. 12 (ROWS_DELAY, ROWS_DECODE_ARRIVED: before the arrival, after the arrival of the first CTA, after
+// the arrival of the last one before its store, after the arrival of every CTA) make the late starters of a grid that does not fit one wave on demand; ROWS_POS_INDEX moves the arrival
+// atomic and the elected store out of bounds; and the wrong protocols that the harness must catch: CFBI_DECODE_TEST_EVERY_CTA_WRITES (no counting: every CTA reads the word and stores the
+// new value at the end of its row loop, the plan-less version of the two-launch scheme without its snapshot), CFBI_DECODE_TEST_FIRST_ARRIVER (the first CTA to arrive, not the last,
+// stores), CFBI_DECODE_TEST_SNAPSHOT_AFTER_ARRIVAL (the fill is read from the word after the arrival, not taken from what the atomic returned) and CFBI_DECODE_TEST_NO_ELECTED_STORE (the
+// elected CTA does not store: every arrival bit stays in the word after the call, which the at-rest check of the harness must see).
 template <bool DECODE>
 using RowsParams = std::conditional_t<DECODE, DecodeParams, Params>;   // DecodeParams: the call's Params and its token windows (cfbi_common.cuh)
 
@@ -212,20 +239,23 @@ __device__ __forceinline__ SeqPlan rows_entry(const RowsParams<DECODE>& p, int n
         const SeqWindow w = seq_window(p.cu_seqlens, p.fixed_len, p.slot_ids, n);
         if (w.len == 0) return SeqPlan{0, 0, 0, 0, 0, 0, 0, w.slot};   // padding entry or empty sequence (uniform over the CTA): no state access, the caller returns
         if (threadIdx.x == 0) {
-#ifdef CFBI_DECODE_TEST_DELAY_NS
-            __nanosleep(static_cast<unsigned>(CFBI_DECODE_TEST_DELAY_NS) * ((blockIdx.x + blockIdx.y) & 3u));
-#endif
+            ROWS_DELAY(9);   // test hook: before the arrival
 #ifdef CFBI_DECODE_TEST_EVERY_CTA_WRITES
-            const int old = atomicAdd(p.pos + w.slot, 0);   // a plain read of the word (an add of zero): no counting
+            const int old = atomicAdd(p.pos + ROWS_POS_INDEX(POS_ACCESS_ARRIVAL, w.slot), 0);   // a plain read of the word (an add of zero): no counting
             pos_smem = old & POS_MASK;
 #else
-            const int old = atomicAdd(p.pos + w.slot, 1 << POS_COUNT_SHIFT);
+            const int old = atomicAdd(p.pos + ROWS_POS_INDEX(POS_ACCESS_ARRIVAL, w.slot), 1 << POS_COUNT_SHIFT);
+            ROWS_DECODE_ARRIVED(old, p.H);   // test hook: delay sites 10 (first arriver), 11 (last arriver, before its store) and 12 (every CTA), after the arrival
+#ifdef CFBI_DECODE_TEST_SNAPSHOT_AFTER_ARRIVAL
+            pos_smem = ld_relaxed_gpu(p.pos + w.slot) & POS_MASK;   // wrong protocol (tests only): the fill from a read of its own after the arrival, which the elected store may have rewritten
+#else
             pos_smem = old & POS_MASK;
+#endif
 #ifdef CFBI_DECODE_TEST_FIRST_ARRIVER
-            if ((old >> POS_COUNT_SHIFT) == 0) st_relaxed_gpu(p.pos + w.slot, (int)(((int64_t)(old & POS_MASK) + w.len) % BT));
+            if ((old >> POS_COUNT_SHIFT) == 0) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE, w.slot), (int)(((int64_t)(old & POS_MASK) + w.len) % BT));
 #else
 #ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE
-            if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(p.pos + w.slot, (int)(((int64_t)(old & POS_MASK) + w.len) % BT));
+            if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE, w.slot), (int)(((int64_t)(old & POS_MASK) + w.len) % BT));
 #endif
 #endif
 #endif
@@ -588,7 +618,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
         if (tid == 0) p.pos[sp.slot] = (int)(((int64_t)sp.pos0 + sp.len) % BT);   // negative control (tests only): every CTA stores, from the fill it read at its own start
 #endif
     } else if (p.fuse_pos && tid == 0) {
-        p.pos[ROWS_POS_INDEX(sp.slot)] = (int)(((int64_t)sp.pos0 + sp.len) % BT);   // same value from every head CTA (sp.pos0 is the plan kernel's snapshot)
+        p.pos[ROWS_POS_INDEX(POS_ACCESS_FUSED_STORE, sp.slot)] = (int)(((int64_t)sp.pos0 + sp.len) % BT);   // same value from every head CTA (sp.pos0 is the plan kernel's snapshot)
     }
 #ifdef CFBI_ROWS_PROFILE
     if (threadIdx.x == 0 && prof_last >= 0 && n * H + h < ROWS_PROF_CTAS)

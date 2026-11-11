@@ -210,12 +210,14 @@ int rows_occupancy(int index, RowsOccupancy* out);
 
 // Row-engine test variants (cfbi_rows.cuh; tests only). rows_test_delay_config sets the delay hook of a build compiled with CFBI_ROWS_DELAY_NS: the length ``ns`` of a delay (0: the
 // compiled default), the ``warp`` that sleeps (-1: every warp), the CTAs that sleep (cta % cta_mod == cta_rem with cta = sequence * H + head; cta_mod 0: every CTA) and the delay
-// sites (bit n: site n; site 0 is the kernel entry, site n of 1 .. 7 is the barrier n of a row, site 8 follows barrier 6), and zeroes the hit counter; rows_test_delay_hits reads the counter (the number of warps
-// that slept since the configuration); rows_test_pos_offset sets the offset of the out-of-bounds control compiled with CFBI_ROWS_TEST_POS_OOB. Every function returns 0, the CUDA
+// sites (bit n: site n; site 0 is the kernel entry, site n of 1 .. 7 is the barrier n of a row, site 8 follows barrier 6, sites 9 .. 12 are the arrival protocol of the single-launch decode: before
+// the arrival, after the arrival of the first CTA of a sequence, after the arrival of the last one, after the arrival of every CTA), and zeroes the hit counter; rows_test_delay_hits reads the
+// counter (the number of warps that slept since the configuration); rows_test_pos_offset sets the offset of the out-of-bounds control compiled with CFBI_ROWS_TEST_POS_OOB and the accesses
+// that it moves (bit 0: the fused position store of the two-launch row engine, bit 1: the arrival atomic and bit 2: the elected store of the single launch). Every function returns 0, the CUDA
 // error of the call that failed, or cudaErrorNotSupported in a build without the matching macro.
 int rows_test_delay_config(unsigned ns, int warp, int cta_mod, int cta_rem, unsigned sites);
 int rows_test_delay_hits(unsigned long long* hits);
-int rows_test_pos_offset(int offset);
+int rows_test_pos_offset(int offset, unsigned accesses);
 
 // Row-engine profile (cfbi_rows.cuh): the dimensions [row position][CTA][stamp] of the device buffer of a build compiled with CFBI_ROWS_PROFILE (all zero in any other
 // build), a copy of its first ``count`` unsigned words to the host (returns the number copied, 0 without a profile build) and a reset to zero.

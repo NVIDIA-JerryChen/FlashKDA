@@ -1,0 +1,195 @@
+"""Source pins of the arrival-count protocol of the single-launch decode, with mutants (plain Python, no GPU: ``PYTHONPATH=. pytest --noconftest tests/cfbi/test_decode_protocol_source.py``).
+
+``rows_entry<true>`` (csrc/cfbi/cfbi_rows.cuh) lets the H head CTAs of a sequence agree on who advances the position word with one atomic and one store. Four rules of its ordering cannot be
+seen by any comparison of results (the bits of the output, E, the rows and pos are the same with a plain store, with the atomic behind a barrier, with an extra masked read of the word):
+
+1. the prologue ``atomicAdd(&pos[slot], 1 << POS_COUNT_SHIFT)`` is the ONLY read of the word; the fill of the open chunk comes from ``old & POS_MASK``;
+2. the CTA whose arrival saw ``H - 1`` before it stores the plain ``(pos0 + len) % 64`` with a relaxed device-scope store;
+3. a skipped CTA (padding entry, empty sequence) returns before the arrival, on a decision that depends on the sequence only (``len`` and ``slot``);
+4. no spin-wait, no extra buffer, no fence; ``POS_MASK < (1 << POS_COUNT_SHIFT)`` is a ``static_assert``.
+
+``protocol_source.py`` reads the sources as a default build reads them (comments gone, test-macro branches resolved, default hooks expanded, tokens) and returns the broken rules, ``R0`` being the
+whole entry. Every rule is shown here to FAIL on a temporary copy of the sources with one edit (a rule that cannot fail proves nothing), and the pins are shown to hold under harmless edits
+(spacing, comments, the numbers of the delay sites, the variant branches). The host model (``test_decode_pos_protocol_model.py``) takes its constants and its election from the same reader.
+"""
+import pytest
+
+import protocol_source as ps
+from test_rows_profile import mutate
+
+R, C, P, L, B = "cfbi_rows.cuh", "cfbi_common.cuh", "cfbi_primitives.cuh", "cfbi_launch.cu", "cfbi_binding.cpp"
+ELECT = "== p.H - 1) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE, w.slot)"
+STORE_LINE = "            if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE, w.slot), (int)(((int64_t)(old & POS_MASK) + w.len) % BT));\n"
+STORE_END = "(old & POS_MASK) + w.len) % BT));\n#endif\n#endif\n#endif"
+HOOK9 = "            ROWS_DELAY(9);   // test hook: before the arrival\n"
+SKIP_LINE = "        if (w.len == 0) return SeqPlan{0, 0, 0, 0, 0, 0, 0, w.slot};"
+BARRIER_LINES = "        }\n        __syncthreads();"
+ARRIVAL_ALL = "            ROWS_DECODE_ARRIVED(old, p.H);"
+
+
+@pytest.fixture(scope="module")
+def real():
+    return ps.load()
+
+
+def copy_with(tmp_path, texts, edits):
+    """A copy of the sources on disk with the edits applied (each ``(file, old, new)`` must find ``old`` exactly once), read back through the reader."""
+    d = tmp_path / "cfbi"
+    d.mkdir()
+    edits_by_file = {}
+    for f, old, new in edits:
+        edits_by_file.setdefault(f, []).append((old, new))
+    for name, text in texts.items():
+        for old, new in edits_by_file.get(name, []):
+            text = mutate(text, old, new)
+        (d / name).write_text(text)
+    return ps.load(d)
+
+
+# ---- the real sources satisfy every rule ----------------------------------------------------------------------------------------------------------------------
+def test_the_real_sources_satisfy_every_rule(real):
+    assert ps.problems(real) == []
+
+
+def test_the_constants_and_the_election_are_read_from_the_sources(real):
+    assert ps.constants(real) == {"BT": 64, "POS_COUNT_SHIFT": 8, "POS_MASK": 63}
+    e = ps.election(real)
+    for H in (1, 2, 7, 64):
+        assert [c for c in range(H + 2) if e(c, H)] == [H - 1]
+
+
+def test_the_decode_branch_is_what_the_pins_say_it_is(real):
+    assert " ".join(ps.decode_branch(real)) == ps.GOLDEN
+    assert ps.GOLDEN.count("p . pos") == 2 and ps.GOLDEN.count("atomicAdd") == 1 and ps.GOLDEN.count("st_relaxed_gpu") == 1 and ps.GOLDEN.count("__syncthreads") == 1
+
+
+# ---- the reader ---------------------------------------------------------------------------------------------------------------------------------------------------
+def test_comments_are_not_code_and_strings_are_not_comments():
+    assert ps.norm("a = b; // atomicAdd(p.pos, 0)\n/* st_relaxed_gpu( */ c;") == "a = b ; c ;"
+    assert ps.norm('asm("ld // x");') == 'asm ( "ld // x" ) ;'
+    assert ps.tokens("k<<<g, b>>>(x);") == ["k", "<<", "<", "g", ",", "b", ">>", ">", "(", "x", ")", ";"]
+
+
+def test_test_macro_branches_are_resolved_the_way_a_default_build_reads_them():
+    text = "a\n#ifdef CFBI_DECODE_TEST_X\nb\n#else\nc\n#ifndef CFBI_DECODE_TEST_Y\nd\n#endif\n#endif\n#ifdef TUNABLE\ne\n#endif\n"
+    view = ps.default_text(text, ps.macros_in([text]))
+    assert [l for l in view.split("\n")] == ["a", "c", "d", "#ifdef TUNABLE", "e", "#endif"]
+    with pytest.raises(ValueError):
+        ps.default_text("#ifdef CFBI_DECODE_TEST_X\n#elif Y\n#endif\n", {"CFBI_DECODE_TEST_X"})
+
+
+def test_the_default_hooks_vanish_and_the_position_index_is_the_slot():
+    toks = ps.tokens("ROWS_DELAY(9); a = ROWS_POS_INDEX(POS_ACCESS_ARRIVAL, w.slot + 1); ROWS_DECODE_ARRIVED(old, p.H); b;")
+    assert " ".join(ps.expand_default_hooks(toks)) == "a = ( w . slot + 1 ) ; b ;"
+
+
+# ---- mutants: each rule fails on a temporary copy of the sources ----------------------------------------------------------------------------------------------
+MUTANTS = [
+    # rule 2: the election and the store
+    ("the election against p.H", [(R, ELECT, "== p.H) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE, w.slot)")], {"R0", "R2"}),
+    ("the election against 0 (the first arriver)", [(R, ELECT, "== 0) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE, w.slot)")], {"R0", "R2"}),
+    ("the election against H - 2", [(R, ELECT, "== p.H - 2) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE, w.slot)")], {"R0", "R2"}),
+    ("the election by head index", [(R, "if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE",
+                                     "if (blockIdx.y == 0) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE")], {"R0", "R2"}),
+    ("the election on the word after the add", [(R, "if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE",
+                                                  "if (((old >> POS_COUNT_SHIFT) + 1) == p.H) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE")], {"R0", "R2"}),
+    ("a plain store instead of the relaxed one", [(R, STORE_LINE, "            if ((old >> POS_COUNT_SHIFT) == p.H - 1) p.pos[ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE, w.slot)] = (int)(((int64_t)(old & POS_MASK) + w.len) % BT);\n")], {"R0", "R2"}),
+    ("the relaxed store helper made a plain global store", [(R, "st.relaxed.gpu.global.b32", "st.global.b32")], {"R6"}),
+    ("the relaxed store helper without volatile", [(R, 'asm volatile("st.relaxed.gpu.global.b32', 'asm("st.relaxed.gpu.global.b32')], {"R6"}),
+    ("the relaxed store helper without its memory clobber", [(R, '::"l"(ptr), "r"(v) : "memory");', '::"l"(ptr), "r"(v));')], {"R6"}),
+    ("the store without the mask", [(R, STORE_END, "(old) + w.len) % BT));\n#endif\n#endif\n#endif")], {"R0", "R2"}),
+    ("the store without the modulo", [(R, STORE_END, "(old & POS_MASK) + w.len)));\n#endif\n#endif\n#endif")], {"R0", "R2"}),
+    ("the store without the 64-bit promotion", [(R, "(int)(((int64_t)(old & POS_MASK) + w.len) % BT));\n#endif\n#endif\n#endif", "(int)((((old & POS_MASK) + w.len) % BT));\n#endif\n#endif\n#endif")], {"R0", "R2"}),
+    ("the store to another slot", [(R, ELECT, "== p.H - 1) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE, w.slot + 1)")], {"R0", "R2"}),
+    ("the store of another length", [(R, STORE_END, "(old & POS_MASK) + w.len + 1) % BT));\n#endif\n#endif\n#endif")], {"R0", "R2"}),
+    ("no elected store at all", [(R, STORE_LINE, "")], {"R0", "R2"}),
+    ("a second store", [(R, STORE_LINE, STORE_LINE + "            st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE, w.slot), 0);\n")], {"R0", "R2"}),
+    ("the elected store only in a variant branch", [(R, "#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1)", "#ifdef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1)")], {"R0", "R2"}),
+    ("the real election in a comment, a wrong one in the code", [(R, ELECT, "== 0) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE, w.slot)"),
+                                                                  (R, STORE_END, "(old & POS_MASK) + w.len) % BT));   // (old >> POS_COUNT_SHIFT) == p.H - 1\n#endif\n#endif\n#endif")], {"R0", "R2"}),
+    # rule 1: the atomic is the only read
+    ("a barrier in front of the atomic", [(R, "        if (threadIdx.x == 0) {\n            ROWS_DELAY(9);", "        __syncthreads();\n        if (threadIdx.x == 0) {\n            ROWS_DELAY(9);")], {"R0", "R4", "R9"}),
+    ("the atomic behind other work", [(R, HOOK9, HOOK9 + "            pos_smem = w.tok0;\n")], {"R0", "R1", "R9"}),
+    ("an extra read of the word before the atomic", [(R, HOOK9, HOOK9 + "            const int snap = p.pos[ROWS_POS_INDEX(POS_ACCESS_ARRIVAL, w.slot)];\n")], {"R0", "R1", "R7"}),
+    ("an extra read of the word through a helper", [(R, HOOK9, HOOK9 + "            const int snap = load_pos(p.pos, w.slot);\n")], {"R0", "R1", "R7"}),
+    ("a read of the word through an alias", [(R, HOOK9, HOOK9 + "            const int* alias = p.pos;\n            const int snap = alias[w.slot];\n")], {"R0", "R1", "R7"}),
+    ("a snapshot of the word after the arrival", [(R, ARRIVAL_ALL, ARRIVAL_ALL + "\n            const int snap = ld_relaxed_gpu(p.pos + w.slot);")], {"R0", "R1", "R4", "R7"}),
+    ("the fill taken without the mask", [(R, "#else\n            pos_smem = old & POS_MASK;\n#endif", "#else\n            pos_smem = old;\n#endif")], {"R0", "R1"}),
+    ("a plain add of zero instead of the counting add", [(R, "ROWS_POS_INDEX(POS_ACCESS_ARRIVAL, w.slot), 1 << POS_COUNT_SHIFT);", "ROWS_POS_INDEX(POS_ACCESS_ARRIVAL, w.slot), 0);")], {"R0", "R1"}),
+    ("the every-CTA tail store enabled in the default build", [(R, "#ifdef CFBI_DECODE_TEST_EVERY_CTA_WRITES\n        if (tid == 0) p.pos[sp.slot] = ", "#if 1\n        if (tid == 0) p.pos[sp.slot] = ")], {"R7", "R12"}),
+    ("the parameter block handed to another function", [(R, "    const int nrows = sp.hrows;\n", "    const int nrows = sp.hrows;\n    touch(p);\n")], {"R7"}),
+    # rule 3: the skip
+    ("the skip behind the atomic", [(R, SKIP_LINE + "   // padding entry or empty sequence (uniform over the CTA): no state access, the caller returns\n", ""),
+                                    (R, "        __syncthreads();\n        return SeqPlan{w.tok0", "        __syncthreads();\n" + SKIP_LINE + "\n        return SeqPlan{w.tok0")], {"R0", "R3"}),
+    ("a skip that depends on the head", [(R, SKIP_LINE, "        if (w.len == 0 || blockIdx.y > 3) return SeqPlan{0, 0, 0, 0, 0, 0, 0, w.slot};")], {"R0", "R3"}),
+    ("a window that depends on the head", [(C, "    if (w.slot < 0) w.len = 0;", "    if (w.slot < 0 || blockIdx.y > 3) w.len = 0;")], {"R3"}),
+    ("a negative slot that is not skipped", [(C, "    if (w.slot < 0) w.len = 0;", "")], {"R3"}),
+    # rule 4: no spin, no fence, one hand-over barrier
+    ("a spin-wait on the counter", [(R, HOOK9, HOOK9 + "            while (atomicAdd(p.pos + ROWS_POS_INDEX(POS_ACCESS_ARRIVAL, w.slot), 0) < 0) {}\n")], {"R0", "R1", "R4"}),
+    ("a fence after the arrival", [(R, ARRIVAL_ALL, ARRIVAL_ALL + "\n            __threadfence();")], {"R0", "R4"}),
+    ("a sleep in the entry", [(R, HOOK9, HOOK9 + "            __nanosleep(100);\n")], {"R0", "R4"}),
+    ("the hand-over barrier removed", [(R, BARRIER_LINES, "        }")], {"R0", "R4", "R9"}),
+    ("the fill read before the barrier", [(R, BARRIER_LINES, "        }\n        const int early = pos_smem;\n        __syncthreads();")], {"R0", "R9"}),
+    ("the static_assert removed", [(C, 'static_assert(POS_MASK < (1 << POS_COUNT_SHIFT), "the fill of the open chunk must fit below the arrival counter");', "")], {"R5"}),
+    # the constants
+    ("the shift changed to 7", [(C, "constexpr int POS_COUNT_SHIFT = 8;", "constexpr int POS_COUNT_SHIFT = 7;")], {"R5"}),
+    ("the mask changed to 127", [(C, "constexpr int POS_MASK = BT - 1;", "constexpr int POS_MASK = BT * 2 - 1;")], {"R5"}),
+    ("the chunk length changed", [(P, "constexpr int BT = 64;", "constexpr int BT = 128;")], {"R5"}),
+    # the geometry
+    ("a grid with one head too many", [(L, "rows_kernel<true><<<dim3(a.N, a.H), NTHREADS", "rows_kernel<true><<<dim3(a.N, a.H + 1), NTHREADS")], {"R8"}),
+    ("a grid with a third dimension", [(L, "rows_kernel<true><<<dim3(a.N, a.H), NTHREADS", "rows_kernel<true><<<dim3(a.N, a.H, 2), NTHREADS")], {"R8"}),
+    ("a head count that is not the grid's", [(L, "    p.H = a.H;\n", "    p.H = a.H + 1;\n")], {"R8"}),
+    ("token windows of another call", [(L, "const DecodeParams dp{p, a.cu_seqlens, a.fixed_len};", "const DecodeParams dp{p, nullptr, a.fixed_len};")], {"R8"}),
+    ("the sequence and head index swapped", [(R, "    const int n = blockIdx.x, h = blockIdx.y, H = p.H;", "    const int n = blockIdx.y, h = blockIdx.x, H = p.H;")], {"R8"}),
+    ("a second launch of the kernel", [(L, "const DecodeParams dp{p, a.cu_seqlens, a.fixed_len};", "const DecodeParams dp{p, a.cu_seqlens, a.fixed_len};\n            rows_kernel<true><<<dim3(a.N, a.H), NTHREADS, ROWS_DYNAMIC_SMEM, stream>>>(dp);")], {"R8"}),
+    ("a heads limit beyond the counter capacity", [(B, 'H < 65536, "problem too large', 'H < 100000000, "problem too large')], {"R10"}),
+    # the hooks of the default build
+    ("the position index offset in the default build", [(R, "#else\n#define ROWS_POS_INDEX(access, slot) (slot)\n#endif", "#else\n#define ROWS_POS_INDEX(access, slot) ((slot) + 1)\n#endif")], {"R11"}),
+    ("the arrival delays in the default build", [(R, "#else\n#define ROWS_DELAY(n) do {} while (0)\n#define ROWS_DECODE_ARRIVED(old, heads) do {} while (0)\n#endif",
+                                                  "#else\n#define ROWS_DELAY(n) do {} while (0)\n#define ROWS_DECODE_ARRIVED(old, heads) rows_delay_arrived(old, heads)\n#endif")], {"R11"}),
+    # text that the compiler does not see but the reader does
+    ("the real protocol under #if 0", [(R, STORE_LINE, "#if 0\n" + STORE_LINE + "#endif\n")], {"R12"}),
+    ("a conditional on a test macro with #elif", [(R, "#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1)", "#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE\n#elif 1\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1)")], {"R12"}),
+]
+
+
+@pytest.mark.parametrize("name,edits,expect", MUTANTS, ids=[m[0] for m in MUTANTS])
+def test_a_wrong_protocol_in_a_temporary_copy_of_the_sources_fails_its_rule(tmp_path, real, name, edits, expect):
+    broken = ps.problems(copy_with(tmp_path, real, edits))
+    rules = {r for r, _ in broken}
+    assert expect <= rules, (name, sorted(rules), [m[:200] for r, m in broken][:4])
+
+
+def test_every_rule_has_a_mutant_that_breaks_it():
+    covered = set().union(*(m[2] for m in MUTANTS))
+    assert {"R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10", "R11", "R12"} <= covered
+
+
+# ---- harmless edits do not trip the pins ----------------------------------------------------------------------------------------------------------------------
+HARMLESS = [
+    ("spacing and line breaks of the entry", [(R, "        const SeqWindow w = seq_window(p.cu_seqlens, p.fixed_len, p.slot_ids, n);", "        const SeqWindow w =\n            seq_window( p.cu_seqlens,   p.fixed_len,\n                        p.slot_ids, n );")]),
+    ("a comment that holds the protocol text", [(R, HOOK9, HOOK9 + "            // old = atomicAdd(p.pos + w.slot, 0);  if ((old >> POS_COUNT_SHIFT) == 0) p.pos[w.slot] = 1;\n")]),
+    ("the numbers of the delay sites", [(R, HOOK9, "            ROWS_DELAY(13);   // test hook: before the arrival\n")]),
+    ("the arguments of the arrival hook", [(R, ARRIVAL_ALL, "            ROWS_DECODE_ARRIVED(old, (p.H));")]),
+    ("a variant branch (the first-arriver protocol of the tests)", [(R, "            if ((old >> POS_COUNT_SHIFT) == 0) st_relaxed_gpu(", "            if ((old >> POS_COUNT_SHIFT) == 1) st_relaxed_gpu(")]),
+    ("the snapshot variant", [(R, "pos_smem = ld_relaxed_gpu(p.pos + w.slot) & POS_MASK;", "pos_smem = ld_relaxed_gpu(p.pos + w.slot + 1) & POS_MASK;")]),
+    ("the tail store of the every-CTA variant", [(R, "#ifdef CFBI_DECODE_TEST_EVERY_CTA_WRITES\n        if (tid == 0) p.pos[sp.slot] = ", "#ifdef CFBI_DECODE_TEST_EVERY_CTA_WRITES\n        if (tid == 0 && true) p.pos[sp.slot] = ")]),
+    ("a comment in the header constants", [(C, "constexpr int POS_MASK = BT - 1;", "constexpr int POS_MASK = BT - 1;   // low bits")]),
+]
+
+
+@pytest.mark.parametrize("name,edits", HARMLESS, ids=[h[0] for h in HARMLESS])
+def test_a_harmless_edit_does_not_trip_the_pins(tmp_path, real, name, edits):
+    assert ps.problems(copy_with(tmp_path, real, edits)) == []
+
+
+def test_a_renamed_entry_is_reported_not_a_crash(tmp_path, real):
+    broken = ps.problems(copy_with(tmp_path, real, [(R, "SeqPlan rows_entry(const RowsParams<DECODE>& p, int n, int& pos_smem)", "SeqPlan rows_enter(const RowsParams<DECODE>& p, int n, int& pos_smem)")]))
+    assert any(r == "R0" for r, _ in broken)
+
+
+# ---- the model reads the sources ---------------------------------------------------------------------------------------------------------------------------
+def test_an_election_that_the_model_cannot_read_is_refused(tmp_path, real):
+    texts = copy_with(tmp_path, real, [(R, "if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE", "if (blockIdx.y == 0) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE")])
+    with pytest.raises(ValueError):
+        ps.election(texts)

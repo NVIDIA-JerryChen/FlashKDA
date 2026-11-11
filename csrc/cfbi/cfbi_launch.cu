@@ -363,13 +363,14 @@ int rows_test_delay_hits(unsigned long long* hits) {
 #endif
 }
 
-int rows_test_pos_offset(int offset) {
+int rows_test_pos_offset(int offset, unsigned accesses) {
 #ifdef CFBI_ROWS_TEST_POS_OOB
     cudaError_t e = cudaDeviceSynchronize();
     if (e == cudaSuccess) e = cudaMemcpyToSymbol(g_rows_test_pos_offset, &offset, sizeof(offset));
+    if (e == cudaSuccess) e = cudaMemcpyToSymbol(g_rows_test_pos_accesses, &accesses, sizeof(accesses));
     return (int)e;
 #else
-    (void)offset;
+    (void)offset; (void)accesses;
     return (int)cudaErrorNotSupported;
 #endif
 }

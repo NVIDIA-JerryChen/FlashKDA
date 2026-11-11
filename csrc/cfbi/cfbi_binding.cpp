@@ -162,7 +162,7 @@ void rows_test_check(int err, const char* what) {
     TORCH_CHECK(err == 0, what, ": ", cudaGetErrorString((cudaError_t)err));
 }
 void rows_test_delay_config_py(int64_t ns, int warp, int cta_mod, int cta_rem, int64_t sites) {
-    TORCH_CHECK(ns >= 0 && ns <= 1000000 && sites >= 0 && sites < 512 && cta_mod >= 0 && warp >= -1 && warp < 8, "rows_test_delay_config: argument out of range");
+    TORCH_CHECK(ns >= 0 && ns <= 1000000 && sites >= 0 && sites < (1 << 13) && cta_mod >= 0 && warp >= -1 && warp < 8, "rows_test_delay_config: argument out of range");
     rows_test_check(cfbi::rows_test_delay_config((unsigned)ns, warp, cta_mod, cta_rem, (unsigned)sites), "rows_test_delay_config");
 }
 int64_t rows_test_delay_hits_py() {
@@ -170,9 +170,10 @@ int64_t rows_test_delay_hits_py() {
     rows_test_check(cfbi::rows_test_delay_hits(&hits), "rows_test_delay_hits");
     return (int64_t)hits;
 }
-void rows_test_pos_offset_py(int64_t offset) {
+void rows_test_pos_offset_py(int64_t offset, int64_t accesses) {
     TORCH_CHECK(offset >= INT32_MIN && offset <= INT32_MAX, "rows_test_pos_offset: offset out of range");
-    rows_test_check(cfbi::rows_test_pos_offset((int)offset), "rows_test_pos_offset");
+    TORCH_CHECK(accesses >= 0 && accesses < 8, "rows_test_pos_offset: the access mask has three bits (fused store, arrival atomic, elected store)");
+    rows_test_check(cfbi::rows_test_pos_offset((int)offset, (unsigned)accesses), "rows_test_pos_offset");
 }
 
 // One entry point for prefill, the training forward and decode.
@@ -392,7 +393,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rows_test_delay_config", &rows_test_delay_config_py, "hidden (CFBI_ROWS_DELAY_NS builds): ns of a delay (0: compiled default), sleeping warp (-1: all), sleeping CTAs (cta % cta_mod == cta_rem, 0: all), site bit mask",
           py::arg("ns"), py::arg("warp"), py::arg("cta_mod"), py::arg("cta_rem"), py::arg("sites"));
     m.def("rows_test_delay_hits", &rows_test_delay_hits_py, "hidden (CFBI_ROWS_DELAY_NS builds): warps that slept since rows_test_delay_config");
-    m.def("rows_test_pos_offset", &rows_test_pos_offset_py, "hidden (CFBI_ROWS_TEST_POS_OOB builds): offset added to the slot of the fused position store", py::arg("offset"));
+    m.def("rows_test_pos_offset", &rows_test_pos_offset_py,
+          "hidden (CFBI_ROWS_TEST_POS_OOB builds): offset added to the slot of the position accesses selected by the mask (bit 0: fused store of the two-launch row engine, bit 1: arrival atomic, bit 2: elected store of the single launch; default: all)",
+          py::arg("offset"), py::arg("accesses") = 7);
     m.def("rows_profile_read", &rows_profile_read_py, "row-engine profile stamps [row position, CTA, stamp] (profile build only)");
     m.def("rows_profile_clear", &cfbi::rows_profile_clear, "reset the row-engine profile buffer (profile build only)");
     m.def("dyn_start_log", &dyn_start_log, "(start ns, SM, [count]) of the first n CTAs of the last device-scheduled K2 (start-order probe build only)", py::arg("n"));

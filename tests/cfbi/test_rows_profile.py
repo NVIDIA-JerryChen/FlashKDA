@@ -47,7 +47,7 @@ EXIT_STAMP = re.compile(r"\[8\] = \(unsigned\)\(clock64\(\) - prof_entry\)")
 GLOBAL_STORE = re.compile(r"\b(?:Xg|Rk|Rg|Ru|Rut|Rw|R|Eg|p\.out|p\.out_f32|p\.pos|p\.E|p\.rows)\[[^\]]*\]\s*=[^=]")
 ROW_LOOP = re.compile(r"^    for \(int i = 0; i < nrows; \+\+i\) \{")
 AFTER_LOOP = "    if (DECODE) {"          # the first statement behind the row loop: the end of the kernel (the position word of the call, then the exit stamp)
-POS_STORE = "p.pos[ROWS_POS_INDEX(sp.slot)] ="
+POS_STORE = "p.pos[ROWS_POS_INDEX(POS_ACCESS_FUSED_STORE, sp.slot)] ="
 
 # the barriers and stamps of one row in source order (a barrier inside an ``if`` is still one entry; SYNC<n> is barrier n, SYNC7 the barrier that ends the row): changes with the barrier
 # structure of the row engine, not with the profile; the delay variant's sites are these barrier numbers (test_rows_hooks.py)
@@ -250,7 +250,7 @@ def test_the_exit_stamp_follows_the_last_global_store(rows_text):
 
 
 def test_an_exit_stamp_before_a_store_is_caught(rows_text):
-    store = "        p.pos[ROWS_POS_INDEX(sp.slot)] = (int)(((int64_t)sp.pos0 + sp.len) % BT);   // same value from every head CTA (sp.pos0 is the plan kernel's snapshot)\n"
+    store = "        p.pos[ROWS_POS_INDEX(POS_ACCESS_FUSED_STORE, sp.slot)] = (int)(((int64_t)sp.pos0 + sp.len) % BT);   // same value from every head CTA (sp.pos0 is the plan kernel's snapshot)\n"
     stamp = "        g_rows_prof[prof_last][n * H + h][8] = (unsigned)(clock64() - prof_entry);   // after the last global store of the kernel\n"
     moved = mutate(mutate(rows_text, store, ""), stamp, stamp + store)       # the fused pos store now follows the exit stamp
     probs = exit_problems(moved)

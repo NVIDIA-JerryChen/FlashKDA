@@ -13,15 +13,24 @@ hardware (the CUDA memory model argument is in the comment of ``rows_entry``: al
 
 Negative controls (each must be caught by the same check, or the check is vacuous): no counting with every CTA storing (the plan-less version of the old scheme: the late starters
 read an advanced fill), the FIRST arrival storing, the counter bits not masked off by the readers, and nobody storing.
+
+What the model is bound to, and what it is not. Its constants (``BT``, ``POS_COUNT_SHIFT``, ``POS_MASK``) and its election (the condition of the elected store) are READ from the CUDA sources
+(``protocol_source``), so a change of either in the kernel changes the model, and the pins of ``test_decode_protocol_source.py`` fail on the same edit. The interleaving checks use Python
+integers; the 32-bit word is modelled explicitly only where it matters (the capacity boundary below). The model says nothing about the CUDA memory model (the argument is in the comment of
+``rows_entry``: every access to the word is an atomic or a relaxed store, the elected store needs no ordering against E and rows), nor about the hardware, and the preconditions that the
+tests below show to be necessary (distinct slots, no arrival residue) are documented in ``flash_kda/cfbi/api.py``, not validated on the device.
 """
 import itertools
 import random
 
 import pytest
 
-BT = 64
-SHIFT = 8
-MASK = BT - 1
+import protocol_source as ps
+
+SOURCES = ps.load()
+CONSTANTS = ps.constants(SOURCES)
+BT, SHIFT, MASK = CONSTANTS["BT"], CONSTANTS["POS_COUNT_SHIFT"], CONSTANTS["POS_MASK"]
+PROTOCOL_ELECTS = ps.election(SOURCES)       # f(count, H): the CTA whose arrival found ``count`` CTAs before it stores (the condition of the elected store in rows_entry)
 
 
 def new_pos(pos0, length):
@@ -50,10 +59,10 @@ def interleavings(counts):
     return rec(out)
 
 
-def elected(variant, old, H):
-    """Does the CTA whose arrival returned ``old`` store the new value?"""
+def elected(variant, old, H, elect=None):
+    """Does the CTA whose arrival returned ``old`` store the new value? (``elect``: another election than the one that the sources pin)"""
     if variant in ("protocol", "no_mask"):
-        return (old >> SHIFT) == H - 1
+        return (elect or PROTOCOL_ELECTS)(old >> SHIFT, H)
     if variant == "first_arrival":
         return (old >> SHIFT) == 0
     if variant == "every_cta":
@@ -63,30 +72,30 @@ def elected(variant, old, H):
     raise ValueError(variant)
 
 
-def run_words(seqs, schedule, variant="protocol"):
-    """seqs: list of (slot, H, pos0, length); schedule: tuple of (sequence, head) pairs, each twice (arrival, then the store step). Returns
-    (words by slot, fill seen by every CTA, number of stores per sequence)."""
+def run_words(seqs, schedule, variant="protocol", elect=None):
+    """seqs: list of (slot, H, pos0, length[, residue]); ``residue`` = arrival bits that an interrupted earlier call left in the word (default 0: a word at rest); schedule: tuple of
+    (sequence, head) pairs, each twice (arrival, then the store step). Returns (words by slot, fill seen by every CTA, number of stores per sequence)."""
     words = {}
-    for slot, _, pos0, _ in seqs:
-        words[slot] = pos0 if slot not in words else words[slot]
+    for slot, _, pos0, _, *residue in seqs:
+        words[slot] = (pos0 + ((residue[0] if residue else 0) << SHIFT)) if slot not in words else words[slot]
     old, seen, started, stores = {}, {}, set(), [0] * len(seqs)
     for (s, c) in schedule:
-        slot, H, pos0, length = seqs[s]
+        slot, H, pos0, length, *_ = seqs[s]
         if (s, c) not in started:
             started.add((s, c))
             old[(s, c)] = words[slot]
             if variant != "every_cta":                       # every_cta: a plain read, no counting
                 words[slot] = words[slot] + (1 << SHIFT)     # the atomic add (the result is the word before the add)
             seen[(s, c)] = old[(s, c)] if variant == "no_mask" else (old[(s, c)] & MASK)
-        elif elected(variant, old[(s, c)], H):
+        elif elected(variant, old[(s, c)], H, elect):
             stores[s] += 1
             words[slot] = new_pos(seen[(s, c)], length)      # the store: the plain new value (the counter is gone with it)
     return words, seen, stores
 
 
-def check_one(H, pos0, length, schedule, variant):
+def check_one(H, pos0, length, schedule, variant, elect=None, residue=0):
     """The two properties of the protocol for one sequence; returns a description of the first violation or None."""
-    words, seen, stores = run_words([(0, H, pos0, length)], [(0, c) for c in schedule], variant)
+    words, seen, stores = run_words([(0, H, pos0, length, residue)], [(0, c) for c in schedule], variant, elect)
     for c in range(H):
         if seen[(0, c)] != pos0:
             return "CTA %d started from fill %d, not %d" % (c, seen[(0, c)], pos0)
@@ -97,8 +106,8 @@ def check_one(H, pos0, length, schedule, variant):
     return None
 
 
-def violations(H, pos0, length, variant, schedules):
-    return [(s, v) for s in schedules for v in [check_one(H, pos0, length, s, variant)] if v is not None]
+def violations(H, pos0, length, variant, schedules, elect=None, residue=0):
+    return [(s, v) for s in schedules for v in [check_one(H, pos0, length, s, variant, elect, residue)] if v is not None]
 
 
 # ---- the protocol is correct in every interleaving ---------------------------------------------------------------------------------------------------------
@@ -226,3 +235,66 @@ def test_every_cta_of_a_sequence_takes_the_same_decision_to_participate():
     for length in (0, 1, 7):
         for slot in (-1, 0, 5):
             assert len({participates(length, slot, h) for h in range(33)}) == 1
+
+
+# ---- the model is the kernel's: constants and election come from the sources ------------------------------------------------------------------------------------
+def test_the_model_constants_are_the_ones_of_the_headers():
+    assert (BT, SHIFT, MASK) == (64, 8, 63) and CONSTANTS == ps.constants(ps.load())
+    assert MASK < (1 << SHIFT), "the fill must fit below the arrival counter"
+
+
+def test_the_model_election_is_the_pinned_expression():
+    for H in (1, 2, 3, 5, 64):
+        assert [c for c in range(H + 3) if PROTOCOL_ELECTS(c, H)] == [H - 1], H
+
+
+def edited_sources(tmp_path, old, new):
+    import test_decode_protocol_source as pins
+
+    return pins.copy_with(tmp_path, ps.load(), [(pins.R, old, new)])
+
+
+@pytest.mark.parametrize("name,new", [("p.H", "== p.H) st_relaxed_gpu("), ("0", "== 0) st_relaxed_gpu("), ("p.H - 2", "== p.H - 2) st_relaxed_gpu(")])
+def test_a_source_with_another_election_makes_the_model_fail(tmp_path, name, new):
+    """The model follows the edit: the protocol that the edited source would run is wrong, and the interleavings find it."""
+    elect = ps.election(edited_sources(tmp_path, "== p.H - 1) st_relaxed_gpu(", new))
+    for H in (2, 3, 4):
+        assert violations(H, 12, 1, "protocol", list(interleavings([2] * H)), elect=elect), (name, H)
+
+
+# ---- the preconditions are necessary: residue of an interrupted call, the capacity of the counter ----------------------------------------------------------------------
+def test_arrival_residue_is_outside_the_contract():
+    """An interrupted call can leave arrival bits in the word (they are not healed). With residue r the election fires after H - r arrivals (premature: the CTAs that arrive after the
+    store see a plain fill again and count anew) and with r >= H nobody is ever elected. Neither is a protocol that works; hence the precondition: pos at rest without residue."""
+    H = 3
+    scheds = list(interleavings([2] * H))
+    for r in (1, 2):
+        assert violations(H, 12, 1, "protocol", scheds, residue=r), "residue %d did not break the protocol in any interleaving" % r
+    words, seen, stores = run_words([(0, H, 12, 1, 3)], tuple((0, c) for c in [0, 1, 2, 0, 1, 2]))
+    assert stores == [0] and words[0] == 12 + ((3 + H) << SHIFT), "residue >= H: nobody stores, the counter just grows"
+
+
+def i32(x):
+    return ((x + 2 ** 31) % 2 ** 32) - 2 ** 31
+
+
+def last_arrival_is_elected_in_a_32_bit_word(H, fill=63):
+    """The arrival of the last CTA of H in a 32-bit signed word: does it see H - 1 above the shift? (The word before that arrival is the fill plus H - 1 additions of 2^SHIFT, reduced to
+    32 bits: a sum of adds that wrap equals the wrapped sum.)"""
+    old = i32(fill + (H - 1) * (1 << SHIFT))
+    return (old >> SHIFT) == H - 1
+
+
+def test_the_counter_fits_the_word_for_every_head_count_the_binding_admits():
+    assert ps.counter_limit_problems(SOURCES) == []
+    import re
+
+    limit = int(re.search(r"H\s*<\s*(\d+)\s*,\s*\"problem too large", ps.strip_comments(SOURCES["cfbi_binding.cpp"])).group(1))
+    assert last_arrival_is_elected_in_a_32_bit_word(limit - 1) and last_arrival_is_elected_in_a_32_bit_word(1)
+
+
+def test_the_counter_capacity_is_two_to_the_23_heads():
+    """The 23 bits above the shift hold the count of CTAs that arrived before: the last CTA of 2^23 heads still sees 2^23 - 1, one head more makes the word negative and nobody is
+    elected. The binding admits fewer than 2^16 heads, so the boundary is far away; it is pinned (R10) so that raising the limit or the shift cannot cross it unnoticed."""
+    assert last_arrival_is_elected_in_a_32_bit_word(2 ** (31 - SHIFT))
+    assert not last_arrival_is_elected_in_a_32_bit_word(2 ** (31 - SHIFT) + 1)
