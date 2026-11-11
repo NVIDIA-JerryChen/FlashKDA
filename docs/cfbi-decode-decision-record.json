@@ -1092,6 +1092,22 @@
     "threads_per_sm": 2048
    }
   },
+  "launch": {
+   "b200": {
+    "commit": "e9cf008",
+    "dynamic_smem": 0,
+    "label": "source",
+    "path": "csrc/cfbi/cfbi_launch.cu",
+    "threads": 256
+   },
+   "b300": {
+    "commit": "800250b",
+    "dynamic_smem": 0,
+    "label": "source",
+    "path": "csrc/cfbi/cfbi_launch.cu",
+    "threads": 256
+   }
+  },
   "lifetimes": {
    "label": "plan",
    "live_phases": {
@@ -1430,7 +1446,7 @@
    ]
   },
   "profile_commit": "19f6937feb6c9f13e0560402ab53816b0fe90963",
-  "recorded_on": "fe0ac8a6b4aff8661a9b300384075bd06e227444"
+  "recorded_on": "07abb21b31456babfb2ee2dc25925f3967b73111"
  },
  "order_basis": {
   "prototypes": {
