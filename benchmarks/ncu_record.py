@@ -9,6 +9,7 @@ Stall sampling needs enough samples: ncu's automatic warp sampling interval gave
 repository are collected with ``--warp-sampling-interval 0`` (a sample every 32 cycles) and a launch with fewer than ``MIN_SAMPLES`` samples is not accepted as evidence.
 """
 import csv
+import re
 from collections import Counter, defaultdict
 
 SCHEMA = "cfbi-ncu-segments-v1"
@@ -18,6 +19,32 @@ MIN_SAMPLES = 1000
 OPS = ("HMMA", "LDS", "LDG", "STG", "STS")      # the instruction counts that a segment line shows
 TOP_OPCODES = 28
 BARRIERS = ("BAR.SYNC", "BAR.ARV")
+NCU_BANNER = "NVIDIA (R) Nsight Compute Command Line Profiler"
+NCU_VERSION_LINE = re.compile(r"^Version (20[0-9]{2}\.[0-9]+\.[0-9]+(?:\.[0-9]+)?) \(build [0-9]+\)")
+NCU_VERSION_VALUE = re.compile(r"^20[0-9]{2}\.[0-9]+\.[0-9]+(?:\.[0-9]+)?$")
+
+
+def parse_ncu_version(text):
+    """The Nsight Compute version in the output of ``ncu --version``, which may sit in a container log that starts with other banners (the PyTorch banner has a ``Version`` line
+    of its own, and it comes first): the version line that follows the Nsight Compute banner. A log without the banner, a banner without a version line, a version of another
+    shape or two different versions raise ``ValueError``; there is no fallback to an assumed version."""
+    lines = text.splitlines()
+    found = set()
+    for i, line in enumerate(lines):
+        if line.strip() != NCU_BANNER:
+            continue
+        for nxt in lines[i + 1:i + 4]:
+            m = NCU_VERSION_LINE.match(nxt.strip())
+            if m:
+                found.add(m.group(1))
+                break
+        else:
+            raise ValueError("the Nsight Compute banner at line %d is not followed by a version line" % (i + 1))
+    if not found:
+        raise ValueError("no Nsight Compute banner (%r) in the log" % NCU_BANNER)
+    if len(found) > 1:
+        raise ValueError("the log names more than one Nsight Compute version: %s" % ", ".join(sorted(found)))
+    return found.pop()
 
 
 def num(x):

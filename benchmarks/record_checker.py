@@ -600,8 +600,8 @@ def ncu_problems(rec, heads=PROFILE_HEADS, expect_commit=None, min_samples=nr.MI
     if not isinstance(meta, dict) or not isinstance(summary, dict):
         return ["%s: metadata and summary are required" % where]
     problems = br.identity_problems(meta, where, expect_commit, True)
-    if not text(meta.get("ncu_version")):
-        problems.append("%s: ncu_version must be a non-empty string" % where)
+    if not (isinstance(meta.get("ncu_version"), str) and nr.NCU_VERSION_VALUE.match(meta["ncu_version"])):
+        problems.append("%s: ncu_version %r is not a Nsight Compute version (YYYY.N.N or YYYY.N.N.N): the version of another tool in the log must not stand for it" % (where, meta.get("ncu_version")))
     case = meta.get("case") if isinstance(meta.get("case"), dict) else {}
     if case.get("kernel") != "rows_kernel":
         problems.append("%s: case.kernel is %r, expected rows_kernel" % (where, case.get("kernel")))

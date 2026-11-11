@@ -202,6 +202,50 @@ def test_a_valid_ncu_record_passes():
     assert rc.ncu_problems(ncu_record(samples=4000), expect_commit="abc1234") == []
 
 
+# the output of `ncu --version` inside the container, as logged by the node runner: the PyTorch banner (with its own "Version" line) comes first
+NCU_VERSION_LOG = """
+=============
+== PyTorch ==
+=============
+
+NVIDIA Release 26.08 (build 406036884)
+PyTorch Version 2.14.0a0+4fdf77b
+Container image Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+NOTE: Mellanox network driver detected, but NVIDIA peer memory driver not
+      detected.  Multi-node communication performance may be reduced.
+
+NVIDIA (R) Nsight Compute Command Line Profiler
+Copyright (c) 2018-2026 NVIDIA Corporation
+Version 2026.3.0.0 (build 38525999) (public-release)
+[node_run] 2026-11-11T07:18:02Z host=umbriel-b200-091 tag=b200 mode=pyrun exit=0
+"""
+
+
+def test_the_ncu_version_is_the_nsight_compute_one_and_never_the_pytorch_banner():
+    assert nr.parse_ncu_version(NCU_VERSION_LOG) == "2026.3.0.0"
+    assert nr.parse_ncu_version(NCU_VERSION_LOG.replace("2026.3.0.0", "2027.1.2")) == "2027.1.2"
+    assert nr.parse_ncu_version(NCU_VERSION_LOG + NCU_VERSION_LOG) == "2026.3.0.0"                       # the same version twice is not ambiguous
+    for name, text in (("no Nsight Compute banner", NCU_VERSION_LOG.split("NVIDIA (R) Nsight")[0]),
+                       ("only a bare version line", "Version 2026.3.0.0 (build 38525999) (public-release)\n"),
+                       ("a banner without a version line", "NVIDIA (R) Nsight Compute Command Line Profiler\nCopyright (c) 2018-2026 NVIDIA Corporation\nnothing\n"),
+                       ("a version of another shape", NCU_VERSION_LOG.replace("2026.3.0.0 (build 38525999)", "2.14.0a0+4fdf77b (build 1)")),
+                       ("two different versions", NCU_VERSION_LOG + NCU_VERSION_LOG.replace("2026.3.0.0", "2025.4.1.0")),
+                       ("an empty log", "")):
+        with pytest.raises(ValueError):
+            nr.parse_ncu_version(text)
+        assert name
+
+
+@pytest.mark.parametrize("value", ["2.14.0a0+4fdf77b", "", "unknown", None, 2026.3, "2026.3", "v2026.3.0.0", "2026.3.0.0 (build 38525999)"])
+def test_the_ncu_record_names_a_real_nsight_compute_version(value):
+    rec = ncu_record()
+    assert rc.ncu_problems(rec) == []
+    assert has(rc.ncu_problems(mutated(rec, lambda r: r["meta"].update(ncu_version=value))), "ncu_version")
+    for good in ("2026.3.0.0", "2026.1.1", "2027.2.0.1"):
+        assert rc.ncu_problems(mutated(rec, lambda r: r["meta"].update(ncu_version=good))) == []
+
+
 @pytest.mark.parametrize("name,edit,expected", [
     ("too few stall samples", lambda r: r["summary"].update(samples=71.0), "at least 1000 are needed"),
     ("a dirty tree", lambda r: r["meta"].update(dirty=True), "dirty"),
