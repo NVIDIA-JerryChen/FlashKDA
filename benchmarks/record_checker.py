@@ -1240,7 +1240,20 @@ def _listing(entry, name, where, problems, allow_empty):
 
 
 def _same(a, b):
-    return a == b if not isinstance(a, float) and not isinstance(b, float) else (num(a) and num(b) and math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9))
+    if isinstance(a, float) or isinstance(b, float):
+        return num(a) and num(b) and math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)
+    return a == b
+
+
+def _missing_unexpected(want, got):
+    """``missing [...], unexpected [...]``: the first three keys of ``want`` that ``got`` lacks and of ``got`` that ``want`` lacks."""
+    want, got = set(want), set(got)
+    return "missing %s, unexpected %s" % (sorted(want - got)[:3], sorted(got - want)[:3])
+
+
+def _cell_keys(rec):
+    """The sorted keys of the cells of a raw record."""
+    return sorted(c.get("key") for c in rec.get("cells", []) if isinstance(c, dict))
 
 
 def report_problems(report, result, where):
@@ -1255,7 +1268,7 @@ def report_problems(report, result, where):
     if len(rows) != len(report["rows"]):
         out.append("%s: the report's rows are not unique cells" % where)
     if set(rows) != set(want):
-        out.append("%s: the report has %d cell(s), the raw records judge %d: missing %s, unexpected %s" % (where, len(rows), len(want), sorted(set(want) - set(rows))[:3], sorted(set(rows) - set(want))[:3]))
+        out.append("%s: the report has %d cell(s), the raw records judge %d: %s" % (where, len(rows), len(want), _missing_unexpected(want, rows)))
     for key in sorted(set(rows) & set(want)):
         bad = [f for f in ROW_EXACT + ROW_NUMERIC if not _same(rows[key].get(f), want[key].get(f))]
         if bad:
@@ -1278,8 +1291,7 @@ def baseline_contract_problems(baseline, dev, campaign, where):
         out.append("%s: the baseline's metrics %s are not the campaign's %s" % (where, sorted(spec.get("metrics") or []), sorted(CANONICAL_METRICS[campaign])))
     want = sorted(canonical_cells(campaign))
     if sorted(spec.get("cells") or []) != want:
-        got = set(spec.get("cells") or [])
-        out.append("%s: the baseline's cells are not the benchmark's %d cells (missing %s, unexpected %s)" % (where, len(want), sorted(set(want) - got)[:3], sorted(got - set(want))[:3]))
+        out.append("%s: the baseline's cells are not the benchmark's %d cells (%s)" % (where, len(want), _missing_unexpected(want, spec.get("cells") or [])))
     if DEVICE_GPU[dev] not in str(baseline.get("gpu")):
         out.append("%s: the baseline is of the GPU %r, the device is %s" % (where, baseline.get("gpu"), dev))
     return out
@@ -1309,13 +1321,14 @@ def campaign_evidence_problems(entry, where, campaign, dev, baseline, base, a_co
         return problems, info
     if rerun["A"] and not allow_rerun:
         problems.append("%s: a campaign that is itself the three-times campaign is never re-run (the factor would compound): records_rerun must be empty" % where)
+    paths = _paths(first) + _paths(rerun)
     loaded = {}
-    for path in _paths(first) + _paths(rerun):
+    for path in paths:
         try:
             loaded[path] = br.load_record(path)
         except (OSError, ValueError) as e:
             problems.append("%s: the raw record %s cannot be read again (%s)" % (where, path, e))
-    if len(loaded) != len(set(_paths(first) + _paths(rerun))):
+    if len(loaded) != len(set(paths)):
         return problems, info
     sides = {"A": a_commit, "B": b_commit}
     hosts = set()
@@ -1335,19 +1348,25 @@ def campaign_evidence_problems(entry, where, campaign, dev, baseline, base, a_co
         problems.append("%s: the raw records come from %d hosts (%s): a campaign runs on one allocation" % (where, len(hosts), ", ".join(sorted(str(h) for h in hosts))))
     if problems:
         return problems, info
-    wanted = canonical_coverage(campaign) if scope is None else dict((m, sorted(c)) for m, c in scope.items())
-    every = sorted(set(k for cells in wanted.values() for k in cells)) if scope is not None else sorted(canonical_cells(campaign))
-    what = "benchmark's definition" if scope is None else "flagged set"
+    if scope is None:
+        wanted = canonical_coverage(campaign)
+        every = sorted(canonical_cells(campaign))
+        what = "benchmark's definition"
+    else:
+        wanted = dict((m, sorted(c)) for m, c in scope.items())
+        every = sorted(set(k for cells in wanted.values() for k in cells))
+        what = "flagged set"
     for side in ("A", "B"):
         for path in first[side]:                                  # a first-campaign file holds every cell of the campaign
-            got = sorted(c.get("key") for c in loaded[path].get("cells", []) if isinstance(c, dict))
+            got = _cell_keys(loaded[path])
             if got != every:
-                problems.append("%s: the raw record %s holds %d cell(s), the %s holds %d: missing %s, unexpected %s" % (
-                    where, path, len(got), what, len(every), sorted(set(every) - set(got))[:3], sorted(set(got) - set(every))[:3]))
+                problems.append("%s: the raw record %s holds %d cell(s), the %s holds %d: %s" % (where, path, len(got), what, len(every), _missing_unexpected(every, got)))
         for path in rerun[side]:                                  # a re-run file holds the cells that were re-run: some of them, and none that the campaign does not have
-            got = sorted(c.get("key") for c in loaded[path].get("cells", []) if isinstance(c, dict))
-            if not got or set(got) - set(every):
-                problems.append("%s: the re-run record %s holds %d cell(s), %s of the %s are not among them" % (where, path, len(got), "none" if not got else "some", what))
+            got = _cell_keys(loaded[path])
+            if not got:
+                problems.append("%s: the re-run record %s holds no cell: a re-run file holds the cells that were re-run" % (where, path))
+            elif set(got) - set(every):
+                problems.append("%s: the re-run record %s holds cell(s) that the %s does not have: %s" % (where, path, what, sorted(set(got) - set(every))[:3]))
     if problems:
         return problems, info
     a_first, b_first = [loaded[p] for p in first["A"]], [loaded[p] for p in first["B"]]
@@ -1369,8 +1388,7 @@ def campaign_evidence_problems(entry, where, campaign, dev, baseline, base, a_co
             continue
         rows = [r["key"] for r in res["rows"]]
         if sorted(rows) != sorted(wanted[metric]):
-            problems.append("%s: the raw records judge %d cell(s), the %s has %d: missing %s, unexpected %s" % (
-                w, len(rows), "benchmark's definition" if scope is None else "flagged set", len(wanted[metric]), sorted(set(wanted[metric]) - set(rows))[:3], sorted(set(rows) - set(wanted[metric]))[:3]))
+            problems.append("%s: the raw records judge %d cell(s), the %s has %d: %s" % (w, len(rows), what, len(wanted[metric]), _missing_unexpected(wanted[metric], rows)))
         for row in res["rows"]:
             info["rows"][(metric, row["key"])] = row
         if metric in by_metric:
@@ -1433,9 +1451,9 @@ def final_problems(rec, repo=None, head="HEAD", document_text=None):
             cw = "%s: %s %s" % (where, dev, campaign)
             contract = baseline_contract_problems(baseline, dev, campaign, cw)
             problems.extend(contract)
-            entry = (d.get("campaigns") or {}).get(campaign) if isinstance(d.get("campaigns"), dict) else None
             if contract:
                 continue
+            entry = d["campaigns"].get(campaign) if isinstance(d.get("campaigns"), dict) else None
             probs, info = campaign_evidence_problems(entry, cw, campaign, dev, baseline, base, base, final)
             problems.extend(probs)
             campaign_info[(dev, campaign)] = (entry, info)

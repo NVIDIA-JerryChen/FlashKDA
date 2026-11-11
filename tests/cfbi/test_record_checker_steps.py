@@ -1076,6 +1076,23 @@ def test_an_unstable_cell_needs_its_rerun_with_three_times_the_calls_and_a_legal
     assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"].update(decode=scale_one)), h), "recomputed from the raw records is INVALID")
 
 
+def test_a_rerun_file_holds_some_of_the_campaigns_cells_and_none_that_it_does_not_have(tmp_path, final_repo):
+    h = final_repo
+    cell = DECODE_KEYS[3]
+    entry = campaign_files(tmp_path, "rerunfiles", "decode", "b200", h["base"], h["final"], "node-a-b200", "sc-b200-1", spreads={cell: 0.01}, rerun_cells=[cell])
+    rec = mutated(final_record(tmp_path, h), lambda r: r["devices"]["b200"]["campaigns"].update(decode=entry))
+    assert fcheck(rec, h) == []                                                                   # a legal re-run of one cell: the file holds that cell only
+    path = entry["records_rerun"]["A"][0]
+    data = json.loads(Path(path).read_text())
+    original = Path(path).read_text()
+    data["cells"] = []
+    Path(path).write_text(json.dumps(data))
+    assert has(fcheck(rec, h), "holds no cell")
+    data["cells"] = json.loads(original)["cells"] + [dict(json.loads(original)["cells"][0], key="decode;N=9;H=9;regime=lockstep;")]
+    Path(path).write_text(json.dumps(data))
+    assert has(fcheck(rec, h), "holds cell(s) that the benchmark's definition does not have")
+
+
 def test_a_regression_of_the_final_ab_needs_a_known_limit_with_its_evidence(tmp_path, final_repo):
     h = final_repo
     slow = {"b200": {SLOW_CELL: 1.08}}
