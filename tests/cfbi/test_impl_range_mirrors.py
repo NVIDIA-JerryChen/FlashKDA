@@ -22,7 +22,7 @@ CSRC = ROOT / "csrc" / "cfbi"
 HEADER, LAUNCH = CSRC / "cfbi_policy.h", CSRC / "cfbi_launch.cu"
 MIRRORS = {"binding": CSRC / "cfbi_binding.cpp", "api": ROOT / "flash_kda" / "cfbi" / "api.py", "verify": ROOT / "flash_kda" / "cfbi" / "verify.py",
            "bench": ROOT / "benchmarks" / "bench_breakdown.py", "arch": ROOT / "tests" / "cfbi" / "test_arch.py", "invalid": ROOT / "tests" / "cfbi" / "test_k2_dyn.py",
-           "perf": ROOT / "docs" / "20261103-cfbi-perf.md"}
+           "perf": ROOT / "docs" / "20261103-cfbi-perf.md", "launch_h": CSRC / "cfbi_launch.h"}
 NOT_BITS = ("IMPL_MAX", "IMPL_ROWS_SWAP_RESERVED")
 
 
@@ -98,6 +98,8 @@ def mirror_problems(header_text, launch_text, texts):
         probs.append("test_k2_dyn.py does not reject %d (the reserved value)" % reserved)
     if spaced not in texts["perf"]:
         probs.append("the performance document does not state the range %s" % spaced)
+    if spaced not in texts["launch_h"] or "%d is reserved" % reserved not in texts["launch_h"]:
+        probs.append("cfbi_launch.h does not state the range %s and the reserved value %d" % (spaced, reserved))
     if consts["IMPL_REF_ROWS"] != dp.IMPL_REF_ROWS or consts["IMPL_DECODE_PLAN"] != dp.IMPL_DECODE_PLAN:
         probs.append("decode_policy.py uses other bits than the header")
     return probs
@@ -165,6 +167,7 @@ def test_the_mirrors_state_the_range_and_the_bits(header, launch, texts):
     ("arch", "for impl in range(128):", "for impl in range(64):", "test_arch.py does not sweep"),
     ("invalid", "for bad in (128, 63,", "for bad in (64, 63,", "does not reject 128"),
     ("perf", "the accepted values are 0 .. 127", "the accepted values are 0 .. 63", "performance document"),
+    ("launch_h", "every value 0 .. 127, IMPL_MAX, is accepted; 128 is reserved and rejected", "every value 0 .. IMPL_MAX is accepted", "cfbi_launch.h does not state"),
 ])
 def test_a_mirror_that_falls_behind_the_header_is_caught(header, launch, texts, where, old, new, expect):
     mutated = dict(texts, **{where: mutate(texts[where], old, new)})

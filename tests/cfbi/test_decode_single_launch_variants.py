@@ -29,6 +29,17 @@ H, STEPS, REPEATS = 12, 5, 3
 DELAY_NS = 50000
 
 
+@pytest.fixture(scope="module", autouse=True)
+def single_launch_forced(ext):
+    """The hidden calibration control on for every test of the module (and off again afterwards): the default build runs the single launch whatever the device's routing and the size of the
+    grid, and every variant build is forced the same way when it is built (``build_variant``)."""
+    previous = ext.decode_single_force(True)
+    try:
+        yield
+    finally:
+        ext.decode_single_force(previous)
+
+
 @pytest.fixture(scope="module")
 def workload(ext):
     """More than two waves of CTAs, every sequence at its own chunk phase (the chain crosses chunk ends), the state every run starts from."""
@@ -50,6 +61,7 @@ def build_variant(name, defines):
             _BUILT[name] = load_variant(name, tuple(defines))
         except Exception as e:   # pragma: no cover - the variants need a JIT build
             pytest.skip(f"cannot build the variant {name}: {e}")
+        _BUILT[name].decode_single_force(True)   # a variant is a module of its own, with its own switch: its decode calls are the single launch whatever the device and the grid
     return _BUILT[name]
 
 

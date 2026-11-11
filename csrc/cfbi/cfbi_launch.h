@@ -126,7 +126,7 @@ DeviceCaps device_caps(int device);   // device < 0: the current device
 // the reference kernels (IMPL_REF_ROWS | IMPL_REF_CHUNK); a device whose shared-memory opt-in limit is below the
 // chunk kernels' need gets IMPL_ROWS_ONLY | IMPL_REF_ROWS (the reference row engine). Idempotent. The row engine evaluates the same program row by row, so
 // the bits do not depend on this choice, only the speed does (tests/cfbi/test_vs_ref.py, test_arch.py).
-// Precedence of the bits (every value 0 .. IMPL_MAX is accepted): IMPL_DECODE_PLAN is a request of its own that no other bit clears and that clears no other bit; it acts only on a
+// Precedence of the bits (every value 0 .. 127, IMPL_MAX, is accepted; 128 is reserved and rejected): IMPL_DECODE_PLAN is a request of its own that no other bit clears and that clears no other bit; it acts only on a
 // decode call of the optimised row engine (decode_single_launch_eligible, cfbi_policy.h), so it never reaches rows_kernel<true> and changes nothing for mode 0, and
 // IMPL_REF_ROWS (requested, or set here below sm_90 or without room for K1) keeps the plan kernel in front of the frozen row engine whatever else is requested.
 int resolve_impl(int requested, int device = -1);
