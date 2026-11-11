@@ -20,6 +20,7 @@ for _p in (_ROOT / "benchmarks", _ROOT / "tests" / "cfbi"):
         sys.path.insert(0, str(_p))
 
 import codegen_gate as cg  # noqa: E402
+import bench_records as br  # noqa: E402
 import record_checker as rc  # noqa: E402
 import test_bench_tools as tbt  # noqa: E402
 from test_record_checker import commit_file, git, has, mutated  # noqa: E402
@@ -765,90 +766,221 @@ def test_the_handoff_command_line(handoff_repo, tmp_path):
 
 
 # ---- the final record ------------------------------------------------------------------------------------------------------------------------
-FINAL_DOC = "# Performance\n\n## Not done / known limits\nThe cell %s is slower than the base on B200 with all changes reverted too.\n\n## Appendix\nx\n" % CELL
+PERF_DOC = ("# Performance\n\n## Results\nNumbers.\n\n## Not done / known limits\nThe cell %s is slower than the base on B200 with every change reverted too (the node, not the code).\n\n"
+            "## Appendix\nx\n")
+DECODE_CELLS = {"decode;N=1;H=12;regime=lockstep;": 14.0, "decode;N=64;H=12;regime=lockstep;": 55.0, "decode;N=64;H=12;regime=cold;": 61.0}
+CHAIN_CELLS = {"chain;N=1;H=12;Dm=2048;regime=lockstep;": 90.0}
+SLOW_CELL = "decode;N=64;H=12;regime=lockstep;"
+METRIC = "k2_stage_us"
 
 
-def final_record(**cells):
-    def entry(delta, **kw):
-        e = {"verdict": "PASS", "median_delta_pct": delta, "tolerance_pct": 1.0, "base_median": 14.0, "cand_median": 14.0 * (1 + delta / 100.0), "noise_limited": False, "confirmed": False}
-        e.update(kw)
-        return e
-    ab = dict((d, {"cells": {CELL: entry(-3.2), "decode;N=64;H=12;regime=lockstep;": entry(0.4)}}) for d in rc.DEVICES)
-    for key, e in cells.items():
-        ab["b200"]["cells"][key] = e
-    return {"schema": rc.FINAL_SCHEMA, "meta": {"commit": C5, "dirty": False}, "final_ab": ab, "known_limits": [], "_path": "mem"}
+@pytest.fixture(scope="module")
+def final_repo(tmp_path_factory):
+    """A history: the base, the measured final candidate, a docs-only commit after it, and (on another line) a source change after the measurement."""
+    repo = tmp_path_factory.mktemp("final") / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    h = {"repo": repo}
+    h["base"] = commit_file(repo, "csrc/k.cu", "base\n", "base")
+    h["final"] = commit_file(repo, "csrc/k.cu", "the final candidate\n", "the final candidate")
+    h["docs"] = commit_file(repo, "docs/perf.md", PERF_DOC % SLOW_CELL, "the performance document, committed after the records it quotes")
+    git(repo, "checkout", "-q", "-b", "later", h["docs"])
+    h["source"] = commit_file(repo, "csrc/k.cu", "changed again after the measurement\n", "a source change")
+    git(repo, "checkout", "-q", "main")
+    return h
 
 
-def confirmed_regression(delta=2.5):
-    return {"verdict": "FAIL", "median_delta_pct": delta, "tolerance_pct": 1.0, "base_median": 14.0, "cand_median": 14.35, "noise_limited": False, "confirmed": True}
+def campaign_files(d, name, cells, base, cand, host="node-a", slow=None, allocation="sc-1", metric=METRIC):
+    """One campaign: three interleaved records per side written to ``d`` (``cells``: key -> total_us of the base; the candidate side is ``slow[key]`` times slower where given), the comparison
+    report that ``compare_bench --json`` would write for it, and the entry of the final record that names them."""
+    slow = slow or {}
+    base_recs = [tbt.rec(base, dict((k, [v] * 5) for k, v in cells.items()), "2026-11-05T10:0%d:00Z" % (2 * i), host=host) for i in range(3)]
+    cand_recs = [tbt.rec(cand, dict((k, [v * slow.get(k, 1.0)] * 5) for k, v in cells.items()), "2026-11-05T10:0%d:00Z" % (2 * i + 1), host=host) for i in range(3)]
+    pa, pb = tbt.write_records(str(d), name + "-A", base_recs), tbt.write_records(str(d), name + "-B", cand_recs)
+    result = br.compare(base_recs, cand_recs, metric=metric, tol_pct=1.0, mode="regress", expect_base_commit=base)
+    report = Path(d) / (name + "-report.json")
+    report.write_text(json.dumps([result], default=str))
+    return {"report": str(report), "records": pa + pb, "allocation": allocation}
 
 
-def test_a_final_record_with_a_verdict_for_every_cell_passes():
-    assert rc.final_problems(final_record()) == []
+def final_record(d, h, slow=None, known_limits=(), host="node-a"):
+    """The final record of both devices (each with a decode and a chain campaign of the measured commit against the base) and its baselines."""
+    d = Path(d)
+    devices = {}
+    for dev in rc.DEVICES:
+        baseline = d / ("baseline-%s.json" % dev)
+        baseline.write_text(json.dumps({"commit": h["base"], "decode_matrix": {"cells": sorted(DECODE_CELLS), "metrics": [METRIC], "bench": "decode", "tolerance_pct": 1.0},
+                                        "layer_chain": {"cells": sorted(CHAIN_CELLS), "metrics": [METRIC], "bench": "chain", "tolerance_pct": 1.0}}))
+        campaigns = {"decode": campaign_files(d, "%s-decode" % dev, DECODE_CELLS, h["base"], h["final"], host="%s-%s" % (host, dev), slow=(slow or {}).get(dev), allocation="sc-%s-1" % dev),
+                     "chain": campaign_files(d, "%s-chain" % dev, CHAIN_CELLS, h["base"], h["final"], host="%s-%s" % (host, dev), allocation="sc-%s-1" % dev)}
+        devices[dev] = {"baseline": str(baseline), "campaigns": campaigns}
+    return {"schema": rc.FINAL_SCHEMA, "meta": {"commit": h["final"], "base": h["base"], "dirty": False}, "devices": devices, "known_limits": list(known_limits), "_path": "mem"}
 
 
-FINAL_MUTANTS = [
-    ("a dirty tree", lambda r: r["meta"].update(dirty=True), "dirty"),
-    ("a commit that is not a hash", lambda r: r["meta"].update(commit="x"), "hexadecimal"),
-    ("one device only", lambda r: r["final_ab"].pop("b300"), "final_ab must give the final A/B"),
-    ("a device without cells", lambda r: r["final_ab"]["b300"].update(cells={}), "has no cells"),
-    ("a cell without a verdict", lambda r: r["final_ab"]["b200"]["cells"][CELL].pop("verdict"), "a verdict (PASS or FAIL)"),
-    ("a verdict that is neither", lambda r: r["final_ab"]["b200"]["cells"][CELL].update(verdict="INVALID"), "a verdict (PASS or FAIL)"),
-    ("a cell without a median difference", lambda r: r["final_ab"]["b300"]["cells"][CELL].update(median_delta_pct=None), "the median difference"),
-    ("a cell without a tolerance", lambda r: r["final_ab"]["b300"]["cells"][CELL].update(tolerance_pct=0), "the tolerance"),
-    ("a PASS for a cell that is slower beyond the tolerance", lambda r: r["final_ab"]["b200"]["cells"][CELL].update(median_delta_pct=2.0), "does not agree"),
-    ("a FAIL for a cell that is not slower", lambda r: r["final_ab"]["b200"]["cells"][CELL].update(verdict="FAIL", median_delta_pct=0.2, confirmed=True), "does not agree"),
-    ("a noise-limited cell without its widened tolerance", lambda r: r["final_ab"]["b200"]["cells"][CELL].update(noise_limited=True), "effective_tolerance_pct"),
-]
+def known_limit(d, h, dev="b200", cell=SLOW_CELL, factor=1.08, confirm_host="node-b", confirm_alloc="sc-b200-2", reverted_factor=1.08):
+    """The known-limit entry for a regression of ``cell``: its confirmation on another node and allocation, and the run with every change reverted (the candidate is the base)."""
+    return {"device": dev, "campaign": "decode", "metric": METRIC, "cell": cell,
+            "confirmation": campaign_files(d, "%s-confirm" % dev, DECODE_CELLS, h["base"], h["final"], host=confirm_host, slow={cell: factor}, allocation=confirm_alloc),
+            "all_changes_reverted": campaign_files(d, "%s-reverted" % dev, DECODE_CELLS, h["base"], h["base"], host="node-c", slow={cell: reverted_factor}, allocation="sc-b200-3")}
 
 
-@pytest.mark.parametrize("name,edit,expected", FINAL_MUTANTS, ids=[m[0] for m in FINAL_MUTANTS])
-def test_a_broken_final_record_is_rejected(name, edit, expected):
-    assert has(rc.final_problems(mutated(final_record(), edit)), expected), name
+def fcheck(rec, h, head=None, document=PERF_DOC % SLOW_CELL):
+    return rc.final_problems(rec, h["repo"], head or h["docs"], document)
 
 
-def test_a_noise_limited_cell_is_judged_against_its_widened_tolerance():
-    rec = final_record()
-    rec["final_ab"]["b200"]["cells"][CELL].update(noise_limited=True, effective_tolerance_pct=2.5, median_delta_pct=2.0)
-    assert rc.final_problems(rec) == []
-    rec["final_ab"]["b200"]["cells"][CELL].update(median_delta_pct=3.0)
-    assert has(rc.final_problems(rec), "does not agree")
+def test_a_complete_final_record_passes_against_a_docs_only_history(tmp_path, final_repo):
+    rec = final_record(tmp_path, final_repo)
+    assert fcheck(rec, final_repo) == []
+    assert fcheck(rec, final_repo, head=final_repo["final"]) == []                         # HEAD is the measured commit itself
 
 
-def test_a_confirmed_final_regression_is_a_known_limit_only_if_it_survives_reverting_everything():
-    key = "decode;N=64;H=12;regime=staggered;"
-    rec = final_record(**{key: confirmed_regression()})
-    assert has(rc.final_problems(rec, FINAL_DOC), "has no known-limit entry")
-    limit = {"device": "b200", "cell": key, "final": {"median_delta_pct": 2.5}, "all_changes_reverted": {"verdict": "FAIL", "median_delta_pct": 2.4}}
-    with_limit = mutated(rec, lambda r: r["known_limits"].append(limit))
-    doc = FINAL_DOC.replace(CELL, key)
-    assert rc.final_problems(with_limit, doc) == []
-    assert has(rc.final_problems(with_limit, FINAL_DOC), "does not name the cell")                                  # the performance document must name the cell
-    assert has(rc.final_problems(with_limit, "# no section at all\n"), "does not name the cell")
-    no_shift = mutated(with_limit, lambda r: r["known_limits"][0].update(all_changes_reverted={"verdict": "PASS", "median_delta_pct": 0.1}))
-    assert has(rc.final_problems(no_shift, doc), "the same shift")                                                  # reverting removes it: caused by the changes, not a known limit
-    missing = mutated(with_limit, lambda r: r["known_limits"][0].pop("all_changes_reverted"))
-    assert has(rc.final_problems(missing, doc), "with all changes reverted")
-    other_cell = mutated(with_limit, lambda r: r["known_limits"][0].update(cell=CELL))
-    assert has(rc.final_problems(other_cell, doc), "has no known-limit entry")
-    other_device = mutated(with_limit, lambda r: r["known_limits"][0].update(device="b300"))
-    assert has(rc.final_problems(other_device, doc), "has no known-limit entry")
-    unconfirmed = final_record(**{key: dict(confirmed_regression(), confirmed=False)})
-    assert has(rc.final_problems(unconfirmed, FINAL_DOC), "was not confirmed")
+def test_the_record_commit_rule_and_the_clean_tree_apply_to_the_final_record(tmp_path, final_repo):
+    h = final_repo
+    rec = final_record(tmp_path, h)
+    assert has(fcheck(mutated(rec, lambda r: r["meta"].update(commit="0000000")), h), "does not have")                   # a commit that does not exist
+    assert has(fcheck(rec, h, head=h["source"]), "outside docs/")                                                        # a source change since the measured commit
+    assert has(rc.final_problems(rec, None, "HEAD", PERF_DOC % SLOW_CELL), "repo is required")
+    assert has(fcheck(mutated(rec, lambda r: r["meta"].update(base="x")), h), "meta.base")
+    assert has(fcheck(mutated(rec, lambda r: r["meta"].update(dirty=True)), h), "dirty")
+    tracked = Path(h["repo"]) / "csrc" / "k.cu"
+    original = tracked.read_text()
+    try:
+        tracked.write_text("an uncommitted change\n")
+        assert has(fcheck(rec, h), "not clean")
+    finally:
+        tracked.write_text(original)
+    assert fcheck(rec, h) == []
 
 
-def test_the_final_command_line(tmp_path):
-    good, bad, doc = tmp_path / "final.json", tmp_path / "bad.json", tmp_path / "perf.md"
-    key = "decode;N=64;H=12;regime=staggered;"
-    limit = {"device": "b200", "cell": key, "all_changes_reverted": {"verdict": "FAIL", "median_delta_pct": 2.4}}
-    rec = mutated(final_record(**{key: confirmed_regression()}), lambda r: r["known_limits"].append(limit))
+def edit_report(entry, edit):
+    """Rewrite a campaign's report file after ``edit(results)``."""
+    path = Path(entry["report"])
+    data = json.loads(path.read_text())
+    edit(data)
+    path.write_text(json.dumps(data))
+
+
+def row_of(results, key=SLOW_CELL):
+    return next(r for r in results[0]["rows"] if r["key"] == key)
+
+
+@pytest.mark.parametrize("name,edit,expected", [
+    ("a candidate median that contradicts the declared difference", lambda res: row_of(res).update(cand_median=row_of(res)["base_median"] * 2), "apart, the report says"),
+    ("a base median that contradicts it", lambda res: row_of(res).update(base_median=row_of(res)["base_median"] * 3), "apart, the report says"),
+    ("a median that is missing", lambda res: row_of(res).pop("cand_median"), "positive finite numbers"),
+    ("a median that is zero", lambda res: row_of(res).update(base_median=0), "positive finite numbers"),
+    ("a median that is NaN", lambda res: row_of(res).update(cand_median=float("nan")), "positive finite numbers"),
+    ("a difference that is missing", lambda res: row_of(res).pop("median_delta_pct"), "apart, the report says"),
+    ("a cell that is missing", lambda res: res[0]["rows"].pop(0), "missing"),
+    ("a cell that is not one of the baseline's", lambda res: res[0]["rows"].append(dict(row_of(res), key="decode;N=9;H=9;regime=lockstep;")), "unexpected"),
+    ("a cell twice", lambda res: res[0]["rows"].append(dict(row_of(res))), "not unique"),
+    ("a report with another metric", lambda res: res[0].update(metric="total_us"), "the report has the metrics"),
+    ("a report without the metric of the baseline", lambda res: res.clear() or res.append({"metric": "k1_us", "rows": [], "mode": "regress", "verdict": "PASS", "tol_pct": 1.0}), "the report has the metrics"),
+    ("an INVALID comparison", lambda res: res[0].update(verdict="INVALID"), "not INVALID"),
+    ("a comparison of another mode", lambda res: res[0].update(mode="within"), "regress comparison"),
+    ("another tolerance", lambda res: res[0].update(tol_pct=5.0), "tolerance"),
+    ("a PASS for a row that is slower beyond its tolerance", lambda res: row_of(res).update(delta_pct=row_of(res)["tol_pct_effective"] + 1.0, status="PASS"), "does not agree"),
+    ("a FAIL for a row that is not slower", lambda res: row_of(res).update(status="FAIL"), "does not agree"),
+    ("an effective tolerance below the tolerance", lambda res: row_of(res).update(tol_pct_effective=0.1), "effective tolerance"),
+    ("no status", lambda res: row_of(res).pop("status"), "a status"),
+    ("a report that is not a list", lambda res: res.append(3), "not a comparison report"),
+])
+def test_a_final_report_that_contradicts_its_numbers_or_misses_cells_is_rejected(tmp_path, final_repo, name, edit, expected):
+    rec = final_record(tmp_path, final_repo)
+    assert fcheck(rec, final_repo) == []
+    edit_report(rec["devices"]["b300"]["campaigns"]["decode"], edit)
+    assert has(fcheck(rec, final_repo), expected), (name, fcheck(rec, final_repo)[:3])
+
+
+def test_a_report_that_is_not_a_report_or_is_gone_is_rejected(tmp_path, final_repo):
+    rec = final_record(tmp_path, final_repo)
+    Path(rec["devices"]["b200"]["campaigns"]["chain"]["report"]).write_text('{"not": "a list"}')
+    assert has(fcheck(rec, final_repo), "is not a comparison report")
+    rec["devices"]["b300"]["campaigns"]["chain"]["report"] = str(tmp_path / "gone.json")
+    assert has(fcheck(rec, final_repo), "cannot be read")
+
+
+def test_the_raw_records_of_the_final_campaign_are_of_the_measured_commit_the_base_and_one_host(tmp_path, final_repo):
+    h = final_repo
+    rec = final_record(tmp_path, h)
+    entry = rec["devices"]["b200"]["campaigns"]["decode"]
+    older = campaign_files(tmp_path, "older", DECODE_CELLS, h["base"], "a" * 40, host="node-b200")                         # the candidate side of an older tree
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].update(records=older["records"])), h), "no raw record is of the commit that is measured")
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].update(records=[])), h), "raw records that the report was made from must be named")
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].update(records=entry["records"] + [str(tmp_path / "gone.json")])), h), "cannot be read again")
+    other_host = campaign_files(tmp_path, "otherhost", DECODE_CELLS, h["base"], h["final"], host="node-z")
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].update(records=entry["records"] + other_host["records"][:1])), h), "more than one host")
+    base_only = [p for p in entry["records"] if "-A" in os.path.basename(p)]
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].update(records=base_only)), h), "no raw record is of the commit that is measured")
+    cand_only = [p for p in entry["records"] if "-B" in os.path.basename(p)]
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].update(records=cand_only)), h), "nothing to compare with")
+    third = campaign_files(tmp_path, "third", DECODE_CELLS, "c" * 40, h["final"], host="node-a-b200")
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].update(records=third["records"])), h), "neither the base")
+    dirty = tbt.rec(h["final"], dict((k, [v] * 5) for k, v in DECODE_CELLS.items()), "2026-11-05T11:00:00Z", host="node-a-b200", dirty=True)
+    dirty_path = tbt.write_records(str(tmp_path), "dirtyrec", [dirty])[0]
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].update(records=entry["records"] + [dirty_path])), h), "dirty")
+
+
+def test_a_final_record_needs_both_devices_both_campaigns_and_the_baselines(tmp_path, final_repo):
+    h = final_repo
+    rec = final_record(tmp_path, h)
+    assert has(fcheck(mutated(rec, lambda r: r["devices"].pop("b300")), h), "devices must give the final A/B")
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"].pop("chain")), h), "the campaign evidence is missing")
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"]["campaigns"]["decode"].pop("allocation")), h), "allocation")
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"].update(baseline=str(tmp_path / "gone.json"))), h), "consolidated baseline")
+    wrong = tmp_path / "wrong-base.json"
+    wrong.write_text(json.dumps({"commit": "9" * 40, "decode_matrix": {}, "layer_chain": {}}))
+    assert has(fcheck(mutated(rec, lambda r: r["devices"]["b200"].update(baseline=str(wrong))), h), "the base of the loop is")
+
+
+def test_a_regression_of_the_final_ab_needs_a_known_limit_with_its_evidence(tmp_path, final_repo):
+    h = final_repo
+    slow = {"b200": {SLOW_CELL: 1.08}}
+    unconfirmed = final_record(tmp_path, h, slow=slow)
+    assert has(fcheck(unconfirmed, h), "has no known-limit entry")
+    limit = known_limit(tmp_path, h)
+    rec = final_record(tmp_path, h, slow=slow, known_limits=[limit])
+    assert fcheck(rec, h) == []
+    cases = (
+        ("no document", lambda: rc.final_problems(rec, h["repo"], h["docs"], None), "needs the performance document"),
+        ("a document that does not name the cell", lambda: fcheck(rec, h, document=PERF_DOC % "decode;N=2;H=2;regime=cold;"), "does not name the cell"),
+        ("a document without the section", lambda: fcheck(rec, h, document="# nothing\n"), "does not name the cell"),
+        ("a confirmation on the node of the final A/B", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].update(
+            confirmation=known_limit(tmp_path, h, confirm_host="node-a-b200")["confirmation"])), h), "same node"),
+        ("a confirmation under the same allocation", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0]["confirmation"].update(allocation="sc-b200-1")), h), "second allocation is required"),
+        ("a confirmation that does not fail the cell", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].update(
+            confirmation=known_limit(tmp_path, h, factor=1.0)["confirmation"])), h), "does not confirm"),
+        ("a run with all changes reverted that shows no shift", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].update(
+            all_changes_reverted=known_limit(tmp_path, h, reverted_factor=1.0)["all_changes_reverted"])), h), "caused by the changes"),
+        ("a run with all changes reverted that is of the final tree", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].update(
+            all_changes_reverted=known_limit(tmp_path, h)["confirmation"])), h), "neither the base"),
+        ("no confirmation", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].pop("confirmation")), h), "the campaign evidence is missing"),
+        ("no run with all changes reverted", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].pop("all_changes_reverted")), h), "the campaign evidence is missing"),
+        ("a limit for another cell", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].update(cell="decode;N=1;H=12;regime=lockstep;")), h), "has no known-limit entry"),
+        ("a limit of another device", lambda: fcheck(mutated(rec, lambda r: r["known_limits"][0].update(device="b300")), h), "has no known-limit entry"),
+    )
+    for name, run, expected in cases:
+        assert has(run(), expected), (name, run()[:3])
+
+
+def test_the_final_command_line(tmp_path, final_repo, capsys):
+    h = final_repo
+    slow = {"b200": {SLOW_CELL: 1.08}}
+    rec = final_record(tmp_path, h, slow=slow, known_limits=[known_limit(tmp_path, h)])
     rec.pop("_path")
+    good, bad, doc = tmp_path / "final.json", tmp_path / "bad.json", tmp_path / "perf.md"
     good.write_text(json.dumps(rec))
     bad.write_text(json.dumps(mutated(rec, lambda r: r.update(known_limits=[]))))
-    doc.write_text(FINAL_DOC.replace(CELL, key))
-    assert rc.main(["final", "--record", str(good), "--document", str(doc)]) == 0
-    assert rc.main(["final", "--record", str(bad), "--document", str(doc)]) == 1
-    assert rc.main(["final", "--record", str(tmp_path / "missing.json")]) == 2
+    doc.write_text(PERF_DOC % SLOW_CELL)
+    args = ["final", "--repo", str(h["repo"]), "--head", h["docs"]]
+    assert rc.main(args + ["--record", str(good), "--document", str(doc)]) == 0
+    capsys.readouterr()
+    assert rc.main(args + ["--record", str(good)]) == 1                                                           # a known limit without the performance document
+    assert "needs the performance document" in capsys.readouterr().out
+    assert rc.main(args + ["--record", str(bad), "--document", str(doc)]) == 1
+    assert rc.main(["final", "--repo", str(h["repo"]), "--head", h["source"], "--record", str(good), "--document", str(doc)]) == 1      # a source change since the measured commit
+    assert "outside docs/" in capsys.readouterr().out
+    assert rc.main(args + ["--record", str(tmp_path / "missing.json")]) == 2
     assert rc.main(["decision", "--record", str(good)]) == 1
 
 

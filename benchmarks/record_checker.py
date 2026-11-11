@@ -13,7 +13,7 @@ them (``PROBLEM: ...``) followed by ``VERDICT: PASS|FAIL``; exit status 0 pass, 
   record_checker.py ledger   --ledger FILE [--repo DIR] [--decision FILE] [--require-all-steps]
   record_checker.py decision --record FILE
   record_checker.py handoff  --record FILE --repo DIR [--ledger FILE]
-  record_checker.py final    --record FILE [--document FILE]
+  record_checker.py final    --record FILE --repo DIR [--head REV] [--document FILE]
 
 What each rule asks (the schemas of the records that later steps write are the ones below):
 
@@ -47,8 +47,12 @@ ledger   ``cfbi-step-ledger-v1``: one row for each step (``single_launch``, ``tr
 decision a decision record has the keys ``row_engine_order`` (the steps of the row engine in their default order, a step may only be left out, never moved), ``value_split_inputs`` and ``budget_table``.
 handoff  ``cfbi-handoff-v1``: the value-split and the operand-swap hand-offs (branch of the form ``explore/<run>/<topic>``, commit, both existing in the repository, the probe test on the branch,
          the next free implementation bit: 128 when single-launch decode took 64, else 64) and the known-limit section of the performance document (topics named without plan identifiers).
-final    ``cfbi-final-v1``: the final A/B record of every device has a verdict, a median difference and a tolerance for every cell (verdict and difference agree); a regression that was confirmed
-         is a known limit only if the same shift also appears with all of the changes reverted (both measurements quoted) and the performance document names the cell.
+final    ``cfbi-final-v1``: the final A/B of the final candidate against the base on every device. The record commit rule (the commit differs from HEAD only under ``docs/``) and a clean tree
+         are applied against ``--repo`` (required); per device the consolidated baseline says which cells and metrics a complete campaign has; each campaign (the decode matrix and the layer
+         chain) is a ``compare_bench.py --json`` report plus the raw records it was made from: the records are of the measured commit and the base, clean, from one host; the report has
+         every cell and metric of the baseline, positive finite medians whose difference is recomputed, and a status that agrees with the effective tolerance. A regression (a FAIL
+         row) is a known limit only with a confirmation campaign (the cell fails again, on another node and allocation) and a campaign with every change reverted (the same shift is there,
+         so the changes do not cause it), and the performance document (``--document``) must name the cell in its known-limit section.
 """
 import argparse
 import json
@@ -1170,49 +1174,170 @@ def handoff_problems(rec, repo=None, single_launch_adopted=None):
 
 # ---- the final record ------------------------------------------------------------------------------------------------------------------------
 FINAL_SCHEMA = "cfbi-final-v1"
+CAMPAIGNS = ("decode", "chain")
+CAMPAIGN_KEY = {"decode": "decode_matrix", "chain": "layer_chain"}          # where the consolidated baseline of a device lists the cells and metrics of a campaign
 
 
-def final_problems(rec, document_text=None):
-    """Problems of a ``cfbi-final-v1`` record (the final A/B of every device against the base)."""
+def _load_report(path):
+    """``(results, problem)`` of a comparison report (``compare_bench.py --json`` writes a list with one result per metric)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        return None, "cannot be read (%s)" % e
+    if not isinstance(data, list) or not data or any(not isinstance(r, dict) or not isinstance(r.get("rows"), list) for r in data):
+        return None, "is not a comparison report (a list with one result, with its rows, per metric)"
+    return data, None
+
+
+def campaign_evidence_problems(entry, where, campaign, expected, base, cand_commit, tolerance):
+    """One measured campaign of the final record (the final A/B, a confirmation, the run with every change reverted): the comparison report, the raw records it was made from and what the
+    two say together. ``expected``: the baseline's entry of the campaign (cells, metrics, bench); ``cand_commit`` the commit that the candidate side must be; ``base`` the base commit.
+    Returns ``(problems, info)``: ``info`` holds the host of the records and the rows by ``(metric, cell)``."""
+    info = {"host": None, "rows": {}}
+    if not isinstance(entry, dict):
+        return ["%s: the campaign evidence is missing" % where], info
+    problems = []
+    if not text(entry.get("allocation")):
+        problems.append("%s: the allocation (the node job that the campaign ran on) must be named" % where)
+    paths = entry.get("records")
+    if not (isinstance(paths, list) and paths and all(text(x) for x in paths)):
+        problems.append("%s: the raw records that the report was made from must be named" % where)
+        paths = []
+    hosts, commits = set(), set()
+    for path in paths:
+        try:
+            rec = br.load_record(path)
+        except (OSError, ValueError) as e:
+            problems.append("%s: the raw record %s cannot be read again (%s)" % (where, path, e))
+            continue
+        problems.extend("%s: %s" % (where, q) for q in br.validate_record(rec, "final", None, True))
+        meta = rec.get("meta") or {}
+        hosts.add(meta.get("host"))
+        commit = str(meta.get("commit"))
+        commits.add(commit)
+        if not (commit_matches(commit, base) or commit_matches(commit, cand_commit)):
+            problems.append("%s: the raw record %s is of commit %s: neither the base %s nor the measured candidate %s" % (where, path, commit, base[:10], cand_commit[:10]))
+    if paths and not any(commit_matches(c, cand_commit) for c in commits):
+        problems.append("%s: no raw record is of the commit that is measured (%s): the report belongs to another tree" % (where, cand_commit))
+    if paths and cand_commit != base and not any(commit_matches(c, base) for c in commits):
+        problems.append("%s: no raw record is of the base %s: there is nothing to compare with" % (where, base))
+    if len(hosts) == 1:
+        info["host"] = next(iter(hosts))
+    elif paths:
+        problems.append("%s: the raw records come from more than one host (%s): a campaign runs on one allocation" % (where, ", ".join(sorted(str(h) for h in hosts))))
+    results, why = _load_report(entry.get("report")) if text(entry.get("report")) else (None, "is not named")
+    if results is None:
+        return problems + ["%s: the comparison report %s" % (where, why)], info
+    metrics = expected.get("metrics") if isinstance(expected.get("metrics"), list) else []
+    seen = [r.get("metric") for r in results]
+    if sorted(seen) != sorted(metrics):
+        problems.append("%s: the report has the metrics %s, the baseline has %s" % (where, sorted(str(m) for m in seen), sorted(metrics)))
+    for result in results:
+        metric, w = result.get("metric"), "%s, %s" % (where, result.get("metric"))
+        if result.get("mode") != "regress" or result.get("verdict") not in ("PASS", "FAIL"):
+            problems.append("%s: the report is a %s comparison with the verdict %r: a regress comparison with a verdict of PASS or FAIL is required (not INVALID)" % (w, result.get("mode"), result.get("verdict")))
+        if result.get("tol_pct") != tolerance:
+            problems.append("%s: the report's tolerance is %r %%, the baseline's is %r %%" % (w, result.get("tol_pct"), tolerance))
+        wanted = set(c for c in (expected.get("cells") or []) if not metric_cells(expected.get("bench"), metric) or any(m in c for m in metric_cells(expected.get("bench"), metric)))
+        rows = dict((r.get("key"), r) for r in result["rows"] if isinstance(r, dict))
+        if len(rows) != len(result["rows"]):
+            problems.append("%s: the report's rows are not unique cells" % w)
+        if set(rows) != wanted:
+            problems.append("%s: the report has %d cell(s), the baseline's cells for this metric are %d: missing %s, unexpected %s" % (
+                w, len(rows), len(wanted), sorted(wanted - set(rows))[:3], sorted(set(rows) - wanted)[:3]))
+        for key, row in sorted(rows.items(), key=lambda kv: str(kv[0])):
+            rw = "%s, %s" % (w, key)
+            if not (num(row.get("base_median")) and num(row.get("cand_median")) and row["base_median"] > 0 and row["cand_median"] > 0):
+                problems.append("%s: the base and candidate medians must be positive finite numbers (%r, %r)" % (rw, row.get("base_median"), row.get("cand_median")))
+                continue
+            delta = (row["cand_median"] / row["base_median"] - 1.0) * 100.0
+            if not (num(row.get("median_delta_pct")) and abs(delta - row["median_delta_pct"]) <= 1e-6 * max(1.0, abs(delta))):
+                problems.append("%s: the medians %r and %r are %.4f %% apart, the report says %r %%" % (rw, row["base_median"], row["cand_median"], delta, row.get("median_delta_pct")))
+            eff = row.get("tol_pct_effective")
+            if not (num(eff) and num(row.get("delta_pct")) and eff >= result.get("tol_pct", 0) and row.get("status") in ("PASS", "FAIL")):
+                problems.append("%s: a status (PASS or FAIL), the delta and the effective tolerance (not below the tolerance) are required" % rw)
+                continue
+            if (row["status"] == "FAIL") != (row["delta_pct"] > eff):
+                problems.append("%s: the status %s does not agree with the delta %.4f %% against the effective tolerance %.4f %%" % (rw, row["status"], row["delta_pct"], eff))
+            info["rows"][(metric, key)] = row
+    return problems, info
+
+
+def final_problems(rec, repo=None, head="HEAD", document_text=None):
+    """Problems of a ``cfbi-final-v1`` record (the final A/B of the final candidate against the base on every device).
+
+    The record names the commit that was measured (``meta.commit``) and, per device, the consolidated baseline (which cells and metrics a complete campaign has), the final A/B
+    campaigns (decode matrix and layer chain) and, for every regression that the final A/B shows (a FAIL row of the comparison), a known limit: the confirmation campaign on another
+    allocation and the campaign with every change reverted. Each campaign is a comparison report (``compare_bench.py --json``), the raw records it was made from and the allocation.
+    What is checked: the docs-only record-commit rule and a clean tree against ``repo`` / ``head`` (the commit must be one of the repository and differ from HEAD only under
+    ``docs/``), the raw records of the final A/B (commit measured, base, clean, one host), the report (every cell and metric of the baseline, positive finite medians, the difference
+    recomputed from them, status against the effective tolerance), and for a regression: the confirmation (the cell fails again, on another node and allocation) and the run with all
+    changes reverted (the same shift is there, so it is not caused by the changes), and the performance document, which must name the cell in its known-limit section."""
     where = "final record %s" % (rec.get("_path", "?") if isinstance(rec, dict) else "?")
     if not isinstance(rec, dict) or rec.get("schema") != FINAL_SCHEMA:
         return ["%s: not a %s record" % (where, FINAL_SCHEMA)]
-    problems = br.identity_problems(rec.get("meta") or {}, where, None, True, ("commit", "dirty"))
-    ab = rec.get("final_ab")
-    if not isinstance(ab, dict) or sorted(ab) != sorted(DEVICES):
-        return problems + ["%s: final_ab must give the final A/B for %s" % (where, ", ".join(DEVICES))]
+    meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
+    problems = br.identity_problems(meta, where, None, True, ("commit", "dirty"))
+    if not hexcommit(meta.get("base")):
+        problems.append("%s: meta.base must be the base commit of the loop" % where)
+    if repo is None:
+        problems.append("%s: a final record is only accepted against a repository and a head (the record commit rule): repo is required" % where)
+    elif hexcommit(meta.get("commit")):
+        problems.extend(record_commit_problems(meta["commit"], repo, head, where=where))
+        problems.extend(clean_tree_problems(repo))
+    devices = rec.get("devices")
+    if not isinstance(devices, dict) or sorted(devices) != sorted(DEVICES):
+        return problems + ["%s: devices must give the final A/B for %s" % (where, ", ".join(DEVICES))]
+    base, final = meta.get("base"), meta.get("commit")
+    if not (hexcommit(base) and hexcommit(final)):
+        return problems
+    regressions, campaign_info = [], {}
+    for dev in DEVICES:
+        d = devices[dev] if isinstance(devices[dev], dict) else {}
+        try:
+            baseline = load_json(d["baseline"])
+        except (KeyError, OSError, ValueError) as e:
+            problems.append("%s: %s: the consolidated baseline %r cannot be read (%s)" % (where, dev, d.get("baseline"), e))
+            continue
+        if not commit_matches(str(baseline.get("commit")), base):
+            problems.append("%s: %s: the consolidated baseline is of commit %s, the base of the loop is %s" % (where, dev, baseline.get("commit"), base))
+        for campaign in CAMPAIGNS:
+            expected = baseline.get(CAMPAIGN_KEY[campaign])
+            entry = (d.get("campaigns") or {}).get(campaign) if isinstance(d.get("campaigns"), dict) else None
+            if not isinstance(expected, dict):
+                problems.append("%s: %s: the baseline has no %s campaign" % (where, dev, CAMPAIGN_KEY[campaign]))
+                continue
+            probs, info = campaign_evidence_problems(entry, "%s: %s %s" % (where, dev, campaign), campaign, expected, base, final, expected.get("tolerance_pct"))
+            problems.extend(probs)
+            campaign_info[(dev, campaign)] = (entry, expected, info)
+            regressions.extend((dev, campaign, metric, key) for (metric, key), row in sorted(info["rows"].items()) if row.get("status") == "FAIL")
     limits = rec.get("known_limits") if isinstance(rec.get("known_limits"), list) else []
     section = known_limit_section(document_text) if document_text is not None else None
-    for dev in DEVICES:
-        cells = ab[dev].get("cells") if isinstance(ab[dev], dict) else None
-        if not (isinstance(cells, dict) and cells):
-            problems.append("%s: final_ab (%s) has no cells" % (where, dev))
+    for dev, campaign, metric, key in regressions:
+        w = "%s: %s %s %s %s" % (where, dev, campaign, metric, key)
+        entry = next((k for k in limits if isinstance(k, dict) and (k.get("device"), k.get("campaign"), k.get("metric"), k.get("cell")) == (dev, campaign, metric, key)), None)
+        if entry is None:
+            problems.append("%s: a regression that the final A/B shows has no known-limit entry with its confirmation and its run with all changes reverted" % w)
             continue
-        for key, c in sorted(cells.items()):
-            w = "%s: %s, %s" % (where, dev, key)
-            if not isinstance(c, dict) or c.get("verdict") not in ("PASS", "FAIL") or not num(c.get("median_delta_pct")) or not (num(c.get("tolerance_pct")) and c["tolerance_pct"] > 0):
-                problems.append("%s: a verdict (PASS or FAIL), the median difference and the tolerance are required" % w)
-                continue
-            limit = c["tolerance_pct"] if not c.get("noise_limited") else c.get("effective_tolerance_pct")
-            if c.get("noise_limited") and not (num(limit) and limit >= c["tolerance_pct"]):
-                problems.append("%s: a noise-limited cell gives the widened effective_tolerance_pct" % w)
-                continue
-            slower = c["median_delta_pct"] > limit
-            if (c["verdict"] == "FAIL") != slower:
-                problems.append("%s: the verdict %s does not agree with the median difference %.3f %% against the tolerance %.3f %%" % (w, c["verdict"], c["median_delta_pct"], limit))
-            if c["verdict"] == "FAIL":
-                if c.get("confirmed") is not True:
-                    problems.append("%s: a regression that was not confirmed (second allocation) is neither accepted nor dismissed" % w)
-                    continue
-                entry = next((k for k in limits if isinstance(k, dict) and k.get("device") == dev and k.get("cell") == key), None)
-                if entry is None:
-                    problems.append("%s: a confirmed regression has no known-limit entry" % w)
-                    continue
-                rev = entry.get("all_changes_reverted")
-                if not (isinstance(rev, dict) and rev.get("verdict") == "FAIL" and num(rev.get("median_delta_pct")) and rev["median_delta_pct"] > c["tolerance_pct"]):
-                    problems.append("%s: a known limit needs the measurement with all changes reverted, and the same shift in it (not caused by the changes)" % w)
-                if document_text is not None and (section is None or key not in section):
-                    problems.append("%s: the performance document does not name the cell in its known-limit section" % w)
+        original, expected, info = campaign_info[(dev, campaign)]
+        conf_probs, conf = campaign_evidence_problems(entry.get("confirmation"), "%s, confirmation" % w, campaign, expected, base, final, expected.get("tolerance_pct"))
+        rev_probs, rev = campaign_evidence_problems(entry.get("all_changes_reverted"), "%s, all changes reverted" % w, campaign, expected, base, base, expected.get("tolerance_pct"))
+        problems.extend(conf_probs + rev_probs)
+        if conf_probs or rev_probs:
+            continue
+        if (metric, key) not in conf["rows"] or conf["rows"][(metric, key)].get("status") != "FAIL":
+            problems.append("%s: the confirmation campaign does not confirm the regression: the cell does not fail there" % w)
+        if conf["host"] is not None and conf["host"] == info["host"]:
+            problems.append("%s: the confirmation ran on the same node (%s) as the final A/B: a second allocation is required" % (w, conf["host"]))
+        if entry["confirmation"].get("allocation") == (original or {}).get("allocation"):
+            problems.append("%s: the confirmation names the allocation of the final A/B: a second allocation is required" % w)
+        if (metric, key) not in rev["rows"] or rev["rows"][(metric, key)].get("status") != "FAIL":
+            problems.append("%s: the same shift is not there with all changes reverted: the regression is caused by the changes, a known limit is not allowed (revert the latest step and re-validate)" % w)
+        if document_text is None:
+            problems.append("%s: a known limit needs the performance document (give it): the cell must be named in its known-limit section" % w)
+        elif section is None or key not in section:
+            problems.append("%s: the performance document does not name the cell in its known-limit section" % w)
     return problems
 
 
@@ -1270,6 +1395,8 @@ def main(argv=None):
     p.add_argument("--ledger", default=None)
     p = sub.add_parser("final")
     p.add_argument("--record", required=True)
+    p.add_argument("--repo", required=True)
+    p.add_argument("--head", default="HEAD")
     p.add_argument("--document", default=None)
     a = ap.parse_args(argv)
     if not a.cmd:
@@ -1314,7 +1441,7 @@ def main(argv=None):
             if a.document:
                 with open(a.document, encoding="utf-8") as f:
                     doc = f.read()
-            return _report(final_problems(load_json(a.record), doc))
+            return _report(final_problems(load_json(a.record), a.repo, a.head, doc))
     except (OSError, ValueError) as e:
         print("unusable input: %s" % e, file=sys.stderr)
         return 2
