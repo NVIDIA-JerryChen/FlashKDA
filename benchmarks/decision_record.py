@@ -187,9 +187,13 @@ def occupancy_device(rec):
             "sm_count": d.get("sm_count")}
 
 
-def occupancy_commit(rec, dev):
-    """The commit that an occupancy record names in its label (``<device>-<commit>``)."""
-    return re.match(r"^%s-(.*)$" % dev, rec["label"]).group(1)
+def label_commit(rec, dev):
+    """The commit that an occupancy record names in its label (``<device>-<commit>``), or None."""
+    m = re.match(r"^%s-([0-9a-f]{7,40})$" % dev, str(rec.get("label"))) if isinstance(rec, dict) else None
+    return m.group(1) if m else None
+
+
+occupancy_commit = label_commit                                    # for a record that has passed ``occupancy_problems``
 
 
 def instance(rec, name):
@@ -237,7 +241,7 @@ def constants_of(*texts):
     """``resolve(name)``: the value of a ``constexpr int`` of the given source texts."""
     defs, env = {}, {}
     for t in texts:
-        defs.update(dict(re.findall(r"constexpr\s+int\s+(\w+)\s*=\s*([^;]+);", t)))
+        defs.update(dict(re.findall(r"constexpr\s+(?:int|size_t)\s+(\w+)\s*=\s*([^;]+);", t)))
 
     def resolve(name, stack=()):
         if name not in env:
@@ -288,6 +292,16 @@ def source_facts(repo, base_commit, e_commit, kd_commit):
 
 
 # ---- the checks of the evidence ---------------------------------------------------------------------------------------------------------------
+LAUNCH_SOURCE, PRIMITIVES_SOURCE = "csrc/cfbi/cfbi_launch.cu", "csrc/cfbi/cfbi_primitives.cuh"
+
+
+def launch_constants(repo, commit):
+    """The threads and the dynamic shared memory of the row-engine launch at a commit, as the sources define them: the thread count of the kernels and the launcher's constant that its
+    launch sites and its occupancy hook both read."""
+    resolve = constants_of(source_text(repo, commit, PRIMITIVES_SOURCE), source_text(repo, commit, LAUNCH_SOURCE))
+    return {"threads": resolve("NTHREADS"), "dynamic_smem": resolve("ROWS_DYNAMIC_SMEM")}
+
+
 def launch_problems(launch, ncu):
     """The launch metrics of the retained reports: every report of the Nsight Compute records exactly once (by the digest of the report), of its device, with the launch that the record
     holds, and one shared-memory carve-out per device."""
@@ -336,9 +350,10 @@ def launch_problems(launch, ncu):
     return out
 
 
-def occupancy_problems(rec, dev, container):
-    """The occupancy-API record of a device, bound to what it claims: the device, the commit (the label), the instantiation, the threads, the registers and the static plus dynamic shared
-    memory against the production-toolchain dump, at least two CTAs per SM for the row engine, and the arithmetic of ``ctas_per_sm`` reproducing the API for every instance."""
+def occupancy_problems(rec, dev, container, launch=None):
+    """The occupancy-API record of a device, bound to what it claims: the device, the commit (the label), the instantiation, the registers and the static shared memory against the
+    production-toolchain dump, the threads and the dynamic shared memory against the launch in the sources at the record's commit (``launch``: ``launch_constants``), at least two CTAs per
+    SM for the row engine, and the arithmetic of ``ctas_per_sm`` reproducing the API for every instance (the CTA count alone does not say which configuration it is the count of)."""
     where = "occupancy record %s" % (rec.get("_path", dev) if isinstance(rec, dict) else dev)
     if not isinstance(rec, dict):
         return ["%s: not a record" % where]
@@ -349,8 +364,7 @@ def occupancy_problems(rec, dev, container):
     if not all(rc.count(dv[k], 1) for k in ("registers_per_sm", "shared_per_sm", "threads_per_sm", "reserve_per_cta", "sm_count")) or rec.get("sm_count") != dv["sm_count"]:
         out.append("%s: the device limits (registers, shared memory, threads, reserve, SM count) must be positive integers and the SM count the record's own" % where)
         return out
-    m = re.match(r"^%s-([0-9a-f]{7,40})$" % dev, str(rec.get("label")))
-    if not m:
+    if label_commit(rec, dev) is None:
         out.append("%s: the label %r does not name the device and the commit (%s-<commit>)" % (where, rec.get("label"), dev))
     for name in (ROWS_KERNEL, REFERENCE_KERNEL):
         inst = instance(rec, name)
@@ -366,6 +380,9 @@ def occupancy_problems(rec, dev, container):
                        % (where, name, inst["registers"], inst["static_smem"], want["reg"], want["shared"]))
         if inst["threads"] != THREADS:
             out.append("%s: %s: %d threads per CTA, %d are required" % (where, name, inst["threads"], THREADS))
+        if launch is not None and (inst["threads"], inst["dynamic_smem"]) != (launch["threads"], launch["dynamic_smem"]):
+            out.append("%s: %s: the API says %d threads and %d B dynamic shared memory, the launch in the sources at the record's commit uses %d threads and %d B"
+                       % (where, name, inst["threads"], inst["dynamic_smem"], launch["threads"], launch["dynamic_smem"]))
         arithmetic = ctas_per_sm(inst["registers"], inst["threads"], inst["static_smem"], inst["dynamic_smem"], dv)
         if inst["ctas_per_sm"] != arithmetic:
             out.append("%s: %s: the API says %d CTAs per SM, the arithmetic of the registers, the shared memory and the threads %d" % (where, name, inst["ctas_per_sm"], arithmetic))
@@ -374,9 +391,31 @@ def occupancy_problems(rec, dev, container):
     return out
 
 
+def retained_launch_problems(rec, dev, launch):
+    """The retained Nsight Compute launches of a device against the occupancy instance of the optimised row engine, figure by figure (static, driver and dynamic shared memory, threads,
+    registers: a sum alone would let a dynamic figure hide behind a static one)."""
+    inst = instance(rec, ROWS_KERNEL) if isinstance(rec, dict) else None
+    dv = occupancy_device(rec) if isinstance(rec, dict) else {}
+    if inst is None or not isinstance(launch, dict) or not all(rc.count(inst.get(f)) for f in INSTANCE_FIGURES) or not rc.count(dv.get("reserve_per_cta"), 1):
+        return []                                                  # named by the other checks
+    want = {"shared_mem_per_block_static": inst["static_smem"], "shared_mem_per_block_driver": dv["reserve_per_cta"], "shared_mem_per_block_dynamic": inst["dynamic_smem"],
+            "block_size": inst["threads"], "registers_per_thread": inst["registers"]}
+    out = []
+    for r in launch.get("reports", []):
+        if not isinstance(r, dict) or r.get("device") != dev or not isinstance(r.get("launch"), dict):
+            continue
+        out.extend("launch-config record: the report %s says %s = %r, the occupancy record of %s %r" % (str(r.get("report_sha256"))[:12], f, r["launch"].get(f), dev, v)
+                   for f, v in sorted(want.items()) if r["launch"].get(f) != v)
+    return out
+
+
 def dump_problems(dump, name, archs, where):
-    if not isinstance(dump, dict) or dump.get("schema") != cg.SCHEMA or not isinstance(dump.get("kernels"), dict):
-        return ["%s: the dump of %s is not a %s dump" % (where, name, cg.SCHEMA)]
+    """A dump is evidence only if the codegen gate's own validator accepts it (a complete toolchain description, complete figures for every kernel of every architecture, the launch bounds
+    of the row-engine family); then the architectures it covers and the commit it names."""
+    try:
+        cg.check_dump(dump, name)
+    except cg.Unusable as e:
+        return ["%s: %s" % (where, " ".join(str(e).split()))]
     out = []
     if sorted(dump["kernels"]) != sorted(archs):
         out.append("%s: the dump of %s covers %s, %s are required" % (where, name, sorted(dump["kernels"]), sorted(archs)))
@@ -392,12 +431,15 @@ def compile_problems(compiled, container, profile_commit):
     if sorted(compiled) != sorted(("base",) + PROTOTYPE_DUMPS):
         out.append("%s: the dumps are %s, the base and the prototypes %s are required" % (where, sorted(compiled), list(PROTOTYPE_DUMPS)))
         return out
-    labels = set()
     for name, dump in sorted(compiled.items()):
         out.extend(dump_problems(dump, name, ARCHS, where))
-        labels.add(str((((dump.get("meta") or {}).get("toolchain") or {}).get("label"))))
-    if len(labels) != 1:
-        out.append("%s: the dumps were made with %d toolchains (%s), one is required" % (where, len(labels), sorted(labels)))
+    if out:
+        return out
+    for name in PROTOTYPE_DUMPS:                                   # a resource figure is only comparable with the base's under the same compiler: every field, the label is for display
+        try:
+            cg.require_same_toolchain(compiled["base"], compiled[name], "the dumps of the base and of %s" % name)
+        except cg.Unusable as e:
+            out.append("%s: %s" % (where, " ".join(str(e).split())))
     if out:
         return out
     for cid, dump, inst, step, what in CANDIDATES:
@@ -421,9 +463,10 @@ def compile_problems(compiled, container, profile_commit):
     return out
 
 
-def evidence_problems(ev):
+def evidence_problems(ev, repo=None):
     """Why the evidence cannot be the basis of a record (the profile set of both devices with three processes each and one commit, the Nsight Compute set of that commit, the launch metrics,
-    the compile dumps of the base and of the prototypes with one toolchain, the production dumps and the occupancy records bound to their devices)."""
+    the compile dumps of the base and of the prototypes with one toolchain, the production dumps and the occupancy records bound to their devices and, with ``repo``, to the launch in
+    the sources at their commits)."""
     out = []
     profiles = ev.get("profiles") or []
     out.extend(rc.profile_set_problems(profiles))
@@ -438,7 +481,18 @@ def evidence_problems(ev):
     out.extend(launch_problems(ev.get("launch"), ev.get("ncu") or []))
     out.extend(compile_problems(ev.get("compile") or {}, ev.get("container") or {}, commits[0]))
     for dev in rc.DEVICES:
-        out.extend(occupancy_problems((ev.get("occupancy") or {}).get(dev), dev, (ev.get("container") or {}).get(dev) or {}))
+        rec = (ev.get("occupancy") or {}).get(dev)
+        launch, commit = None, label_commit(rec, dev)
+        if repo is not None and commit is not None:
+            try:
+                launch = launch_constants(repo, commit)
+            except ValueError as e:
+                out.append("occupancy record of %s: the launch cannot be read from the sources at commit %s: %s" % (dev, commit, e))
+        out.extend(occupancy_problems(rec, dev, (ev.get("container") or {}).get(dev) or {}, launch))
+        out.extend(retained_launch_problems(rec, dev, ev.get("launch")))
+    configs = set((inst["threads"], inst["dynamic_smem"]) for inst in (instance(r, ROWS_KERNEL) for r in (ev.get("occupancy") or {}).values()) if inst and inst.get("threads") is not None)
+    if len(configs) > 1:
+        out.append("the occupancy records of the two devices describe different launches of the row engine (threads, dynamic shared memory): %s" % sorted(configs))
     return out
 
 
@@ -507,8 +561,9 @@ def excess(base, cand):
     return (["registers"] if cand["registers"] > GATE_REGISTERS else []) + out
 
 
-def budget_table(ev, facts):
+def budget_table(ev, facts, launches):
     compiled, container, occupancy = ev["compile"], ev["container"], ev["occupancy"]
+    base_dynamic = launches[rc.DEVICES[0]]["dynamic_smem"]          # the launch of the row engine is one configuration (the same on both devices, see evidence_problems)
     reserve = {}
     devices = {}
     for arch in ARCHS:
@@ -525,7 +580,7 @@ def budget_table(ev, facts):
         "constants": {"unified_l1_and_shared_bytes": {"value": UNIFIED_BYTES, "label": "model"}, "static_cap_bytes": {"value": STATIC_CAP_BYTES, "label": "plan"},
                       "gate_registers": GATE_REGISTERS, "gate_ctas_per_sm": GATE_CTAS, "threads_per_cta": THREADS},
         "devices": devices,
-        "api_instances": {}, "carveout": {}, "source_facts": facts,
+        "api_instances": {}, "carveout": {}, "source_facts": facts, "launch": launches,
         "compiled": {}, "production": {}, "tiles": {}, "configurations": {},
         "statements": list(STATEMENTS["budget"]),
     }
@@ -569,7 +624,7 @@ def budget_table(ev, facts):
         static0 = kernel(compiled["base"], arch, ROWS_KERNEL)["shared"] - reserve[arch]
         kd, a = fact["kd_tile_bytes"], A_FRAGMENTS_PLAN_BYTES
         definitions = (
-            ("base", "row_smem", static0, 0, "compiler"),
+            ("base", "row_smem", static0, base_dynamic, "compiler"),
             ("e_tile", "row_smem + e_tile", static0, fact["e_tile_dynamic_bytes"], "arithmetic"),
             ("kd_tile", "row_smem + kd_tile", static0 + kd, 0, "arithmetic"),
             ("a_fragments", "row_smem + a_fragments", static0 + a, 0, "arithmetic_with_plan_estimate"),
@@ -600,6 +655,8 @@ def build_record(ev, recorded_on, repo):
     heads = profiles[0]["meta"]["heads"]
     base_commit = ev["compile"]["base"]["meta"]["tree"]["commit"]
     facts = source_facts(repo, base_commit, ev["compile"]["coalesced-state-access-path"]["meta"]["tree"]["commit"], ev["compile"]["chunk-end-row-offload"]["meta"]["tree"]["commit"])
+    launches = dict((dev, dict(launch_constants(repo, occupancy_commit(ev["occupancy"][dev], dev)), commit=occupancy_commit(ev["occupancy"][dev], dev), path=LAUNCH_SOURCE, label="source"))
+                    for dev in rc.DEVICES)
     cells = phase_profile(profiles)
     rec = {
         "schema": SCHEMA,
@@ -614,7 +671,7 @@ def build_record(ev, recorded_on, repo):
         "order_basis": {"targets": dict((s, list(STEP_TARGETS[s])) for s in rc.ROW_ENGINE_ORDER), "prototypes": dict(STEP_PROTOTYPES), "statements": list(STATEMENTS["order"])},
         "phase_profile": {"phases": list(rpr.PHASES), "cells": cells},
         "value_split_inputs": value_split_inputs(ev["occupancy"], heads),
-        "budget_table": budget_table(ev, facts),
+        "budget_table": budget_table(ev, facts, launches),
     }
     return json.loads(json.dumps(rec))
 
@@ -677,6 +734,9 @@ def render_section(rec, number=SECTION_NUMBER):
                     bt["production"][d][k]["static_smem"], bt["production"][d][k]["same_as_conda"]] for d in rc.DEVICES for k in ("base", "reference")]) + [""]
     out += ["#### Source constants", ""]
     out += _table(["name", "bytes", "commit", "path", "defines"], [[f["name"], f["value"], f["commit"][:12], f["path"], f["defines"]] for f in bt["source_facts"]]) + [""]
+    out += ["#### Launch of the row engine (source constants at the commits of the occupancy records)", ""]
+    out += _table(["device", "commit", "path", "threads", "dynamic B", "provenance"], [[d, bt["launch"][d]["commit"], bt["launch"][d]["path"], bt["launch"][d]["threads"], bt["launch"][d]["dynamic_smem"], bt["launch"][d]["label"]]
+                                                                                      for d in rc.DEVICES]) + [""]
     lt = bt["lifetimes"]
     out += ["#### Tile lifetimes (provenance: %s, tested: %s)" % (lt["label"], _fmt(lt["tested"])), ""]
     out += _table(["tile", "live phases"], [[t, lt["live_phases"][t]] for t in sorted(lt["live_phases"])]) + [""]
@@ -752,7 +812,7 @@ def record_problems(rec, ev, repo, document_text=None, head="HEAD"):
         return ["%s: not a %s record" % (where, SCHEMA)]
     problems = rc.decision_problems(rec)
     try:
-        problems.extend("%s: %s" % (where, p) for p in evidence_problems(ev))
+        problems.extend("%s: %s" % (where, p) for p in evidence_problems(ev, repo))
     except (AttributeError, KeyError, TypeError, ValueError, ArithmeticError) as e:
         problems.append("%s: the evidence cannot be read: %s" % (where, e))
     if repo is None:
@@ -784,7 +844,7 @@ def record_problems(rec, ev, repo, document_text=None, head="HEAD"):
         commit = ev["compile"][tree]["meta"]["tree"]["commit"]
         problems.extend("%s: %s" % (where, p) for p in commit_problems("the prototype %s" % tree, commit, repo, None, ancestor=False))
     if document_text is not None:
-        problems.extend(document_problems(given, document_text, where))
+        problems.extend(document_problems(want, document_text, where))                  # the derived record: a record that differs from it is a problem already, and must not crash the rendering
     return problems
 
 
@@ -848,7 +908,7 @@ def main(argv=None):
     try:
         if a.cmd == "build":
             ev = load_evidence(a.evidence)
-            problems = evidence_problems(ev)
+            problems = evidence_problems(ev, a.repo)
             if problems:
                 return _report(problems)
             on = rc.resolve(a.repo, a.recorded_on)

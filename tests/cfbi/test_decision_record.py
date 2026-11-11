@@ -4,6 +4,7 @@ Plain Python, no GPU and no torch (``pytest --noconftest tests/cfbi/test_decisio
 phases are constants (so that every share is a ratio of small integers), compile dumps with chosen register / stack / spill figures, occupancy-API records, Nsight Compute launch metrics and a
 git history whose sources define the tile sizes. Every rule has a mutant of the record and a mutant of the evidence.
 """
+import contextlib
 import copy
 import hashlib
 import json
@@ -25,7 +26,7 @@ from test_record_checker import commit_file, git, has, mutated, ncu_record, prof
 from test_rows_profile import make_slots  # noqa: E402
 
 GPU = {"b200": "NVIDIA B200", "b300": "NVIDIA B300 SXM6 AC"}
-PRIMITIVES = "constexpr int HEAD_K = 128;\nconstexpr int HEAD_V = 128;\nconstexpr int BT = 64;\n"
+PRIMITIVES = "constexpr int HEAD_K = 128;\nconstexpr int HEAD_V = 128;\nconstexpr int BT = 64;\nconstexpr int NTHREADS = 256;   // all kernels use 8 warps\n"
 ROWS = """namespace cfbi {
 struct RowSmem {
     float k[HEAD_K];      // khat of the current row
@@ -45,6 +46,7 @@ struct RowSmem {
 ROWS_FLOATS = 6 * 128 + 2 * 128 + 3 * 128 + 3 * 128 + 2 * 64 + 1                      # 1921, counted by hand from the struct above
 E_LINES = "constexpr int ROWS_E_STRIDE = HEAD_K + 4;\nconstexpr int ROWS_DYN_SMEM_BYTES = HEAD_V * ROWS_E_STRIDE * static_cast<int>(sizeof(float));   // staged copy of E\n"
 KD_LINES = "constexpr int ROWS_KD_FRAGS = 8 * 8 * 32;\n"
+LAUNCH = "constexpr size_t ROWS_DYNAMIC_SMEM = 0;   // the dynamic shared memory of the row-engine launch: the launch sites and the occupancy hook read it\n"
 E_BYTES, KD_BYTES = 128 * 132 * 4, 8 * 8 * 32 * 16                                    # 67584 and 32768, by hand
 RESERVE = 1024
 # the base row engine per architecture: (registers, stack, spill stores, spill loads, static shared memory)
@@ -131,8 +133,9 @@ def make_evidence(root, processes):
     commits["kd"] = commit_file(repo, "csrc/cfbi/cfbi_rows.cuh", ROWS + KD_LINES, "the KD tile")
     git(repo, "checkout", "-q", "main")
     commits["profile"] = commit_file(repo, "docs/profile.md", "profile\n", "the profile build")
-    commits["occ_b200"] = commit_file(repo, "docs/occ200.md", "occupancy\n", "the occupancy binding")
-    commits["occ_b300"] = commit_file(repo, "docs/occ300.md", "occupancy\n", "the occupancy binding, second device")
+    commits["occ_b200"] = commit_file(repo, "csrc/cfbi/cfbi_launch.cu", LAUNCH, "the occupancy binding")
+    commits["occ_b300"] = commit_file(repo, "csrc/cfbi/cfbi_launch.cu", LAUNCH + "// second device\n", "the occupancy binding, second device")
+    commits["cfg"] = commit_file(repo, "csrc/cfbi/cfbi_launch.cu", LAUNCH.replace("= 0;", "= 4096;"), "a launch with dynamic shared memory")
     commits["head"] = commit_file(repo, "docs/last.md", "last\n", "the commit that the record is written on")
     profile_commit = commits["profile"]
     ev = root / "evidence"
@@ -189,23 +192,31 @@ def check(world, rec=None, document=None, ev=None, repo="repo", head=None):
     return dr.record_problems(rec, ev, world["repo"] if repo == "repo" else repo, document, head or world["commits"]["head"])
 
 
-def reloaded(world, files):
-    """The evidence with some of its files replaced: ``files`` maps a manifest path ('profile', 0) / ('compile', 'base') / ... to a function that edits the loaded JSON."""
+@contextlib.contextmanager
+def edited(world, files):
+    """The evidence files of ``files`` rewritten on disk for the duration of the block: ``files`` maps a manifest path ('profile', 0) / ('compile', 'base') / ... to a function that edits
+    the loaded JSON."""
     manifest = json.loads(Path(world["manifest"]).read_text())
     root = Path(world["manifest"]).parent
-    edited = {}
-    for (group, key), edit in files.items():
-        name = manifest[group][key] if isinstance(manifest[group], (list, dict)) else manifest[group]
-        path = root / name
-        edited[path] = path.read_text()
-        content = json.loads(edited[path])
-        edit(content)
-        path.write_text(json.dumps(content, sort_keys=True))
+    saved = {}
     try:
-        return dr.load_evidence(world["manifest"])
+        for (group, key), edit in files.items():
+            name = manifest[group][key] if isinstance(manifest[group], (list, dict)) else manifest[group]
+            path = root / name
+            saved[path] = path.read_text()
+            content = json.loads(saved[path])
+            edit(content)
+            path.write_text(json.dumps(content, sort_keys=True))
+        yield
     finally:
-        for path, text in edited.items():
+        for path, text in saved.items():
             path.write_text(text)
+
+
+def reloaded(world, files):
+    """The evidence with some of its files replaced (see ``edited``)."""
+    with edited(world, files):
+        return dr.load_evidence(world["manifest"])
 
 
 # ---- the derivation, by hand ---------------------------------------------------------------------------------------------------------------------
@@ -338,6 +349,13 @@ def test_a_document_that_is_not_the_generated_section_is_rejected(world, name, e
     assert has(check(world, document=doc), expected), (name, check(world, document=doc)[:2])
 
 
+def test_a_record_that_lacks_a_section_of_the_derivation_is_a_problem_and_not_a_crash_when_the_document_is_given(world):
+    """An older record (without the launch section) next to its document: the document is compared with the derived record, so the missing section is reported and nothing raises."""
+    old = mutated(world["rec"], lambda r: r["budget_table"].pop("launch"))
+    probs = check(world, rec=old, document=document_with(world["rec"]))
+    assert has(probs, "budget_table.launch is missing") and not has(probs, "not the generated one")
+
+
 # ---- mutants of the record ---------------------------------------------------------------------------------------------------------------------
 def set_path(path, value):
     def edit(rec):
@@ -451,18 +469,106 @@ def test_the_occupancy_record_is_bound_to_its_device_commit_instantiation_and_sh
     assert has(probs, expected), (name, probs[:3])
 
 
+def toolchain_edit(**fields):
+    return lambda d: d["meta"]["toolchain"].update(fields)
+
+
 @pytest.mark.parametrize("name,files,expected", [
-    ("a prototype dump with another toolchain", {("compile", "chunk-end-row-offload"): lambda d: d["meta"]["toolchain"].update(label="another")}, "toolchains"),
-    ("a dump that lacks an architecture", {("compile", "base"): lambda d: d["kernels"].pop("sm_103a")}, "covers"),
+    ("a prototype dump with another toolchain label", {("compile", "chunk-end-row-offload"): toolchain_edit(label="another")}, "different toolchains"),
+    ("a prototype dump of the same label with other flags (review control)", {("compile", "chunk-end-row-offload"): toolchain_edit(flags=["-O0"])}, "different toolchains"),
+    ("a prototype dump of the same label with another nvcc (review control)", {("compile", "chunk-end-row-offload"): toolchain_edit(nvcc="CUDA 12.9")}, "different toolchains"),
+    ("another host compiler", {("compile", "launch-chain-collapse"): toolchain_edit(host_compiler="g++ 11")}, "different toolchains"),
+    ("another ptxas", {("compile", "operand-swapped-mma-tiles"): toolchain_edit(ptxas="ptxas 12.9")}, "different toolchains"),
+    ("another cuobjdump", {("compile", "value-split-decode-ctas"): toolchain_edit(cuobjdump="cuobjdump 12.9")}, "different toolchains"),
+    ("another language standard", {("compile", "coalesced-state-access-path"): toolchain_edit(std="c++17")}, "different toolchains"),
+    ("a base dump of another toolchain than every prototype", {("compile", "base"): toolchain_edit(flags=["-O2"])}, "different toolchains"),
+    ("a dump that names an architecture that it has no kernels for", {("compile", "base"): lambda d: d["meta"]["toolchain"]["archs"].append("sm_120a")}, "no kernels for sm_120a"),
+    ("a dump that lacks an architecture", {("compile", "base"): lambda d: d["kernels"].pop("sm_103a")}, "no kernels for sm_103a"),
+    ("a dump without a spill figure (review control)", {("compile", "value-split-decode-ctas"): lambda d: d["kernels"]["sm_100a"]["cfbi::rows_kernel<Li32E>"].pop("spill_loads")}, "incomplete evidence"),
+    ("a base dump without the launch bounds of the row engine", {("compile", "base"): lambda d: d["kernels"]["sm_100a"]["cfbi::rows_kernel"].update(max_threads=None)}, "launch-bound"),
+    ("a production dump without a figure", {("container", "b200"): lambda d: d["kernels"]["sm_100a"]["cfbi::rows_kernel"].pop("stack")}, "incomplete evidence"),
     ("a dump that lacks an instantiation", {("compile", "value-split-decode-ctas"): lambda d: d["kernels"]["sm_100a"].pop("cfbi::rows_kernel<Li32E>")}, "has no instantiation"),
     ("a dump that names no commit", {("compile", "launch-chain-collapse"): lambda d: d["meta"]["tree"].update(commit=None)}, "names no commit"),
     ("a production dump of another commit", {("container", "b200"): lambda d: d["meta"]["tree"].update(commit="1234567abcdef")}, "the profile is of"),
-    ("a production dump made with the conda toolchain", {("container", "b300"): lambda d: d["meta"]["toolchain"].update(label="conda 13.1")}, "container toolchain"),
+    ("a production dump made with the conda toolchain", {("container", "b300"): toolchain_edit(label="conda 13.1")}, "container toolchain"),
     ("a production dump whose figures differ from the API's", {("container", "b300"): lambda d: d["kernels"]["sm_103a"]["cfbi::rows_kernel"].update(reg=112)}, "the production dump"),
 ])
-def test_the_compile_dumps_are_one_toolchain_and_the_production_dumps_the_profiled_commit(world, name, files, expected):
+def test_the_compile_dumps_are_complete_one_toolchain_and_the_production_dumps_the_profiled_commit(world, name, files, expected):
     probs = check(world, ev=reloaded(world, files))
     assert has(probs, expected), (name, probs[:3])
+
+
+def test_a_prototype_that_breaks_the_resource_gate_is_data_and_the_container_toolchain_may_differ_from_the_conda_one(world):
+    """The checks of the dumps do not reject the analysis because a prototype is over the base's resources, and the production dumps are not compared with the development toolchain."""
+    gates = [r["gate_excess"] for r in world["rec"]["budget_table"]["compiled"]["sm_100a"] if r["id"] != "base"]
+    assert any(gates) and check(world) == []
+    assert world["ev"]["container"]["b200"]["meta"]["toolchain"]["label"] != world["ev"]["compile"]["base"]["meta"]["toolchain"]["label"]
+
+
+# ---- B14: the occupancy figures are the figures of the launch --------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("dynamic", [1, 32768])
+def test_an_occupancy_dynamic_shared_memory_that_the_launch_does_not_use_is_rejected(world, dynamic):
+    """The review's control: the CTAs per SM stay 2 (the register file allows two whatever the dynamic memory), so the arithmetic alone cannot see which configuration they are the count of."""
+    probs = check(world, ev=reloaded(world, {("occupancy", "b200"): lambda rec: rec["occupancy"]["instances"][0].update(dynamic_smem=dynamic)}))
+    assert has(probs, "the launch in the sources at the record's commit uses 256 threads and 0 B"), probs[:3]
+    assert has(probs, "says shared_mem_per_block_dynamic = 0"), probs[:3]                                              # the retained launches say 0 as well
+
+
+def test_the_launch_of_the_sources_at_the_records_commit_is_the_configuration_that_counts(world):
+    c = world["commits"]
+    other = reloaded(world, {("occupancy", "b200"): lambda rec: rec.update(label="b200-" + c["cfg"][:9])})            # the launch of that commit has dynamic shared memory
+    assert has(check(world, ev=other), "uses 256 threads and 4096 B"), "a record of another launch configuration"
+    nolaunch = reloaded(world, {("occupancy", "b200"): lambda rec: rec.update(label="b200-" + c["e"][:9])})           # a commit that has no launcher
+    assert has(check(world, ev=nolaunch), "the launch cannot be read from the sources")
+
+
+@pytest.mark.parametrize("field,value", [("shared_mem_per_block_static", 4096), ("shared_mem_per_block_driver", 512), ("shared_mem_per_block_dynamic", 1), ("block_size", 128),
+                                         ("registers_per_thread", 96)])
+def test_the_retained_launch_is_checked_figure_by_figure(world, field, value):
+    probs = check(world, ev=reloaded(world, {("launch_config", None): lambda rec: rec["reports"][0]["launch"].update({field: value})}))
+    assert has(probs, "says %s = %r" % (field, value)), (field, probs[:3])
+
+
+def test_the_two_devices_describe_one_launch_of_the_row_engine(world):
+    probs = check(world, ev=reloaded(world, {("occupancy", "b300"): lambda rec: rec["occupancy"]["instances"][0].update(dynamic_smem=1)}))
+    assert has(probs, "describe different launches")
+
+
+def test_the_base_configuration_is_derived_from_the_validated_launch(world):
+    bt = world["rec"]["budget_table"]
+    assert bt["launch"]["b200"] == {"commit": world["commits"]["occ_b200"][:9], "path": dr.LAUNCH_SOURCE, "threads": 256, "dynamic_smem": 0, "label": "source"}
+    base = bt["configurations"]["sm_100a"][0]
+    assert base["id"] == "base" and base["dynamic_bytes"] == 0 and base["per_cta_bytes"] == 8192 + 1024
+
+    def occupancy(rec):                                                         # a legitimate other launch: dynamic shared memory 4096 in the sources, in the API and in the retained launches
+        rec["label"] = rec["label"].split("-")[0] + "-" + world["commits"]["cfg"][:9]
+        for inst in rec["occupancy"]["instances"]:
+            inst["dynamic_smem"] = 4096
+
+    def retained(rec):
+        for r in rec["reports"]:
+            r["launch"]["shared_mem_per_block_dynamic"] = 4096
+    ev = reloaded(world, {("occupancy", "b200"): occupancy, ("occupancy", "b300"): occupancy, ("launch_config", None): retained})
+    rec = dr.build_record(ev, world["commits"]["head"], world["repo"])
+    assert dr.record_problems(copy.deepcopy(rec), ev, world["repo"], None, world["commits"]["head"]) == []
+    moved = dict((r["id"], r) for r in rec["budget_table"]["configurations"]["sm_100a"])["base"]
+    assert moved["dynamic_bytes"] == 4096 and moved["per_cta_bytes"] == 8192 + 4096 + 1024                              # nothing is hard-coded to 0
+
+
+def test_the_decision_command_rejects_the_review_controls_of_the_evidence(world, tmp_path, capsys):
+    """B13 and B14 at the command line: the same label with other flags, and the base's dynamic shared memory written as 32 KiB: exit 1 and VERDICT: FAIL (both were exit 0 and PASS)."""
+    rec_path, doc_path = tmp_path / "record.json", tmp_path / "perf.md"
+    rec_path.write_text(json.dumps(world["rec"]))
+    doc_path.write_text(dr.render_section(world["rec"]))
+    args = ["decision", "--record", str(rec_path), "--evidence", str(world["manifest"]), "--repo", str(world["repo"]), "--document", str(doc_path), "--head", world["commits"]["head"]]
+    assert rc.main(args) == 0
+    capsys.readouterr()
+    for name, files, expected in (("flags", {("compile", "chunk-end-row-offload"): toolchain_edit(flags=["-O0"])}, "different toolchains"),
+                                  ("dynamic", {("occupancy", "b200"): lambda rec: rec["occupancy"]["instances"][0].update(dynamic_smem=32768)}, "the launch in the sources")):
+        with edited(world, files):
+            assert rc.main(args) == 1
+        out = capsys.readouterr().out
+        assert "VERDICT: FAIL" in out and expected in out, (name, out[:300])
 
 
 def test_a_figure_of_a_dump_moves_the_budget_table(world):
@@ -508,7 +614,7 @@ def test_a_source_that_changes_moves_the_tile_sizes_and_an_unreadable_source_is_
     elsewhere.mkdir()
     git(elsewhere, "init", "-q", "-b", "main")
     commit_file(elsewhere, "csrc/cfbi/cfbi_primitives.cuh", PRIMITIVES, "an unrelated history")
-    assert has(check(world, repo=elsewhere), "cannot be derived from the evidence")                                  # the commits of the evidence are not in this repository
+    assert has(check(world, repo=elsewhere), "the launch cannot be read from the sources")                          # the commits of the evidence are not in this repository
     with pytest.raises(ValueError):
         dr.source_facts(elsewhere, world["commits"]["base"], world["commits"]["e"], world["commits"]["kd"])
 
