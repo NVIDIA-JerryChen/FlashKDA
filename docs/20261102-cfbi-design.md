@@ -73,9 +73,10 @@ IEEE intrinsics, the extension is built without `--use_fast_math` and with `-fma
 | `k2_kernel` | (8, N, H) x 256 | 26 KiB / 54 | serial scan of a sequence's chunks with a `[16 x 128]` E slice in smem: P1/P2, `U = UT - P1`, `O` (cross-sub-block `dot3` + FMA chain, bf16 store), chunk-end update; a partial chunk stores its `U` rows in the cache |
 | `finalize_pos_kernel` | N | - | `pos = (pos0 + len) % 64` (`pos` is per sequence but read by every head's CTA, so it is only advanced at the very end) |
 
-- **Decode is one launch** (mode 1 on the optimised row engine, `decode_single_launch` in `cfbi_launch.h`; `_impl` bit 6 = 64 keeps the plan kernel, the frozen
-  reference row engine and mode 0 always do, and so do grids of more than 8 CTAs per SM, `N * H > 8 * SMs`, a gate that is an estimate; written at
-  source level, not yet run on a GPU): `rows_kernel<true>` derives its plan entry itself with the plan kernel's own `seq_window` (token window and slot from
+- **Decode is one launch** (mode 1 on the optimised row engine, `decode_single_launch_policy` in `cfbi_policy.h`, which the wrapper `decode_single_launch` in `cfbi_launch.h` calls with
+  the device's SM count and compute capability; `_impl` bit 6 = 64 keeps the plan kernel, the frozen reference row engine and mode 0 always do, and so do grids of more than
+  8 CTAs per SM, `N * H > 8 * SMs`, and every device outside the routing set, compute capability 10, where a hidden calibration control forces the single launch for
+  tests; the limit and the routing set are estimates; written at source level, not yet run on a GPU): `rows_kernel<true>` derives its plan entry itself with the plan kernel's own `seq_window` (token window and slot from
   `cu_seqlens` / `fixed_len` and `slot_ids`) and replaces the plan kernel's `pos` snapshot by an arrival count in the high bits of the `pos` word: each head CTA of a
   participating sequence starts with `old = atomicAdd(&pos[slot], 1 << 8)`, whose result carries the fill (`& 63`) and the number of CTAs that arrived before; the CTA
   that sees `H - 1` is the last of the `H`, every other CTA has already read the word, so it stores the plain `(pos0 + len) % 64`. At rest `pos` is unchanged; skipped

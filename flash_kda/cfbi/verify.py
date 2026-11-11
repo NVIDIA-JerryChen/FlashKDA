@@ -37,16 +37,18 @@ _ACCURACY_MAX_REL = 2e-6                                   # |dot3 - exact| / su
 
 
 def _impl_name(impl):
-    """Human-readable name of the implementation bits returned by ``resolve_impl`` (csrc/cfbi/cfbi_launch.h)."""
+    """Human-readable name of the implementation bits returned by ``resolve_impl`` (csrc/cfbi/cfbi_policy.h; the accepted values are 0 .. 127, bit 6 = 64 keeps the plan kernel of decode)."""
     rows = "reference" if impl & 1 else "optimised"
     if impl & 4:
-        return f"{rows} row engine only (no K1/K2)"
-    chunk = "reference" if impl & 2 else "optimised"
-    if impl & 8 and not impl & 2:
-        chunk = "optimised, tcgen05 (UMMA) K2"
-    elif impl & 16 and not impl & 2:
-        chunk = "optimised, K2 from a device-built schedule"
-    return rows if rows == chunk else f"{rows} row engine + {chunk} K1/K2"
+        name = f"{rows} row engine only (no K1/K2)"
+    else:
+        chunk = "reference" if impl & 2 else "optimised"
+        if impl & 8 and not impl & 2:
+            chunk = "optimised, tcgen05 (UMMA) K2"
+        elif impl & 16 and not impl & 2:
+            chunk = "optimised, K2 from a device-built schedule"
+        name = rows if rows == chunk else f"{rows} row engine + {chunk} K1/K2"
+    return name + ", decode with the plan kernel" if impl & 64 else name
 
 
 def _bits(x):

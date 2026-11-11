@@ -5,7 +5,9 @@
 * the hidden calibration control: while it is on the wrapper answers the eligible part of the rule and nothing else (the pure policy is not affected), and it reports its previous setting;
 * the plan buffer: a call that is one launch (the control on) allocates no plan buffer and launches no plan kernel; a call that needs the plan kernel (bit 64, or a grid beyond the limit)
   with a plan buffer that is too small (empty or one int short) is an error, with the right size it runs;
-* bit 64 changes no launch of a prefill call (with ``cu_seqlens``, where the default routing may choose the device-scheduled K2, and with a fixed length).
+* bit 64 changes no launch of a prefill call (with ``cu_seqlens``, where the default routing may choose the device-scheduled K2, and with a fixed length), and no prefill call launches
+  ``rows_kernel<true>`` even with the control on;
+* ``resolve_impl`` precedence: bit 64 is a request of its own (no bit clears it, it clears no other bit), and neither it nor the control brings the reference row engine to the single launch.
 """
 import pytest
 import torch
@@ -17,7 +19,7 @@ from test_decode_policy import CONTROLS
 from test_decode_single_launch import _cc, _sms, kernel_counts
 from test_k2_dyn import fixed_fn, launched, varlen_fn
 
-DECODE_PLAN = 64
+REF_ROWS, REF, ROWS_ONLY, DECODE_PLAN = 1, 3, 4, 64
 
 
 @pytest.fixture()
@@ -145,3 +147,25 @@ def test_prefill_launches_the_same_kernels_with_and_without_bit_64(ext, name, ma
     if name == "varlen routed":
         routed = ext.k2_route(16, 6, 16 * 256, -1)
         assert (plain["k2_dyn_kernel"] >= 1) == routed, (routed, dict(plain))        # the default routing is live where the rule says so, and bit 64 does not switch it off
+
+
+@pytest.mark.parametrize("name,make", PREFILLS, ids=[p[0] for p in PREFILLS])
+def test_no_prefill_call_launches_the_single_launch_kernel_even_when_the_control_is_on(ext, forced, name, make):
+    for impl in (0, DECODE_PLAN):
+        cnt = kernel_counts(make(impl))
+        assert cnt["rows_kernel<true>"] == 0 and cnt["rows_kernel<false>"] + cnt["ref::rows_kernel"] >= 1, (impl, dict(cnt))
+
+
+# ---- the precedence of the bits ---------------------------------------------------------------------------------------------------------------------------
+def test_resolve_impl_keeps_bit_64_a_request_of_its_own(ext):
+    for v in range(dp.IMPL_MAX + 1):
+        r = ext.resolve_impl(v, -1)
+        assert r & DECODE_PLAN == v & DECODE_PLAN, v                                   # no bit clears it (and the device cannot add it)
+        assert r & ~DECODE_PLAN == ext.resolve_impl(v & ~DECODE_PLAN, -1) & ~DECODE_PLAN, v      # it clears no other bit
+        assert ext.resolve_impl(r, -1) == r, v                                          # idempotent
+
+
+@pytest.mark.parametrize("impl", [REF_ROWS, REF_ROWS | DECODE_PLAN, REF, REF | DECODE_PLAN])
+def test_the_reference_row_engine_keeps_its_plan_kernel_whatever_else_is_requested(ext, forced, impl):
+    assert dict(kernel_counts(decode_call(ext, 4, 6, impl))) == {"plan_kernel": 1, "ref::rows_kernel": 1}
+    assert not ext.decode_single_launch(1, ext.resolve_impl(impl, -1), 4, 6)           # not even with the control on (it is the fixture here)

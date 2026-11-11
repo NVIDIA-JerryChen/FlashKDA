@@ -6,7 +6,9 @@ usage: python benchmarks/bench_breakdown.py [--impl N] [--prefill B,L,H ...] [--
              csrc/cfbi/cfbi_launch.h), 3 = the frozen v1 reference kernels,
              8 = optimised row engine + K1 with the tcgen05 (UMMA) K2 (kernel k2u_kernel instead of k2_kernel),
              16 = K1 + the K2 driven by a schedule built on the device (kernels k2_sched_kernel, k2_dyn_kernel), 32 = the old K2 kernels
-             also where the default would route to the device-scheduled one (the baseline of a comparison with 16)
+             also where the default would route to the device-scheduled one (the baseline of a comparison with 16),
+             64 = decode keeps the plan kernel in front of the row engine (two launches; the A side of a comparison with the single launch);
+             every value 0 .. 127 is accepted (bit 7, value 128, is reserved and rejected)
   --prefill  one or more "B,L,H" shapes (default: the CF-BI report's H6/L8K shapes)
   --varlen   one or more variable-length prefill calls (one cu_seqlens call, B = 1): a corpus entry (V1 .. V7d, see --list-corpus), a corpus
              entry with another head count ("V2@12") or an explicit list ("8192+7*1024@6": terms LEN or COUNT*LEN joined by +, head count after @)

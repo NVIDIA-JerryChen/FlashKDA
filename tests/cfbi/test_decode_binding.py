@@ -162,8 +162,7 @@ def test_a_binding_without_the_pure_policy_or_the_control_in_its_place_is_caught
 
 
 def test_the_control_is_not_part_of_the_documented_api():
-    """None of the hidden functions is exported by the package, and the documentation does not offer the control or the pure policy as an interface (the prose of ``_impl`` may name the
-    rule that the wrapper decides)."""
+    """None of the hidden functions is exported by the package, and the documentation does not offer the control as an interface (the prose of ``_impl`` names the rule, the policy)."""
     import ast
 
     init = (ROOT / "flash_kda" / "cfbi" / "__init__.py").read_text()
@@ -175,8 +174,7 @@ def test_the_control_is_not_part_of_the_documented_api():
     hidden = ("decode_single_force", "decode_single_launch_policy", "decode_single_launch", "rows_occupancy")
     assert not exported & set(hidden)
     api = (ROOT / "flash_kda" / "cfbi" / "api.py").read_text() + init
-    for name in ("decode_single_force", "decode_single_launch_policy"):
-        assert name not in api, name
+    assert "decode_single_force" not in api                          # the control is for tests and the benchmark and is not described to a user (the prose may name the rule, the policy)
 
 
 def test_a_control_compiled_in_by_a_macro_is_caught(binding, launch):

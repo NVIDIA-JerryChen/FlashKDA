@@ -52,7 +52,7 @@ def test_the_specification_uses_the_numbers_of_the_header():
     v = header_values(header_text())
     assert v["DECODE_SINGLE_MAX_CTAS_PER_SM"] == dp.MAX_CTAS_PER_SM
     assert v["DECODE_SINGLE_ROUTING_CC_MAJOR"] == dp.ROUTING_CC_MAJOR
-    assert v["IMPL_REF_ROWS"] == dp.IMPL_REF_ROWS and v["IMPL_DECODE_PLAN"] == dp.IMPL_DECODE_PLAN
+    assert v["IMPL_REF_ROWS"] == dp.IMPL_REF_ROWS and v["IMPL_DECODE_PLAN"] == dp.IMPL_DECODE_PLAN and v["IMPL_MAX"] == dp.IMPL_MAX
 
 
 PLAIN_CPP_BREAKERS = re.compile(r"#\s*include\s*[<\"](?:cuda|cub|cooperative_groups|nv|thrust)|__global__|__device__|__host__|__shared__|__CUDACC__|\bdim3\b|\bcuda[A-Z]\w*")

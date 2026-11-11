@@ -14,6 +14,7 @@ of every (SM count, heads) pair, so a gate that is one CTA looser or tighter, a 
 """
 IMPL_REF_ROWS = 1
 IMPL_DECODE_PLAN = 64
+IMPL_MAX = 127                                                # the largest accepted impl value: every bit up to IMPL_DECODE_PLAN
 MAX_CTAS_PER_SM = 8
 ROUTING_CC_MAJOR = 10
 

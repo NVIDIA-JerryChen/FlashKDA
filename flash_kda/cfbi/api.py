@@ -49,10 +49,11 @@ def _impl_arg(_impl: Optional[int]) -> int:
     ``_k2_bv`` 8 / 16 / 32 forces that tile width for every pair under bit 4 (the device ordering stays), 0 = the device
     policy; ``1000 + x`` is rejected. Bit 5 (value 32) keeps the old K2 kernels where the default would run the
     device-scheduled one (it excludes bit 4). Bit 6 (value 64) keeps the plan kernel in front of the row engine for decode:
-    by default decode (mode 1) on the optimised row engine is ONE kernel launch (the row engine derives its sequence entry
-    itself and advances ``pos`` by an arrival count; grids beyond ``decode_single_launch``'s limit of 8 CTAs per SM keep the
-    plan kernel, see csrc/cfbi/cfbi_launch.h), bit 6 asks for the two launches (A/B, differential tests); same bits either
-    way. 0 = the optimised kernels where the device can run them (the launcher falls
+    decode (mode 1) on the optimised row engine is ONE kernel launch (the row engine derives its sequence entry itself and
+    advances ``pos`` by an arrival count) where ``decode_single_launch_policy`` of csrc/cfbi/cfbi_policy.h says so (by default
+    on devices of compute capability 10 and for grids of at most 8 CTAs per SM; every other decode call keeps the plan
+    kernel), bit 6 asks for the two launches (A/B, differential tests) and changes nothing for any other call; same bits either
+    way. The accepted values are 0 .. 127 (bit 7, value 128, is reserved and rejected). 0 = the optimised kernels where the device can run them (the launcher falls
     back to the reference kernels below sm_90 and to the row engine where K1 does not fit in shared memory, see
     csrc/cfbi/cfbi_launch.h); on a Blackwell device a ``cu_seqlens`` prefill call with ``_impl=0`` and no forced tile
     width that is predicted to gain from it also runs the device-scheduled K2 (the rule is ``k2_dyn_default_route`` in that header and section 7
