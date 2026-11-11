@@ -94,7 +94,7 @@ def strip_comments(text):
 
 def tokens(text):
     """The tokens of the code in ``text`` (comments dropped; preprocessor lines are not code and are dropped as well)."""
-    code = "\n".join(l for l in strip_comments(text).splitlines() if not l.lstrip().startswith("#"))
+    code = "\n".join(line for line in strip_comments(text).splitlines() if not line.lstrip().startswith("#"))
     return TOKEN.findall(code)
 
 
@@ -176,7 +176,7 @@ def function_body(toks, head, after=0):
 
 ENTRY_HEAD = "SeqPlan rows_entry("
 KERNEL_HEAD = "rows_kernel("
-BRANCH_PREFIX = norm("if constexpr (!DECODE) { return p.plan[n]; } else {").split()
+BRANCH_PREFIX = tokens("if constexpr (!DECODE) { return p.plan[n]; } else {")
 
 # ---- the pinned text -----------------------------------------------------------------------------------------------------------------------------------------
 GOLDEN = norm("""
@@ -217,11 +217,11 @@ def evaluate(expr, names):
 
 def constants(texts):
     """``BT``, ``POS_COUNT_SHIFT`` and ``POS_MASK`` as the sources define them (evaluated, not copied)."""
-    view = default_view(texts)
+    code = [strip_comments(text) for text in default_view(texts).values()]
     found = {}
     for name in ("BT", "POS_COUNT_SHIFT", "POS_MASK"):
-        for text in view.values():
-            m = re.search(r"constexpr\s+int\s+%s\s*=\s*([^;]+);" % name, strip_comments(text))
+        for text in code:
+            m = re.search(r"constexpr\s+int\s+%s\s*=\s*([^;]+);" % name, text)
             if m:
                 found[name] = evaluate(m.group(1).strip(), found)
                 break
@@ -233,10 +233,8 @@ def constants(texts):
 def decode_branch(texts):
     """The tokens of the ``DECODE = true`` branch of ``rows_entry`` as the default build reads them (hooks expanded); ``None`` if the function or the branch is not there."""
     toks = expand_default_hooks(tokens(default_view(texts)["cfbi_rows.cuh"]))
-    body = function_body(toks, ENTRY_HEAD.replace("(", " ("))
-    if body is None:
-        return None
-    if body[:len(BRANCH_PREFIX)] != BRANCH_PREFIX or body[-1] != "}":
+    body = function_body(toks, ENTRY_HEAD)
+    if body is None or body[:len(BRANCH_PREFIX)] != BRANCH_PREFIX or body[-1] != "}":
         return None
     return body[len(BRANCH_PREFIX):-1]
 
@@ -257,15 +255,14 @@ def election(texts):
 
 def counter_limit_problems(texts):
     """The arrival counter must never wrap the word: heads * 2^POS_COUNT_SHIFT + POS_MASK < 2^31 for every H that the binding admits (``H < N`` in its size check)."""
-    probs = []
     c = constants(texts)
     m = re.search(r"H\s*<\s*(\d+)\s*,\s*\"problem too large", strip_comments(texts["cfbi_binding.cpp"]))
     if not m:
         return [("R10", "the binding has no size check of the form H < <limit> that the counter capacity can be tied to")]
-    limit = int(m.group(1))
-    if (limit - 1) * (1 << c["POS_COUNT_SHIFT"]) + c["POS_MASK"] >= 2 ** 31 - (1 << c["POS_COUNT_SHIFT"]):
-        probs.append(("R10", "H up to %d heads can overflow the arrival counter: %d x 2^%d" % (limit - 1, limit - 1, c["POS_COUNT_SHIFT"])))
-    return probs
+    limit, shift = int(m.group(1)), c["POS_COUNT_SHIFT"]
+    if (limit - 1) * (1 << shift) + c["POS_MASK"] >= 2 ** 31 - (1 << shift):
+        return [("R10", "H up to %d heads can overflow the arrival counter: %d x 2^%d" % (limit - 1, limit - 1, shift))]
+    return []
 
 
 # the conditionals that remain in the default view of a file (those on build tunables, which no variant build changes); any other one would hide text from the compiler that the rules still read
@@ -277,7 +274,7 @@ def stray_conditionals(view_text, allowed):
     for i, line in enumerate(view_text.splitlines(), 1):
         m = re.match(r"^\s*#\s*(if|ifdef|ifndef|elif)\b\s*(.*)$", line)
         if m:
-            key = re.sub(r"\s*(//.*|/\*.*)$", "", ("%s %s" % (m.group(1), m.group(2).strip())).strip())
+            key = re.sub(r"\s*(//.*|/\*.*)$", "", "%s %s" % m.groups()).strip()
             if key not in allowed:
                 out.append((i, line.strip()))
     return out
@@ -300,12 +297,11 @@ def problems(texts):
         if name not in defs or defs[name][0] != params or norm(defs[name][1]) != norm(HOOK_BODIES[name]):
             out.append(("R11", "the default definition of %s is not the one that the rules expand (%s(%s) %s)" % (name, name, ", ".join(params), HOOK_BODIES[name])))
     # R5: constants
-    c = None
     try:
         c = constants(texts)
     except KeyError as e:
         out.append(("R5", str(e)))
-    if c is not None:
+    else:
         if c["BT"] != 64:
             out.append(("R5", "BT is %d, the protocol is written for 64" % c["BT"]))
         if c["POS_COUNT_SHIFT"] != 8:
@@ -318,7 +314,8 @@ def problems(texts):
     if norm("POS_MASK < (1 << POS_COUNT_SHIFT)") not in cond:
         out.append(("R5", "the static_assert POS_MASK < (1 << POS_COUNT_SHIFT) is missing (the fill must fit below the arrival counter)"))
     # R6: the relaxed store helper
-    rt = " ".join(expand_default_hooks(tokens(rows)))
+    allrows = expand_default_hooks(tokens(rows))
+    rt = " ".join(allrows)
     if STORE_HELPER not in rt:
         out.append(("R6", "st_relaxed_gpu is not the relaxed device-scope store (st.relaxed.gpu.global.b32, volatile, memory clobber)"))
     # the entry
@@ -349,7 +346,7 @@ def problems(texts):
     i_skip, i_pos = s.find(SKIP), s.find("p . pos")
     if i_skip < 0 or (i_pos >= 0 and i_skip > i_pos):
         out.append(("R3", "the skip `%s` does not come before the first access to the pos word" % SKIP))
-    sw = function_body(tokens(view["cfbi_common.cuh"]), "SeqWindow seq_window (")
+    sw = function_body(common, "SeqWindow seq_window (")
     if sw is None:
         out.append(("R3", "seq_window is not found"))
     else:
@@ -365,16 +362,15 @@ def problems(texts):
     if branch.count("__syncthreads") != 1:
         out.append(("R4", "the decode branch has %d barriers, expected one (the hand-over of the fill)" % branch.count("__syncthreads")))
     # R9: the hand-over: pos_smem is written before the barrier, read after it
-    if branch.count("pos_smem") != 2 or not (s.find(FILL) >= 0 and s.find(FILL) < s.find(BARRIER) < s.rfind("pos_smem")):
+    if branch.count("pos_smem") != 2 or not (0 <= s.find(FILL) < s.find(BARRIER) < s.rfind("pos_smem")):
         out.append(("R9", "pos_smem is not written inside the thread-0 block before the barrier and read once after it"))
     if BARRIER in s and s.find(BARRIER) < s.find(ARRIVAL):
         out.append(("R9", "a barrier comes before the arrival atomic"))
     # R7: no other access to the pos word in the whole row engine; the kernel hands p to rows_entry only
-    allrows = expand_default_hooks(tokens(rows))
     member = [i for i, t in enumerate(allrows) if t == "pos" and i > 0 and allrows[i - 1] in (".", "->")]
     if len(member) != 3:
         out.append(("R7", "cfbi_rows.cuh reaches a member `pos` %d times, expected 3 (the arrival atomic, the elected store and the fused store of the two-launch path)" % len(member)))
-    if FUSED_TAIL not in " ".join(allrows):
+    if FUSED_TAIL not in rt:
         out.append(("R7", "the fused position store is not `%s` (it must be the DECODE = false branch of the kernel tail)" % FUSED_TAIL))
     kbody = function_body(allrows, "__global__ void __launch_bounds__ ( NTHREADS , CFBI_ROWS_MINB ) rows_kernel (")
     if kbody is None:

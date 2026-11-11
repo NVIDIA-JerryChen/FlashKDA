@@ -191,8 +191,8 @@ def test_racecheck_reports_no_hazard_over_a_bounded_workload_that_crosses_a_chun
 
 # ---- the controls: an out-of-bounds position access is reported, the one that was moved and no other ---------------------------------------------------------------------
 OOB_ENV = {"PYTORCH_NO_CUDA_MEMORY_CACHING": "1"}      # every tensor is its own allocation: an offset beyond the pool's pos leaves it
-# (id, path, accesses moved, what memcheck must report first, the number of errors it must report (None: not asserted))
 OOB_CTAS = sw.OOB_SEQUENCES * sw.OOB_HEADS
+# (id, path, accesses moved, what memcheck must report first, the number of errors it must report (None: not asserted))
 OOB_REPORTED = [
     ("single_arrival_atomic", "single", ACC_ARRIVAL, "Invalid __global__ atomic", OOB_CTAS),           # every CTA of the launch arrives once
     ("single_elected_store", "single", ACC_ELECTED, "Invalid __global__ write", sw.OOB_SEQUENCES),       # exactly one CTA per sequence stores
@@ -209,8 +209,7 @@ def memcheck_oob(ext, tmp_path, path_name, offset, accesses):
     path = rw.PATHS[path_name]
     on_path(mod, path_name, lambda: sw.oob_workload(mod, path, 0, 0, assert_launches=True))
     r = run_driver("memcheck", tmp_path, OOB_DRIVER, env=OOB_ENV, offset=offset, path=path_name, accesses=accesses)
-    text = r.stdout + r.stderr
-    return r, text
+    return r, r.stdout + r.stderr
 
 
 def kernel_lines(text):

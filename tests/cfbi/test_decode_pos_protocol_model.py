@@ -20,8 +20,8 @@ integers; the 32-bit word is modelled explicitly only where it matters (the capa
 ``rows_entry``: every access to the word is an atomic or a relaxed store, the elected store needs no ordering against E and rows), nor about the hardware, and the preconditions that the
 tests below show to be necessary (distinct slots, no arrival residue) are documented in ``flash_kda/cfbi/api.py``, not validated on the device.
 """
-import itertools
 import random
+import re
 
 import pytest
 
@@ -41,7 +41,6 @@ def interleavings(counts):
     """Every distinct order of the multiset in which CTA c appears ``counts[c]`` times."""
     counts = list(counts)
     total = sum(counts)
-    out = []
 
     def rec(prefix):
         if len(prefix) == total:
@@ -51,12 +50,11 @@ def interleavings(counts):
             if counts[c] > 0:
                 counts[c] -= 1
                 prefix.append(c)
-                for s in rec(prefix):
-                    yield s
+                yield from rec(prefix)
                 prefix.pop()
                 counts[c] += 1
 
-    return rec(out)
+    return rec([])
 
 
 def elected(variant, old, H, elect=None):
@@ -77,12 +75,12 @@ def run_words(seqs, schedule, variant="protocol", elect=None):
     (sequence, head) pairs, each twice (arrival, then the store step). Returns (words by slot, fill seen by every CTA, number of stores per sequence)."""
     words = {}
     for slot, _, pos0, _, *residue in seqs:
-        words[slot] = (pos0 + ((residue[0] if residue else 0) << SHIFT)) if slot not in words else words[slot]
-    old, seen, started, stores = {}, {}, set(), [0] * len(seqs)
-    for (s, c) in schedule:
-        slot, H, pos0, length, *_ = seqs[s]
-        if (s, c) not in started:
-            started.add((s, c))
+        if slot not in words:
+            words[slot] = pos0 + ((residue[0] if residue else 0) << SHIFT)
+    old, seen, stores = {}, {}, [0] * len(seqs)
+    for s, c in schedule:
+        slot, H, _, length, *_ = seqs[s]
+        if (s, c) not in old:                                # the first step of a CTA: its arrival
             old[(s, c)] = words[slot]
             if variant != "every_cta":                       # every_cta: a plain read, no counting
                 words[slot] = words[slot] + (1 << SHIFT)     # the atomic add (the result is the word before the add)
@@ -192,16 +190,14 @@ def test_the_naive_scheme_fails_exactly_when_a_cta_starts_after_a_store():
     what the late starters of a multi-wave grid do, and what a delayed CTA does in the test variants."""
     H = 3
     for sched in interleavings([2] * H):
-        first_store_step = None
-        started_after_store = False
-        seen_started = set()
-        for i, c in enumerate(sched):
-            if c not in seen_started:
-                seen_started.add(c)
-                if first_store_step is not None:
+        started, stored, started_after_store = set(), False, False
+        for c in sched:
+            if c in started:
+                stored = True                     # the second step of a CTA: in this scheme every CTA stores
+            else:
+                started.add(c)
+                if stored:
                     started_after_store = True
-            elif first_store_step is None:
-                first_store_step = i
         bad = check_one(H, 12, 1, sched, "every_cta")
         if started_after_store:
             assert bad is not None, sched
@@ -220,8 +216,8 @@ def test_duplicate_slots_are_outside_the_contract():
     for _ in range(500):
         sched = list(base)
         rng.shuffle(sched)
-        words, seen, stores = run_words(seqs, tuple(sched))
-        if any(seen[k] != 10 for k in seen):
+        _, seen, _ = run_words(seqs, tuple(sched))
+        if any(v != 10 for v in seen.values()):
             broken += 1
     assert broken > 0
 
@@ -287,8 +283,6 @@ def last_arrival_is_elected_in_a_32_bit_word(H, fill=63):
 
 def test_the_counter_fits_the_word_for_every_head_count_the_binding_admits():
     assert ps.counter_limit_problems(SOURCES) == []
-    import re
-
     limit = int(re.search(r"H\s*<\s*(\d+)\s*,\s*\"problem too large", ps.strip_comments(SOURCES["cfbi_binding.cpp"])).group(1))
     assert last_arrival_is_elected_in_a_32_bit_word(limit - 1) and last_arrival_is_elected_in_a_32_bit_word(1)
 

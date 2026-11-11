@@ -36,12 +36,10 @@ def copy_with(tmp_path, texts, edits):
     """A copy of the sources on disk with the edits applied (each ``(file, old, new)`` must find ``old`` exactly once), read back through the reader."""
     d = tmp_path / "cfbi"
     d.mkdir()
-    edits_by_file = {}
-    for f, old, new in edits:
-        edits_by_file.setdefault(f, []).append((old, new))
     for name, text in texts.items():
-        for old, new in edits_by_file.get(name, []):
-            text = mutate(text, old, new)
+        for f, old, new in edits:
+            if f == name:
+                text = mutate(text, old, new)
         (d / name).write_text(text)
     return ps.load(d)
 
@@ -73,7 +71,7 @@ def test_comments_are_not_code_and_strings_are_not_comments():
 def test_test_macro_branches_are_resolved_the_way_a_default_build_reads_them():
     text = "a\n#ifdef CFBI_DECODE_TEST_X\nb\n#else\nc\n#ifndef CFBI_DECODE_TEST_Y\nd\n#endif\n#endif\n#ifdef TUNABLE\ne\n#endif\n"
     view = ps.default_text(text, ps.macros_in([text]))
-    assert [l for l in view.split("\n")] == ["a", "c", "d", "#ifdef TUNABLE", "e", "#endif"]
+    assert view.split("\n") == ["a", "c", "d", "#ifdef TUNABLE", "e", "#endif"]
     with pytest.raises(ValueError):
         ps.default_text("#ifdef CFBI_DECODE_TEST_X\n#elif Y\n#endif\n", {"CFBI_DECODE_TEST_X"})
 

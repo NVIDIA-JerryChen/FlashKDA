@@ -19,7 +19,7 @@ EMPTY_EVERY, ONE_EVERY, TWO_EVERY = (11, 5), (13, 7), (17, 3)   # (modulus, resi
 
 def live_floor(capacity, waves=WAVES):
     """The fewest live CTAs per launch that make it ``waves`` waves of ``capacity`` resident CTAs."""
-    return int(math.ceil(waves * capacity))
+    return math.ceil(waves * capacity)
 
 
 def active_quota(capacity, heads, waves=WAVES):

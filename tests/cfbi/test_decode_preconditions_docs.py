@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+import protocol_source as ps
+
 ROOT = Path(__file__).resolve().parents[2]
 API = ROOT / "flash_kda" / "cfbi" / "api.py"
 PERF = ROOT / "docs" / "20261103-cfbi-perf.md"
@@ -53,8 +55,8 @@ def docstring(function):
     raise KeyError(function)
 
 
-def perf_paragraph(text=None):
-    text = PERF.read_text() if text is None else text
+def perf_paragraph():
+    text = PERF.read_text()
     start = text.index(HEADING)
     end = text.find("\n\n", start)
     return text[start:end if end > 0 else len(text)]
@@ -88,17 +90,13 @@ def test_the_performance_document_states_the_four_preconditions():
 
 @pytest.mark.parametrize("statement", list(API_PHRASES))
 def test_a_deleted_statement_is_caught_in_the_api_documentation(statement):
-    text = plain(docstring("prefill"))
-    for pat in API_PHRASES[statement][:1]:
-        text = re.sub(pat, "", text)
+    text = re.sub(API_PHRASES[statement][0], "", plain(docstring("prefill")))
     assert statement in missing(text, API_PHRASES)
 
 
 @pytest.mark.parametrize("statement", list(PERF_PHRASES))
 def test_a_deleted_statement_is_caught_in_the_performance_document(statement):
-    text = plain(perf_paragraph())
-    for pat in PERF_PHRASES[statement][:1]:
-        text = re.sub(pat, "", text)
+    text = re.sub(PERF_PHRASES[statement][0], "", plain(perf_paragraph()))
     assert statement in missing(text, PERF_PHRASES)
 
 
@@ -108,9 +106,7 @@ def test_the_old_unqualified_wording_is_caught():
 
 
 def test_the_counter_capacity_the_document_quotes_is_the_one_of_the_sources():
-    import protocol_source as ps
-
-    c = ps.constants(ps.load())
+    sources = ps.load()
     text = plain(perf_paragraph())
     assert "23 bits above the shift" in text and "2^23 heads" in text and "2^16 heads" in text
-    assert 31 - c["POS_COUNT_SHIFT"] == 23 and ps.counter_limit_problems(ps.load()) == []
+    assert 31 - ps.constants(sources)["POS_COUNT_SHIFT"] == 23 and ps.counter_limit_problems(sources) == []

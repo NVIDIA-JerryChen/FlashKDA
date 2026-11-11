@@ -107,7 +107,8 @@ def test_a_padded_batch_leaves_the_active_quota_live(cap, H, every, residue):
     assert N - len(padding) == active and padding and all(i % every == residue for i in padding)
     prev_live = (N - 1) - len([i for i in padding if i < N - 1])
     assert prev_live < active                                          # the smallest batch with that many live entries
-    cov = rw.launch_coverage([([1] * N, [-1 if i in set(padding) else i for i in range(N)])], H)
+    pad = set(padding)
+    cov = rw.launch_coverage([([1] * N, [-1 if i in pad else i for i in range(N)])], H)
     assert rw.beyond_waves_problems(cov["live_ctas"], {"i": cap}) == []
 
 

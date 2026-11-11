@@ -43,7 +43,7 @@ WRONG = {
 }
 REPS = 5
 NS = (2000, 20000)
-SITES = dict((name, (site,)) for name, site in lg.PLACEMENTS.items())
+SITES = {name: (site,) for name, site in lg.PLACEMENTS.items()}
 SITES["all_four"] = tuple(sorted(lg.PLACEMENTS.values()))
 TARGETS = {"all_ctas": (0, 0), "even_ctas": (2, 0), "odd_ctas": (2, 1), "every_third_cta": (3, 1)}      # (cta_mod, cta_rem) with cta = sequence * H + head
 SELECTIVE = ("before", "all")                      # the placements that may select CTAs by index; the first and the last arrival are not told by the index
@@ -146,9 +146,7 @@ def exposure_case(mod, workload, ns, placement, target):
     """A wrong protocol under a delay: it must differ from the oracle in some repetition (a position that leaves 0 .. 63, the arrival bits that stayed in the word, counts as differing)."""
     step, warm, ref = workload
     cap = helpers.resident_ctas(mod, rw.SINGLE.instance)
-    if step.live_ctas() <= cap:
-        pass                                                # the co-resident shape: all of it fits at once
-    else:
+    if step.live_ctas() > cap:                              # not the co-resident shape (all of it fits at once): beyond waves
         floor = rw.beyond_waves_problems([step.live_ctas()], {"this variant": cap})
         assert not floor, "; ".join(floor)
     seen = []
