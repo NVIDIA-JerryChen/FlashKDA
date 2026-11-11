@@ -203,16 +203,17 @@ static std::atomic<int> g_decode_single_force{0};   // the hidden calibration co
 
 int decode_single_force(int on) { return g_decode_single_force.exchange(on != 0 ? 1 : 0); }
 
-// The rule is decode_single_launch_policy (cfbi_policy.h), documented at the declaration (cfbi_launch.h); this reads the device. A failed device query keeps the plan kernel (the
-// safe, old schedule): the SM count then is not positive and the capability is 0. The calibration control applies the eligible part of the rule and nothing else.
+// The rule is decode_single_launch_policy (cfbi_policy.h), documented at the declaration (cfbi_launch.h); this reads the device (three attributes, on every decode call: the binding and
+// the launcher both ask). A failed device query keeps the plan kernel, the safe, old schedule. The calibration control applies the eligible part of the rule and nothing else.
 bool decode_single_launch(int mode, int impl, int64_t N, int64_t H, int device) {
     if (!decode_single_launch_eligible(mode, impl, N, H)) return false;
     if (g_decode_single_force.load() != 0) return true;
     if (device < 0 && cudaGetDevice(&device) != cudaSuccess) return false;
-    int sms = 0;
-    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) return false;
-    const DeviceCaps c = device_caps(device);
-    return decode_single_launch_policy(mode, impl, N, H, sms, 10 * c.major + c.minor);
+    int sms = 0, major = 0, minor = 0;
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess)
+        return false;
+    return decode_single_launch_policy(mode, impl, N, H, sms, 10 * major + minor);
 }
 
 void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
