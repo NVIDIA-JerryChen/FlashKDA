@@ -350,7 +350,7 @@ def raw_sample_problems(rec, key, metric):
 
 
 def campaign_cell_problems(records, role):
-    """``(problems, union of the cell keys)`` of the record files of one side: unique keys inside every file and the same cells in every file."""
+    """``(problems, union of the cell keys, keys that not every file holds)`` of the record files of one side: unique keys inside every file and the same cells in every file."""
     problems, sets = [], []
     for rec in records:
         keys = [c["key"] for c in rec["cells"]]
@@ -362,7 +362,7 @@ def campaign_cell_problems(records, role):
     for rec, keys in zip(records, sets):
         if keys != union:
             problems.append("%s record %s lacks the cell(s) %s that other records of the same side hold" % (role, rec.get("_path", "?"), sorted(union - keys)[:4]))
-    return problems, union
+    return problems, union, union - (set.intersection(*sets) if sets else set())
 
 
 def _arg_values(records, key, name):
@@ -453,12 +453,13 @@ def compare(base, cand, metric="k2_stage_us", tol_pct=1.0, mode="regress", expec
                 problems.append("baseline and candidate records of the %s are not interleaved in time (%d variant switches, %d needed)" % (label, got, need))
 
     # ---- the campaign: unique keys, the same cells in every file of a side, the same cells in both builds, a consistent re-run set -----------------------------
-    sides = {}
+    sides, ragged = {}, set()
     for role, recs in (("baseline", base), ("candidate", cand), ("baseline re-run", base_rerun), ("candidate re-run", cand_rerun)):
         if recs:
-            probs, union = campaign_cell_problems(recs, role)
+            probs, union, partial = campaign_cell_problems(recs, role)
             problems.extend(probs)
             sides[role] = union
+            ragged |= partial                                          # a cell that not every file of a side holds has no valid sample set: it gets no row
 
     def chosen(keys):
         return set(k for k in keys if not cells or any(sub in k for sub in cells))
@@ -481,7 +482,7 @@ def compare(base, cand, metric="k2_stage_us", tol_pct=1.0, mode="regress", expec
     unstable_base = False
     failed = False
     for key in first_order:
-        if key not in base_set or key not in cand_set:
+        if key not in base_set or key not in cand_set or key in ragged:
             continue
         judged_on = "rerun" if key in rerun_keys else "first"
         base_k, cand_k = (base_rerun, cand_rerun) if judged_on == "rerun" else (base, cand)

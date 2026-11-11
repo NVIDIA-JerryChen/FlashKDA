@@ -1323,6 +1323,17 @@ def test_a_defective_sample_makes_the_comparison_invalid_and_names_the_cell():
         first[2]["cells"][0]["samples"][1]["gpu_graph_us"] = bad
         res = br.compare(first, cand, metric="gpu_graph_us", base_rerun=rbase, cand_rerun=rcand)
         assert res["verdict"] == "INVALID" and any(k1 in p and "baseline record" in p for p in res["problems"]), bad
+    few = json.loads(json.dumps(cand))                                                               # review counterexample: four of five trials carry no wall metric
+    for s_ in few[1]["cells"][0]["samples"][:4]:
+        del s_["gpu_graph_us"]
+    res = br.compare(base, few, metric="gpu_graph_us")
+    assert res["verdict"] == "INVALID" and any("4 of 5 sample(s) carry no gpu_graph_us" in p and k1 in p for p in res["problems"])
+    all_nan = json.loads(json.dumps(cand, allow_nan=True))                                          # review counterexample: every compared value is NaN
+    for r in all_nan:
+        for s_ in r["cells"][0]["samples"]:
+            s_["gpu_graph_us"] = float("nan")
+    res = br.compare(base, all_nan, metric="gpu_graph_us")
+    assert res["verdict"] == "INVALID" and any("non-finite" in p and k1 in p for p in res["problems"]) and not any(r["status"] == "PASS" and r["key"] == k1 for r in res["rows"])
     d = tempfile.mkdtemp()                                                                         # the file round trip keeps a NaN a NaN
     broken = json.loads(json.dumps(cand))
     broken[0]["cells"][0]["samples"][0]["gpu_graph_us"] = float("nan")
@@ -1349,6 +1360,12 @@ def test_every_record_of_a_side_holds_the_same_unique_cells():
     dup[0]["cells"].append(json.loads(json.dumps(dup[0]["cells"][0])))                            # one key twice in one record
     res = br.compare(dup, cand, metric="gpu_graph_us")
     assert res["verdict"] == "INVALID" and any("repeats the cell key" in p for p in res["problems"])
+    extra = br.cell_key("decode", N=16, H=12, regime="lockstep")                                   # review counterexample: a cell that only the first file of EACH side holds
+    both_b, both_c = json.loads(json.dumps(base)), json.loads(json.dumps(cand))
+    for recs in (both_b, both_c):
+        recs[0]["cells"].append(wall_cell(extra, trials(100.0)))
+    res = br.compare(both_b, both_c, metric="gpu_graph_us")
+    assert res["verdict"] == "INVALID" and any("lacks the cell" in p and extra in p for p in res["problems"]) and extra not in [r["key"] for r in res["rows"] if r["status"] == "PASS"]
     only = json.loads(json.dumps(cand))
     for r in only:
         r["cells"] = r["cells"][:1]                                                                # the candidate lost a cell everywhere
@@ -1765,7 +1782,9 @@ def test_layer_chain_wrong_paths_with_the_right_number_of_kernels_are_refused():
     single = lc.CANONICAL_COMPUTE["single-launch"]
     assert single == {k: v for k, v in TWO_LAUNCH.items() if k != "plan_kernel"} and sum(single.values()) == 10 and sum(TWO_LAUNCH.values()) == 11
     ref_rows = "void cfbi::ref::rows_kernel(cfbi::Params)"                                            # the frozen reference kernel, a compute kernel of its own name
-    wrong = {"missing plan, rows twice": dict(CHAIN_COUNTS, **{"void cfbi::plan_kernel(long const*, int)": 0.0, "void cfbi::rows_kernel(cfbi::Params)": 2.0}),
+    wrong = {"review counterexample: no plan, two reference rows kernels": dict(CHAIN_COUNTS, **{"void cfbi::plan_kernel(long const*, int)": 0.0,
+                                                                                               "void cfbi::rows_kernel(cfbi::Params)": 0.0, ref_rows: 2.0}),
+             "missing plan, rows twice": dict(CHAIN_COUNTS, **{"void cfbi::plan_kernel(long const*, int)": 0.0, "void cfbi::rows_kernel(cfbi::Params)": 2.0}),
              "reference rows instead of the optimised one": dict(CHAIN_COUNTS, **{"void cfbi::rows_kernel(cfbi::Params)": 0.0, ref_rows: 1.0}),
              "plan twice, one linear less": dict(CHAIN_COUNTS, **{"void cfbi::plan_kernel(long const*, int)": 2.0, LIN_K: 5.0})}
     for what, counts in sorted(wrong.items()):
