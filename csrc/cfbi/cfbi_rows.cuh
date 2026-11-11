@@ -199,7 +199,8 @@ __device__ __forceinline__ void st_relaxed_gpu(int* ptr, int v) {
 // Test builds only (the default build has none of these macros): CFBI_DECODE_TEST_DELAY_NS lets every CTA linger for 0 .. 3 x the delay before it arrives (the late starters
 // of a grid that does not fit one wave, on demand), and two wrong protocols that the harness must catch: CFBI_DECODE_TEST_EVERY_CTA_WRITES (no counting: every CTA reads the
 // word and stores the new value at the end of its row loop, the plan-less version of the two-launch scheme without its snapshot) and CFBI_DECODE_TEST_FIRST_ARRIVER (the
-// first CTA to arrive, not the last, stores).
+// first CTA to arrive, not the last, stores), and CFBI_DECODE_TEST_NO_ELECTED_STORE (the elected CTA does not store: every arrival bit stays in the word after the call, which the at-rest
+// check of the harness must see).
 template <bool DECODE>
 using RowsParams = std::conditional_t<DECODE, DecodeParams, Params>;   // DecodeParams: the call's Params and its token windows (cfbi_common.cuh)
 
@@ -223,7 +224,9 @@ __device__ __forceinline__ SeqPlan rows_entry(const RowsParams<DECODE>& p, int n
 #ifdef CFBI_DECODE_TEST_FIRST_ARRIVER
             if ((old >> POS_COUNT_SHIFT) == 0) st_relaxed_gpu(p.pos + w.slot, (int)(((int64_t)(old & POS_MASK) + w.len) % BT));
 #else
+#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE
             if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(p.pos + w.slot, (int)(((int64_t)(old & POS_MASK) + w.len) % BT));
+#endif
 #endif
 #endif
         }

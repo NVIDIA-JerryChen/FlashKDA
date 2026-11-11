@@ -186,7 +186,7 @@ def default_build_problems(rows_text, launch_text):
 def test_the_variant_macros_of_the_row_engine_are_found(rows_text, launch_text):
     found = macros_in([rows_text, launch_text])
     assert {"CFBI_ROWS_DELAY_NS", "CFBI_ROWS_TEST_NO_END_BARRIER", "CFBI_ROWS_TEST_POS_OOB", "CFBI_ROWS_TEST_COMPILE_ERROR", "CFBI_ROWS_PROFILE", "CFBI_NEG_CONTROL"} <= found
-    assert {"CFBI_DECODE_TEST_DELAY_NS", "CFBI_DECODE_TEST_EVERY_CTA_WRITES", "CFBI_DECODE_TEST_FIRST_ARRIVER"} <= found      # the hooks of the single-launch decode entry
+    assert {"CFBI_DECODE_TEST_DELAY_NS", "CFBI_DECODE_TEST_EVERY_CTA_WRITES", "CFBI_DECODE_TEST_FIRST_ARRIVER", "CFBI_DECODE_TEST_NO_ELECTED_STORE"} <= found      # the hooks of the single-launch decode entry
 
 
 def test_the_default_build_of_the_hooks_is_the_unhooked_kernel(rows_text, launch_text):
@@ -198,7 +198,8 @@ def test_the_default_build_of_the_hooks_is_the_unhooked_kernel(rows_text, launch
     ("the end barrier removed by default", "rows", "#else\n#define ROWS_SYNC_END() ROWS_SYNC(7)\n#endif", "#else\n#define ROWS_SYNC_END() ROWS_DELAY(7)\n#endif", "ROWS_SYNC_END() ROWS_SYNC(7)"),
     ("the position offset compiled in", "rows", "#else\n#define ROWS_POS_INDEX(slot) (slot)\n#endif", "#else\n#define ROWS_POS_INDEX(slot) ((slot) + 1)\n#endif", "ROWS_POS_INDEX(slot) (slot)"),
     ("a sleep outside the macro", "rows", "    ROWS_DELAY(0);   // test hook", "    __nanosleep(1);\n    ROWS_DELAY(0);   // test hook", "__nanosleep"),
-    ("the first-arriver election by default", "rows", "#else\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(", "#else\n            if ((old >> POS_COUNT_SHIFT) == 0) st_relaxed_gpu(", "== p.H - 1) st_relaxed_gpu"),
+    ("the first-arriver election by default", "rows", "#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(", "#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == 0) st_relaxed_gpu(", "== p.H - 1) st_relaxed_gpu"),
+    ("the elected store missing by default", "rows", "#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(", "#ifdef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(", "== p.H - 1) st_relaxed_gpu"),
     ("the non-counting read by default", "rows", "#else\n            const int old = atomicAdd(p.pos + w.slot, 1 << POS_COUNT_SHIFT);", "#else\n            const int old = atomicAdd(p.pos + w.slot, 0);", "1 << POS_COUNT_SHIFT"),
     ("the every-CTA store by default", "rows", "#ifdef CFBI_DECODE_TEST_EVERY_CTA_WRITES\n        if (tid == 0) p.pos[sp.slot]", "#if 1\n        if (tid == 0) p.pos[sp.slot]", "wrong protocol"),
     ("a sleep of the decode entry outside its macro", "rows", "#ifdef CFBI_DECODE_TEST_DELAY_NS\n            __nanosleep(", "#if 1\n            __nanosleep(", "__nanosleep"),
@@ -257,7 +258,8 @@ def test_the_default_build_defines_no_test_macro_of_any_prefix():
 
 @pytest.mark.parametrize("macro", ["CFBI_ROWS_DELAY_NS", "CFBI_ROWS_TEST_NO_END_BARRIER", "CFBI_ROWS_TEST_POS_OOB", "CFBI_ROWS_TEST_COMPILE_ERROR", "CFBI_ROWS_TEST_ANYTHING_NEW",
                                    "CFBI_ROWS_PROFILE", "CFBI_NEG_CONTROL", "CFBI_DYN_TEST_SKIP_ITEM", "CFBI_UMMA_RACE_DELAY_NS", "CFBI_CONV_NEG_CONTROL",
-                                   "CFBI_DECODE_TEST_DELAY_NS", "CFBI_DECODE_TEST_EVERY_CTA_WRITES", "CFBI_DECODE_TEST_FIRST_ARRIVER", "CFBI_DECODE_TEST_ANYTHING_NEW"])
+                                   "CFBI_DECODE_TEST_DELAY_NS", "CFBI_DECODE_TEST_EVERY_CTA_WRITES", "CFBI_DECODE_TEST_FIRST_ARRIVER", "CFBI_DECODE_TEST_NO_ELECTED_STORE",
+                                   "CFBI_DECODE_TEST_ANYTHING_NEW"])
 def test_a_planted_define_of_any_prefix_is_caught(macro):
     srcs, flags, nvcc = real_guard_inputs()
     planted = dict(srcs)
