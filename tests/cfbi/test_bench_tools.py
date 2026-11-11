@@ -1905,7 +1905,7 @@ def test_decode_profiled_pass_scales_with_the_rerun_and_covers_whole_position_cy
     for regime in bd.REGIMES:
         loop = regime != "probe"
         for scale in (1, 3):
-            cell, env, log, opts = run_decode_cell(monkeypatch, regime, scale)
+            cell, env, log, _ = run_decode_cell(monkeypatch, regime, scale)
             want_calls = (128 if loop else 70) * scale                                           # 100 calls round up to two whole cycles, the probe calls stay
             want_profiled = (128 if loop else 100) * scale
             passes = [e for e in log if e[0] == "kernel_times"]
