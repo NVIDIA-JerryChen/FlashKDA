@@ -4,13 +4,18 @@
 usage: python benchmarks/compare_bench.py --summary R1.json R2.json R3.json [--metric ...] [--expect-base-commit HASH]
        python benchmarks/compare_bench.py --base A1.json A2.json A3.json --cand B1.json B2.json B3.json
            [--metric total_us|k1_us|k2_stage_us|k2_main_us|<kernel name> ...] [--tol PERCENT] [--mode regress|within]
-           [--expect-base-commit HASH] [--require-clean-cand] [--min-repeats N] [--no-interleave-check] [--unstable-baseline invalid|worst]
-           [--cells SUBSTR ...] [--json OUT]
+           [--expect-base-commit HASH] [--require-clean-cand] [--min-repeats N] [--no-interleave-check] [--unstable-baseline invalid|worst|widen]
+           [--rerun-base A1.json ... --rerun-cand B1.json ...] [--cells SUBSTR ...] [--json OUT]
 
 ``--mode regress`` (default): FAIL when a cell of the candidate is more than ``--tol`` percent slower than the baseline median (no-regression gate).
 ``--mode within``: FAIL when it differs by more than ``--tol`` percent in either direction (protection of an unchanged code path).
-The records come from ``bench_breakdown.py --json``; see ``bench_records.py`` for the rules (expected commit, clean tree, GPU / SM metadata, same
-hardware, interleaving, 0.3 % spread).
+The records come from ``bench_breakdown.py --json`` and ``bench_decode.py --json``; see ``bench_records.py`` for the rules (expected commit, clean tree,
+GPU / SM metadata, same hardware, interleaving, 0.3 % spread, absent or zero metrics, per-process-median samples).
+
+``--unstable-baseline``: ``invalid`` (default) refuses a cell whose spread exceeds 0.3 % as a gate baseline; ``worst`` judges it on its worst repeat;
+``widen`` judges it as noise-limited with the tolerance widened by the larger of the two spreads (a noise-limited cell can fail a gross regression and is never
+the evidence of a gain). ``--rerun-base`` / ``--rerun-cand``: the records of a second campaign over some cells with more calls per trial; the cells they
+contain are judged on them. After every table the cells that are slower, faster or noise-limited beyond the plain tolerance are listed.
 
 exit status: 0 PASS, 1 FAIL, 2 INVALID (wrong, dirty or unstable baseline, missing data, not interleaved, mixed hardware, unusable input)
 """
@@ -37,9 +42,12 @@ def main(argv=None):
     ap.add_argument("--require-clean-cand", action="store_true", help="refuse candidate records of a dirty tree")
     ap.add_argument("--min-repeats", type=int, default=3, help="minimum number of record files per build (default 3)")
     ap.add_argument("--no-interleave-check", action="store_true", help="do not require the records of A and B to alternate in time")
-    ap.add_argument("--unstable-baseline", choices=("invalid", "worst"), default="invalid",
-                    help="unstable baseline cell (spread > 0.3 %%): invalid = not accepted as a gate baseline (default); "
-                         "worst = judged on its worst repeat (baseline at its fastest repeat, unstable candidate at its slowest)")
+    ap.add_argument("--unstable-baseline", choices=br.UNSTABLE_POLICIES, default="invalid",
+                    help="unstable cell (spread > 0.3 %%): invalid = an unstable baseline cell is not accepted as a gate baseline (default); "
+                         "worst = judged on its worst repeat (baseline at its fastest repeat, unstable candidate at its slowest); "
+                         "widen = judged as noise-limited with the tolerance widened by the larger of the two spreads")
+    ap.add_argument("--rerun-base", nargs="+", default=None, help="record files of the re-run of the baseline build (cells with more calls per trial)")
+    ap.add_argument("--rerun-cand", nargs="+", default=None, help="record files of the re-run of the candidate build")
     ap.add_argument("--cells", nargs="*", default=None, help="only cells whose key contains one of these substrings")
     ap.add_argument("--json", default=None, help="write the results to this file")
     a = ap.parse_args(argv)
@@ -74,6 +82,8 @@ def main(argv=None):
     try:
         base = [br.load_record(p) for p in a.base]
         cand = [br.load_record(p) for p in a.cand]
+        base_rerun = [br.load_record(p) for p in a.rerun_base or []]
+        cand_rerun = [br.load_record(p) for p in a.rerun_cand or []]
     except (OSError, ValueError) as e:
         print("cannot read the records: %s" % e, file=sys.stderr)
         return 2
@@ -83,11 +93,17 @@ def main(argv=None):
         try:
             res = br.compare(base, cand, metric=metric, tol_pct=a.tol, mode=a.mode, expect_base_commit=a.expect_base_commit,
                              require_clean_cand=a.require_clean_cand, min_repeats=a.min_repeats,
-                             require_interleaved=not a.no_interleave_check, cells=a.cells, baseline_unstable=a.unstable_baseline)
+                             require_interleaved=not a.no_interleave_check, cells=a.cells, baseline_unstable=a.unstable_baseline,
+                             base_rerun=base_rerun, cand_rerun=cand_rerun)
         except (KeyError, TypeError, ValueError, IndexError) as e:  # an unforeseen record shape is unusable input, never a performance FAIL
             print("cannot compare the records: %s: %s" % (type(e).__name__, e), file=sys.stderr)
             return 2
         print(br.format_table(res))
+        if res["rows"]:
+            res["classification"] = br.classify_rows(res)
+            print("beyond the %.2f %% tolerance: %d slower, %d faster, %d noise-limited cell(s)%s" % (
+                res["tol_pct"], len(res["classification"]["slower"]), len(res["classification"]["faster"]), len(res["classification"]["noise_limited"]),
+                "".join("\n  %s: %s" % (k, ", ".join(v)) for k, v in sorted(res["classification"].items()) if v and k != "neutral")))
         print()
         results.append(res)
     if a.json:

@@ -858,3 +858,182 @@ def test_codegen_compile_matrix_and_a_failing_build_with_nvcc():
         cg.dump_tree(d, ("sm_90a",), (), tc)
     assert cg.main(["matrix", "--tree", d, "--archs", "sm_90a"]) == 1
     assert cg.main(["gate", "--base-tree", d, "--cand-tree", d, "--archs", "sm_90a"]) == 2
+
+
+# ---- wall metrics, per-process-median samples, the widening mode and the comparison tool --------------------------------------------------------
+
+PLAN_K = "void cfbi::plan_kernel(long const*, int, int const*, int const*, int, int, cfbi::SeqPlan*)"
+ROWS_K = "void cfbi::rows_kernel(cfbi::Params)"
+FILL_K = "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, std::array<char*, 1ul> >(int, at::native::FillFunctor<float>)"
+WALL_KEY = "decode;N=1;H=12;regime=lockstep;"
+
+
+def wall_cell(key, vals, kind="decode"):
+    """A decode cell with one trial per value: ``gpu_graph_us`` = value, ``gpu_eager_us`` = value + 1, ``cpu_graph_us`` = value + 3; the kernels of a trial are
+    plan 2 us + rows 10 us and one helper kernel of 40 us that must stay out of the kernel sum."""
+    runs = [{PLAN_K: 2.0, ROWS_K: 10.0, FILL_K: 40.0} for _ in vals]
+    wall = [{"gpu_graph_us": v, "gpu_eager_us": v + 1.0, "cpu_graph_us": v + 3.0} for v in vals]
+    return br.make_cell(kind, key, {}, runs, drop_helpers=True, wall=wall)
+
+
+def wall_rec(commit, cells, ts, stat=br.PROCESS_MEDIAN, gpu="NVIDIA B200", sm=148, host="node1", dirty=False):
+    meta = {"commit": commit, "dirty": dirty, "gpu": gpu, "sm_count": sm, "host": host, "timestamp": ts, "sample_stat": stat, "trials": 5}
+    return {"schema": br.SCHEMA, "meta": meta, "cells": [wall_cell(k, v) for k, v in cells.items()]}
+
+
+def trials(median, spread=0.0):
+    """Five trial values whose median is ``median`` and whose range is ``2 * spread`` (relative)."""
+    return [median * (1 - spread), median * (1 - spread / 2), median, median * (1 + spread / 2), median * (1 + spread)]
+
+
+def wall_sets(base_meds, cand_meds, keys=(WALL_KEY,), hour="10", cand_commit="abc1234", **kw):
+    """Interleaved record lists (A B A B A B ...) with one per-process median per record file for each cell key."""
+    base = [wall_rec(BASE_COMMIT, {k: trials(m) for k in keys}, "2026-11-10T%s:0%d:00Z" % (hour, 2 * i), **kw) for i, m in enumerate(base_meds)]
+    cand = [wall_rec(cand_commit, {k: trials(m) for k in keys}, "2026-11-10T%s:0%d:00Z" % (hour, 2 * i + 1), **kw) for i, m in enumerate(cand_meds)]
+    return base, cand
+
+
+def test_wall_metrics_round_trip_and_helper_kernels_are_left_out_of_the_kernel_sum():
+    cell = wall_cell("decode;N=1;H=12;regime=cold;", [14.0, 14.2, 14.1, 14.0, 14.3])
+    s = cell["samples"][0]
+    assert s["total_us"] == 12.0 and s["helper_us"] == 40.0 and set(s["kernels"]) == {"plan_kernel", "rows_kernel"}
+    assert s["gpu_graph_us"] == 14.0 and s["gpu_eager_us"] == 15.0 and s["cpu_graph_us"] == 17.0 and "cpu_eager_us" not in s
+    d = tempfile.mkdtemp()
+    r = wall_rec(BASE_COMMIT, {"decode;N=1;H=12;regime=cold;": [14.0] * 5}, "2026-11-10T10:00:00Z")
+    path = os.path.join(d, "r.json")
+    br.write_record(path, r["meta"], r["cells"])
+    back = br.load_record(path)
+    assert br.structure_problems(back) == [] and br.metric_value(back["cells"][0]["samples"][0], "gpu_graph_us") == 14.0
+    assert br.metric_value(back["cells"][0]["samples"][0], "cpu_eager_us") is None
+    kept = br.make_cell("decode", "k", {}, [{PLAN_K: 2.0, ROWS_K: 10.0, FILL_K: 40.0}])             # without the exclusion every kernel is summed, as before
+    assert kept["samples"][0]["total_us"] == 52.0 and "helper_us" not in kept["samples"][0]
+    assert br.is_helper_kernel(FILL_K) and br.is_helper_kernel("Memset (Device)") and br.is_helper_kernel("void at::native::elementwise_kernel<128, 2>")
+    assert not br.is_helper_kernel(ROWS_K) and not br.is_helper_kernel("void cfbi::ref::rows_kernel(cfbi::Params)")
+    with pytest.raises(ValueError):
+        br.make_cell("decode", "k", {}, [{ROWS_K: 1.0}], wall=[{"bogus_us": 1.0}])
+    with pytest.raises(ValueError):
+        br.make_cell("decode", "k", {}, [{ROWS_K: 1.0}], wall=[])
+    broken = wall_rec(BASE_COMMIT, {WALL_KEY: [1.0] * 5}, "2026-11-10T10:00:00Z")
+    broken["cells"][0]["samples"][0]["gpu_graph_us"] = "fast"
+    assert br.structure_problems(broken)
+
+
+def test_cell_keys_end_every_field_with_a_delimiter_and_the_cell_filter_uses_them():
+    k1, k16 = br.cell_key("decode", N=1, H=12, regime="lockstep"), br.cell_key("decode", N=16, H=12, regime="lockstep")
+    assert k1 == "decode;N=1;H=12;regime=lockstep;" and "N=1;" in k1 and "N=1;" not in k16
+    base, cand = wall_sets([100.0, 100.05, 99.95], [100.0, 100.05, 99.95], keys=(k1, k16))
+    res = br.compare(base, cand, metric="gpu_graph_us", cells=["N=1;"])
+    assert [r["key"] for r in res["rows"]] == [k1]
+    assert [r["key"] for r in br.compare(base, cand, metric="gpu_graph_us", cells=["N=16;"])["rows"]] == [k16]
+
+
+def test_wall_metric_regress_gate_passes_aa_fails_a_3_percent_slower_and_passes_a_faster_candidate():
+    d = tempfile.mkdtemp()
+    for cand_meds, code in (([100.02, 100.07, 99.97], 0), ([103.0, 103.05, 102.95], 1), ([97.0, 97.05, 96.95], 0)):
+        base, cand = wall_sets([100.0, 100.05, 99.95], cand_meds)
+        args = (["--base"] + write_records(d, "a", base) + ["--cand"] + write_records(d, "b", cand) +
+                ["--mode", "regress", "--tol", "1", "--metric", "gpu_graph_us", "--min-repeats", "3", "--expect-base-commit", BASE_COMMIT, "--require-clean-cand"])
+        assert compare_bench.main(args) == code, cand_meds
+    base, cand = wall_sets([100.0, 100.05, 99.95], [100.0, 100.05, 99.95])                       # the kernel sum of the same records gates as well
+    assert br.compare(base, cand, metric="total_us")["verdict"] == "PASS" and br.compare(base, cand, metric="total_us")["rows"][0]["base_median"] == 12.0
+
+
+def test_widening_mode_passes_an_unstable_aa_pair_that_the_worst_mode_fails_and_still_fails_a_slower_candidate():
+    base, cand = wall_sets([100.0, 100.45, 100.9], [100.15, 100.6, 101.05])                      # 0.9 % spread on each side, offset by 0.15 %
+    worst = br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="worst")
+    assert worst["verdict"] == "FAIL" and 1.0 < worst["rows"][0]["delta_pct"] < 1.1              # fastest baseline repeat vs slowest candidate repeat
+    assert br.compare(base, cand, metric="gpu_graph_us")["verdict"] == "INVALID"                  # the default does not accept an unstable baseline
+    wide = br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen")
+    row = wide["rows"][0]
+    assert wide["verdict"] == "PASS" and row["noise_limited"] and abs(row["tol_pct_effective"] - 1.896) < 0.01 and row["median_delta_pct"] < 0.2
+    assert "noise-limited" in br.format_table(wide)
+    _, slower = wall_sets([100.0, 100.45, 100.9], [103.2, 103.65, 104.1])
+    assert br.compare(base, slower, metric="gpu_graph_us", baseline_unstable="widen")["verdict"] == "FAIL"
+    stable_b, stable_c = wall_sets([100.0, 100.05, 99.95], [100.0, 100.05, 99.95])               # stable cells keep the plain tolerance
+    assert not br.compare(stable_b, stable_c, metric="gpu_graph_us", baseline_unstable="widen")["rows"][0]["noise_limited"]
+    assert br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="bogus")["verdict"] == "INVALID"
+
+
+def test_process_median_samples_are_one_value_per_record_and_need_five_trials():
+    vals = [100.0, 100.1, 99.9, 100.0, 130.0]                                                    # one outlier trial per process does not move its median
+    base = [wall_rec(BASE_COMMIT, {WALL_KEY: vals}, "2026-11-10T10:0%d:00Z" % (2 * i)) for i in range(3)]
+    cand = [wall_rec("abc1234", {WALL_KEY: vals}, "2026-11-10T10:0%d:00Z" % (2 * i + 1)) for i in range(3)]
+    res = br.compare(base, cand, metric="gpu_graph_us")
+    assert res["verdict"] == "PASS" and res["rows"][0]["n_base"] == 3 and res["rows"][0]["base_spread_pct"] == 0.0 and res["rows"][0]["base_median"] == 100.0
+    few = [wall_rec(BASE_COMMIT, {WALL_KEY: [100.0] * 4}, "2026-11-10T10:0%d:00Z" % (2 * i)) for i in range(3)]
+    res = br.compare(few, cand, metric="gpu_graph_us")
+    assert res["verdict"] == "INVALID" and any("at least 5 are required" in p for p in res["problems"])
+    pooled = [dict(r, meta=dict(r["meta"], sample_stat="pooled")) for r in base]
+    res = br.compare(pooled, cand, metric="gpu_graph_us")
+    assert res["verdict"] == "INVALID" and any("mix sample statistics" in p for p in res["problems"])
+    assert br.compare(base[:2], cand[:2], metric="gpu_graph_us")["verdict"] == "INVALID"           # at least three record files per build
+    odd = [dict(r, meta=dict(r["meta"], sample_stat="mean")) for r in base]
+    assert br.compare(odd, odd, metric="gpu_graph_us")["verdict"] == "INVALID"
+
+
+def test_a_metric_that_is_zero_or_absent_in_a_cell_is_invalid_not_a_failure():
+    base, cand = wall_sets([100.0, 100.05, 99.95], [100.0, 100.05, 99.95])
+    res = br.compare(base, cand)                                                                  # the default metric k2_stage_us: a decode call has no K2 stage
+    assert res["verdict"] == "INVALID" and res["rows"] == [] and any("zero in cell" in p and "kind decode" in p for p in res["problems"])
+    d = tempfile.mkdtemp()
+    assert compare_bench.main(["--base"] + write_records(d, "a", base) + ["--cand"] + write_records(d, "b", cand)) == 2
+    assert compare_bench.main(["--base"] + write_records(d, "a", base) + ["--cand"] + write_records(d, "b", cand) + ["--metric", "k2_main_us"]) == 2
+    pre_b, pre_c = interleaved([100.0, 100.1, 99.9], [100.0, 100.1, 99.9])                       # prefill records carry no wall metric at all
+    assert br.compare(pre_b, pre_c, metric="gpu_graph_us")["verdict"] == "INVALID"
+    stripped = [json.loads(json.dumps(r)) for r in cand]                                          # the candidate lost the metric in this cell only
+    for r in stripped:
+        for cell in r["cells"]:
+            for s in cell["samples"]:
+                del s["gpu_graph_us"]
+    res = br.compare(base, stripped, metric="gpu_graph_us")
+    assert res["verdict"] == "INVALID" and any("absent in cell" in p and "candidate" in p for p in res["problems"])
+    gone = [json.loads(json.dumps(r)) for r in cand]                                              # a derived metric that vanished in the candidate is not a speed-up
+    for r in gone:
+        for cell in r["cells"]:
+            for s in cell["samples"]:
+                s["total_us"] = 0.0
+    assert br.compare(base, gone, metric="total_us")["verdict"] == "INVALID"
+
+
+def test_rerun_records_override_the_cells_they_contain():
+    k1, k2 = br.cell_key("decode", N=1, H=12, regime="lockstep"), br.cell_key("decode", N=4, H=12, regime="lockstep")
+    base, cand = wall_sets([100.0, 100.45, 100.9], [100.15, 100.6, 101.05], keys=(k1, k2))       # both cells are noise-limited in the first campaign
+    rbase, rcand = wall_sets([100.0, 100.05, 99.95], [100.1, 100.15, 100.05], keys=(k1,), hour="11")
+    res = br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=rbase, cand_rerun=rcand)
+    rows = {r["key"]: r for r in res["rows"]}
+    assert res["verdict"] == "PASS" and rows[k1]["judged_on"] == "rerun" and not rows[k1]["noise_limited"] and "judged on the re-run" in rows[k1]["note"]
+    assert rows[k2]["judged_on"] == "first" and rows[k2]["noise_limited"]
+    assert br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=rbase)["verdict"] == "INVALID"      # one side only
+    _, rcand_other = wall_sets([100.0, 100.05, 99.95], [100.1, 100.15, 100.05], keys=(k2,), hour="11")
+    res = br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=rbase, cand_rerun=rcand_other)
+    assert res["verdict"] == "INVALID" and any("one side only" in p for p in res["problems"])
+    few = rbase[:2]
+    assert br.compare(base, cand, metric="gpu_graph_us", baseline_unstable="widen", base_rerun=few, cand_rerun=rcand[:2])["verdict"] == "INVALID"
+
+
+def test_classify_rows_reads_slower_faster_and_noise_limited_cells():
+    rows = [{"key": "a", "median_delta_pct": 2.0, "noise_limited": False}, {"key": "b", "median_delta_pct": -2.0, "noise_limited": False},
+            {"key": "c", "median_delta_pct": -2.0, "noise_limited": True}, {"key": "d", "median_delta_pct": 0.5, "noise_limited": False},
+            {"key": "e", "median_delta_pct": -1.0, "noise_limited": False}, {"key": "f", "median_delta_pct": 1.0, "noise_limited": False},
+            {"key": "g", "median_delta_pct": 3.0, "noise_limited": True}]
+    out = br.classify_rows({"tol_pct": 1.0, "rows": rows})
+    assert out["slower"] == ["a", "g"] and out["faster"] == ["b", "e"] and out["noise_limited"] == ["c", "g"] and out["neutral"] == ["d", "f"]
+
+
+def test_compare_bench_cli_widen_rerun_and_the_json_classification():
+    d = tempfile.mkdtemp()
+    base, cand = wall_sets([100.0, 100.45, 100.9], [97.0, 97.4, 97.8])                            # unstable and about 3 % faster
+    rbase, rcand = wall_sets([100.0, 100.05, 99.95], [97.0, 97.05, 96.95], hour="11")
+    out = os.path.join(d, "out.json")
+    common = ["--base"] + write_records(d, "a", base) + ["--cand"] + write_records(d, "b", cand) + ["--metric", "gpu_graph_us"]
+    assert compare_bench.main(common) == 2                                                        # invalid: unstable baseline
+    assert compare_bench.main(common + ["--unstable-baseline", "widen", "--json", out]) == 0
+    with open(out) as f:
+        res = json.load(f)[0]
+    assert res["classification"]["noise_limited"] == [WALL_KEY] and res["classification"]["faster"] == []   # noise-limited: not the evidence of a gain
+    assert compare_bench.main(common + ["--unstable-baseline", "widen", "--rerun-base"] + write_records(d, "ra", rbase) +
+                              ["--rerun-cand"] + write_records(d, "rb", rcand) + ["--json", out]) == 0
+    with open(out) as f:
+        res = json.load(f)[0]
+    assert res["classification"]["faster"] == [WALL_KEY] and res["rows"][0]["judged_on"] == "rerun" and res["classification"]["noise_limited"] == []
+    assert compare_bench.main(common + ["--unstable-baseline", "widen", "--rerun-base"] + write_records(d, "ra", rbase)) == 2
