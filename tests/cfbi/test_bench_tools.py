@@ -1785,11 +1785,12 @@ def test_decode_calls_per_trial_cover_whole_position_cycles_and_scale_for_the_re
     assert [bd.calls_per_trial(r, scaled) for r in bd.REGIMES] == [3 * 1536, 3 * 1536, 3 * 256, 3 * 256]
 
 
-def test_decode_expected_kernel_set_is_asserted_and_trials_carry_the_wall_metrics():
-    assert bd.check_expected_kernels({"plan_kernel", "rows_kernel"}, ["rows_kernel", "plan_kernel"]) is None
-    assert bd.check_expected_kernels({"anything"}, None) is None
-    assert "launched ['rows_kernel']" in bd.check_expected_kernels({"rows_kernel"}, ["plan_kernel", "rows_kernel"])
-    assert "expected ['rows_kernel']" in bd.check_expected_kernels({"plan_kernel", "rows_kernel"}, ["rows_kernel"])
+def test_decode_expected_launch_mapping_is_asserted_and_trials_carry_the_wall_metrics():
+    assert br.check_nodes({"plan_kernel": 1.0, "rows_kernel": 1.0}, {}, {"rows_kernel": 1, "plan_kernel": 1}, None) is None
+    assert br.check_nodes({"anything": 1.0}, {}, None, None) is None
+    assert "compute kernels {'rows_kernel': 1}" in br.check_nodes({"rows_kernel": 1.0}, {}, {"plan_kernel": 1, "rows_kernel": 1}, None)
+    assert "expected {'rows_kernel': 1}" in br.check_nodes({"plan_kernel": 1.0, "rows_kernel": 1.0}, {}, {"rows_kernel": 1}, None)
+    assert "expected {'plan_kernel': 1, 'rows_kernel': 1}" in br.check_nodes({"plan_kernel": 1.0, "rows_kernel": 2.0}, {}, {"plan_kernel": 1, "rows_kernel": 1}, None)       # a duplicate
     assert bd.trial_wall(14.0, 13.0, 18.0, 9.0) == {"gpu_eager_us": 14.0, "gpu_graph_us": 13.0, "cpu_eager_us": 18.0, "cpu_graph_us": 9.0}
     assert bd.trial_wall(14.0, 13.0) == {"gpu_eager_us": 14.0, "gpu_graph_us": 13.0}
     cell = wall_cell(WALL_KEY, [14.0, 14.2, 14.1, 14.0, 14.3])
@@ -2309,6 +2310,130 @@ def test_decode_reruns_prove_three_times_the_calls_and_the_profiled_calls_to_the
         assert any("profile_calls" in p and "not 3 times" in p for p in br.rerun_problems(as_records(first), as_records(unscaled), "baseline", key, "total_us")), regime
     odd, _, _, _ = run_decode_cell(monkeypatch, "lockstep", 1, profile_calls=65)                  # 65 calls are not a whole cycle: two cycles are profiled, and recorded
     assert odd["args"]["profile_calls"] == 128 and odd["args"]["profile_cycles"] == 2
+
+
+# ---- the decode benchmark records and asserts the launch mapping of EVERY trial (not the union of the names that the trials launched) ----------------------
+
+D_TWO = {"plan_kernel": 1, "rows_kernel": 1}                      # the two-launch decode: the plan kernel and the row engine behind it
+D_ONE = {"rows_kernel": 1}                                        # the single-launch decode: the row engine only
+D_REF = {"plan_kernel": 1, "ref::rows_kernel": 1}                 # the frozen reference
+D_TWO_COUNTS = {PLAN_K: 1.0, ROWS_K: 1.0}                         # launches per call as the profiler reports them
+D_ONE_COUNTS = {ROWS_K: 1.0}
+REF_ROWS_K = "void cfbi::ref::rows_kernel(cfbi::Params)"
+
+
+def run_decode_nodes(monkeypatch, counts_seq, expect=D_TWO, regime="lockstep", trials=5):
+    """One decode cell whose n-th trial profiles the launch counts ``counts_seq[n]`` (the last one repeats), asserted against ``expect`` (None: no assertion)."""
+    log = []
+    monkeypatch.setitem(sys.modules, "bench_breakdown", fake_breakdown(log, {PLAN_K: 2.0, ROWS_K: 10.0}, counts_seq))
+    env = FakeDecodeEnv(log)
+    opts = dict(bd.DEFAULTS, trials=trials, calls=100, cold_calls=100, probe_calls=70, profile_calls=100, calls_scale=1)
+    spec = {"N": 4, "H": 12, "regime": regime, "pos": 5 if regime == "probe" else None, "key": "decode;N=4;H=12;regime=%s;" % regime}
+    return bd.measure_cell(spec, env, opts, {}, expect, FakeBuffer())
+
+
+@pytest.mark.parametrize("bad_trial", [0, 2, 4])
+def test_decode_asserts_the_launch_mapping_in_every_trial_not_the_union_of_the_names(monkeypatch, bad_trial):
+    """One trial on the other path (no plan kernel) among trials that launch plan + rows: the union of the names is still {plan_kernel, rows_kernel}, which is all that the tool asserted
+    before, so the trial went through and was measured as if it had run the asserted path."""
+    seq = [D_TWO_COUNTS] * 5
+    seq[bad_trial] = D_ONE_COUNTS
+    with pytest.raises(SystemExit) as e:
+        run_decode_nodes(monkeypatch, seq)
+    assert "trial %d" % bad_trial in str(e.value)
+
+
+DECODE_DRIFTS = {"the plan kernel missing": D_ONE_COUNTS, "a duplicated launch": {PLAN_K: 1.0, ROWS_K: 2.0},
+                 "a fractional count (a launch missing from some calls)": {PLAN_K: 1.0, ROWS_K: 0.984},
+                 "the row engine of the frozen reference": {PLAN_K: 1.0, REF_ROWS_K: 1.0},
+                 "another kernel as well": dict(D_TWO_COUNTS, **{"void cfbi::finalize_pos_kernel(int*, int)": 1.0})}
+
+
+@pytest.mark.parametrize("what", sorted(DECODE_DRIFTS))
+def test_decode_rejects_a_trial_with_a_missing_duplicated_fractional_or_foreign_launch(monkeypatch, what):
+    for bad_trial in (0, 2):
+        seq = [D_TWO_COUNTS] * 5
+        seq[bad_trial] = DECODE_DRIFTS[what]
+        with pytest.raises(SystemExit) as e:
+            run_decode_nodes(monkeypatch, seq)
+        assert "trial %d" % bad_trial in str(e.value), (what, bad_trial)
+
+
+def test_decode_trials_must_agree_with_each_other_even_without_an_expectation(monkeypatch):
+    for bad_trial in (1, 3):
+        seq = [D_TWO_COUNTS] * 5
+        seq[bad_trial] = D_ONE_COUNTS
+        with pytest.raises(SystemExit) as e:
+            run_decode_nodes(monkeypatch, seq, expect=None)
+        assert "trial %d" % bad_trial in str(e.value) and "differ" in str(e.value)
+
+
+@pytest.mark.parametrize("regime", bd.REGIMES)
+def test_decode_cell_records_the_launch_mapping_of_every_trial(monkeypatch, regime):
+    for counts, mapping in ((D_TWO_COUNTS, D_TWO), (D_ONE_COUNTS, D_ONE)):
+        cell = run_decode_nodes(monkeypatch, [counts], expect=mapping, regime=regime)
+        args = cell["args"]
+        assert args["compute_nodes"] == mapping and args["aux_nodes"] == {} and args["compute_kernels"] == sum(mapping.values()) and args["expect_compute"] == mapping, regime
+        assert args["kernels"] == sorted(mapping)                                               # the list of names that readers of older records use
+        assert [s["nodes"] for s in cell["samples"]] == [{"compute": mapping, "aux": {}}] * 5
+        assert br.cell_node_problems(cell, mapping) == [] and br.cell_node_problems(cell) == []
+        assert br.cell_node_problems(cell, D_TWO if mapping == D_ONE else D_ONE) != []           # the recorded mapping is the one that was launched, not the other one
+
+
+def test_decode_helper_kernels_are_recorded_apart_from_the_compute_kernels(monkeypatch):
+    for regime in ("cold", "probe"):                                                              # the eviction write and the position rewrite run next to the call in these regimes
+        cell = run_decode_nodes(monkeypatch, [dict(D_TWO_COUNTS, **{ATEN_FILL: 1.0})], regime=regime)
+        assert cell["args"]["compute_nodes"] == D_TWO and cell["args"]["aux_nodes"] == {ATEN_FILL: 1}, regime
+        assert all(s["nodes"] == {"compute": D_TWO, "aux": {ATEN_FILL: 1}} for s in cell["samples"])
+
+
+def test_the_decode_and_chain_benchmarks_share_one_node_validator():
+    for name in ("split_nodes", "check_nodes", "parse_mapping", "cell_node_problems"):
+        assert getattr(lc, name) is getattr(br, name), name
+    assert bd.CANONICAL_COMPUTE == {"single-launch": D_ONE, "two-launch": D_TWO, "reference": D_REF}
+
+
+def test_decode_expectation_options_are_one_exact_mapping():
+    assert bd.expected_mapping("two-launch", None) == D_TWO and bd.expected_mapping("single-launch", None) == D_ONE and bd.expected_mapping("reference", None) == D_REF
+    assert bd.expected_mapping("plan_kernel=1;rows_kernel=1", None) == D_TWO
+    assert bd.expected_mapping(None, "plan_kernel,rows_kernel") == D_TWO and bd.expected_mapping(None, "rows_kernel") == D_ONE      # the older shorthand: every name once, in every trial
+    assert bd.expected_mapping(None, None) is None and bd.expected_mapping(None, "") is None
+    for bad in ("rows_kernel=0", "rows_kernel=1;rows_kernel=1", "rows_kernel", "rows_kernel=1.5", "rows_kernel=-1"):
+        with pytest.raises(ValueError):
+            bd.expected_mapping(bad, None)
+    with pytest.raises(ValueError):
+        bd.expected_mapping("two-launch", "plan_kernel,rows_kernel")                              # two spellings of one assertion
+    with pytest.raises(SystemExit) as e:
+        bd.main(["--expect-compute", "rows_kernel=0", "--list-cells"])
+    assert e.value.code == 2
+
+
+def test_a_record_with_per_trial_mappings_is_checked_where_every_record_is_loaded_and_a_record_without_them_stays_valid(monkeypatch):
+    import copy
+
+    def record_of(cell):
+        return {"schema": br.SCHEMA, "meta": {"commit": "abc1234"}, "cells": [cell]}
+    cell = run_decode_nodes(monkeypatch, [D_TWO_COUNTS])
+    assert br.structure_problems(record_of(cell)) == []
+    chain, _, _ = run_chain_cell(monkeypatch, [CHAIN_COUNTS])
+    assert br.structure_problems(record_of(chain)) == []                                           # the chain's cells go through the same check
+    tampered = copy.deepcopy(cell)
+    tampered["samples"][2]["nodes"]["compute"] = dict(D_ONE)                                       # a middle trial that launched the other path
+    assert any("trial 2" in p for p in br.structure_problems(record_of(tampered)))
+    stripped = copy.deepcopy(cell)
+    del stripped["samples"][1]["nodes"]
+    assert any("trial 1 carries no node mapping" in p for p in br.structure_problems(record_of(stripped)))
+    unclaimed = copy.deepcopy(cell)
+    del unclaimed["args"]["compute_nodes"]
+    assert any("records no compute_nodes" in p for p in br.structure_problems(record_of(unclaimed)))
+    legacy = copy.deepcopy(cell)                                                                   # a record of before the mapping: no node anywhere
+    for name in ("compute_nodes", "aux_nodes", "compute_kernels", "expect_compute"):
+        del legacy["args"][name]
+    for sample in legacy["samples"]:
+        del sample["nodes"]
+    assert br.structure_problems(record_of(legacy)) == []
+    assert br.cell_node_problems(legacy, D_TWO) != []                                              # but it cannot satisfy an expectation of the launches
+    assert br.structure_problems(record_of(legacy), require_nodes=True) != []                      # nor a caller that requires them
 
 
 def run_chain_cell(monkeypatch, counts_seq, expect_compute=TWO_LAUNCH, expect_aux={}, scale=1, trials=5):          # noqa: B006  (never modified)

@@ -2,7 +2,7 @@
 
 usage: python benchmarks/bench_decode.py [--impl N] [--shapes N,H ...] [--regimes lockstep staggered cold probe] [--probe-shapes N,H ...] [--positions P ...]
            [--trials T] [--calls C] [--cold-calls C] [--probe-calls C] [--profile-calls C] [--calls-scale S] [--cells SUBSTR ...]
-           [--expect-kernels NAME,NAME] [--json PATH] [--label TEXT] [--list-cells]
+           [--expect-compute MAPPING | --expect-kernels NAME,NAME] [--json PATH] [--label TEXT] [--list-cells]
 
 Regimes (one cell per shape, the probe regime one cell per shape and position):
   lockstep   all sequences at the same ``pos``; the calls of a trial advance ``pos`` one by one, so a trial covers all 64 positions equally
@@ -23,8 +23,14 @@ The record (schema in benchmarks/bench_records.py) declares ``sample_stat = proc
 record file as one sample, so at least five trials per cell are needed and at least three record files per build (interleaved A / B runs of this tool).
 
 The tool measures the flash_kda of its own source tree. CFBI_BENCH_SRC=<dir> measures the flash_kda of another tree (a git archive snapshot of a baseline
-commit, for example) with this tool; the record then carries that tree's commit. ``--expect-kernels`` asserts the set of CF-BI kernels one decode call launches
-(``plan_kernel,rows_kernel`` for the two-launch decode) so that a side of an A/B that silently runs another path fails instead of measuring it.
+commit, for example) with this tool; the record then carries that tree's commit.
+
+Launch assertion: every trial's profiled pass yields the exact mapping ``{kernel: launches per call}`` of the CF-BI kernels (the helper kernels of a regime, an eviction write or
+a ``pos`` rewrite, are listed apart as auxiliary nodes), the same split and check as the layer chain's (``bench_records.split_nodes`` / ``check_nodes``). The mapping is recorded in
+every sample (``nodes``) and in the cell (``compute_nodes``, ``aux_nodes``, ``compute_kernels``), every trial must carry the cell's mapping, and with ``--expect-compute`` every trial must
+equal the asserted one (``single-launch``: ``rows_kernel`` only; ``two-launch``: ``plan_kernel`` and ``rows_kernel``; ``reference``: ``plan_kernel`` and ``ref::rows_kernel``; or
+``NAME=COUNT;NAME=COUNT``): a side of an A/B that silently runs another path in any trial fails instead of measuring it. ``--expect-kernels a,b`` is the shorthand for "every name once".
+The names carry no template arguments (the profiler pass strips them), so the two paths are told apart by the plan kernel. ``cell_node_problems`` checks a recorded cell.
 """
 import argparse
 import datetime
@@ -52,6 +58,7 @@ PROBE_POSITIONS = (0, 1, 15, 16, 31, 32, 47, 48, 62, 63)
 REGIMES = ("lockstep", "staggered", "cold", "probe")
 LOOP_REGIMES = ("lockstep", "staggered")           # no helper between the calls: loop bracketing, CPU clock available
 DEFAULTS = {"trials": 5, "calls": 1536, "cold_calls": 256, "probe_calls": 256, "profile_calls": 64, "calls_scale": 1}
+CANONICAL_COMPUTE = {"single-launch": {"rows_kernel": 1}, "two-launch": {"plan_kernel": 1, "rows_kernel": 1}, "reference": {"plan_kernel": 1, "ref::rows_kernel": 1}}   # one decode call's launches
 
 
 # ---- cells and trials (pure Python, no torch) ------------------------------------------------------------------------------------------------
@@ -104,14 +111,15 @@ def parse_shape(text):
     return int(n), int(h)
 
 
-def check_expected_kernels(launched, expected):
-    """None when the launched CF-BI kernels (base names) are the expected ones, otherwise the message of the assertion."""
-    if expected is None:
-        return None
-    got, want = sorted(set(launched)), sorted(set(expected))
-    if got != want:
-        return "the decode call launched %s, expected %s" % (got, want)
-    return None
+def expected_mapping(expect_compute, expect_kernels):
+    """The exact mapping ``{kernel: launches per call}`` that every trial of a run must show (None: no assertion). ``expect_compute``: a preset of ``CANONICAL_COMPUTE`` or
+    ``NAME=COUNT;NAME=COUNT``; ``expect_kernels``: the shorthand ``NAME,NAME`` (every name once). Giving both is an error: they are two spellings of one assertion."""
+    if expect_compute and expect_kernels:
+        raise ValueError("--expect-compute and --expect-kernels are two spellings of one assertion: give one of them")
+    if expect_compute:
+        return records.parse_mapping(expect_compute, CANONICAL_COMPUTE)
+    names = [x.strip() for x in (expect_kernels or "").split(",") if x.strip()]
+    return records.parse_mapping(";".join("%s=1" % n for n in names)) if names else None
 
 
 def trial_wall(gpu_eager, gpu_graph, cpu_eager=None, cpu_graph=None):
@@ -232,8 +240,9 @@ def device_info(torch):
     return {"name": prop.name, "sm_count": prop.multi_processor_count, "cc": "%d.%d" % (prop.major, prop.minor), "l2_bytes": int(l2), "eviction_bytes": 2 * int(l2) + (1 << 20)}
 
 
-def measure_cell(spec, env, opts, device, expected, evict_buf):
-    """One cell: ``opts["trials"]`` trials of (eager, graph, one profiled pass); returns the cell for the record."""
+def measure_cell(spec, env, opts, device, expect_compute, evict_buf):
+    """One cell: ``opts["trials"]`` trials of (eager, graph, one profiled pass); returns the cell for the record. The launch mapping of the profiled pass is checked and recorded in EVERY
+    trial: whole launches per call, equal to ``expect_compute`` when that is given (None: no assertion) and equal to the first trial's in any case."""
     torch, regime = env.torch, spec["regime"]
     from bench_breakdown import kernel_times
 
@@ -264,11 +273,11 @@ def measure_cell(spec, env, opts, device, expected, evict_buf):
         env.eager(counter[0])
         counter[0] += 1
 
-    runs, walls, launched = [], [], set()
+    runs, walls, nodes = [], [], []
     gc.collect()
     gc.disable()
     try:
-        for _ in range(opts["trials"]):
+        for trial in range(opts["trials"]):
             env.set_positions(regime)
             if regime in LOOP_REGIMES:
                 gpu_e, cpu_e = loop_trial(torch, env.eager, calls)
@@ -281,20 +290,32 @@ def measure_cell(spec, env, opts, device, expected, evict_buf):
                 wall = trial_wall(gpu_e, gpu_g)
             env.set_positions(regime)
             counter[0] = 0                                          # the data step of a call follows its position: both start at 0 in every trial
-            times, _ = kernel_times(profiled, iters=profile_calls, warm=PROFILE_WARM)
+            times, counts = kernel_times(profiled, iters=profile_calls, warm=PROFILE_WARM)
+            compute, aux = records.split_nodes(counts)
+            problem = records.check_nodes(compute, aux, expect_compute, None)
+            if not problem and nodes and (compute, aux) != nodes[0]:
+                problem = "the nodes of this trial differ from those of the first trial (%s / %s vs %s / %s)" % (compute, aux, nodes[0][0], nodes[0][1])
+            if problem:
+                raise SystemExit("cell %s, trial %d: %s" % (spec["key"], trial, problem))
             runs.append(times)
             walls.append(wall)
-            launched |= {records.kernel_base(n) for n in times if not records.is_helper_kernel(n)}
+            nodes.append((compute, aux))
     finally:
         gc.enable()
-    problem = check_expected_kernels(launched, expected)
-    if problem:
-        raise SystemExit("cell %s: %s" % (spec["key"], problem))
+    compute, aux = nodes[0]
     loop = regime != "probe"                                        # the positions of a loop regime advance with the calls: the profiled pass covers whole cycles
     args = {"N": spec["N"], "H": spec["H"], "regime": regime, "pos": spec["pos"], "impl": env.impl, "calls_per_trial": calls, "profile_calls": profile_calls,
             "profile_cycles": profile_calls // STEPS if loop else None, "profile_start_phase": PROFILE_WARM if loop else None, "calls_scale": opts["calls_scale"],
-            "kernels": sorted(launched)}
-    return records.make_cell("decode", spec["key"], args, runs, drop_helpers=True, wall=walls)
+            "kernels": sorted(compute), "compute_nodes": whole(compute), "compute_kernels": int(round(sum(compute.values()))), "aux_nodes": whole(aux), "expect_compute": expect_compute}
+    cell = records.make_cell("decode", spec["key"], args, runs, drop_helpers=True, wall=walls)
+    for sample, (c, a) in zip(cell["samples"], nodes):
+        sample["nodes"] = {"compute": whole(c), "aux": whole(a)}
+    return cell
+
+
+def whole(mapping):
+    """``{name: launches per call}`` with whole numbers (the profiler reports them as quotients; ``check_nodes`` has already refused a fractional one), sorted by name."""
+    return {k: int(round(v)) for k, v in sorted(mapping.items())}
 
 
 def main(argv=None):
@@ -313,7 +334,9 @@ def main(argv=None):
     ap.add_argument("--calls-scale", type=int, default=DEFAULTS["calls_scale"],
                     help="multiplier of the calls per trial AND of the profiled calls (3 for the re-run of unstable cells)")
     ap.add_argument("--cells", nargs="*", default=None, help="only cells whose key contains one of these substrings")
-    ap.add_argument("--expect-kernels", default=None, help="comma-separated base names of the CF-BI kernels one decode call must launch")
+    ap.add_argument("--expect-compute", default=None, help="the exact mapping of the CF-BI kernels one decode call launches, asserted in EVERY trial: single-launch, two-launch, reference "
+                                                           "or NAME=COUNT;NAME=COUNT")
+    ap.add_argument("--expect-kernels", default=None, help="shorthand of --expect-compute: comma-separated base names of the CF-BI kernels one decode call must launch (each once)")
     ap.add_argument("--json", default=None)
     ap.add_argument("--label", default="")
     ap.add_argument("--list-cells", action="store_true")
@@ -321,6 +344,10 @@ def main(argv=None):
     for name in ("trials", "calls", "cold_calls", "probe_calls", "profile_calls", "calls_scale"):
         if getattr(a, name) < 1:
             ap.error("--%s must be at least 1" % name.replace("_", "-"))
+    try:
+        expect_compute = expected_mapping(a.expect_compute, a.expect_kernels)
+    except ValueError as e:
+        ap.error(str(e))
     shapes = [parse_shape(s) for s in a.shapes] if a.shapes else list(MATRIX_D)
     probe_shapes = [parse_shape(s) for s in a.probe_shapes] if a.probe_shapes else list(PROBE_SHAPES)
     specs = select_cells(cell_specs(shapes, a.regimes, probe_shapes, a.positions), a.cells)
@@ -332,7 +359,6 @@ def main(argv=None):
         print("no cell selected", file=sys.stderr)
         return 2
     opts = {"trials": a.trials, "calls": a.calls, "cold_calls": a.cold_calls, "probe_calls": a.probe_calls, "profile_calls": a.profile_calls, "calls_scale": a.calls_scale}
-    expected = [x for x in a.expect_kernels.split(",") if x] if a.expect_kernels else None
 
     import torch
 
@@ -349,7 +375,7 @@ def main(argv=None):
             env = ShapeEnv(spec["N"], spec["H"], a.impl)
             env.capture()
             env_shape = (spec["N"], spec["H"])
-        cell = measure_cell(spec, env, opts, device, expected, evict_buf)
+        cell = measure_cell(spec, env, opts, device, expect_compute, evict_buf)
         cells.append(cell)
         print(cell_line(spec, cell), flush=True)
     if a.json:

@@ -1248,6 +1248,29 @@ def both(*edits):
     return lambda rec: [e(rec) for e in edits]
 
 
+NODES_TWO = {"plan_kernel": 1, "rows_kernel": 1}
+
+
+def with_nodes(mapping, keys=None):
+    """The cells of a record as the benchmarks record them since the launch mapping is per trial: ``compute_nodes`` / ``aux_nodes`` in the cell and ``nodes`` in every sample."""
+    def edit(rec):
+        for cell in rec["cells"]:
+            if keys is None or cell["key"] in keys:
+                cell["args"].update(compute_nodes=dict(mapping), aux_nodes={}, compute_kernels=sum(mapping.values()))
+                for s in cell["samples"]:
+                    s["nodes"] = {"compute": dict(mapping), "aux": {}}
+    return edit
+
+
+def trial_nodes(trial, mapping, keys):
+    """The launches of one trial of the cells ``keys`` as another mapping (that trial ran another path)."""
+    def edit(rec):
+        for cell in rec["cells"]:
+            if cell["key"] in keys:
+                cell["samples"][trial]["nodes"]["compute"] = dict(mapping)
+    return edit
+
+
 FINAL_CAMPAIGN_CASES = [
     # the sampling of Method M: process-median records of at least five trials, declared = held
     ("one-trial pooled records on both sides, the report untouched (first control of the review)", "decode", "AB", one_trial_pooled, "process_median"),
@@ -1271,6 +1294,11 @@ FINAL_CAMPAIGN_CASES = [
     ("a chain cell of another model width", "chain", "AB", set_args({"Dm": 4096}, [CHAIN_CELL]), "workload its key names"),
     ("a chain cell of another regime", "chain", "B", set_args({"regime": "cold"}, [CHAIN_CELL]), "workload its key names"),
     ("a cell of another kind", "decode", "B", lambda rec: rec["cells"][3].update(kind="chain"), "is not a decode cell"),
+    # the launches of every trial: a cell that records per-trial mappings records them consistently (the decode benchmark did not record them before, the chain's cells did)
+    ("a middle trial of a decode cell on another launch path (no plan kernel)", "decode", "B", both(with_nodes(NODES_TWO), trial_nodes(2, {"rows_kernel": 1}, [SLOW_CELL])), "trial 2"),
+    ("a trial of a decode cell with a duplicated launch, on both sides", "decode", "AB", both(with_nodes(NODES_TWO), trial_nodes(4, {"plan_kernel": 1, "rows_kernel": 2}, [PROBE_CELL])), "trial 4"),
+    ("a trial of a chain cell on another mapping", "chain", "A", both(with_nodes(ROUTE["chain"]["compute_nodes"]), trial_nodes(1, {"rows_kernel": 1}, [CHAIN_CELL])), "trial 1"),
+    ("a decode cell whose samples carry mappings and whose arguments do not", "decode", "B", both(with_nodes(NODES_TWO), drop_arg("compute_nodes")), "records no compute_nodes"),
 ]
 
 
@@ -1282,6 +1310,15 @@ def test_a_final_campaign_is_made_of_method_m_records_of_the_benchmarks_own_work
         rewrite_records(rec["devices"]["b200"]["campaigns"][campaign], side, edit)
     probs = fcheck(rec, final_repo)
     assert has(probs, expected), (name, probs[:3])
+
+
+def test_a_final_campaign_whose_cells_record_consistent_per_trial_mappings_passes_like_a_legacy_one(tmp_path, final_repo):
+    rec = final_record(tmp_path, final_repo)
+    assert fcheck(rec, final_repo) == []                                                          # cells without mappings (the records of before): valid
+    for side in "AB":
+        rewrite_records(rec["devices"]["b200"]["campaigns"]["decode"], side, with_nodes(NODES_TWO))
+        rewrite_records(rec["devices"]["b200"]["campaigns"]["chain"], side, with_nodes(ROUTE["chain"]["compute_nodes"]))
+    assert fcheck(rec, final_repo) == []                                                          # cells that record them: valid when every trial equals the cell's mapping
 
 
 def test_the_generic_comparator_keeps_its_pooled_support():

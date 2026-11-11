@@ -69,78 +69,8 @@ def profile_calls_of(opts):
     return bd.cycles_up(opts["profile_calls"]) * opts["calls_scale"]
 
 
-def parse_mapping(text, presets=None):
-    """``{name: count}`` from ``NAME=COUNT;NAME=COUNT`` (``none`` or the empty string: the empty mapping; a preset name: that mapping)."""
-    text = text.strip()
-    if presets and text in presets:
-        return dict(presets[text])
-    if text in ("", "none"):
-        return {}
-    out = {}
-    for item in text.split(";"):
-        name, sep, count = item.rpartition("=")
-        if not sep or not name.strip() or not count.strip().isdigit() or int(count) < 1 or name.strip() in out:
-            raise ValueError("%r is not NAME=COUNT (a positive count, every name once)" % item)
-        out[name.strip()] = int(count)
-    return out
-
-
-def split_nodes(counts):
-    """``(compute, aux)`` from ``{raw kernel name: launches per replay}``: compute kernels are the CF-BI kernels (``{base name: count}``), everything else
-    (memsets, copies, ATen kernels) is auxiliary."""
-    compute, aux = {}, {}
-    for name, n in counts.items():
-        if records.is_helper_kernel(name):
-            aux[name.strip()] = aux.get(name.strip(), 0) + n
-        else:
-            base = records.kernel_base(name)
-            compute[base] = compute.get(base, 0) + n
-    return compute, aux
-
-
-def check_nodes(compute, aux, expect_compute, expect_aux):
-    """None when one replay holds exactly the expected nodes, otherwise the message. ``compute`` / ``aux``: ``{name: launches per replay}`` from the profiler counts of
-    one trial; a fractional count (a launch that is missing from some replays) is a defect of its own. ``expect_compute``: the exact mapping of the compute kernels
-    (None = no assertion); ``expect_aux``: the exact mapping of the auxiliary nodes that may remain (``{}`` asserts that there is none, None = no assertion)."""
-    for what, got in (("compute", compute), ("auxiliary", aux)):
-        fractional = {k: round(v, 3) for k, v in got.items() if abs(v - round(v)) > 1e-6}
-        if fractional:
-            return "%s nodes are not launched a whole number of times per replay: %s" % (what, dict(sorted(fractional.items())))
-    if expect_compute is not None:
-        got = {k: int(round(v)) for k, v in compute.items()}
-        if got != dict(expect_compute):
-            return "the step launches the compute kernels %s, expected %s" % (dict(sorted(got.items())), dict(sorted(expect_compute.items())))
-    if expect_aux is not None:
-        got = {k: int(round(v)) for k, v in aux.items()}
-        if got != dict(expect_aux):
-            return "the graph holds the auxiliary nodes %s, expected %s" % (dict(sorted(got.items())), dict(sorted(expect_aux.items())))
-    return None
-
-
-def cell_node_problems(cell, expect_compute=None, expect_aux=None):
-    """Why the per-trial node mappings of a recorded chain cell are not the asserted ones (an empty list means every trial carries them): the cell records its
-    ``compute_nodes`` / ``aux_nodes``, they equal the given expectation when there is one, and the ``nodes`` of EVERY sample equal them."""
-    out, args, key = [], cell.get("args", {}), cell.get("key")
-    samples = cell.get("samples") or []
-    for name in ("compute_nodes", "aux_nodes"):
-        if not isinstance(args.get(name), dict):
-            out.append("cell %r records no %s" % (key, name))
-    if not samples:
-        out.append("cell %r has no samples" % key)
-    if out:
-        return out
-    for what, want, claimed in (("compute", expect_compute, args["compute_nodes"]), ("auxiliary", expect_aux, args["aux_nodes"])):
-        if want is not None and dict(want) != dict(claimed):
-            out.append("cell %r: the recorded %s nodes %s are not the expected %s" % (key, what, dict(sorted(claimed.items())), dict(sorted(want.items()))))
-    for i, s in enumerate(samples):
-        nodes = s.get("nodes")
-        if not isinstance(nodes, dict) or not isinstance(nodes.get("compute"), dict) or not isinstance(nodes.get("aux"), dict):
-            out.append("cell %r: trial %d carries no node mapping" % (key, i))
-            continue
-        problem = check_nodes(nodes["compute"], nodes["aux"], args["compute_nodes"], args["aux_nodes"])
-        if problem:
-            out.append("cell %r: trial %d: %s" % (key, i, problem))
-    return out
+# the one validator of the launch mappings of a trial, shared with the decode benchmark (benchmarks/bench_records.py)
+parse_mapping, split_nodes, check_nodes, cell_node_problems = records.parse_mapping, records.split_nodes, records.check_nodes, records.cell_node_problems
 
 
 def run_meta(a, started, opts, device, torch_mod):
