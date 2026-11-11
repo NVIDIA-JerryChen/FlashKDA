@@ -1472,7 +1472,11 @@ def test_a_rerun_proves_three_times_the_calls_of_the_same_configuration():
     half = edited("baseline", lambda r: r["cells"][0]["args"].update(profile_calls=PROFILE_CALLS))   # the profiled calls were not scaled
     res = run(half, "total_us")                                                                    # the kernel sum depends on them ...
     assert res["verdict"] == "INVALID" and any("profile_calls" in p and "not 3 times" in p and "baseline" in p for p in res["problems"])
-    assert run(half)["verdict"] == "PASS"                                                          # ... a wall metric does not (the wall-only contract is explicit)
+    both_unscaled = json.loads(json.dumps(good))                                                   # ... a wall metric does not (the wall-only contract is explicit):
+    for r in both_unscaled[0] + both_unscaled[1]:                                                  # re-runs on both sides that scaled the calls but not the profiled calls
+        r["cells"][0]["args"].update(profile_calls=PROFILE_CALLS)
+    assert run(both_unscaled)["verdict"] == "PASS" and run(both_unscaled, "total_us")["verdict"] == "INVALID"
+    assert run(half)["verdict"] == "INVALID"                                                       # one side only: the two sides were not measured alike, whatever the metric
     for field in ("calls_per_trial", "profile_calls"):                                             # a count that is not recorded cannot be proven
         res = run(edited("candidate", lambda r: r["cells"][0]["args"].pop(field)), "total_us")
         assert res["verdict"] == "INVALID" and any(field in p and "not recorded as one positive integer" in p for p in res["problems"]), field
@@ -1541,7 +1545,78 @@ def test_a_kernel_sum_rerun_needs_the_recorded_profiled_calls_on_both_sides_and_
         rec["cells"][0]["args"]["profile_calls"] = 3 * (PROFILE_CALLS // 2)
     res = run(*other)
     assert res["verdict"] == "INVALID" and any("different profile_calls" in p for p in res["problems"])
-    assert run(*other, metric="gpu_graph_us")["verdict"] == "PASS"                                 # which a wall metric does not care about
+    assert run(*other, metric="gpu_graph_us")["verdict"] == "INVALID"                              # and the two sides must have been measured alike for every metric
+
+
+def edit_records(records, edit):
+    """A deep copy of the record list with ``edit(record)`` applied to every record."""
+    out = json.loads(json.dumps(records))
+    for r in out:
+        edit(r)
+    return out
+
+
+def test_identity_and_fixed_configuration_are_validated_on_every_campaign_and_by_the_command_line():
+    base, cand = wall_sets([100.0, 100.05, 99.95], [100.0, 100.05, 99.95])                          # stable: no re-run, the first campaign alone decides
+    kw = dict(metric="gpu_graph_us", expect_base_commit=BASE_COMMIT, require_clean_cand=True)
+    assert br.compare(base, cand, **kw)["verdict"] == "PASS"
+    d = tempfile.mkdtemp()
+
+    def refused(b, c, cli=True, **over):
+        """The comparison is INVALID, with a problem that contains every word of ``over['words']``; the command line exits with 2."""
+        words = over.pop("words", ())
+        res = br.compare(b, c, **dict(kw, **over))
+        assert res["verdict"] == "INVALID", res["problems"]
+        for w in words:
+            assert any(w in p for p in res["problems"]), (w, res["problems"][:4])
+        if cli:
+            args = ["--base"] + write_records(d, "a", b) + ["--cand"] + write_records(d, "b", c) + ["--metric", "gpu_graph_us", "--expect-base-commit", BASE_COMMIT, "--require-clean-cand"]
+            assert compare_bench.main(args) == 2
+        return res
+    # the four counterexamples of the review, literally
+    refused(edit_records(base, lambda r: r["meta"].update(commit="")), cand, words=("commit",))                                       # 1: an empty commit matched every expected commit
+    refused(edit_records(base, lambda r: r["meta"].update(dirty="true")), cand, words=("dirty", "boolean"))                           # 2: a string for the dirty flag
+    refused(base, edit_records(cand, lambda r: [c["args"].update(calls_per_trial=1, profile_calls=1) for c in r["cells"]]), words=("calls_per_trial",))   # 3: 1536 / 256 against 1 / 1
+    mixed = [edit_records([r], lambda x, i=i: x["meta"].update(commit="%07x" % (i + 1), impl=i))[0] for i, r in enumerate(cand)]       # 4: three processes, three commits and impls
+    refused(base, mixed, words=("disagree on meta commit", "disagree on meta impl"))
+    # types and lengths of the identity fields
+    for commit in ("abc", "zzzzzzz", "ABCDEF1", 1234567, None, " " * 7):
+        refused(edit_records(base, lambda r, c=commit: r["meta"].update(commit=c)), cand, cli=False, words=("commit",))
+    for dirty in ("false", "true", 0, 1, None):
+        refused(base, edit_records(cand, lambda r, v=dirty: r["meta"].update(dirty=v)), cli=False, words=("dirty",))
+    for field, bad in (("gpu", ""), ("gpu", None), ("host", ""), ("host", None), ("sm_count", 0), ("sm_count", -1), ("sm_count", "148"), ("sm_count", True), ("sm_count", 148.0)):
+        refused(edit_records(base, lambda r, f=field, b=bad: r["meta"].update({f: b})), edit_records(cand, lambda r, f=field, b=bad: r["meta"].update({f: b})), cli=False, words=(field,))
+    refused(base, cand, cli=False, expect_base_commit="abc", words=("expected commit",))                                                              # the expected prefix must be a real prefix
+    assert br.compare(edit_records(base, lambda r: r["meta"].update(commit=BASE_COMMIT[:7])), cand, **kw)["verdict"] == "PASS"             # a seven-character abbreviation is fine
+    # one fixed configuration per side: a field that differs between the files of a side
+    for field, value in (("tree", "other"), ("src", "/other"), ("env_impl", "32"), ("torch", "9.9"), ("cuda", "9.9"), ("cc", "9.0"), ("trials", 6), ("kind", "x")):
+        odd = json.loads(json.dumps(cand))
+        odd[1]["meta"][field] = value
+        refused(base, odd, cli=False, words=("disagree on meta %s" % field,))
+    odd = json.loads(json.dumps(cand))
+    odd[2]["cells"][0]["args"]["N"] = 2                                                             # one process measured another workload under the same key
+    refused(base, odd, cli=False, words=("disagree on the arguments of cell",))
+    # the two builds must have been measured under one contract and one toolchain ...
+    for field, value in (("torch", "9.9"), ("cuda", "9.9"), ("cc", "9.0"), ("trials", 6), ("kind", "x")):
+        refused(base, edit_records(cand, lambda r, f=field, v=value: r["meta"].update({f: v})), cli=False, words=("differ in meta %s" % field,))
+    refused(base, edit_records(cand, lambda r: [c["args"].update(N=2) for c in r["cells"]]), cli=False, words=("differ in N",))
+    # ... but may differ in what is compared: commit, source directory, implementation and the launched kernels
+    other = edit_records(cand, lambda r: (r["meta"].update(commit="b" * 40, src="/other/snapshot", impl=64, env_impl="64", tree="at-bbbbbbb"),
+                                          [c["args"].update(impl=64, kernels=["rows_kernel"]) for c in r["cells"]]))
+    assert br.compare(base, other, **kw)["verdict"] == "PASS"
+    # a per-process-median record declares its trials and holds exactly that many per cell
+    refused(edit_records(base, lambda r: r["meta"].update(trials=7)), cand, cli=False, words=("declares 7",))
+    refused(edit_records(base, lambda r: r["meta"].pop("trials")), edit_records(cand, lambda r: r["meta"].pop("trials")), cli=False, words=("must declare its trials",))
+    # a re-run is the same workload as its first campaign except for the scaled counts
+    base2, cand2 = wall_sets([100.0, 100.45, 100.9], [100.15, 100.6, 101.05])
+    rbase, rcand = wall_sets([100.0, 100.05, 99.95], [100.1, 100.15, 100.05], hour="11", scale=3)
+    widen = dict(kw, baseline_unstable="widen")
+    assert br.compare(base2, cand2, base_rerun=rbase, cand_rerun=rcand, **widen)["verdict"] == "PASS"
+    for edit in (lambda r: r["cells"][0]["args"].update(N=9), lambda r: r["cells"][0]["args"].update(kernels=["x"])):
+        res = br.compare(base2, cand2, base_rerun=edit_records(rbase, edit), cand_rerun=rcand, **widen)
+        assert res["verdict"] == "INVALID" and any("first campaign and the baseline re-run differ" in p for p in res["problems"])
+    res = br.compare(base2, cand2, base_rerun=edit_records(rbase, lambda r: r["meta"].update(torch="9.9")), cand_rerun=rcand, **widen)       # and a re-run of another configuration
+    assert res["verdict"] == "INVALID"
 
 
 def test_classify_rows_reads_slower_faster_and_noise_limited_cells():

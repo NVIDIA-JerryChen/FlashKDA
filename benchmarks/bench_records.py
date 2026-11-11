@@ -36,12 +36,14 @@ widened by the larger of the two spreads; the rows of a first campaign without r
 import json
 import math
 import os
+import re
 import statistics
 import subprocess
 
 SCHEMA = "cfbi-bench-v1"
 UNSTABLE_SPREAD = 0.003  # 0.3 %: repeat-to-repeat spread above which a cell is unstable
-REQUIRED_META = ("commit", "dirty", "gpu", "sm_count")
+REQUIRED_META = ("commit", "dirty", "gpu", "sm_count", "host")
+COMMIT_PATTERN = re.compile(r"^[0-9a-f]{7,40}$")  # a commit hash or an abbreviation of at least seven hexadecimal characters
 DERIVED_METRICS = ("total_us", "k1_us", "k2_stage_us", "k2_main_us")
 WALL_METRICS = ("gpu_graph_us", "gpu_eager_us", "cpu_graph_us", "cpu_eager_us")
 SUMMARY_METRICS = ("k1_us", "k2_stage_us", "total_us")  # default metrics of a per-build summary
@@ -49,7 +51,11 @@ PROCESS_MEDIAN = "process_median"
 MIN_TRIALS = 5  # trials per cell and process of a process-median record
 UNSTABLE_POLICIES = ("invalid", "worst", "widen")
 RERUN_SCALE = 3  # calls per trial (and profiled calls) of a re-run relative to the first campaign
-RERUN_SAME_CONFIG = ("commit", "tree", "src", "impl", "env_impl", "gpu", "sm_count", "host", "torch", "cuda", "trials", "sample_stat")  # meta fields a re-run shares with its first campaign
+SIDE_META = ("commit", "tree", "src", "impl", "env_impl", "torch", "cuda", "cc", "trials", "sample_stat", "kind")  # meta fields that are one value for all record files of a side
+RERUN_SAME_CONFIG = SIDE_META + ("gpu", "sm_count", "host")  # meta fields a re-run shares with its first campaign
+AB_META = ("trials", "torch", "cuda", "cc", "kind", "dm", "heads", "l2_cache_bytes", "eviction_bytes")  # the baseline and the candidate are measured under one contract and one toolchain
+BUILD_ARGS = ("impl", "kernels", "compute_nodes", "aux_nodes", "compute_kernels", "expect_compute", "expect_aux")  # cell arguments that describe a build, which A and B may differ in
+SCALED_ARGS = ("calls_per_trial", "profile_calls", "profile_cycles", "calls_scale")  # cell arguments that a re-run multiplies
 
 
 # ---- kernel names and stages ---------------------------------------------------------------------------------------------------------------
@@ -227,17 +233,37 @@ def validate_record(rec, role="baseline", expect_commit=None, require_clean=True
         if meta.get(field) is None:
             problems.append("%s: metadata field %r is missing" % (where, field))
     commit = meta.get("commit")
-    if expect_commit and commit is not None and not str(commit).startswith(expect_commit) and not str(expect_commit).startswith(str(commit)):
-        problems.append("%s: commit %s is not the expected %s" % (where, commit, expect_commit))
-    if require_clean and meta.get("dirty") is True:
+    if commit is not None:
+        if not (isinstance(commit, str) and COMMIT_PATTERN.match(commit)):
+            problems.append("%s: commit %r is not a hexadecimal commit hash of at least 7 characters" % (where, commit))
+        elif expect_commit:
+            if not (isinstance(expect_commit, str) and COMMIT_PATTERN.match(expect_commit)):
+                problems.append("the expected commit %r is not a hexadecimal hash of at least 7 characters" % (expect_commit,))
+            elif not commit.startswith(expect_commit) and not expect_commit.startswith(commit):
+                problems.append("%s: commit %s is not the expected %s" % (where, commit, expect_commit))
+    dirty = meta.get("dirty")
+    if dirty is not None and type(dirty) is not bool:
+        problems.append("%s: metadata field 'dirty' must be a boolean, got %r" % (where, dirty))
+    elif require_clean and dirty is True:
         problems.append("%s: the measured tree was dirty" % where)
+    for field in ("gpu", "host"):
+        if meta.get(field) is not None and not (isinstance(meta[field], str) and meta[field].strip()):
+            problems.append("%s: metadata field %r must be a non-empty string, got %r" % (where, field, meta[field]))
+    if meta.get("sm_count") is not None and not _positive_int(meta["sm_count"]):
+        problems.append("%s: metadata field 'sm_count' must be a positive integer, got %r" % (where, meta["sm_count"]))
     stat = sample_stat_of(rec)
     if stat not in ("pooled", PROCESS_MEDIAN):
         problems.append("%s: unknown sample statistic %r" % (where, stat))
     elif stat == PROCESS_MEDIAN:
+        declared = meta.get("trials")
+        if not _positive_int(declared):
+            problems.append("%s: a per-process-median record must declare its trials per cell (meta.trials, a positive integer), got %r" % (where, declared))
         for cell in rec["cells"]:
-            if len(cell["samples"]) < MIN_TRIALS:
-                problems.append("%s: cell %r has %d trial(s), at least %d are required for a per-process median" % (where, cell["key"], len(cell["samples"]), MIN_TRIALS))
+            n = len(cell["samples"])
+            if n < MIN_TRIALS:
+                problems.append("%s: cell %r has %d trial(s), at least %d are required for a per-process median" % (where, cell["key"], n, MIN_TRIALS))
+            if _positive_int(declared) and n != declared:
+                problems.append("%s: cell %r holds %d trial(s) but the record declares %d" % (where, cell["key"], n, declared))
     return problems
 
 
@@ -410,6 +436,51 @@ def rerun_problems(first, rerun, side, key, metric):
     return out
 
 
+def _meta_values(records, field):
+    return sorted(set(json.dumps((r.get("meta") or {}).get(field), sort_keys=True) for r in records))
+
+
+def side_config_problems(records, role):
+    """Why the record files of one side (a first campaign, or a re-run) are not one fixed configuration: every meta field of ``SIDE_META`` is one value over the files
+    (one commit, tree, source directory, implementation, toolchain and statistic: three candidate processes of different commits are not one candidate), and every cell
+    has the same arguments (workload, counts, launched kernels) in every file. This holds for a stable first campaign as well as for a re-run."""
+    out = []
+    for field in SIDE_META:
+        values = _meta_values(records, field)
+        if len(values) > 1:
+            out.append("%s records disagree on meta %s: %s" % (role, field, ", ".join(values)))
+    cells = {}
+    for rec in records:
+        for cell in rec["cells"]:
+            cells.setdefault(cell["key"], set()).add(json.dumps(cell.get("args") or {}, sort_keys=True))
+    for key in sorted(cells):
+        if len(cells[key]) > 1:
+            out.append("%s records disagree on the arguments of cell %r: %s" % (role, key, " | ".join(sorted(cells[key]))[:300]))
+    return out
+
+
+def workload_problems(records_a, records_b, name_a, name_b, ignore):
+    """Why two record lists do not measure the same workload: for every cell that both hold, the cell arguments except those named in ``ignore`` are equal."""
+    cells_a = dict((c["key"], c) for r in records_a for c in r["cells"])
+    cells_b = dict((c["key"], c) for r in records_b for c in r["cells"])
+    out = []
+    for key in sorted(set(cells_a) & set(cells_b)):
+        a = dict((k, v) for k, v in (cells_a[key].get("args") or {}).items() if k not in ignore)
+        b = dict((k, v) for k, v in (cells_b[key].get("args") or {}).items() if k not in ignore)
+        if a != b:
+            diff = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+            out.append("cell %r: %s and %s differ in %s (%s vs %s)" % (key, name_a, name_b, ", ".join(diff), [a.get(k) for k in diff], [b.get(k) for k in diff]))
+    return out
+
+
+def ab_problems(base, cand, name):
+    """Why the baseline and the candidate records of one campaign (``name``) were not measured under the same contract: the same trials, toolchain versions and cell
+    workload / call / profiled-call counts. Their commit, source directory and implementation may differ, that is what is compared."""
+    out = ["the baseline and the candidate %s differ in meta %s (%s vs %s)" % (name, field, ", ".join(_meta_values(base, field)), ", ".join(_meta_values(cand, field)))
+           for field in AB_META if _meta_values(base, field) != _meta_values(cand, field)]
+    return out + workload_problems(base, cand, "the baseline %s" % name, "the candidate %s" % name, BUILD_ARGS)
+
+
 def compare(base, cand, metric="k2_stage_us", tol_pct=1.0, mode="regress", expect_base_commit=None, require_clean_cand=False,
             min_repeats=3, require_interleaved=True, cells=None, baseline_unstable="invalid", base_rerun=None, cand_rerun=None):
     """Compare the record lists ``base`` (A) and ``cand`` (B).
@@ -462,6 +533,14 @@ def compare(base, cand, metric="k2_stage_us", tol_pct=1.0, mode="regress", expec
         ident.add((m.get("gpu"), m.get("sm_count"), m.get("host")))
     if len(ident) > 1:
         problems.append("records come from different GPU / SM count / host combinations: %s" % sorted(str(i) for i in ident))
+    for name, recs in (("baseline", base), ("candidate", cand), ("baseline re-run", base_rerun), ("candidate re-run", cand_rerun)):
+        if recs:
+            problems.extend(side_config_problems(recs, name))
+    problems.extend(ab_problems(base, cand, "first campaigns"))
+    if base_rerun and cand_rerun:
+        problems.extend(ab_problems(base_rerun, cand_rerun, "re-runs"))
+        for name, first, rerun in (("baseline", base, base_rerun), ("candidate", cand, cand_rerun)):
+            problems.extend(workload_problems(first, rerun, "the %s first campaign" % name, "the %s re-run" % name, SCALED_ARGS))
     for name, recs in (("baseline", base), ("candidate", cand), ("baseline re-run", base_rerun), ("candidate re-run", cand_rerun)):
         if recs and len(recs) < min_repeats:
             problems.append("%s has %d record file(s), at least %d interleaved repeats are required" % (name, len(recs), min_repeats))
