@@ -510,6 +510,24 @@ def test_ledger_commits_are_checked_against_the_repository(steps_repo_rw):
     assert has(rc.ledger_problems(mutated(ok, lambda l: l["steps"][0].update(commit=off)), repo=repo), "is not an ancestor")
 
 
+def test_the_decision_record_is_written_before_the_first_row_engine_commit(steps_repo_rw):
+    """The order of the steps is recorded before any of them is committed: a step commit must come after the commit that the decision record was written on."""
+    repo, h = steps_repo_rw["repo"], steps_repo_rw
+    later = commit_file(repo, "csrc/after.cu", "a row-engine step\n", "a step after the record")
+    ok = {"schema": rc.LEDGER_SCHEMA, "meta": dict(META), "steps": [adopted("trims", later)], "_path": "mem"}
+    dec = dict(decision(), meta={"recorded_on": h["base"]})
+    assert rc.ledger_problems(ok, repo=repo, decision=dec) == []
+    early = mutated(ok, lambda l: l["steps"][0].update(commit=h["base"]))                                  # the step is the commit that the record was written on
+    assert has(rc.ledger_problems(early, repo=repo, decision=dec), "does not come after the decision record")
+    after = dict(decision(), meta={"recorded_on": later})                                                    # the record was written after the step
+    assert has(rc.ledger_problems(ok, repo=repo, decision=after), "does not come after the decision record")
+    assert rc.ledger_problems(ok, repo=repo, decision=decision()) == []                                      # a decision record without the commit asks nothing of the history
+    unknown = dict(decision(), meta={"recorded_on": "0" * 40})                                                # a commit that the repository does not have is not skipped silently
+    assert has(rc.ledger_problems(ok, repo=repo, decision=unknown), "which the repository does not have")
+    other = {"schema": rc.LEDGER_SCHEMA, "meta": dict(META), "steps": [adopted("single_launch", h["base"])], "_path": "mem"}
+    assert rc.ledger_problems(other, repo=repo, decision=dec) == []                                          # the single-launch step comes before the record, by the plan's order
+
+
 def test_the_ledger_and_decision_command_lines(steps_repo, tmp_path, capsys):
     rec = ledger(0)
     rec.pop("_path")

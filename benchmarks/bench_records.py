@@ -446,8 +446,8 @@ def _meta_values(records, field):
 
 
 def config_differences(first, other, fields):
-    """``[(field, values of first, values of other)]`` for the meta ``fields`` in which two record lists are not one and the same value (each list holds a single value of the field and it
-    is the same in both): the configuration that two campaigns must share (the snapshot, the routing, the toolchain, the statistic, the device) to measure the same thing."""
+    """``[(field, values of first, values of other)]`` for the meta ``fields`` that do not hold one value that both record lists share (the values are the sorted JSON texts of the field in
+    each list): the configuration that two campaigns must share (the snapshot, the routing, the toolchain, the statistic, the device) to measure the same thing."""
     out = []
     for field in fields:
         a, b = _meta_values(first, field), _meta_values(other, field)

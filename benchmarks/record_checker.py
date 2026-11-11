@@ -11,7 +11,7 @@ them (``PROBLEM: ...``) followed by ``VERDICT: PASS|FAIL``; exit status 0 pass, 
   record_checker.py commit   --record-commit HASH --repo DIR [--head REV] [--require-clean]
   record_checker.py markers  --ledger FILE --tree DIR [--repo DIR]
   record_checker.py ledger   --ledger FILE [--repo DIR] [--decision FILE] [--require-all-steps]
-  record_checker.py decision --record FILE
+  record_checker.py decision --record FILE [--evidence MANIFEST --repo DIR [--document FILE] [--head REV]]
   record_checker.py handoff  --record FILE --repo DIR [--ledger FILE]
   record_checker.py final    --record FILE --repo DIR [--head REV] [--document FILE]
 
@@ -45,6 +45,8 @@ ledger   ``cfbi-step-ledger-v1``: one row for each step (``single_launch``, ``tr
          against which state the gain is judged, so every adopted row passes everything itself, except the E tile that F rescued, which the selected state E + F stands in for. A ledger
          that contradicts the table is rejected. ``--decision`` cross-checks the skipped steps with the decision record.
 decision a decision record has the keys ``row_engine_order`` (the steps of the row engine in their default order, a step may only be left out, never moved), ``value_split_inputs`` and ``budget_table``.
+         With ``--evidence`` (the manifest of the raw evidence) the record is derived again from the evidence and must equal the given one, and the section of the performance document
+         (``--document``) must be the generated one (see ``decision_record.py``).
 handoff  ``cfbi-handoff-v1``: the value-split and the operand-swap hand-offs (branch of the form ``explore/<run>/<topic>``, commit, both existing in the repository, the probe test on the branch,
          the next free implementation bit: 128 when single-launch decode took 64, else 64) and the known-limit section of the performance document (topics named without plan identifiers).
 final    ``cfbi-final-v1``: the final A/B of the final candidate against the base on every device. The record commit rule (the commit differs from HEAD only under ``docs/``) and a clean tree
@@ -702,6 +704,7 @@ LEDGER_SCHEMA = "cfbi-step-ledger-v1"
 STEP_IDS = ("single_launch", "trims", "e_tile", "a_fragments", "kd_tile")
 ROW_ENGINE_ORDER = ("trims", "e_tile", "a_fragments")        # the default order of the row-engine steps; the decision record may leave a step out, never move one
 SKIPPABLE = ROW_ENGINE_ORDER
+ROW_ENGINE_STEPS = ROW_ENGINE_ORDER + ("kd_tile",)             # the steps whose commits come after the decision record
 UNIT = ("e_tile", "a_fragments")                              # adopted or reverted together by the three-arm rule
 OUTCOMES = ("adopted", "not_adopted", "skipped")
 GATE_PHASES = ("compile", "exactness", "codegen", "timing")   # the order of the step gate protocol; a step that failed ends at one of them
@@ -1061,6 +1064,10 @@ def ledger_problems(ledger, repo=None, decision=None, require_all_steps=False, h
                     problems.append("%s: %s is skipped in the ledger, the decision record keeps it" % (where, sid))
     if repo is not None:
         head_full = resolve(repo, head)
+        recorded = decision["meta"].get("recorded_on") if isinstance(decision, dict) and isinstance(decision.get("meta"), dict) else None
+        recorded_full = resolve(repo, recorded) if hexcommit(recorded) else None
+        if hexcommit(recorded) and recorded_full is None:
+            problems.append("%s: the decision record was written on commit %s, which the repository does not have" % (where, recorded))
         for s in steps:
             if not isinstance(s, dict) or s.get("outcome") == "skipped":
                 continue
@@ -1069,8 +1076,12 @@ def ledger_problems(ledger, repo=None, decision=None, require_all_steps=False, h
                 full = resolve(repo, c)
                 if full is None:
                     problems.append("%s: step %s names commit %s, which the repository does not have" % (where, s.get("id"), c))
-                elif s.get("outcome") == "adopted" and head_full and not (full == head_full or is_ancestor(repo, full, head_full)):
+                    continue
+                if s.get("outcome") == "adopted" and head_full and not (full == head_full or is_ancestor(repo, full, head_full)):
                     problems.append("%s: adopted step %s: commit %s is not an ancestor of %s" % (where, s.get("id"), c, head))
+                if recorded_full and s.get("id") in ROW_ENGINE_STEPS and (full == recorded_full or not is_ancestor(repo, recorded_full, full)):
+                    problems.append("%s: step %s: commit %s does not come after the decision record (written on %s): the order of the row-engine steps is recorded before the first of them"
+                                    % (where, s.get("id"), c, recorded))
     return problems
 
 
@@ -1211,6 +1222,7 @@ def canonical_coverage(campaign):
 
 
 META_KIND = {"decode": "decode-wall", "chain": "chain-wall"}                 # the kind of record that the benchmark of a campaign writes
+SIDE_NAMES = (("A", "baseline"), ("B", "candidate"))                          # the two sides of an A/B campaign by their role
 EFFECTIVE_COUNTS = ("calls_per_trial", "profile_calls")                      # recorded by every cell: the calls of a trial and of its profiled pass (the kernel sum needs both)
 
 
@@ -1222,13 +1234,9 @@ def key_fields(key):
 def canonical_workloads(campaign):
     """``{cell key: {argument: value}}`` of a campaign, from the benchmark that defines its cells (never from a record): what each cell must measure. A decode cell: N, H, the regime and
     the probe position (None outside the probe regime); a chain cell: N, H, the model width Dm and the regime that its key names (the chain benchmark runs one)."""
-    out = {}
-    for s in bd.cell_specs() if campaign == "decode" else bl.cell_specs():
-        if campaign == "decode":
-            out[s["key"]] = {"N": s["N"], "H": s["H"], "regime": s["regime"], "pos": s["pos"]}
-        else:
-            out[s["key"]] = {"N": s["N"], "H": s["H"], "Dm": s["Dm"], "regime": key_fields(s["key"])["regime"]}
-    return out
+    if campaign == "decode":
+        return dict((s["key"], {"N": s["N"], "H": s["H"], "regime": s["regime"], "pos": s["pos"]}) for s in bd.cell_specs())
+    return dict((s["key"], {"N": s["N"], "H": s["H"], "Dm": s["Dm"], "regime": key_fields(s["key"])["regime"]}) for s in bl.cell_specs())
 
 
 def _exactly(a, b):
@@ -1249,7 +1257,8 @@ def campaign_contract_problems(records, campaign, where):
         stat, trials = br.sample_stat_of(rec), meta.get("trials")
         if stat != br.PROCESS_MEDIAN:
             out.append("%s: the raw record %s has sample_stat %r, not %r: a final campaign is judged on the per-process medians of Method M (pooled records are for the A/A tools)" % (where, name, stat, br.PROCESS_MEDIAN))
-        if not count(trials, br.MIN_TRIALS):
+        trials_ok = count(trials, br.MIN_TRIALS)
+        if not trials_ok:
             out.append("%s: the raw record %s declares %r trials per cell: Method M needs at least %d trials" % (where, name, trials, br.MIN_TRIALS))
         if meta.get("kind") != kind:
             out.append("%s: the raw record %s is not a %s record (meta kind %r)" % (where, name, kind, meta.get("kind")))
@@ -1257,7 +1266,7 @@ def campaign_contract_problems(records, campaign, where):
         for cell in rec.get("cells", []):
             key, args = cell.get("key"), cell.get("args") or {}
             held = len(cell.get("samples") or [])
-            if count(trials, br.MIN_TRIALS) and held != trials:
+            if trials_ok and held != trials:
                 found.setdefault("held", []).append("declares %d trials per cell, the cell %r holds %d samples" % (trials, key, held))
             if cell.get("kind") != campaign:
                 found.setdefault("kind", []).append("the cell %r is not a %s cell (kind %r)" % (key, campaign, cell.get("kind")))
@@ -1272,7 +1281,8 @@ def campaign_contract_problems(records, campaign, where):
                 if not count(args.get(field), 1):
                     found.setdefault("count " + field, []).append("the cell %r has %s = %r: an effective count must be a positive integer" % (key, field, args.get(field)))
         for details in found.values():
-            out.append("%s: the raw record %s: %s%s" % (where, name, details[0], " (and %d more cell(s) of the record)" % (len(details) - 1) if len(details) > 1 else ""))
+            more = " (and %d more cell(s) of the record)" % (len(details) - 1) if len(details) > 1 else ""
+            out.append("%s: the raw record %s: %s%s" % (where, name, details[0], more))
     return out
 
 
@@ -1474,9 +1484,9 @@ def scale_problems(first, confirmation, wanted, where):
     out = []
     for metric, keys in sorted(wanted.items()):
         for key in keys:
-            for side, name in (("A", "baseline"), ("B", "candidate")):
+            for side, name in SIDE_NAMES:
                 out.extend("%s: %s" % (where, p) for p in br.rerun_problems(first[side], confirmation[side], name, key, metric, same_config=CONFIRMATION_SAME_CONFIG))
-    for side, name in (("A", "baseline"), ("B", "candidate")):
+    for side, name in SIDE_NAMES:
         out.extend("%s: %s" % (where, p) for p in br.workload_problems(first[side], confirmation[side], "the final A/B %s" % name, "the confirmation %s" % name, br.SCALED_ARGS))
     return out
 
@@ -1489,7 +1499,7 @@ def default_route_problems(first, where):
     neither side may pin another routing (the frozen reference, a forced launch structure) or carry an environment override. A baseline pinned on a slower route would hide a regression,
     and everything that a known limit binds to the baseline (the confirmation, the reverted run) would be consistent with it and still not mean anything."""
     out = []
-    for side, name in (("A", "baseline"), ("B", "candidate")):
+    for side, name in SIDE_NAMES:
         for rec in first[side]:
             meta = rec.get("meta") or {}
             for field, want in DEFAULT_ROUTE.items():
@@ -1653,6 +1663,10 @@ def main(argv=None):
     p.add_argument("--require-all-steps", action="store_true")
     p = sub.add_parser("decision")
     p.add_argument("--record", required=True)
+    p.add_argument("--evidence", default=None)
+    p.add_argument("--repo", default=None)
+    p.add_argument("--document", default=None)
+    p.add_argument("--head", default="HEAD")
     p = sub.add_parser("handoff")
     p.add_argument("--record", required=True)
     p.add_argument("--repo", required=True)
@@ -1693,6 +1707,10 @@ def main(argv=None):
         if a.cmd == "ledger":
             return _report(ledger_problems(load_json(a.ledger), a.repo, load_json(a.decision) if a.decision else None, a.require_all_steps))
         if a.cmd == "decision":
+            if a.evidence:
+                import decision_record as dr
+                document = open(a.document, encoding="utf-8").read() if a.document else None
+                return _report(dr.record_problems(load_json(a.record), dr.load_evidence(a.evidence), a.repo, document, a.head))
             return _report(decision_problems(load_json(a.record)))
         if a.cmd == "handoff":
             adopted = None
