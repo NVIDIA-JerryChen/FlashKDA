@@ -1,14 +1,15 @@
 """Wall time of one graph-captured decode step of the KDA layer chain: six batch-invariant linears, three short convolutions and the CF-BI decode call.
 
 usage: python benchmarks/bench_layer_chain.py [--shapes N ...] [--dm D] [--heads H] [--impl N] [--trials T] [--calls C] [--profile-calls C] [--calls-scale S]
-           [--cells SUBSTR ...] [--expect-compute two-launch|NAME=COUNT;NAME=COUNT] [--expect-aux none|NAME=COUNT;NAME=COUNT] [--json PATH] [--label TEXT] [--list-cells]
+           [--cells SUBSTR ...] [--expect-compute two-launch|single-launch|NAME=COUNT;NAME=COUNT] [--expect-aux none|NAME=COUNT;NAME=COUNT] [--json PATH] [--label TEXT] [--list-cells]
 
 The step is the layer of tests/cfbi/test_layer_chain.py (q / k / v / low-rank g / beta projections, the three depthwise convolutions with SiLU and the decode
 core) on a pre-allocated path: every output buffer exists before the capture and no fp32 side output is requested, so the graph holds no zero-fill or other
 auxiliary node. The tool lists the nodes of one replay from the CUDA profiler, splits them into compute kernels (the CF-BI kernels: 6 linear + 3 convolution
 + the decode kernels, 11 with the two-launch decode and 10 with the single-launch decode) and auxiliary nodes (memsets, copies, anything else) and records both
 mappings ``{name: launches per replay}`` in the profiled pass of EVERY trial (``nodes`` of the sample). ``--expect-compute`` asserts the exact mapping of the compute
-kernels (``two-launch`` is the canonical one of the two-launch decode: 3 convolution, 6 linear, plan and rows kernel once each) and ``--expect-aux`` the exact mapping
+kernels (``two-launch`` is the canonical one of the two-launch decode: 3 convolution, 6 linear, plan and rows kernel once each; ``single-launch`` the same without the plan
+kernel) and ``--expect-aux`` the exact mapping
 of the auxiliary nodes that may remain (``none`` asserts that there is none); the assertion runs on the profiler counts of every trial, and the trials of a cell must
 agree with each other. Nothing is asserted without the options, but the mappings are in the record and ``cell_node_problems`` checks them there.
 
@@ -44,7 +45,8 @@ SHAPES = (1, 64)
 DEFAULT_DM = 2048
 DEFAULT_H = 12
 DEFAULTS = {"trials": 5, "calls": 1536, "profile_calls": 64, "calls_scale": 1}      # the profiled pass is one whole 64-position cycle
-CANONICAL_COMPUTE = {"two-launch": {"conv::conv_kernel": 3, "lin::linear_kernel": 6, "plan_kernel": 1, "rows_kernel": 1}}
+CANONICAL_COMPUTE = {"two-launch": {"conv::conv_kernel": 3, "lin::linear_kernel": 6, "plan_kernel": 1, "rows_kernel": 1},
+                     "single-launch": {"conv::conv_kernel": 3, "lin::linear_kernel": 6, "rows_kernel": 1}}      # the single-launch decode has no plan kernel
 
 
 # ---- cells and node lists (pure Python, no torch) ---------------------------------------------------------------------------------------------
@@ -272,8 +274,9 @@ def main(argv=None):
     ap.add_argument("--profile-calls", type=int, default=DEFAULTS["profile_calls"], help="replays of the profiled pass of a trial, rounded up to whole 64-position cycles")
     ap.add_argument("--calls-scale", type=int, default=DEFAULTS["calls_scale"], help="multiplier of the replays per trial AND of the profiled replays (3 for the re-run)")
     ap.add_argument("--cells", nargs="*", default=None)
-    ap.add_argument("--expect-compute", default=None, metavar="two-launch|NAME=COUNT;...",
-                    help="the exact mapping of the compute kernels one step launches (two-launch: 3 conv, 6 linear, plan, rows; asserted in every trial)")
+    ap.add_argument("--expect-compute", default=None, metavar="two-launch|single-launch|NAME=COUNT;...",
+                    help="the exact mapping of the compute kernels one step launches (two-launch: 3 conv, 6 linear, plan, rows; single-launch: without the plan; "
+                         "asserted in every trial)")
     ap.add_argument("--expect-aux", default=None, metavar="none|NAME=COUNT;...",
                     help="the exact mapping of the auxiliary nodes that may remain (none asserts that there is none; asserted in every trial)")
     ap.add_argument("--json", default=None)

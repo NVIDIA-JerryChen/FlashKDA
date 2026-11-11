@@ -1596,6 +1596,122 @@ def test_suite_record_cli_builds_checks_and_refuses_bad_input():
     assert sr.main(args) == 2
 
 
+SAN_FILE = "tests/cfbi/test_k2_dyn_sanitizer.py"
+SESSION = ('<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="%d" time="3.2" '
+           'timestamp="2026-11-10T19:37:30.65" hostname="node7">%s</testsuite></testsuites>')
+
+
+def junit_of(names, cls="tests.cfbi.test_x"):
+    return SESSION % (len(names), "".join('<testcase classname="%s" name="%s" time="0.1" />' % (cls, n) for n in names))
+
+
+def merge_part(names, cls="tests.cfbi.test_x", ignored=(), **meta):
+    m = {"suite": "S", "commit": BASE_COMMIT, "dirty": False, "gpu": "NVIDIA B200", "sm_count": 148, "tree": "at-7ebb589", "env": {"CFBI_BIG": "1"}, "python": "3.12.3",
+         "torch": "2.14.0", "cuda": "13.4", "ignored": list(ignored), "label": "part", "junit": "p.xml", "subset": True, "host": "node7"}
+    m.update(meta)
+    return suite_record_of(junit_of(names, cls), **m)
+
+
+def test_suite_record_keeps_per_test_outcomes_the_session_and_refuses_duplicate_ids():
+    rec = suite_record_of(JUNIT)
+    assert rec["tests"] == {"tests/cfbi/test_arch.py::test_a": "passed", "tests/cfbi/test_arch.py::test_b[x]": "passed", "tests/cfbi/test_vs_ref.py::test_c": "failed",
+                            "tests/cfbi/test_vs_ref.py::test_d": "passed", "tests/cfbi/test_guard_zones.py::test_e": "skipped",
+                            "tests/cfbi/test_guard_zones.py::test_f": "passed", "tests/cfbi/test_cp.py::test_g": "errors"}
+    assert sr.structure_problems(rec) == []
+    wrong = json.loads(json.dumps(rec))
+    wrong["tests"]["tests/cfbi/test_vs_ref.py::test_c"] = "passed"                                  # the outcomes must say what the counts say
+    assert any("do not match the per-test outcomes" in p for p in sr.structure_problems(wrong))
+    assert any("malformed per-test outcomes" in p for p in sr.structure_problems(dict(rec, tests={"a::b": "ok"})))
+    d = tempfile.mkdtemp()
+    xml = os.path.join(d, "s.xml")
+    with open(xml, "w") as f:
+        f.write(junit_of(["test_a", "test_a"]))
+    parsed = sr.parse_junit(xml)
+    assert parsed["duplicates"] == ["tests/cfbi/test_x.py::test_a"] and parsed["session"]["hostname"] == "node7" and parsed["session"]["timestamp"] == "2026-11-10T19:37:30.65"
+    assert sr.main(["--junit", xml, "--suite", "S", "--out", os.path.join(d, "o.json"), "--commit", BASE_COMMIT, "--gpu", "g", "--sm-count", "1"]) == 2
+    with open(xml, "w") as f:
+        f.write(junit_of(["test_a", "test_b"]))
+    out = os.path.join(d, "o.json")
+    assert sr.main(["--junit", xml, "--suite", "S", "--out", out, "--commit", BASE_COMMIT, "--gpu", "g", "--sm-count", "1", "--ignored", SAN_FILE]) == 0
+    with open(out) as f:
+        back = json.load(f)
+    assert back["meta"]["host"] == "node7" and back["meta"]["kind"] == "single" and back["meta"]["subset"] is True and len(back["tests"]) == 2
+
+
+def test_suite_record_merge_joins_separate_runs_and_validates_every_rule():
+    main_part = merge_part(["test_a", "test_b[1]"], ignored=[SAN_FILE])
+    san = merge_part(["test_san[memcheck]", "test_san[initcheck]"], cls="tests.cfbi.test_k2_dyn_sanitizer", host="node8")
+    infos = [{"file": "a.json", "sha256": "1" * 64}, {"file": "b.json", "sha256": "2" * 64}]
+    files = ["tests/cfbi/test_x.py", SAN_FILE]
+    ids = ["tests/cfbi/test_x.py::test_a", "tests/cfbi/test_x.py::test_b[1]", SAN_FILE + "::test_san[memcheck]", SAN_FILE + "::test_san[initcheck]"]
+    merged = sr.merge_records([main_part, san], infos, "full suite", files, ids, "tree + collection")
+    assert sr.structure_problems(merged) == [] and merged["meta"]["kind"] == "merge" and merged["meta"]["subset"] is False and merged["meta"]["ignored"] == []
+    assert merged["totals"] == {"passed": 4, "failed": 0, "skipped": 0, "errors": 0, "total": 4} and sorted(merged["files"]) == sorted(files)
+    assert [p["sha256"] for p in merged["meta"]["parts"]] == ["1" * 64, "2" * 64] and merged["meta"]["parts"][1]["tests"] == 2 and merged["meta"]["hosts"] == ["node7", "node8"]
+    assert merged["meta"]["expected"] == {"source": "tree + collection", "files": 2, "tests": 4}
+    assert sr.check(merged, merged) == []
+
+    def problems(*parts, **kw):
+        return sr.merge_problems(list(parts), kw.get("files"), kw.get("ids"))
+    assert problems(main_part, san, files=files, ids=ids) == []
+    assert any("at least two" in p for p in problems(main_part))
+    for field, value in (("commit", "f" * 40), ("tree", "at-other"), ("gpu", "NVIDIA B300"), ("sm_count", 160), ("env", {}), ("torch", "9.9"), ("cuda", "12.9"), ("suite", "gate")):
+        other = merge_part(["test_san[memcheck]"], cls="tests.cfbi.test_k2_dyn_sanitizer", **{field: value})
+        assert any("differ in %s" % field in p for p in problems(main_part, other)), field          # one session of one tree and toolchain
+    assert any("dirty" in p for p in problems(main_part, merge_part(["test_s"], dirty=True)))
+    assert any("is in part 0 and in part 1" in p for p in problems(main_part, merge_part(["test_a"])))      # a test is counted once
+    assert any("ignored by part 0 and no part covers it" in p for p in problems(main_part, merge_part(["test_c"])))
+    assert any("expected file" in p and SAN_FILE in p for p in problems(main_part, merge_part(["test_c"], ignored=[]), files=files))
+    assert any("expected test" in p for p in problems(main_part, san, ids=ids + [SAN_FILE + "::test_san[racecheck]"]))
+    assert any("not expected" in p for p in problems(main_part, san, ids=ids[:3]))
+    assert any("not expected" in p and "file" in p for p in problems(main_part, san, files=files[:1]))
+    old = json.loads(json.dumps(main_part))
+    del old["tests"]                                                                                  # a record of the first round has no per-test outcomes
+    assert any("no per-test outcomes" in p for p in problems(old, san))
+    assert any("part 1" in p for p in problems(main_part, {"schema": "x"}))
+    with pytest.raises(ValueError):
+        sr.merge_records([main_part, merge_part(["test_a"])], infos, "x")
+    assert sr.completeness_problems(merged, files, ids) == []                                         # only the merge certifies the whole suite
+    assert any("subset record" in p for p in sr.completeness_problems(main_part, files, ids)) and any("ignores" in p for p in sr.completeness_problems(main_part))
+    assert any("expected file" in p for p in sr.completeness_problems(merged, files + ["tests/cfbi/test_y.py"]))
+    assert any("expected test" in p for p in sr.completeness_problems(merged, None, ids + ["tests/cfbi/test_x.py::test_z"]))
+    assert any("not expected" in p for p in sr.completeness_problems(merged, None, ids[:3]))
+    old = json.loads(json.dumps(merged))
+    del old["tests"]
+    assert any("no per-test outcomes" in p for p in sr.completeness_problems(old, None, ids))
+
+
+def test_suite_record_merge_command_line():
+    d = tempfile.mkdtemp()
+    parts, tree = [], os.path.join(d, "tree", "tests", "cfbi")
+    os.makedirs(tree)
+    for name in ("test_x.py", "test_k2_dyn_sanitizer.py", "helpers.py"):
+        with open(os.path.join(tree, name), "w") as f:
+            f.write("")
+    for name, rec_ in (("a.json", merge_part(["test_a"], ignored=[SAN_FILE])), ("b.json", merge_part(["test_san[memcheck]"], cls="tests.cfbi.test_k2_dyn_sanitizer"))):
+        parts.append(os.path.join(d, name))
+        with open(parts[-1], "w") as f:
+            json.dump(rec_, f)
+    ids = os.path.join(d, "ids.txt")
+    with open(ids, "w") as f:
+        f.write("# collection\ntests/cfbi/test_x.py::test_a\n" + SAN_FILE + "::test_san[memcheck]\n")
+    out = os.path.join(d, "m.json")
+    assert sr.main(["--merge"] + parts + ["--out", out, "--label", "full", "--expect-files-from", os.path.join(d, "tree"), "--expect-tests", ids]) == 0
+    with open(out) as f:
+        merged = json.load(f)
+    assert merged["meta"]["kind"] == "merge" and merged["totals"]["passed"] == 2 and len(merged["meta"]["parts"][0]["sha256"]) == 64
+    assert merged["meta"]["parts"][0]["file"] == "a.json" and merged["meta"]["expected"]["files"] == 2          # helpers.py is no test file
+    with open(ids, "a") as f:
+        f.write(SAN_FILE + "::test_san[racecheck]\n")
+    assert sr.main(["--merge"] + parts + ["--out", out, "--expect-tests", ids]) == 2                                # an expected test that no part ran
+    assert sr.main(["--merge", parts[0], "--out", out]) == 2 and sr.main(["--merge"] + parts) == 2
+    with open(ids, "w") as f:
+        f.write("tests/cfbi/test_x.py::test_a\n" + SAN_FILE + "::test_san[memcheck]\n")
+    common = ["--expect-files-from", os.path.join(d, "tree"), "--expect-tests", ids]
+    assert sr.main(["--merge"] + parts + ["--out", out] + common) == 0
+    assert sr.main(["--complete", out] + common) == 0 and sr.main(["--complete", parts[0]] + common) == 1      # the part without the sanitizer file is not the suite
+
+
 # ---- the layer-chain graph benchmark: cells, node lists and the zero-free step (the measurement needs a GPU) -------------------------------------
 
 CHAIN_COUNTS = {"void cfbi::lin::linear_kernel<128, 2>(cfbi::lin::Args)": 6.0, "void cfbi::conv::conv_kernel<4>(cfbi::conv::Args)": 3.0,
@@ -1641,8 +1757,27 @@ def test_layer_chain_cells_and_the_exact_kernel_node_mappings():
     assert "whole number" in lc.check_nodes(c4, a4, None, None)
 
 
+def test_layer_chain_wrong_paths_with_the_right_number_of_kernels_are_refused():
+    single = lc.CANONICAL_COMPUTE["single-launch"]
+    assert single == {k: v for k, v in TWO_LAUNCH.items() if k != "plan_kernel"} and sum(single.values()) == 10 and sum(TWO_LAUNCH.values()) == 11
+    ref_rows = "void cfbi::ref::rows_kernel(cfbi::Params)"                                            # the frozen reference kernel, a compute kernel of its own name
+    wrong = {"missing plan, rows twice": dict(CHAIN_COUNTS, **{"void cfbi::plan_kernel(long const*, int)": 0.0, "void cfbi::rows_kernel(cfbi::Params)": 2.0}),
+             "reference rows instead of the optimised one": dict(CHAIN_COUNTS, **{"void cfbi::rows_kernel(cfbi::Params)": 0.0, ref_rows: 1.0}),
+             "plan twice, one linear less": dict(CHAIN_COUNTS, **{"void cfbi::plan_kernel(long const*, int)": 2.0, LIN_K: 5.0})}
+    for what, counts in sorted(wrong.items()):
+        counts = dict((k, v) for k, v in counts.items() if v)                                         # the profiler lists only the kernels that ran
+        compute, aux = lc.split_nodes(counts)
+        assert sum(compute.values()) == 11, what                                                       # the number of compute kernels alone cannot tell
+        assert "expected" in lc.check_nodes(compute, aux, TWO_LAUNCH, {}), what
+    compute, aux = lc.split_nodes({k: v for k, v in CHAIN_COUNTS.items() if "plan_kernel" not in k})
+    assert lc.check_nodes(compute, aux, single, {}) is None and lc.check_nodes(compute, aux, TWO_LAUNCH, {}) is not None
+    compute, aux = lc.split_nodes(CHAIN_COUNTS)
+    assert lc.check_nodes(compute, aux, single, {}) is not None                                       # the two-launch step is not the single-launch one
+
+
 def test_layer_chain_node_mappings_are_parsed_strictly():
     assert lc.parse_mapping("two-launch", lc.CANONICAL_COMPUTE) == TWO_LAUNCH and lc.parse_mapping("none") == {} and lc.parse_mapping("") == {}
+    assert lc.parse_mapping("single-launch", lc.CANONICAL_COMPUTE) == lc.CANONICAL_COMPUTE["single-launch"]
     assert lc.parse_mapping("conv::conv_kernel=3;lin::linear_kernel=6") == {"conv::conv_kernel": 3, "lin::linear_kernel": 6}
     assert lc.parse_mapping("void at::native::vectorized_elementwise_kernel<4, FillFunctor>=2") == {"void at::native::vectorized_elementwise_kernel<4, FillFunctor>": 2}
     for bad in ("11", "a", "=3", "a=0", "a=x", "a=1;a=2", "a=1;;b=2"):

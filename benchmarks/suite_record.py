@@ -2,7 +2,9 @@
 """Per-test-file counts of a pytest run (JUnit XML) as a ``cfbi-suite-v1`` record (plain Python, no torch).
 
 usage: python benchmarks/suite_record.py --junit FILE --suite gate|S|Sd --out FILE --commit HASH [--dirty 0|1] [--tree TEXT] [--probe FILE]
-           [--gpu NAME --sm-count N] [--env NAME=VALUE ...] [--ignored PATH ...] [--label TEXT]
+           [--gpu NAME --sm-count N] [--env NAME=VALUE ...] [--ignored PATH ...] [--label TEXT] [--subset]
+       python benchmarks/suite_record.py --merge PART.json PART.json ... --out FILE [--label TEXT] [--expect-files-from TREE] [--expect-tests FILE]
+       python benchmarks/suite_record.py --complete RECORD.json [--expect-files-from TREE] [--expect-tests FILE]
        python benchmarks/suite_record.py --check BASELINE.json CANDIDATE.json [--allow-failures FILE]
 
 The record::
@@ -10,7 +12,14 @@ The record::
     {"schema": "cfbi-suite-v1",
      "meta":   {"suite": "gate|S|Sd", "commit": ..., "dirty": ..., "tree": ..., "gpu": ..., "sm_count": ..., "env": {...}, "ignored": [...], ...},
      "files":  {"tests/cfbi/test_vs_ref.py": {"passed": n, "failed": n, "skipped": n, "errors": n, "total": n}, ...},
+     "tests":  {"tests/cfbi/test_vs_ref.py::test_x[1-2]": "passed|failed|errors|skipped", ...},
      "totals": {"passed": n, ...}, "failed": [test ids], "skipped": [{"id": ..., "reason": ...}]}
+
+``--merge`` joins records of the same suite that were run separately (the part of a suite that cannot run in one session, per-case runs of a long test) into one
+record that says it is a merge (``kind``, ``parts`` with the hash of every part). A merge is only valid when every part has per-test outcomes, a clean tree and the same
+commit, tree, GPU, SM count, environment and toolchain versions, no test is in two parts, every file that a part ignored is covered by another part and, when given,
+the union is exactly the expected files (the ``tests/cfbi/test_*.py`` of a source tree) and the expected test ids (a pytest collection of that tree). A record that
+leaves files out of its suite says so with ``--subset``; ``--complete`` tells whether a record certifies the whole suite.
 
 ``--check``: the candidate must have, for every file of the baseline, at least as many passed tests, and no failed or errored test other than the ids
 listed in ``--allow-failures`` (one id per line: the failures that are by design on a device); files that only the candidate has are allowed (new tests).
@@ -18,6 +27,7 @@ listed in ``--allow-failures`` (one id per line: the failures that are by design
 exit status: 0 ok, 1 the check fails, 2 unusable input
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -26,6 +36,8 @@ import xml.etree.ElementTree as ET
 
 SCHEMA = "cfbi-suite-v1"
 COUNTS = ("passed", "failed", "skipped", "errors", "total")
+OUTCOMES = ("passed", "failed", "errors", "skipped")
+MERGE_SAME = ("suite", "commit", "dirty", "tree", "gpu", "sm_count", "env", "python", "torch", "cuda")   # what the parts of a merge must agree on
 
 
 def classname_to_file(classname):
@@ -41,27 +53,34 @@ def classname_to_file(classname):
 
 
 def parse_junit(path):
-    """``{"files": {file: counts}, "failed": [ids], "skipped": [{"id", "reason"}]}`` of a pytest ``--junitxml`` file."""
+    """``{"files": {file: counts}, "tests": {id: outcome}, "failed": [ids], "skipped": [{"id", "reason"}], "duplicates": [ids], "session": {...}}`` of a pytest
+    ``--junitxml`` file. ``duplicates`` are test ids that occur more than once (a record built from such a file would count a test twice)."""
     root = ET.parse(path).getroot()
-    files, failed, skipped = {}, [], []
+    files, failed, skipped, tests, duplicates = {}, [], [], {}, []
     for case in root.iter("testcase"):
         f = classname_to_file(case.get("classname", ""))
         counts = files.setdefault(f, dict.fromkeys(COUNTS, 0))
         tid = "%s::%s" % (f, case.get("name", ""))
-        counts["total"] += 1
         skip = case.find("skipped")
         if case.find("error") is not None:
-            counts["errors"] += 1
+            outcome = "errors"
             failed.append(tid)
         elif case.find("failure") is not None:
-            counts["failed"] += 1
+            outcome = "failed"
             failed.append(tid)
         elif skip is not None:
-            counts["skipped"] += 1
+            outcome = "skipped"
             skipped.append({"id": tid, "reason": (skip.get("message") or "")[:200]})
         else:
-            counts["passed"] += 1
-    return {"files": files, "failed": failed, "skipped": skipped}
+            outcome = "passed"
+        counts[outcome] += 1
+        counts["total"] += 1
+        if tid in tests:
+            duplicates.append(tid)
+        tests[tid] = outcome
+    suite = root if root.tag == "testsuite" else next(root.iter("testsuite"), None)
+    session = {k: suite.get(k) for k in ("hostname", "timestamp", "time")} if suite is not None else {}
+    return {"files": files, "tests": tests, "failed": failed, "skipped": skipped, "duplicates": duplicates, "session": session}
 
 
 def parse_probe(text):
@@ -78,7 +97,7 @@ def build_record(parsed, meta):
     for c in parsed["files"].values():
         for k in COUNTS:
             totals[k] += c[k]
-    return {"schema": SCHEMA, "meta": meta, "files": parsed["files"], "totals": totals, "failed": parsed["failed"], "skipped": parsed["skipped"]}
+    return {"schema": SCHEMA, "meta": meta, "files": parsed["files"], "tests": parsed["tests"], "totals": totals, "failed": parsed["failed"], "skipped": parsed["skipped"]}
 
 
 def structure_problems(rec):
@@ -100,6 +119,20 @@ def structure_problems(rec):
                 problems.append("file %s: malformed counts" % f)
             elif c["passed"] + c["failed"] + c["skipped"] + c["errors"] != c["total"]:
                 problems.append("file %s: the counts do not add up" % f)
+    tests = rec.get("tests")
+    if tests is not None:                                    # per-test outcomes must say what the per-file counts say
+        if not isinstance(tests, dict) or any(v not in OUTCOMES for v in tests.values()):
+            problems.append("malformed per-test outcomes")
+        elif isinstance(files, dict) and files:
+            derived = {}
+            for tid, outcome in tests.items():
+                c = derived.setdefault(tid.split("::", 1)[0], dict.fromkeys(COUNTS, 0))
+                c[outcome] += 1
+                c["total"] += 1
+            if derived != files:
+                problems.append("the per-file counts do not match the per-test outcomes")
+            if sorted(rec.get("failed") or []) != sorted(t for t, o in tests.items() if o in ("failed", "errors")):
+                problems.append("the list of failed tests does not match the per-test outcomes")
     return problems
 
 
@@ -123,6 +156,121 @@ def check(baseline, candidate, allowed_failures=()):
     return problems
 
 
+def completeness_problems(rec, expected_files=None, expected_tests=None):
+    """Why ``rec`` does not certify the whole suite (an empty list means it does): it is no subset record, ignores no file, holds every expected file and exactly the
+    expected test ids. Whether the tests passed is a different question (``check``)."""
+    problems = structure_problems(rec)
+    if problems:
+        return problems
+    meta = rec["meta"]
+    if meta.get("subset"):
+        problems.append("the record is a subset record: it leaves files of its suite out")
+    if meta.get("ignored"):
+        problems.append("the record ignores %s" % ", ".join(meta["ignored"]))
+    if expected_files is not None:
+        missing = sorted(set(expected_files) - set(rec["files"]))
+        if missing:
+            problems.append("%d expected file(s) are missing: %s" % (len(missing), ", ".join(missing[:5])))
+    if expected_tests is not None:
+        if rec.get("tests") is None:
+            problems.append("the record has no per-test outcomes to compare with the expected test ids")
+        else:
+            missing, extra = sorted(set(expected_tests) - set(rec["tests"])), sorted(set(rec["tests"]) - set(expected_tests))
+            if missing:
+                problems.append("%d expected test(s) are missing: %s" % (len(missing), ", ".join(missing[:5])))
+            if extra:
+                problems.append("%d test(s) are not expected: %s" % (len(extra), ", ".join(extra[:5])))
+    return problems
+
+
+def merge_problems(parts, expected_files=None, expected_tests=None):
+    """Why ``parts`` (suite records) are not a valid merge (an empty list means they are); see the module docstring for the rules."""
+    problems = []
+    if len(parts) < 2:
+        problems.append("a merge needs at least two records, got %d" % len(parts))
+    for i, p in enumerate(parts):
+        problems.extend("part %d: %s" % (i, q) for q in structure_problems(p))
+        if isinstance(p, dict) and isinstance(p.get("meta"), dict):
+            if p.get("tests") is None:
+                problems.append("part %d has no per-test outcomes (build it again from its JUnit file)" % i)
+            if p["meta"].get("dirty") is not False:
+                problems.append("part %d was run on a dirty or unidentified tree" % i)
+    if problems:
+        return problems
+    for field in MERGE_SAME:
+        values = sorted(set(json.dumps(p["meta"].get(field), sort_keys=True) for p in parts))
+        if len(values) > 1:
+            problems.append("the parts differ in %s: %s" % (field, ", ".join(values)))
+    owner = {}
+    for i, p in enumerate(parts):
+        for tid in p["tests"]:
+            if tid in owner:
+                problems.append("test %s is in part %d and in part %d" % (tid, owner[tid], i))
+            owner.setdefault(tid, i)
+    covered = set(tid.split("::", 1)[0] for tid in owner)
+    for i, p in enumerate(parts):
+        for f in p["meta"].get("ignored") or []:
+            if f not in covered:
+                problems.append("the file %s was ignored by part %d and no part covers it" % (f, i))
+    if expected_files is not None:
+        missing, extra = sorted(set(expected_files) - covered), sorted(covered - set(expected_files))
+        if missing:
+            problems.append("%d expected file(s) are in no part: %s" % (len(missing), ", ".join(missing[:5])))
+        if extra:
+            problems.append("%d file(s) are not expected: %s" % (len(extra), ", ".join(extra[:5])))
+    if expected_tests is not None:
+        missing, extra = sorted(set(expected_tests) - set(owner)), sorted(set(owner) - set(expected_tests))
+        if missing:
+            problems.append("%d expected test(s) are in no part: %s" % (len(missing), ", ".join(missing[:5])))
+        if extra:
+            problems.append("%d test(s) are not expected: %s" % (len(extra), ", ".join(extra[:5])))
+    return problems
+
+
+def merge_records(parts, infos, label="", expected_files=None, expected_tests=None, expected_source=None):
+    """The merged record of ``parts`` (``infos``: one dict per part naming it, e.g. its file and hash); raises ``ValueError`` when they are not a valid merge."""
+    problems = merge_problems(parts, expected_files, expected_tests)
+    if problems:
+        raise ValueError("; ".join(problems))
+    meta = dict((f, parts[0]["meta"].get(f)) for f in MERGE_SAME)
+    meta.update({"kind": "merge", "subset": False, "label": label, "ignored": [], "hosts": sorted(set(p["meta"].get("host") for p in parts if p["meta"].get("host"))),
+                 "parts": [dict(info, label=p["meta"].get("label"), junit=p["meta"].get("junit"), host=p["meta"].get("host"), started=p["meta"].get("started"),
+                                tests=len(p["tests"])) for p, info in zip(parts, infos)]})
+    if expected_files is not None or expected_tests is not None:
+        meta["expected"] = {"source": expected_source, "files": None if expected_files is None else len(expected_files),
+                            "tests": None if expected_tests is None else len(expected_tests)}
+    tests, files = {}, {}
+    for p in parts:
+        tests.update(p["tests"])
+    for tid, outcome in tests.items():
+        c = files.setdefault(tid.split("::", 1)[0], dict.fromkeys(COUNTS, 0))
+        c[outcome] += 1
+        c["total"] += 1
+    parsed = {"files": files, "tests": tests, "failed": sorted(t for t, o in tests.items() if o in ("failed", "errors")),
+              "skipped": sorted((s for p in parts for s in p["skipped"]), key=lambda s: s["id"])}
+    return build_record(parsed, meta)
+
+
+def _expected(tree, ids_path):
+    """``(files, ids)``: the ``tests/cfbi/test_*.py`` of a source tree and the test ids of a collection file (None where not given)."""
+    files = ids = None
+    if tree:
+        names = os.listdir(os.path.join(tree, "tests", "cfbi"))
+        files = sorted("tests/cfbi/%s" % n for n in names if n.startswith("test_") and n.endswith(".py"))
+    if ids_path:
+        with open(ids_path, encoding="utf-8") as f:
+            ids = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+    return files, ids
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
 def _load(path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
@@ -142,10 +290,36 @@ def main(argv=None):
     ap.add_argument("--env", action="append", default=[])
     ap.add_argument("--ignored", nargs="*", default=[])
     ap.add_argument("--label", default="")
+    ap.add_argument("--subset", action="store_true", help="the run left files of its suite out (ignored): the record is a part of a merge, not a baseline of the suite")
+    ap.add_argument("--merge", nargs="+", metavar="PART", help="merge suite records of separate runs (needs --out)")
+    ap.add_argument("--complete", metavar="RECORD", help="check that a record certifies the whole suite: no subset, nothing ignored, the expected files and tests")
+    ap.add_argument("--expect-files-from", default=None, metavar="TREE", help="merge / complete: every tests/cfbi/test_*.py of this source tree must be covered")
+    ap.add_argument("--expect-tests", default=None, metavar="FILE",
+                    help="merge / complete: the tests must be exactly the ids listed in this file (a pytest collection, one id per line)")
     ap.add_argument("--check", nargs=2, metavar=("BASELINE", "CANDIDATE"))
     ap.add_argument("--allow-failures", default=None)
     a = ap.parse_args(argv)
     try:
+        if a.merge:
+            if not a.out:
+                print("--merge needs --out", file=sys.stderr)
+                return 2
+            files, ids = _expected(a.expect_files_from, a.expect_tests)
+            rec = merge_records([_load(p) for p in a.merge], [{"file": os.path.basename(p), "sha256": _sha256(p)} for p in a.merge], a.label, files, ids,
+                                a.expect_files_from or a.expect_tests)
+            with open(a.out, "w", encoding="utf-8") as f:
+                json.dump(rec, f, indent=1, sort_keys=True)
+                f.write("\n")
+            t = rec["totals"]
+            print("merge of %d records: %d files, %d passed, %d failed, %d errors, %d skipped" % (len(a.merge), len(rec["files"]), t["passed"], t["failed"], t["errors"], t["skipped"]))
+            return 0
+        if a.complete:
+            files, ids = _expected(a.expect_files_from, a.expect_tests)
+            problems = completeness_problems(_load(a.complete), files, ids)
+            for p in problems:
+                print("PROBLEM: %s" % p)
+            print("VERDICT: %s" % ("COMPLETE" if not problems else "INCOMPLETE"))
+            return 0 if not problems else 1
         if a.check:
             allowed = []
             if a.allow_failures:
@@ -160,7 +334,8 @@ def main(argv=None):
             print("--junit, --suite, --out and --commit are required", file=sys.stderr)
             return 2
         meta = {"suite": a.suite, "commit": a.commit, "dirty": a.dirty not in ("0", "", "false", "False"), "tree": a.tree, "gpu": a.gpu, "sm_count": a.sm_count,
-                "env": dict(e.split("=", 1) for e in a.env), "ignored": list(a.ignored), "label": a.label, "junit": os.path.basename(a.junit)}
+                "env": dict(e.split("=", 1) for e in a.env), "ignored": list(a.ignored), "label": a.label, "junit": os.path.basename(a.junit), "kind": "single",
+                "subset": bool(a.subset or a.ignored)}
         if a.probe:
             with open(a.probe, encoding="utf-8", errors="replace") as f:
                 probe = parse_probe(f.read())
@@ -168,7 +343,12 @@ def main(argv=None):
                 if meta[k] is None:
                     meta[k] = probe.get(k)
             meta.update({k: probe.get(k) for k in ("python", "torch", "cuda")})
-        rec = build_record(parse_junit(a.junit), meta)
+        parsed = parse_junit(a.junit)
+        if parsed["duplicates"]:
+            print("unusable: %d test id(s) occur more than once in %s, e.g. %s" % (len(parsed["duplicates"]), a.junit, parsed["duplicates"][0]), file=sys.stderr)
+            return 2
+        meta.update({"host": parsed["session"].get("hostname"), "started": parsed["session"].get("timestamp"), "duration_s": parsed["session"].get("time")})
+        rec = build_record(parsed, meta)
         problems = structure_problems(rec)
         if problems:
             print("unusable: %s" % "; ".join(problems), file=sys.stderr)
