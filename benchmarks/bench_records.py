@@ -49,7 +49,7 @@ PROCESS_MEDIAN = "process_median"
 MIN_TRIALS = 5  # trials per cell and process of a process-median record
 UNSTABLE_POLICIES = ("invalid", "worst", "widen")
 RERUN_SCALE = 3  # calls per trial (and profiled calls) of a re-run relative to the first campaign
-RERUN_SAME_CONFIG = ("commit", "tree", "impl", "gpu", "sm_count", "host", "trials", "sample_stat")  # meta fields a re-run shares with its first campaign
+RERUN_SAME_CONFIG = ("commit", "tree", "src", "impl", "env_impl", "gpu", "sm_count", "host", "torch", "cuda", "trials", "sample_stat")  # meta fields a re-run shares with its first campaign
 
 
 # ---- kernel names and stages ---------------------------------------------------------------------------------------------------------------

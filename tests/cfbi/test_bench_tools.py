@@ -1410,7 +1410,8 @@ def test_a_rerun_proves_three_times_the_calls_of_the_same_configuration():
     for field in ("calls_per_trial", "profile_calls"):                                             # a count that is not recorded cannot be proven
         res = run(edited("candidate", lambda r: r["cells"][0]["args"].pop(field)))
         assert res["verdict"] == "INVALID" and any(field in p and "not recorded consistently" in p for p in res["problems"]), field
-    for field, value in (("commit", "ffff000"), ("trials", 7), ("host", "node9"), ("impl", 1), ("sample_stat", "pooled")):
+    for field, value in (("commit", "ffff000"), ("trials", 7), ("host", "node9"), ("impl", 1), ("sample_stat", "pooled"), ("env_impl", "32"), ("torch", "9.9"), ("cuda", "9.9"),
+                         ("src", "/other/snapshot")):
         res = run(edited("candidate", lambda r: r["meta"].update({field: value})))                 # another snapshot, configuration or machine
         assert res["verdict"] == "INVALID" and res["problems"], field
     res = run(edited("candidate", lambda r: r["cells"][0]["args"].update(calls_per_trial=3 * CALLS + 64)))
