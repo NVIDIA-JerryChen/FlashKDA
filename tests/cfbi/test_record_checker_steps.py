@@ -21,6 +21,7 @@ for _p in (_ROOT / "benchmarks", _ROOT / "tests" / "cfbi"):
 
 import codegen_gate as cg  # noqa: E402
 import bench_records as br  # noqa: E402
+import decision_record as dr  # noqa: E402
 import record_checker as rc  # noqa: E402
 import test_bench_tools as tbt  # noqa: E402
 from test_record_checker import commit_file, git, has, mutated  # noqa: E402
@@ -36,21 +37,40 @@ META = {"base": BASE, "head": C5}
 LABELS = {"conda": "Cuda compilation tools, release 13.1 | conda gcc 14.3", "container_b200": "container NGC pytorch 26.08: nvcc 13.4.59", "container_b300": "container NGC pytorch 26.08: nvcc 13.4.59"}
 SPILLS = {"sm_100a": (4, 4), "sm_103a": (12, 8), "sm_90a": (428, 172)}      # (stores, loads) of the base row engine
 ROWS = "cfbi::rows_kernel"
+LB0, LB1 = ROWS + "<Lb0E>", ROWS + "<Lb1E>"                      # the instantiations of a commit with the template, as the dumps spell them
+REFERENCE = "cfbi::ref::rows_kernel"
+RESERVE = 1024
+SHARED = 8192 + RESERVE                                          # static shared memory of the row engine and its reference in the dumps (the figure includes the reserve of the driver)
+GPU = {"b200": "NVIDIA B200", "b300": "NVIDIA B300 SXM6 AC"}
+LIMITS = {"registers_per_sm": 65536, "shared_per_sm": 233472, "threads_per_sm": 2048, "reserve_per_cta": RESERVE}
+SINGLE_ALLOW = os.path.join(DUMPS, "allow-single-launch.json")   # the allow-list of the identity comparison: the plan kernel's instantiation is the base's row engine
+with open(SINGLE_ALLOW, "w") as _f:
+    json.dump({"schema": cg.ALLOW_SCHEMA, "aliases": {LB0: ROWS}, "may_differ": []}, _f)
+PRIMITIVES, LAUNCH = "constexpr int NTHREADS = 256;\n", "constexpr size_t ROWS_DYNAMIC_SMEM = 0;\n"      # the launch of the row engine as the sources define it
 _dumps = {}
+_occupancy = {}
 
 
-def dump_file(key, commit, role="cand", rows=None, others=None, extra=None, label=None):
-    """The path of a synthetic dump for the comparison ``key``: the base of the loop (role base) or a candidate of ``commit``. ``rows`` edits the figures of the row engine of a candidate,
-    ``others`` those of other kernels (kernel -> figures), ``extra`` adds kernels (kernel -> arguments of ``cg_kernel``)."""
-    sig = json.dumps([key, commit, role, rows, others, extra, label], sort_keys=True)
+def dump_file(key, commit, role="cand", rows=None, others=None, extra=None, label=None, templated=False):
+    """The path of a synthetic dump for the comparison ``key``: the base of the loop (role base) or a candidate of ``commit``. ``rows`` edits the figures of the row engine of a candidate (of the
+    decode instantiation ``<Lb1E>`` when ``templated``), ``others`` those of other kernels (kernel -> figures), ``extra`` adds kernels (kernel -> arguments of ``cg_kernel``). A ``templated``
+    candidate has the template: ``<Lb0E>`` is the base's row engine (the same machine code) and ``<Lb1E>`` the single-launch decode, a new kernel."""
+    sig = json.dumps([key, commit, role, rows, others, extra, label, templated], sort_keys=True)
     if sig not in _dumps:
         kernels = {}
         for arch in rc.COMPARISON_ARCHS[key]:
-            k = {ROWS: tbt.cg_kernel(reg=128, stack=112, spill=SPILLS[arch], sass="rows" if role == "base" else "rows-" + commit[:7]),
-                 "cfbi::ref::rows_kernel": tbt.cg_kernel(reg=48, sass="ref-rows", maxreg=None, maxthr=None),
-                 "cfbi::k2_kernel<Li16E>": tbt.cg_kernel(reg=172, sass="k2"), "cfbi::plan_kernel": tbt.cg_kernel(reg=40, sass="plan")}
+            def engine(sass):
+                return tbt.cg_kernel(reg=128, stack=112, spill=SPILLS[arch], sass=sass, shared=SHARED)
+            if role == "base":
+                k = {ROWS: engine("rows")}
+            elif templated:
+                k = {LB0: engine("rows"), LB1: tbt.cg_kernel(reg=128, stack=96, spill=(0, 0), sass="rows-" + commit[:7], shared=SHARED)}
+            else:
+                k = {ROWS: engine("rows-" + commit[:7])}
+            k.update({REFERENCE: tbt.cg_kernel(reg=48, sass="ref-rows", maxreg=None, maxthr=None, shared=SHARED),
+                      "cfbi::k2_kernel<Li16E>": tbt.cg_kernel(reg=172, sass="k2"), "cfbi::plan_kernel": tbt.cg_kernel(reg=40, sass="plan")})
             if role != "base":
-                k[ROWS].update(rows or {})
+                k[LB1 if templated else ROWS].update(rows or {})
                 for name, fig in (others or {}).items():
                     k[name].update(fig)
                 for name, args in (extra or {}).items():
@@ -65,13 +85,42 @@ def dump_file(key, commit, role="cand", rows=None, others=None, extra=None, labe
     return _dumps[sig]
 
 
-def comparison(key, commit, instantiations=(ROWS,), **kw):
-    """The honest ledger entry of the comparison ``key`` for a candidate of ``commit`` (``kw`` edits the candidate dump) and the resource figures of its row engine."""
-    base, cand = dump_file(key, BASE, "base"), dump_file(key, commit, "cand", **kw)
+def occupancy_file(dev, commit, dump_path, edit=None):
+    """The occupancy-API record of ``dev`` at ``commit`` for the instantiations of a candidate dump (the figures are the dump's, the CTAs per SM the arithmetic's); ``edit`` edits the record."""
+    sig = (dev, commit, dump_path, None if edit is None else id(edit))
+    if sig not in _occupancy:
+        kernels = cg.load_dump(dump_path)["kernels"][dr.DEVICE_ARCH[dev]]
+        instances = []
+        for key in sorted(k for k in kernels if cg.family(k) == ROWS) + [REFERENCE]:
+            k, static = kernels[key], kernels[key]["shared"] - RESERVE
+            instances.append({"name": key.replace("<Lb0E>", "<false>").replace("<Lb1E>", "<true>"), "registers": k["reg"], "static_smem": static, "dynamic_smem": 0, "threads": 256,
+                              "ctas_per_sm": dr.ctas_per_sm(k["reg"], 256, static, 0, LIMITS)})
+        rec = {"capability": [10, 0], "cuda": "13.4", "gpu": GPU[dev], "label": "%s-%s" % (dev, commit[:9]), "sm_count": 148, "torch": "2.14.0",
+               "occupancy": {"device": {"max_threads_per_sm": 2048, "regs_per_sm": 65536, "sm_count": 148, "smem_per_sm": 233472, "smem_reserved_per_block": RESERVE}, "instances": instances}}
+        if edit is not None:
+            edit(rec)
+        path = os.path.join(DUMPS, "occupancy-%s-%d.json" % (dev, len(_occupancy)))
+        with open(path, "w") as f:
+            json.dump(rec, f)
+        _occupancy[sig] = path
+    return _occupancy[sig]
+
+
+def comparison(key, commit, instantiations=None, sid="trims", templated=None, **kw):
+    """The honest ledger entry of the comparison ``key`` for a candidate of ``commit`` (``kw`` edits the candidate dump) and the resource figures of its row engine. The steps of
+    ``rc.IDENTITY_STEPS`` are compared in identity mode and their candidate has the template (``templated``, ``<Lb0E>`` renamed onto the base's row engine by the allow-list); another step may
+    be templated too. A production-toolchain comparison names the occupancy record of its device."""
+    single = sid in rc.IDENTITY_STEPS
+    templated = single if templated is None else templated
+    instantiations = tuple(instantiations or ((LB0, LB1) if templated else (ROWS,)))
+    base, cand = dump_file(key, BASE, "base"), dump_file(key, commit, "cand", templated=templated, **kw)
     bd, cd = cg.load_dump(base), cg.load_dump(cand)
-    report = cg.compare_dumps(bd, cd, None, "change")
-    entry = {"base_dump": base, "cand_dump": cand, "prev_dump": None, "allow": None, "mode": "change", "instantiations": list(instantiations),
+    allow, mode = SINGLE_ALLOW if templated else None, "identity" if single else "change"
+    report = cg.compare_dumps(bd, cd, cg.load_allow(allow), mode)
+    entry = {"base_dump": base, "cand_dump": cand, "prev_dump": None, "allow": allow, "mode": mode, "instantiations": list(instantiations),
              "verdict": "PASS" if report["exit"] == 0 else "FAIL", "compared": report["compared"], "differences": len(report["differences"])}
+    if key.startswith("container_"):
+        entry["occupancy"] = occupancy_file(key.split("_", 1)[1], commit, cand)
     figures = dict((arch, dict((i, dict((f, cd["kernels"][arch][i][f]) for f in rc.RESOURCE_FIGURES)) for i in instantiations)) for arch in rc.COMPARISON_ARCHS[key])
     return entry, figures
 
@@ -92,7 +141,7 @@ def chain_of(sid):
 
 
 def adopted(sid, commit=C1, markers=("none",), vs_previous="pass", vs_base="pass", chain=None, **cand_kw):
-    codegen, resources = gate_evidence(commit, **cand_kw)
+    codegen, resources = gate_evidence(commit, sid=sid, **cand_kw)
     return {"id": sid, "outcome": "adopted", "commit": commit, "revert_commit": None, "markers": list(markers), "failed_at": None, "reason": "",
             "gates": {"exactness": True, "codegen": True}, "timing": {"vs_previous": vs_previous, "vs_base": vs_base, "chain": chain or chain_of(sid)},
             "codegen_gate": codegen, "resource_gate": resources, "ab": ab_figures()}
@@ -105,9 +154,9 @@ def not_adopted(sid, failed_at, commit=None, revert=None, markers=("none",), tim
             "codegen_gate": None, "resource_gate": None, "ab": None}
     candidate = commit or "e" * 40
     if reached == 2:                                                      # the resource gate failed on the conda toolchain: 129 registers
-        step["codegen_gate"], step["resource_gate"] = gate_evidence(candidate, keys=("conda",), rows={"reg": 129})
+        step["codegen_gate"], step["resource_gate"] = gate_evidence(candidate, keys=("conda",), sid=sid, rows={"reg": 129})
     if reached == 3:
-        step["codegen_gate"], step["resource_gate"] = gate_evidence(candidate)
+        step["codegen_gate"], step["resource_gate"] = gate_evidence(candidate, sid=sid)
         step["ab"] = ab_figures()
         step["timing"] = timing or {"vs_previous": "fail", "vs_base": "pass", "chain": chain_of(sid)}
     return step
@@ -254,8 +303,8 @@ def edit_entry(key, **fields):
     return lambda s: s["codegen_gate"][key].update(fields)
 
 
-def edit_figure(key, arch, **fields):
-    return lambda s: s["resource_gate"][key][arch][ROWS].update(fields)
+def edit_figure(key, arch, inst=ROWS, **fields):
+    return lambda s: s["resource_gate"][key][arch][inst].update(fields)
 
 
 def swap_dump(key, field, **dump_kw):
@@ -308,17 +357,11 @@ def test_the_ledger_names_the_base_commit_that_the_base_dumps_are_bound_to():
     ("spill loads above the base", {"rows": {"spill_loads": 5}}),
     ("a launch bound that differs", {"rows": {"max_threads": 512}}),
     ("another kernel that is no longer identical", {"others": {"cfbi::plan_kernel": {"sass_hash": tbt.cg_hash("plan2"), "sass_hash_strict": tbt.cg_hash("plan2")}}}),
-    ("a new instantiation of the row engine with 129 registers", {"extra": {"cfbi::rows_kernel<Lb1E>": {"reg": 129, "sass": "x"}}}),
+    ("a new instantiation of the row engine with 129 registers", {"templated": True, "rows": {"reg": 129}}),
 ])
 def test_a_resource_or_identity_failure_of_the_dumps_rejects_an_adopted_row_whatever_the_ledger_says(name, cand_kw):
     """The review's 129 registers, and the base-relative stack and spill: the comparison of the dumps decides, an honest ledger that declares the failure is rejected too."""
-    honest = adopted("trims", **cand_kw) if name != "a new instantiation of the row engine with 129 registers" else None
-    if honest is None:                                           # a second instantiation of the family is declared in the ledger by the honest row
-        codegen, resources = {}, {}
-        for key in rc.COMPARISONS:
-            codegen[key], resources[key] = comparison(key, C1, instantiations=(ROWS, "cfbi::rows_kernel<Lb1E>"), **cand_kw)
-        honest = adopted("trims")
-        honest["codegen_gate"], honest["resource_gate"] = codegen, resources
+    honest = adopted("trims", **cand_kw)                         # a second instantiation of the family is declared in the ledger by the honest row
     problems = step_check(honest)
     assert has(problems, "the comparison of the dumps fails"), (name, problems[:3])
     dishonest = mutated(honest, lambda s: [e.update(verdict="PASS", differences=0) for e in s["codegen_gate"].values()])
@@ -332,14 +375,150 @@ def test_a_dump_without_a_launch_bound_of_the_row_engine_is_unusable_evidence_no
 
 
 def test_a_second_instantiation_of_the_row_engine_is_bound_and_gated_like_the_first():
-    codegen, resources = {}, {}
-    for key in rc.COMPARISONS:
-        codegen[key], resources[key] = comparison(key, C1, instantiations=(ROWS, "cfbi::rows_kernel<Lb1E>"), extra={"cfbi::rows_kernel<Lb1E>": {"reg": 128, "sass": "dec"}})
-    row = adopted("trims")
-    row["codegen_gate"], row["resource_gate"] = codegen, resources
+    row = adopted("trims", templated=True)
     assert step_check(row) == []
-    hidden = mutated(row, lambda s: [e.update(instantiations=[ROWS]) for e in s["codegen_gate"].values()])
+    hidden = mutated(row, lambda s: [e.update(instantiations=[LB0]) for e in s["codegen_gate"].values()])
     assert has(step_check(hidden), "names the instantiations")
+
+
+# ---- the single launch: the identity comparison, and the occupancy record of every device --------------------------------------------------------
+def single(commit=C1, **kw):
+    return adopted("single_launch", commit, ("single_launch_marker",), **kw)
+
+
+def allow_file(aliases=None, may_differ=()):
+    path = os.path.join(DUMPS, "allow-%d.json" % len(os.listdir(DUMPS)))
+    with open(path, "w") as f:
+        json.dump({"schema": cg.ALLOW_SCHEMA, "aliases": {LB0: ROWS} if aliases is None else aliases, "may_differ": list(may_differ)}, f)
+    return path
+
+
+def changed(name):
+    return {"sass_hash": tbt.cg_hash(name), "sass_hash_strict": tbt.cg_hash(name)}
+
+
+def test_the_single_launch_row_is_judged_by_the_identity_comparison_and_the_other_steps_by_the_change_mode():
+    row = single()
+    assert step_check(row) == []
+    for key in rc.COMPARISONS:
+        entry = row["codegen_gate"][key]
+        assert (entry["mode"], entry["instantiations"], entry["allow"]) == ("identity", [LB0, LB1], SINGLE_ALLOW)
+        assert all(set(row["resource_gate"][key][arch]) == {LB0, LB1} for arch in rc.COMPARISON_ARCHS[key])
+    assert adopted("trims")["codegen_gate"]["conda"]["mode"] == "change" and step_check(adopted("trims")) == []
+
+
+SINGLE_MUTANTS = [
+    ("the change mode for the single launch", edit_entry("conda", mode="change"), "the mode of the comparison of single_launch is identity"),
+    ("an allow-list that lets the row engine differ", edit_entry("conda", allow=allow_file(may_differ=[ROWS])), "allows no kernel to differ"),
+    ("an allow-list that renames another kernel", edit_entry("container_b200", allow=allow_file({LB0: ROWS, "cfbi::plan_kernel": "cfbi::old_plan_kernel"})), "only an instantiation of the row engine may be renamed"),
+    ("an allow-list that cannot be read", edit_entry("conda", allow="/nonexistent/allow.json"), "cannot be used"),
+    ("no resource figures for the decode instantiation", lambda s: s["resource_gate"]["conda"]["sm_90a"].pop(LB1), "says None"),
+    ("a resource figure of the decode instantiation that the dump does not have", edit_figure("container_b300", "sm_103a", LB1, reg=127), "says"),
+    ("the decode instantiation left out of the ledger", edit_entry("conda", instantiations=[LB0]), "names the instantiations"),
+]
+
+
+@pytest.mark.parametrize("name,edit,expected", SINGLE_MUTANTS, ids=[m[0] for m in SINGLE_MUTANTS])
+def test_the_comparison_of_the_single_launch_is_bound_to_its_mode_its_allow_list_and_its_dumps(name, edit, expected):
+    good = single()
+    assert step_check(good) == []
+    assert has(step_check(mutated(good, edit)), expected), (name, step_check(mutated(good, edit))[:3])
+
+
+@pytest.mark.parametrize("name,cand_kw", [
+    ("the plan kernel's instantiation <Lb0E> that is not the base's row engine", {"others": {LB0: changed("changed")}}),
+    ("the plan kernel's instantiation <Lb0E> with one register less", {"others": {LB0: {"reg": 127}}}),
+    ("another kernel that is no longer identical", {"others": {"cfbi::plan_kernel": changed("plan2")}}),
+    ("the decode instantiation with 129 registers", {"rows": {"reg": 129}}),
+    ("the decode instantiation with a stack above the base", {"rows": {"stack": 113}}),
+    ("the decode instantiation with spill stores above the base", {"rows": {"spill_stores": 5}}),
+    ("a launch bound of the decode instantiation that differs", {"rows": {"max_threads": 512}}),
+])
+def test_a_difference_of_the_default_path_or_a_resource_failure_of_the_decode_instantiation_rejects_the_single_launch_row(name, cand_kw):
+    honest = single(**cand_kw)
+    problems = step_check(honest)
+    assert has(problems, "the comparison of the dumps fails"), (name, problems[:3])
+    dishonest = mutated(honest, lambda s: [e.update(verdict="PASS", differences=0) for e in s["codegen_gate"].values()])
+    assert has(step_check(dishonest), "the comparison of the dumps says FAIL") or has(step_check(dishonest), "differences ="), name
+
+
+def test_the_same_change_of_the_plan_kernels_instantiation_is_tolerated_in_change_mode_and_fails_the_identity_comparison():
+    edit = {"others": {LB0: changed("changed")}}
+    assert step_check(adopted("trims", templated=True, **edit)) == []                         # a row-engine step may change the row engine
+    assert has(step_check(single(**edit)), "the comparison of the dumps fails")               # the single launch may not
+
+
+def occupancy_edit(dev, edit, commit=C1):
+    """A row edit that gives the comparison of ``dev`` the occupancy record that ``edit`` changed (the record is built from the candidate dump of the comparison)."""
+    def apply(s):
+        key = "container_" + dev
+        s["codegen_gate"][key]["occupancy"] = occupancy_file(dev, commit, s["codegen_gate"][key]["cand_dump"], edit)
+    return apply
+
+
+OCCUPANCY_MUTANTS = [
+    ("no occupancy record", edit_entry("container_b200", occupancy=None), "needs occupancy"),
+    ("an occupancy record that cannot be read", edit_entry("container_b300", occupancy="/nonexistent/occupancy.json"), "cannot be used"),
+    ("the record of the other device", lambda s: s["codegen_gate"]["container_b200"].update(occupancy=s["codegen_gate"]["container_b300"]["occupancy"]), "is not b200"),
+    ("a record of another commit", occupancy_edit("b200", lambda r: r.update(label="b200-" + "d" * 9)), "the record is of commit"),
+    ("a record whose label does not name the commit", occupancy_edit("b200", lambda r: r.update(label="b200")), "does not name the device and the commit"),
+    ("an instantiation of the dump that the record lacks", occupancy_edit("b200", lambda r: r["occupancy"]["instances"].pop(1)), "the record has no instance for it"),
+    ("only the decode instantiation in the record", occupancy_edit("b200", lambda r: r["occupancy"]["instances"].pop(0)), "either the plain cfbi::rows_kernel or both of its instantiations"),
+    ("a name that the dump does not have", occupancy_edit("b200", lambda r: r["occupancy"]["instances"][1].update(name="cfbi::rows_kernel<3>")), "the record has no instance for it"),
+    ("registers that are not the dump's", occupancy_edit("b200", lambda r: r["occupancy"]["instances"][1].update(registers=96)), "the production dump"),
+    ("static shared memory that is not the dump's", occupancy_edit("b200", lambda r: r["occupancy"]["instances"][0].update(static_smem=7680)), "static shared memory"),
+    ("fewer than two CTAs per SM", occupancy_edit("b300", lambda r: r["occupancy"]["instances"][1].update(ctas_per_sm=1)), "at least 2 CTAs"),
+    ("a CTA of other threads", occupancy_edit("b300", lambda r: r["occupancy"]["instances"][0].update(threads=128, ctas_per_sm=4)), "256 are required"),
+    ("a CTA count that the arithmetic does not reproduce", occupancy_edit("b300", lambda r: r["occupancy"]["instances"][0].update(ctas_per_sm=3)), "the arithmetic"),
+    ("the record of another GPU", occupancy_edit("b300", lambda r: r.update(gpu="NVIDIA H100")), "is not b300"),
+]
+
+
+@pytest.mark.parametrize("name,edit,expected", OCCUPANCY_MUTANTS, ids=[m[0] for m in OCCUPANCY_MUTANTS])
+def test_the_occupancy_record_of_a_device_is_bound_to_the_candidate_dump_of_its_comparison(name, edit, expected):
+    good = single()
+    assert step_check(good) == [] and "occupancy" not in good["codegen_gate"]["conda"]      # the conda comparison has no device
+    assert has(step_check(mutated(good, edit)), expected), (name, step_check(mutated(good, edit))[:4])
+
+
+@pytest.mark.parametrize("sid", rc.STEP_IDS)
+def test_every_step_that_reaches_the_codegen_gate_on_the_production_toolchain_carries_the_occupancy_of_both_devices(sid):
+    row = adopted(sid)
+    assert step_check(row) == []
+    for dev in rc.DEVICES:
+        assert has(step_check(mutated(row, edit_entry("container_" + dev, occupancy=None))), "container_%s) needs occupancy" % dev), (sid, dev)
+    late = not_adopted(sid, "timing", commit=C2, revert=C3)                                  # a row that was measured has built on both devices
+    assert step_check(late) == [] and has(step_check(mutated(late, edit_entry("container_b200", occupancy=None))), "needs occupancy")
+    early = not_adopted(sid, "codegen")                                                      # a row that failed on the conda toolchain has no device evidence to ask for
+    assert step_check(early) == [] and "container_b200" not in early["codegen_gate"]
+
+
+def build_launch_repo(repo):
+    """A history with the launch of the row engine at the second commit and another thread count at the third."""
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    h = {"repo": repo}
+    h["bare"] = commit_file(repo, "docs/readme.md", "no sources yet\n", "a commit without the launch")
+    commit_file(repo, "csrc/cfbi/cfbi_primitives.cuh", PRIMITIVES, "the sizes of the kernels")
+    h["launch"] = commit_file(repo, "csrc/cfbi/cfbi_launch.cu", LAUNCH, "the launch of the row engine")
+    h["threads"] = commit_file(repo, "csrc/cfbi/cfbi_primitives.cuh", PRIMITIVES.replace("256", "128"), "another thread count")
+    h["dynamic"] = commit_file(repo, "csrc/cfbi/cfbi_launch.cu", LAUNCH.replace("= 0;", "= 4096;"), "a dynamic shared memory")
+    return h
+
+
+def test_the_launch_of_the_sources_at_the_commit_of_the_record_binds_the_threads_and_the_dynamic_shared_memory(tmp_path):
+    h = build_launch_repo(tmp_path / "repo")
+    repo = h["repo"]
+    assert rc.step_problems(single(h["launch"]), None, META, repo) == []
+    dynamic = mutated(single(h["launch"]), occupancy_edit("b200", lambda r: r["occupancy"]["instances"][1].update(dynamic_smem=4096), h["launch"]))
+    assert has(rc.step_problems(dynamic, None, META, repo), "the launch in the sources")
+    assert rc.step_problems(dynamic, None, META) == []                                         # without a repository the launch is not read: the CTAs per SM do not change
+    assert has(rc.step_problems(single(h["threads"]), None, META, repo), "the launch in the sources")                       # the sources say 128 threads, the records 256
+    assert has(rc.step_problems(single(h["dynamic"]), None, META, repo), "the launch in the sources")                       # the sources say 4096 B, the records 0
+    assert has(rc.step_problems(single(h["bare"]), None, META, repo), "the launch cannot be read from the sources")
+    assert has(rc.step_problems(single(h["launch"]), None, META, tmp_path / "nowhere"), "the launch cannot be read from the sources")
+    ledger_row = {"schema": rc.LEDGER_SCHEMA, "meta": dict(META), "steps": [single(h["threads"])], "_path": "mem"}
+    assert has(rc.ledger_problems(ledger_row, repo=repo), "the launch in the sources")         # the ledger hands its repository to the rows
 
 
 ADOPTED_MUTANTS = [
@@ -478,6 +657,8 @@ def build_steps_repo(repo):
     repo.mkdir()
     git(repo, "init", "-q", "-b", "main")
     h = {"repo": repo}
+    commit_file(repo, "csrc/cfbi/cfbi_primitives.cuh", PRIMITIVES, "the sizes of the kernels")                 # the launch of the row engine, which the occupancy records are read against
+    commit_file(repo, "csrc/cfbi/cfbi_launch.cu", LAUNCH, "the launch of the row engine")
     h["base"] = commit_file(repo, "csrc/k.cu", "base\n", "base")
     h["step"] = commit_file(repo, "csrc/step.cu", "the step\n", "add the step")
     h["other"] = commit_file(repo, "csrc/o.cu", "other\n", "another change")

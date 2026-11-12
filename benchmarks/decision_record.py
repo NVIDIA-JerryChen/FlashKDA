@@ -201,6 +201,38 @@ def instance(rec, name):
     return found[0] if len(found) == 1 else None
 
 
+# ---- the names of the optimised row engine: read from the record and from the dump, not a constant ------------------------------------------------------------
+# A commit from before the template has one row engine, ``cfbi::rows_kernel``. After it the occupancy API names the instantiations ``cfbi::rows_kernel<false>`` (behind the plan kernel: the base's
+# row engine) and ``cfbi::rows_kernel<true>`` (the single-launch decode), and the machine-code dumps spell the template argument ``<Lb0E>`` / ``<Lb1E>``.
+ROW_ENGINE_NAME = re.compile(r"^cfbi::rows_kernel(<false>|<true>)?$")
+DUMP_SPELLING = {"<false>": "<Lb0E>", "<true>": "<Lb1E>"}
+ROW_ENGINE_SHAPES = ([ROWS_KERNEL], [ROWS_KERNEL + "<false>", ROWS_KERNEL + "<true>"])      # what a record may name: the plain engine, or both instantiations (each once)
+
+
+def row_names(rec):
+    """The names of the optimised row engine in an occupancy record, in the record's order (the frozen reference is not one of them)."""
+    instances = ((rec.get("occupancy") or {}).get("instances") or []) if isinstance(rec, dict) else []
+    return [i["name"] for i in instances if isinstance(i, dict) and isinstance(i.get("name"), str) and ROW_ENGINE_NAME.match(i["name"])]
+
+
+def dump_name(name):
+    """The key of the machine-code dump for the name that the occupancy API gives an instance (``cfbi::rows_kernel<true>`` is ``cfbi::rows_kernel<Lb1E>``; a plain name stays)."""
+    head, sep, arg = name.partition("<")
+    return head + DUMP_SPELLING.get("<" + arg, "<" + arg) if sep else name
+
+
+def base_row_name(rec):
+    """The instance of an occupancy record that is the base's optimised row engine: the plain name, else the instantiation behind the plan kernel (``<false>``); None when it has neither."""
+    names = row_names(rec)
+    return next((n for n in (ROWS_KERNEL, ROWS_KERNEL + "<false>") if n in names), None)
+
+
+def dump_row_keys(dump, arch):
+    """The keys of the optimised row engine in a dump for one architecture: the plain key or its instantiations."""
+    kernels = ((dump.get("kernels") or {}).get(arch) or {}) if isinstance(dump, dict) else {}
+    return sorted(k for k in kernels if cg.family(k) == ROWS_KERNEL)
+
+
 # ---- the source facts: constants read from the sources at a commit -----------------------------------------------------------------------------
 def source_text(repo, commit, path):
     code, out, err = rc.git(repo, "show", "%s:%s" % (commit, path))
@@ -356,10 +388,12 @@ def launch_problems(launch, ncu):
     return out
 
 
-def occupancy_problems(rec, dev, container, launch=None):
-    """The occupancy-API record of a device, bound to what it claims: the device, the commit (the label), the instantiation, the registers and the static shared memory against the
+def occupancy_problems(rec, dev, container, launch=None, commit=None):
+    """The occupancy-API record of a device, bound to what it claims: the device, the commit (the label; ``commit``: the commit that the evidence is of), the instantiations (the names are
+    read from the record, the keys of the dump from them, and every row-engine kernel of the dump needs an instance), the registers and the static shared memory against the
     production-toolchain dump, the threads and the dynamic shared memory against the launch in the sources at the record's commit (``launch``: ``launch_constants``), at least two CTAs per
-    SM for the row engine, and the arithmetic of ``ctas_per_sm`` reproducing the API for every instance (the CTA count alone does not say which configuration it is the count of)."""
+    SM and at most 128 registers for every instantiation of the row engine, and the arithmetic of ``ctas_per_sm`` reproducing the API for every instance (the CTA count alone does not say
+    which configuration it is the count of)."""
     where = "occupancy record %s" % (rec.get("_path", dev) if isinstance(rec, dict) else dev)
     if not isinstance(rec, dict):
         return ["%s: not a record" % where]
@@ -372,9 +406,17 @@ def occupancy_problems(rec, dev, container, launch=None):
         return out
     if label_commit(rec, dev) is None:
         out.append("%s: the label %r does not name the device and the commit (%s-<commit>)" % (where, rec.get("label"), dev))
-    for name in (ROWS_KERNEL, REFERENCE_KERNEL):
+    elif commit is not None and not rc.commit_matches(label_commit(rec, dev), commit):
+        out.append("%s: the record is of commit %s, the evidence it belongs to is of commit %s" % (where, label_commit(rec, dev), commit))
+    names = row_names(rec)
+    if sorted(names) not in ROW_ENGINE_SHAPES:
+        out.append("%s: the optimised row engine is named %s: either the plain %s or both of its instantiations <false> and <true>, each once (an instantiation without an occupancy figure is unchecked)"
+                   % (where, names or "nowhere", ROWS_KERNEL))
+    covered = set(dump_name(n) for n in names)
+    out.extend("%s: the production dump has the row-engine kernel %s, the record has no instance for it" % (where, key) for key in dump_row_keys(container, DEVICE_ARCH[dev]) if key not in covered)
+    for name in (names or [ROWS_KERNEL]) + [REFERENCE_KERNEL]:
         inst = instance(rec, name)
-        want = kernel(container, DEVICE_ARCH[dev], name)
+        want = kernel(container, DEVICE_ARCH[dev], dump_name(name))
         if inst is None or want is None:
             out.append("%s: the instantiation %s is not in the record or not in the production dump" % (where, name))
             continue
@@ -392,15 +434,15 @@ def occupancy_problems(rec, dev, container, launch=None):
         arithmetic = ctas_per_sm(inst["registers"], inst["threads"], inst["static_smem"], inst["dynamic_smem"], dv)
         if inst["ctas_per_sm"] != arithmetic:
             out.append("%s: %s: the API says %d CTAs per SM, the arithmetic of the registers, the shared memory and the threads %d" % (where, name, inst["ctas_per_sm"], arithmetic))
-        if name == ROWS_KERNEL and (inst["ctas_per_sm"] < GATE_CTAS or inst["registers"] > GATE_REGISTERS):
-            out.append("%s: the row engine has %d CTAs per SM with %d registers: at least %d CTAs and at most %d registers are required" % (where, inst["ctas_per_sm"], inst["registers"], GATE_CTAS, GATE_REGISTERS))
+        if name != REFERENCE_KERNEL and (inst["ctas_per_sm"] < GATE_CTAS or inst["registers"] > GATE_REGISTERS):
+            out.append("%s: the row engine %s has %d CTAs per SM with %d registers: at least %d CTAs and at most %d registers are required" % (where, name, inst["ctas_per_sm"], inst["registers"], GATE_CTAS, GATE_REGISTERS))
     return out
 
 
 def retained_launch_problems(rec, dev, launch):
     """The retained Nsight Compute launches of a device against the occupancy instance of the optimised row engine, figure by figure (static, driver and dynamic shared memory, threads,
     registers: a sum alone would let a dynamic figure hide behind a static one)."""
-    inst = instance(rec, ROWS_KERNEL) if isinstance(rec, dict) else None
+    inst = instance(rec, base_row_name(rec)) if isinstance(rec, dict) else None            # the profiled launch is the base's row engine
     dv = occupancy_device(rec) if isinstance(rec, dict) else {}
     if inst is None or not isinstance(launch, dict) or not all(rc.count(inst.get(f)) for f in INSTANCE_FIGURES) or not rc.count(dv.get("reserve_per_cta"), 1):
         return []                                                  # named by the other checks
@@ -463,9 +505,10 @@ def compile_problems(compiled, container, profile_commit):
                 out.append("%s: the production dump of %s was not made with the container toolchain" % (where, dev))
             if not rc.commit_matches(str(((dump["meta"].get("tree") or {}).get("commit"))), str(profile_commit)):
                 out.append("%s: the production dump of %s is of commit %s, the profile is of %s" % (where, dev, ((dump["meta"].get("tree") or {}).get("commit")), profile_commit))
-            for name in (ROWS_KERNEL, REFERENCE_KERNEL):
-                if kernel(dump, DEVICE_ARCH[dev], name) is None:
-                    out.append("%s: the production dump of %s has no %s" % (where, dev, name))
+            if not dump_row_keys(dump, DEVICE_ARCH[dev]):
+                out.append("%s: the production dump of %s has no %s" % (where, dev, ROWS_KERNEL))
+            if kernel(dump, DEVICE_ARCH[dev], REFERENCE_KERNEL) is None:
+                out.append("%s: the production dump of %s has no %s" % (where, dev, REFERENCE_KERNEL))
     return out
 
 
@@ -496,7 +539,7 @@ def evidence_problems(ev, repo=None):
                 out.append("occupancy record of %s: the launch cannot be read from the sources at commit %s: %s" % (dev, commit, e))
         out.extend(occupancy_problems(rec, dev, (ev.get("container") or {}).get(dev) or {}, launch))
         out.extend(retained_launch_problems(rec, dev, ev.get("launch")))
-    configs = set((inst["threads"], inst["dynamic_smem"]) for inst in (instance(r, ROWS_KERNEL) for r in (ev.get("occupancy") or {}).values()) if inst and inst.get("threads") is not None)
+    configs = set((inst["threads"], inst["dynamic_smem"]) for r in (ev.get("occupancy") or {}).values() for inst in (instance(r, n) for n in row_names(r)) if inst and inst.get("threads") is not None)
     if len(configs) > 1:
         out.append("the occupancy records of the two devices describe different launches of the row engine (threads, dynamic shared memory): %s" % sorted(configs))
     return out
@@ -547,7 +590,7 @@ def value_split_inputs(occupancy, heads):
     capacity = []
     for dev in rc.DEVICES:
         d = occupancy_device(occupancy[dev])
-        ctas = instance(occupancy[dev], ROWS_KERNEL)["ctas_per_sm"]
+        ctas = instance(occupancy[dev], base_row_name(occupancy[dev]))["ctas_per_sm"]
         slots = d["sm_count"] * ctas
         capacity.append({"device": dev, "sm_count": d["sm_count"], "ctas_per_sm": ctas, "resident_slots": slots,
                          "max_nh_by_slices": [{"slices": s, "one_cta_per_sm": d["sm_count"] // s, "resident_slots": slots // s} for s in (2, 4, 8)]})
@@ -592,11 +635,12 @@ def budget_table(ev, facts, launches):
     }
     for dev in rc.DEVICES:
         rec = occupancy[dev]
+        base_name = base_row_name(rec)
         out["api_instances"][dev] = [{"name": n, "registers": instance(rec, n)["registers"], "static_smem": instance(rec, n)["static_smem"], "dynamic_smem": instance(rec, n)["dynamic_smem"],
-                                      "threads": instance(rec, n)["threads"], "ctas_per_sm": instance(rec, n)["ctas_per_sm"], "label": "api"} for n in (ROWS_KERNEL, REFERENCE_KERNEL)]
+                                      "threads": instance(rec, n)["threads"], "ctas_per_sm": instance(rec, n)["ctas_per_sm"], "label": "api"} for n in row_names(rec) + [REFERENCE_KERNEL]]
         values = [r["launch"]["shared_mem_config_size"] for r in ev["launch"]["reports"] if r["device"] == dev]
-        out["carveout"][dev] = {"shared_mem_config_bytes": values[0], "reports": len(values), "label": "measured", "kernel": ROWS_KERNEL}
-        k = kernel(container[dev], DEVICE_ARCH[dev], ROWS_KERNEL)
+        out["carveout"][dev] = {"shared_mem_config_bytes": values[0], "reports": len(values), "label": "measured", "kernel": base_name}
+        k = kernel(container[dev], DEVICE_ARCH[dev], dump_name(base_name))
         ref = kernel(container[dev], DEVICE_ARCH[dev], REFERENCE_KERNEL)
         conda_ref = kernel(compiled["base"], DEVICE_ARCH[dev], REFERENCE_KERNEL)
         out["production"][dev] = {"arch": DEVICE_ARCH[dev],
@@ -646,7 +690,7 @@ def budget_table(ev, facts, launches):
                    "ctas_per_sm": ctas_per_sm(GATE_REGISTERS, THREADS, static, dynamic, dv), "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
                    "l1_upper_bound_bytes": UNIFIED_BYTES - 2 * per_cta, "l1_label": "arithmetic", "label": label}
             if cid == "base" and dv["device"] is not None:
-                api = instance(occupancy[dv["device"]], ROWS_KERNEL)
+                api = instance(occupancy[dv["device"]], base_row_name(occupancy[dv["device"]]))
                 carve = out["carveout"][dv["device"]]["shared_mem_config_bytes"]
                 row.update(ctas_per_sm=api["ctas_per_sm"], ctas_per_sm_label="api", l1_after_measured_carveout_bytes=UNIFIED_BYTES - carve, l1_after_measured_carveout_label="model")
             rows.append(row)

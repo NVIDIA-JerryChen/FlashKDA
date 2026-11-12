@@ -38,7 +38,13 @@ ledger   ``cfbi-step-ledger-v1``: one row for each step (``single_launch``, ``tr
          carries a reason). The code-generation and resource evidence is not a summary that the row writes about itself: for the conda toolchain and for the production container
          toolchain on each device the row names the base dump and the candidate dump, and the checker runs ``codegen_gate.compare_dumps`` on them and recomputes the verdict, the kernels
          compared, the differences, the instantiations of the row engine and their registers, stack and spill; the dumps must be of the base commit of the ledger and of the commit of the
-         row, of the toolchain and the architectures of the comparison, and the ledger's figures must be the dumps'. An adopted row passes every comparison and all of timing (beats the
+         row, of the toolchain and the architectures of the comparison, and the ledger's figures must be the dumps'. The comparison of the ``single_launch`` row is Gate X in identity mode (the
+         base's ``rows_kernel`` is the alias of ``rows_kernel<Lb0E>``, no kernel may differ, ``<Lb1E>`` is a new kernel that Gate R bounds; the allow-list renames nothing else and allows
+         nothing to differ), the comparison of every other step is the ``change`` mode. The comparison of a production-toolchain device (``container_b200``, ``container_b300``) also names the
+         occupancy-API record of the device (``occupancy``, the JSON of ``occupancy_dump.py``) that is bound to the device, to the commit of the candidate dump, to every row-engine
+         instantiation of that dump (the names come from the record and the dump), to the registers and the static shared memory of the dump, to the threads and the dynamic shared memory of
+         the launch in the sources at the record's commit (with ``--repo``), to the arithmetic of the CTAs per SM, and to at least two CTAs per SM and at most 128 registers for every
+         instantiation (``decision_record.occupancy_problems``). An adopted row passes every comparison and all of timing (beats the
          previous accepted state, does not regress against the base, keeps the layer chain where the step changes the shared-memory requirement of the row kernel: ``e_tile``,
          ``a_fragments``, ``kd_tile``, the type of the step decides); the E tile and the A fragments are one adoption unit decided on three arms (T the previous accepted state, E, F)
          by a table (E passes against T and F beats E: both adopted; E passes and F does not beat E: E only; E fails against T and F beats T: both; neither: none): the table only changes
@@ -711,6 +717,7 @@ GATE_PHASES = ("compile", "exactness", "codegen", "timing")   # the order of the
 # the code-generation evidence of a row is one comparison of a base dump and a candidate dump for each of these: the conda toolchain of the login node (the three architectures) and the
 # production container toolchain on each device (one architecture each)
 COMPARISONS = ("conda", "container_b200", "container_b300")
+IDENTITY_STEPS = ("single_launch",)                           # the steps whose comparison is Gate X in identity mode: they add an instantiation and change no kernel of the base
 TOOLCHAINS = COMPARISONS
 COMPARISON_ARCHS = {"conda": ("sm_100a", "sm_103a", "sm_90a"), "container_b200": ("sm_100a",), "container_b300": ("sm_103a",)}
 CHAIN_STEPS = ("e_tile", "a_fragments", "kd_tile")            # the steps that change the shared-memory requirement of the row kernel (the E tile unit, the chunk-end KD tile): the layer chain is judged too
@@ -775,17 +782,54 @@ def _load_dump(path, what):
         return None, "%s %s cannot be used: %s" % (what, path, _first_line(e))
 
 
-def comparison_problems(row, key, entry, resources, meta, where):
+def identity_allow_problems(allow, w):
+    """The allow-list of an identity comparison renames an instantiation of the row engine onto the base's row engine and allows nothing to differ (a wider list would make the identity empty)."""
+    problems = []
+    if allow.get("may_differ"):
+        problems.append("%s: the identity comparison allows no kernel to differ, the allow-list names %s" % (w, sorted(allow["may_differ"])))
+    for ckey, bkey in sorted((allow.get("aliases") or {}).items()):
+        if cg.family(ckey) not in cg.DEFAULT_OWNED or cg.family(bkey) not in cg.DEFAULT_OWNED:
+            problems.append("%s: the allow-list renames %s to %s, only an instantiation of the row engine may be renamed onto the row engine of the base" % (w, ckey, bkey))
+    return problems
+
+
+def occupancy_entry_problems(entry, key, cand, w, repo):
+    """The occupancy-API record of the device of a production-toolchain comparison against the candidate dump of the comparison (``decision_record.occupancy_problems``: device, the commit of the
+    dump, every row-engine instantiation of the dump, registers and static shared memory against the dump, the launch of the sources at the record's commit when ``repo`` is given, the arithmetic,
+    at least two CTAs per SM and at most 128 registers for every instantiation of the row engine)."""
+    import decision_record as dr                                   # not at the top: that module imports this one
+    dev = key.split("_", 1)[1]
+    path = entry.get("occupancy")
+    if not text(path):
+        return ["%s needs occupancy (the path of the occupancy-API record of %s at the commit of the candidate dump)" % (w, dev)]
+    try:
+        rec = load_json(path)
+    except (OSError, ValueError) as e:
+        return ["%s: the occupancy record %s cannot be used: %s" % (w, path, _first_line(e))]
+    launch, problems, label = None, [], dr.label_commit(rec, dev)
+    if repo is not None and label is not None:
+        try:
+            launch = dr.launch_constants(repo, label)
+        except ValueError as e:
+            problems.append("%s: the launch cannot be read from the sources at commit %s of the occupancy record: %s" % (w, label, e))
+    return problems + ["%s: %s" % (w, p) for p in dr.occupancy_problems(rec, dev, cand, launch, commit=cand["meta"]["tree"].get("commit"))]
+
+
+def comparison_problems(row, key, entry, resources, meta, where, repo=None):
     """One code-generation comparison of a row bound to its dumps, and what the comparison says. Returns ``(problems, report)``; ``report`` is the result of
     ``codegen_gate.compare_dumps`` (None when the dumps cannot be used). The ledger declares a verdict, the kernels compared, the differences, the instantiations of the row engine and the
     resource figures; every one of them is recomputed from the dumps (the base dump is the base of the loop, the candidate dump the commit of the row, both of the toolchain and the
     architectures that ``key`` names) and a declared figure that is not the recomputed one is a problem. The recomputed Gate R (registers, base-relative stack and spill, launch bounds)
-    is the comparison's own result, never the ledger's."""
+    is the comparison's own result, never the ledger's. The mode is identity for the steps of ``IDENTITY_STEPS`` and change for the others; the comparison of a production-toolchain device also
+    carries the occupancy-API record of the device (``occupancy_entry_problems``; ``repo``: the repository that the launch of the record's commit is read from)."""
     w = "%s: codegen_gate (%s)" % (where, key)
     if not isinstance(entry, dict):
         return ["%s is not an object" % w], None
     problems = ["%s needs %s (the path of a dump)" % (w, f) for f in ("base_dump", "cand_dump") if not text(entry.get(f))]
-    if entry.get("mode") != "change":
+    identity = row.get("id") in IDENTITY_STEPS
+    if identity and entry.get("mode") != "identity":
+        problems.append("%s: the mode of the comparison of %s is identity (it changes no kernel of the base and adds an instantiation that gate R bounds), got %r" % (w, row.get("id"), entry.get("mode")))
+    if not identity and entry.get("mode") != "change":
         problems.append("%s: the mode of a step's comparison is change (the row engine differs from the base), got %r" % (w, entry.get("mode")))
     if problems:
         return problems, None
@@ -802,6 +846,8 @@ def comparison_problems(row, key, entry, resources, meta, where):
     errors = [e for e in (e1, e2, e3) if e]
     if errors:
         return ["%s: %s" % (w, e) for e in errors], None
+    if identity and allow is not None:
+        problems.extend(identity_allow_problems(allow, w))
     cclass = toolchain_class(cand["meta"]["toolchain"].get("label"))
     if cclass != key.split("_")[0]:
         problems.append("%s: the candidate dump was made with the toolchain %r, which is not the %s toolchain" % (w, cand["meta"]["toolchain"].get("label"), key.split("_")[0]))
@@ -815,7 +861,7 @@ def comparison_problems(row, key, entry, resources, meta, where):
     if row.get("commit") is not None and not commit_matches(cand["meta"]["tree"].get("commit"), row["commit"]):
         problems.append("%s: the candidate dump is of commit %s, the row names commit %s" % (w, cand["meta"]["tree"].get("commit"), row["commit"]))
     try:
-        report = cg.compare_dumps(base, cand, allow, "change", prev)
+        report = cg.compare_dumps(base, cand, allow, entry["mode"], prev)
     except cg.Unusable as e:
         return problems + ["%s: the dumps cannot be compared: %s" % (w, _first_line(e))], None
     passed = report["exit"] == 0
@@ -839,10 +885,12 @@ def comparison_problems(row, key, entry, resources, meta, where):
                 say = figures[arch].get(inst) if isinstance(figures[arch], dict) else None
                 if not isinstance(say, dict) or any(say.get(f) != got[f] or type(say.get(f)) is bool for f in RESOURCE_FIGURES):
                     problems.append("%s: resource_gate (%s, %s, %s) says %r, the dump has %r" % (where, key, arch, inst, say, got))
+    if key.startswith("container_"):
+        problems.extend(occupancy_entry_problems(entry, key, cand, w, repo))
     return problems, report
 
 
-def _codegen_problems(step, where, reached_codegen, both_required, meta):
+def _codegen_problems(step, where, reached_codegen, both_required, meta, repo=None):
     """The code-generation and resource evidence of a row: none before the phase was reached, a bound comparison for every toolchain of the gate when the step passed it (or went on to
     the timing), at least one when it failed there; and the recomputed result decides: an adopted row passes every comparison, a row that failed at the code generation fails at least one.
     Returns ``(problems, results)`` with the recomputed pass / fail of the comparisons that could be made."""
@@ -861,7 +909,7 @@ def _codegen_problems(step, where, reached_codegen, both_required, meta):
         if key not in entries:
             problems.append("%s: codegen_gate has no comparison for %s" % (where, key))
             continue
-        probs, report = comparison_problems(step, key, entries[key], resources, meta, where)
+        probs, report = comparison_problems(step, key, entries[key], resources, meta, where, repo)
         problems.extend(probs)
         if report is not None:
             results.append(report["exit"] == 0)
@@ -921,9 +969,9 @@ def _timing_problems(step, where, adopted, waiver):
     return problems
 
 
-def step_problems(step, waiver=None, meta=None):
+def step_problems(step, waiver=None, meta=None, repo=None):
     """One row of the ledger. The evidence required depends on the outcome and on the phases of the gate protocol that the step reached; ``waiver`` is what the three-arm rule changes for
-    the row (``unit_waivers``), ``meta`` the ledger's metadata (the base commit that the base dumps are bound to)."""
+    the row (``unit_waivers``), ``meta`` the ledger's metadata (the base commit that the base dumps are bound to), ``repo`` the repository that the launch of an occupancy record is read from."""
     sid = step.get("id") if isinstance(step, dict) else None
     where = "step %s" % sid
     if not isinstance(step, dict) or sid not in STEP_IDS:
@@ -959,7 +1007,7 @@ def step_problems(step, waiver=None, meta=None):
             problems.append("%s: an adopted step failed at nothing (failed_at %r)" % (where, step.get("failed_at")))
         if gates.get("exactness") is not True or gates.get("codegen") is not True:
             problems.append("%s: an adopted step passes the exactness and the code-generation gate (gates %r)" % (where, gates))
-        probs, _ = _codegen_problems(step, where, True, True, meta)
+        probs, _ = _codegen_problems(step, where, True, True, meta, repo)
         problems.extend(probs + _ab_problems(step, where, True) + _timing_problems(step, where, True, waiver))
         return problems
     # not adopted: the evidence stops at the phase where it failed
@@ -975,7 +1023,7 @@ def step_problems(step, waiver=None, meta=None):
     for g in ("exactness", "codegen"):
         if gates.get(g) is not expected_gates[g]:
             problems.append("%s: failed at %s, so the %s gate is %r, got %r" % (where, failed_at, g, expected_gates[g], gates.get(g)))
-    probs, results = _codegen_problems(step, where, reached >= 2, reached == 3, meta)
+    probs, results = _codegen_problems(step, where, reached >= 2, reached == 3, meta, repo)
     problems.extend(probs + _ab_problems(step, where, reached == 3))
     if failed_at == "codegen" and results and all(results):
         problems.append("%s: failed at the code generation, but every comparison of the dumps passes" % where)
@@ -1049,7 +1097,7 @@ def ledger_problems(ledger, repo=None, decision=None, require_all_steps=False, h
     waivers = unit_waivers(unit) if in_unit else {}
     meta = ledger.get("meta") if isinstance(ledger.get("meta"), dict) else {}
     for s in steps:
-        problems.extend("%s: %s" % (where, p) for p in step_problems(s, waivers.get(s.get("id")) if isinstance(s, dict) else None, meta))
+        problems.extend("%s: %s" % (where, p) for p in step_problems(s, waivers.get(s.get("id")) if isinstance(s, dict) else None, meta, repo))
     if decision is not None:
         problems.extend(decision_problems(decision))
         order = decision.get("row_engine_order") if isinstance(decision, dict) else None

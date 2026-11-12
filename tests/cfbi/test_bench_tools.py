@@ -7,9 +7,11 @@ candidate fails the 0.5 % protection gate, and a build with one more register or
 import argparse
 import ast
 import concurrent.futures
+import copy
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import types
@@ -1265,6 +1267,55 @@ def test_codegen_controls_with_nvcc():
         rep = cg.compare_dumps(base, built[name], mode="change")
         assert rep["exit"] == 1 and rep["gate_r"]["failures"] and not rep["differences"], (name, rep)
         assert cg.compare_dumps(base, built[name])["exit"] == 1            # identity mode shows the same variant as a difference of the row engine
+
+
+def _tree_with(edits):
+    """A copy of what a dump reads of the tree (``csrc`` and the extension's flag file) with the edits applied; each ``(path, old, new)`` finds ``old`` exactly once."""
+    d = tempfile.mkdtemp(prefix="cfbi-tree-")
+    shutil.copytree(os.path.join(str(_ROOT), "csrc"), os.path.join(d, "csrc"))
+    os.makedirs(os.path.join(d, "flash_kda", "cfbi"))
+    shutil.copy(os.path.join(str(_ROOT), "flash_kda", "cfbi", "_ext.py"), os.path.join(d, "flash_kda", "cfbi", "_ext.py"))
+    for rel, old, new in edits:
+        path = os.path.join(d, rel)
+        with open(path) as f:
+            text = f.read()
+        assert text.count(old) == 1, (rel, old)
+        with open(path, "w") as f:
+            f.write(text.replace(old, new))
+    return d
+
+
+def test_codegen_instance_specific_controls_with_nvcc():
+    """The single launch changes nothing of the default path and keeps its own instantiation inside the budget, and the gate can tell the two instantiations apart (login node, conda nvcc).
+    The base of the comparison is the dump of this tree turned into one from before the template (the plan kernel's instantiation under the plain name, no decode instantiation): the allow-list
+    renames ``<Lb0E>`` onto it, so ``<Lb0E>`` is held to identity and ``<Lb1E>`` is a new kernel that gate R bounds. A mutation of ``rows_kernel<false>`` only fails identity and names
+    ``<Lb0E>`` (``<Lb1E>`` and gate R untouched); a register-pressure variant of ``rows_kernel<true>`` only (a tighter ``__launch_bounds__``) fails gate R for ``<Lb1E>`` while ``<Lb0E>``
+    and every other kernel stay identical."""
+    tc, archs = _toolchain_or_skip(), ("sm_100a",)
+    base = cg.dump_tree(str(_ROOT), archs, (), tc)
+    plain = copy.deepcopy(base)
+    for kernels in plain["kernels"].values():
+        kernels["cfbi::rows_kernel"] = kernels.pop("cfbi::rows_kernel<Lb0E>")
+        del kernels["cfbi::rows_kernel<Lb1E>"]
+    allow = {"aliases": {"cfbi::rows_kernel<Lb0E>": "cfbi::rows_kernel"}, "may_differ": []}
+    rows = "csrc/cfbi/cfbi_rows.cuh"
+    trees = {"false": _tree_with([(rows, "        return p.plan[n];\n", "        SeqPlan q = p.plan[n];\n        q.hrows = q.hrows > 63 ? 63 : q.hrows;\n        return q;\n")]),
+             "true": _tree_with([(rows, "__launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel", "__launch_bounds__(NTHREADS, DECODE ? 3 : CFBI_ROWS_MINB) rows_kernel")])}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futs = {k: pool.submit(cg.dump_tree, tree, archs, (), tc) for k, tree in trees.items()}
+        built = {k: f.result() for k, f in futs.items()}
+    ok = cg.compare_dumps(plain, base, allow, "identity")
+    assert ok["exit"] == 0 and not ok["differences"] and ok["added"] == ["sm_100a cfbi::rows_kernel<Lb1E>"] and ok["gate_r"]["checked"], ok
+    false_only = cg.compare_dumps(plain, built["false"], allow, "identity")
+    assert false_only["exit"] == 1 and len(false_only["differences"]) == 1 and "cfbi::rows_kernel<Lb0E>" in false_only["differences"][0], false_only
+    assert not false_only["gate_r"]["failures"], false_only
+    true_only = cg.compare_dumps(plain, built["true"], allow, "identity")
+    assert true_only["exit"] == 1 and not true_only["differences"] and true_only["gate_r"]["failures"], true_only
+    assert all("cfbi::rows_kernel<Lb1E>" in f for f in true_only["gate_r"]["failures"]), true_only
+    for name in ("false", "true"):
+        other = "cfbi::rows_kernel<Lb1E>" if name == "false" else "cfbi::rows_kernel<Lb0E>"
+        same = {k: built[name]["kernels"]["sm_100a"][k] for k in base["kernels"]["sm_100a"] if k == other or not k.startswith("cfbi::rows_kernel<")}
+        assert all(cg._field_diffs(base["kernels"]["sm_100a"][k], v) == [] for k, v in same.items()), name        # the instantiation that was not touched and every other kernel
 
 
 def test_codegen_compile_matrix_and_a_failing_build_with_nvcc():

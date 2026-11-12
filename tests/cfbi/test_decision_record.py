@@ -469,6 +469,79 @@ def test_the_occupancy_record_is_bound_to_its_device_commit_instantiation_and_sh
     assert has(probs, expected), (name, probs[:3])
 
 
+# ---- the names of the row engine come from the record and from the dump: a commit with the template names its instantiations -------------------------------------------
+def instantiate_record(rec):
+    """An occupancy record of a commit with the template: ``cfbi::rows_kernel<false>`` (the plain engine's figures) and its twin ``<true>`` (the single-launch decode)."""
+    insts = rec["occupancy"]["instances"]
+    assert insts[0]["name"] == "cfbi::rows_kernel"
+    insts[0]["name"] = "cfbi::rows_kernel<false>"
+    insts.insert(1, dict(insts[0], name="cfbi::rows_kernel<true>"))
+
+
+def instantiate_dump(dump):
+    """A production dump of a commit with the template: the keys ``cfbi::rows_kernel<Lb0E>`` and ``<Lb1E>`` instead of the plain one."""
+    for kernels in dump["kernels"].values():
+        plain = kernels.pop("cfbi::rows_kernel")
+        kernels["cfbi::rows_kernel<Lb0E>"] = plain
+        kernels["cfbi::rows_kernel<Lb1E>"] = copy.deepcopy(plain)
+
+
+def instantiated(record_edit=None, dump_edit=None, dev="b200"):
+    """The evidence files of the instantiated commit for both devices; ``record_edit`` / ``dump_edit`` edit the one of ``dev`` after it was instantiated."""
+    files = dict((("occupancy", d), instantiate_record) for d in rc.DEVICES)
+    files.update(dict((("container", d), instantiate_dump) for d in rc.DEVICES))
+    if record_edit:
+        files[("occupancy", dev)] = lambda rec: (instantiate_record(rec), record_edit(rec))[0]
+    if dump_edit:
+        files[("container", dev)] = lambda d: (instantiate_dump(d), dump_edit(d))[0]
+    return files
+
+
+def test_the_names_of_the_api_and_the_keys_of_the_dumps_are_related_by_the_template_argument():
+    assert [dr.dump_name(n) for n in ("cfbi::rows_kernel", "cfbi::rows_kernel<false>", "cfbi::rows_kernel<true>", "cfbi::ref::rows_kernel")] == [
+        "cfbi::rows_kernel", "cfbi::rows_kernel<Lb0E>", "cfbi::rows_kernel<Lb1E>", "cfbi::ref::rows_kernel"]
+    rec = {"occupancy": {"instances": [{"name": "cfbi::rows_kernel<true>"}, {"name": "cfbi::ref::rows_kernel"}, {"name": "cfbi::rows_kernel<false>"}, {"name": "cfbi::rows_kernel<3>"}]}}
+    assert dr.row_names(rec) == ["cfbi::rows_kernel<true>", "cfbi::rows_kernel<false>"] and dr.base_row_name(rec) == "cfbi::rows_kernel<false>"
+    assert dr.base_row_name({"occupancy": {"instances": [{"name": "cfbi::rows_kernel<true>"}]}}) is None and dr.base_row_name({"occupancy": {"instances": [{"name": "cfbi::rows_kernel"}]}}) == "cfbi::rows_kernel"
+    dump = {"kernels": {"sm_100a": {"cfbi::rows_kernel<Lb1E>": {}, "cfbi::rows_kernel<Lb0E>": {}, "cfbi::ref::rows_kernel": {}, "cfbi::k2_kernel<Li16E>": {}}}}
+    assert dr.dump_row_keys(dump, "sm_100a") == ["cfbi::rows_kernel<Lb0E>", "cfbi::rows_kernel<Lb1E>"] and dr.dump_row_keys(dump, "sm_90a") == []
+
+
+def test_a_record_and_a_dump_that_name_the_instantiations_are_checked_and_the_budget_follows_the_base_instance(world):
+    ev = reloaded(world, instantiated())
+    assert dr.evidence_problems(ev, world["repo"]) == []
+    rec = dr.build_record(ev, world["commits"]["head"], world["repo"])
+    assert dr.record_problems(rec, ev, world["repo"], None, world["commits"]["head"]) == []
+    bt, plain = rec["budget_table"], world["rec"]["budget_table"]
+    for dev in rc.DEVICES:
+        assert [i["name"] for i in bt["api_instances"][dev]] == ["cfbi::rows_kernel<false>", "cfbi::rows_kernel<true>", "cfbi::ref::rows_kernel"]
+        assert bt["carveout"][dev]["kernel"] == "cfbi::rows_kernel<false>"
+    assert bt["configurations"] == plain["configurations"] and bt["production"] == plain["production"] and bt["devices"] == plain["devices"]      # the base's figures are those of <false>
+
+
+@pytest.mark.parametrize("name,files,expected", [
+    ("the single-launch instance with one CTA per SM", instantiated(lambda rec: rec["occupancy"]["instances"][1].update(ctas_per_sm=1)), "at least 2 CTAs"),
+    ("the single-launch instance with more registers than the gate allows", instantiated(lambda rec: rec["occupancy"]["instances"][1].update(registers=136, ctas_per_sm=1)), "at most 128 registers"),
+    ("the single-launch instance with registers that are not the dump's", instantiated(lambda rec: rec["occupancy"]["instances"][1].update(registers=96)), "the production dump"),
+    ("the single-launch kernel of the dump with other registers than the API's", instantiated(dump_edit=lambda d: d["kernels"]["sm_100a"]["cfbi::rows_kernel<Lb1E>"].update(reg=112)), "the production dump"),
+    ("the single-launch instance with a dynamic shared memory that is not the launch's", instantiated(lambda rec: rec["occupancy"]["instances"][1].update(dynamic_smem=4096)), "the launch in the sources"),
+    ("an instance that the dump does not have", instantiated(dump_edit=lambda d: d["kernels"]["sm_100a"].pop("cfbi::rows_kernel<Lb1E>")), "is not in the record or not in the production dump"),
+    ("a kernel of the dump without an instance in the record", instantiated(lambda rec: rec["occupancy"]["instances"].pop(1)), "the record has no instance for it"),
+    ("only the single-launch instance", instantiated(lambda rec: rec["occupancy"]["instances"].pop(0)), "either the plain cfbi::rows_kernel or both of its instantiations"),
+    ("the plain name next to an instantiation", instantiated(lambda rec: rec["occupancy"]["instances"][0].update(name="cfbi::rows_kernel")), "either the plain cfbi::rows_kernel or both of its instantiations"),
+])
+def test_every_instantiation_of_the_row_engine_is_bound_to_the_dump_the_launch_and_the_gate(world, name, files, expected):
+    probs = dr.evidence_problems(reloaded(world, files), world["repo"])
+    assert has(probs, expected), (name, probs[:4])
+
+
+def test_the_record_must_be_of_the_commit_of_the_evidence_it_belongs_to(world):
+    rec, dump = world["ev"]["occupancy"]["b200"], world["ev"]["container"]["b200"]
+    commit = dr.label_commit(rec, "b200")
+    assert dr.occupancy_problems(rec, "b200", dump, None, commit=commit) == [] and dr.occupancy_problems(rec, "b200", dump, None, commit=commit + "0123") == []      # a prefix either way
+    assert has(dr.occupancy_problems(rec, "b200", dump, None, commit="1" * 40), "the record is of commit")
+
+
 def toolchain_edit(**fields):
     return lambda d: d["meta"]["toolchain"].update(fields)
 

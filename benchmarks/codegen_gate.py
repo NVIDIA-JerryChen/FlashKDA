@@ -962,7 +962,7 @@ def compare_dumps(base, cand, allow=None, mode="identity", prev=None, owned=DEFA
                 if bk[bkey].get("sass_hash_strict") != ck[ckey].get("sass_hash_strict"):
                     notes.append("%s %s: instructions equal, encodings or control words differ (scheduling only)" % (arch, bkey))
                 continue
-            entry = "%s %s: %s" % (arch, bkey, ", ".join(changes))
+            entry = "%s %s%s: %s" % (arch, bkey, "" if ckey == bkey else " (%s)" % ckey, ", ".join(changes))      # an aliased kernel names both keys
             tolerated = bkey in may_differ or family(bkey) in may_differ or (mode == "change" and family(bkey) in owned)
             if tolerated:
                 allowed.append(entry)
