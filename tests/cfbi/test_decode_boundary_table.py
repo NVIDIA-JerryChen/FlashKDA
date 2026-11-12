@@ -504,7 +504,7 @@ def test_the_tracked_table_satisfies_every_rule_for_the_limit_of_the_tree():
     assert slr.final_problems(table) == []
     if slr.decide_table(table)["outcome"] == "adopted":
         assert table["meta"]["per_sm"] == dp.MAX_CTAS_PER_SM == dp.header_per_sm(_ROOT)
-        assert slr.calibrate(table) == dp.MAX_CTAS_PER_SM
+        assert max(slr.verified_limits(table)) == dp.MAX_CTAS_PER_SM                                      # the largest limit that the table verifies is the limit of the tree
         assert slr.table_problems(table, dp.MAX_CTAS_PER_SM) == []
         doubled = 2 * dp.MAX_CTAS_PER_SM
         assert slr.table_problems(table, doubled, constants={"header": doubled, "specification": doubled}) != []
