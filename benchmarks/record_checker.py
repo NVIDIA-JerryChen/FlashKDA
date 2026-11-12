@@ -782,14 +782,20 @@ def _load_dump(path, what):
         return None, "%s %s cannot be used: %s" % (what, path, _first_line(e))
 
 
+IDENTITY_ALIASES = {cg.GATE_R_REF_INSTANCE: cg.GATE_R_REF}      # the one rename of an identity comparison: the plan kernel's instantiation <Lb0E> onto the plain row engine of the base
+
+
 def identity_allow_problems(allow, w):
-    """The allow-list of an identity comparison renames an instantiation of the row engine onto the base's row engine and allows nothing to differ (a wider list would make the identity empty)."""
+    """The allow-list of an identity comparison renames exactly the instantiation behind the plan kernel (``cfbi::rows_kernel<Lb0E>``) onto the plain row engine of the base, or nothing, and
+    allows nothing to differ. A rename is judged by the instance on both sides, not by the family: a list that lets the decode instantiation stand for the base's engine, or that moves the plan
+    kernel's instantiation to a name the base does not have, takes the identity away from the kernel that has to keep it."""
     problems = []
     if allow.get("may_differ"):
         problems.append("%s: the identity comparison allows no kernel to differ, the allow-list names %s" % (w, sorted(allow["may_differ"])))
     for ckey, bkey in sorted((allow.get("aliases") or {}).items()):
-        if cg.family(ckey) not in cg.DEFAULT_OWNED or cg.family(bkey) not in cg.DEFAULT_OWNED:
-            problems.append("%s: the allow-list renames %s to %s, only an instantiation of the row engine may be renamed onto the row engine of the base" % (w, ckey, bkey))
+        if IDENTITY_ALIASES.get(ckey) != bkey:
+            problems.append("%s: the allow-list renames %s to %s, the only rename of an identity comparison is %s to %s (the plan kernel's instantiation onto the row engine of the base)" % (
+                w, ckey, bkey, cg.GATE_R_REF_INSTANCE, cg.GATE_R_REF))
     return problems
 
 

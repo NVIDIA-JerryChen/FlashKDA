@@ -63,6 +63,8 @@ def dump_file(key, commit, role="cand", rows=None, others=None, extra=None, labe
                 return tbt.cg_kernel(reg=128, stack=112, spill=SPILLS[arch], sass=sass, shared=SHARED)
             if role == "base":
                 k = {ROWS: engine("rows")}
+            elif templated == "swapped":     # the review's candidate: the plan kernel's instantiation is CHANGED and the decode instantiation carries the base's machine code
+                k = {LB0: engine("rows-" + commit[:7]), LB1: engine("rows")}
             elif templated:
                 k = {LB0: engine("rows"), LB1: tbt.cg_kernel(reg=128, stack=96, spill=(0, 0), sass="rows-" + commit[:7], shared=SHARED)}
             else:
@@ -106,7 +108,7 @@ def occupancy_file(dev, commit, dump_path, edit=None):
     return _occupancy[sig]
 
 
-def comparison(key, commit, instantiations=None, sid="trims", templated=None, **kw):
+def comparison(key, commit, instantiations=None, sid="trims", templated=None, allow=None, **kw):
     """The honest ledger entry of the comparison ``key`` for a candidate of ``commit`` (``kw`` edits the candidate dump) and the resource figures of its row engine. The steps of
     ``rc.IDENTITY_STEPS`` are compared in identity mode and their candidate has the template (``templated``, ``<Lb0E>`` renamed onto the base's row engine by the allow-list); another step may
     be templated too. A production-toolchain comparison names the occupancy record of its device."""
@@ -115,7 +117,7 @@ def comparison(key, commit, instantiations=None, sid="trims", templated=None, **
     instantiations = tuple(instantiations or ((LB0, LB1) if templated else (ROWS,)))
     base, cand = dump_file(key, BASE, "base"), dump_file(key, commit, "cand", templated=templated, **kw)
     bd, cd = cg.load_dump(base), cg.load_dump(cand)
-    allow = SINGLE_ALLOW if templated else None
+    allow = allow or (SINGLE_ALLOW if templated else None)
     mode = "identity" if single else "change"
     report = cg.compare_dumps(bd, cd, cg.load_allow(allow), mode)
     entry = {"base_dump": base, "cand_dump": cand, "prev_dump": None, "allow": allow, "mode": mode, "instantiations": list(instantiations),
@@ -411,7 +413,7 @@ def test_the_single_launch_row_is_judged_by_the_identity_comparison_and_the_othe
 SINGLE_MUTANTS = [
     ("the change mode for the single launch", edit_entry("conda", mode="change"), "the mode of the comparison of single_launch is identity"),
     ("an allow-list that lets the row engine differ", edit_entry("conda", allow=allow_file(may_differ=[ROWS])), "allows no kernel to differ"),
-    ("an allow-list that renames another kernel", edit_entry("container_b200", allow=allow_file({LB0: ROWS, "cfbi::plan_kernel": "cfbi::old_plan_kernel"})), "only an instantiation of the row engine may be renamed"),
+    ("an allow-list that renames another kernel", edit_entry("container_b200", allow=allow_file({LB0: ROWS, "cfbi::plan_kernel": "cfbi::old_plan_kernel"})), "the only rename of an identity comparison is"),
     ("an allow-list that cannot be read", edit_entry("conda", allow="/nonexistent/allow.json"), "cannot be used"),
     ("no resource figures for the decode instantiation", lambda s: s["resource_gate"]["conda"]["sm_90a"].pop(LB1), "says None"),
     ("a resource figure of the decode instantiation that the dump does not have", edit_figure("container_b300", "sm_103a", LB1, reg=127), "says"),
@@ -447,6 +449,49 @@ def test_the_same_change_of_the_plan_kernels_instantiation_is_tolerated_in_chang
     edit = {"others": {LB0: changed("changed")}}
     assert step_check(adopted("trims", templated=True, **edit)) == []                         # a row-engine step may change the row engine
     assert has(step_check(single(**edit)), "the comparison of the dumps fails")               # the single launch may not
+
+
+# the review's attack on the identity comparison: an allow-list that is right by family and wrong by instance
+SWAP_ALIASES = {LB1: ROWS, LB0: ROWS + "<kept>"}          # the decode instantiation stands for the base's engine, the plan kernel's instantiation is moved to a name that the base does not have
+
+
+def swapped_row(aliases=None):
+    """A single-launch row whose plan-kernel instantiation <Lb0E> has CHANGED machine code and whose decode instantiation <Lb1E> carries the base's, compared with an allow-list of ``aliases``."""
+    return adopted("single_launch", C1, ("single_launch_marker",), templated="swapped", allow=allow_file(aliases or SWAP_ALIASES))
+
+
+def test_the_review_s_alias_swap_passed_every_check_of_the_comparison_except_the_allow_list():
+    row = swapped_row()
+    entry = row["codegen_gate"]["conda"]
+    base, cand = cg.load_dump(entry["base_dump"]), cg.load_dump(entry["cand_dump"])
+    report = cg.compare_dumps(base, cand, cg.load_allow(entry["allow"]), "identity")
+    assert report["exit"] == 0 and not report["differences"] and "sm_100a cfbi::rows_kernel<Lb0E>" in report["added"], report      # the dump comparison itself is fooled: <Lb0E> counts as a new kernel
+    assert cand["kernels"]["sm_100a"][LB0]["sass_hash"] != base["kernels"]["sm_100a"][ROWS]["sass_hash"]                              # although its machine code is not the base's
+    assert has(step_check(row), "the only rename of an identity comparison is")                                                         # the allow-list is what stops it
+
+
+@pytest.mark.parametrize("name,aliases,whole_row", [
+    ("the decode instantiation onto the base's engine and the plan instantiation to another name", SWAP_ALIASES, True),
+    ("only the decode instantiation renamed", {LB1: ROWS}, True),
+    ("the right rename and a second one of the same family", {LB0: ROWS, ROWS + "<Lb2E>": ROWS}, True),
+    ("the plan instantiation to a name that the base does not have", {LB0: ROWS + "<kept>"}, True),
+    ("an instance of another family to the right name", {"cfbi::k2_kernel<Li16E>": ROWS}, True),
+    ("the right instance to the reference kernel", {LB0: "cfbi::ref::rows_kernel"}, False),       # the dump comparison itself refuses two kernels under one name: no whole row to build
+])
+def test_only_the_plan_kernels_instantiation_may_be_renamed_onto_the_base_s_engine(name, aliases, whole_row):
+    problems = rc.identity_allow_problems({"aliases": aliases, "may_differ": []}, "w")
+    assert any("the only rename of an identity comparison is" in p for p in problems), (name, problems)
+    if whole_row:
+        assert has(step_check(swapped_row(aliases)), "the only rename of an identity comparison is"), name
+
+
+def test_the_exact_rename_or_none_is_a_valid_identity_allow_list_and_the_honest_row_passes():
+    assert rc.identity_allow_problems({"aliases": {LB0: ROWS}, "may_differ": []}, "w") == []                    # the allow-list of the real comparisons (records/allow-import1-r6.json)
+    assert rc.identity_allow_problems({"aliases": {}, "may_differ": []}, "w") == []
+    assert rc.identity_allow_problems({"may_differ": []}, "w") == []
+    assert json.load(open(SINGLE_ALLOW))["aliases"] == {"cfbi::rows_kernel<Lb0E>": "cfbi::rows_kernel"}          # the fixture is the real allow-list
+    assert step_check(single()) == []
+    assert has(rc.identity_allow_problems({"aliases": {LB0: ROWS}, "may_differ": [ROWS]}, "w"), "allows no kernel to differ")
 
 
 def occupancy_edit(dev, edit, commit=C1):
