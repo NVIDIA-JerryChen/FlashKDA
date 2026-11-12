@@ -445,6 +445,28 @@ def test_binary_comparison_cli_exit_codes():
     assert cb.main(["--base-regs", a, "--cand-regs", os.path.join(d, "missing.txt")]) == 2
 
 
+def test_binary_comparison_follows_a_kernel_that_became_a_template_instantiation_by_alias():
+    plain, plan, decode = "_ZN4cfbi11rows_kernelENS_6ParamsE", "_ZN4cfbi11rows_kernelILb0EEEvNS_6ParamsE", "_ZN4cfbi11rows_kernelILb1EEEvNS_12DecodeParamsE"
+    d = tempfile.mkdtemp()
+
+    def write(name, text):
+        path = os.path.join(d, name)
+        open(path, "w").write(text)
+        return path
+    base_r, base_s = write("br", cg_regs({plain: (128, 112), K1: (128, 0)})), write("bs", cg_sass({plain: CODE, K1: CODE}))
+    cand_r, cand_s = write("cr", cg_regs({plan: (128, 112), decode: (128, 96), K1: (128, 0)})), write("cs", cg_sass({plan: CODE, decode: CODE + ["NOP"], K1: CODE}))
+    args = ["--base-regs", base_r, "--cand-regs", cand_r, "--base-sass", base_s, "--cand-sass", cand_s]
+    assert cb.main(args) == 1                                                                  # the heuristic follows names: the renamed row engine is missing
+    assert cb.main(args + ["--alias", "%s=%s" % (plan, plain)]) == 0                           # with the alias it is equal, the decode instantiation is new
+    base, cand = cb.parse_resource_usage(open(base_r).read()), cb.apply_aliases(cb.parse_resource_usage(open(cand_r).read()), {plan: plain})
+    assert cb.compare_resources(base, cand) == ([], ["sm_100a %s" % decode])
+    changed = write("cs2", cg_sass({plan: CODE + ["NOP"], decode: CODE, K1: CODE}))
+    assert cb.main(["--base-regs", base_r, "--cand-regs", cand_r, "--base-sass", base_s, "--cand-sass", changed, "--alias", "%s=%s" % (plan, plain)]) == 1      # a difference behind an alias counts
+    assert cb.main(args + ["--alias", "_ZN4cfbi3nopE=%s" % plain]) == 2                          # an alias that names no function of the candidate is unusable input
+    assert cb.main(args + ["--alias", "%s=%s" % (decode, plain), "--alias", "%s=%s" % (plan, plain)]) == 2         # two functions under one name
+    assert cb.main(args + ["--alias", plan]) == 2
+
+
 # ---- compile-only code-generation gate (benchmarks/codegen_gate.py) ----------------------------------------------------------------------------
 
 ROWS = "_ZN4cfbi11rows_kernelENS_6ParamsE"

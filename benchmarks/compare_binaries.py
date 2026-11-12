@@ -2,13 +2,15 @@
 """Compare the resource usage and the SASS of the kernels of two built CF-BI extensions (cuobjdump text; plain Python, no torch).
 
 usage: python benchmarks/compare_binaries.py --base-regs A.regs.txt --cand-regs B.regs.txt [--base-sass A.sass.txt --cand-sass B.sass.txt]
-           [--functions SUBSTR ...]
+           [--functions SUBSTR ...] [--alias CANDIDATE_NAME=BASE_NAME ...]
 
 The inputs are the outputs of ``cuobjdump --dump-resource-usage <extension.so>`` and ``cuobjdump -sass <extension.so>`` (the node driver's modes
 ``regs`` and ``sass``). For every function (per architecture) of the baseline the tool requires equal REG, STACK (spill frame), SHARED and LOCAL
 figures, an equal SASS instruction count and an equal opcode histogram in the candidate. Functions that only exist in the candidate (new kernels)
 are listed and are not a difference; a baseline function missing in the candidate is. Equality is an equivalence heuristic, not proof of identical
-machine code: a difference is recorded and the timing gate decides.
+machine code (the code-generation gate, ``codegen_gate.py``, compares the normalised SASS instruction by instruction): a difference is recorded and the timing gate decides.
+``--alias`` renames a function of the candidate to the name that the baseline has for it (the mangled names), for a kernel that became a template instantiation: every
+alias must name a candidate function and two functions may not end up under one name (unusable input, exit 2 otherwise).
 
 exit status: 0 equal, 1 differences, 2 unusable input
 """
@@ -66,6 +68,21 @@ def parse_sass(text):
     return out
 
 
+def apply_aliases(table, aliases):
+    """``table`` with the functions that ``aliases`` (candidate name -> baseline name) names under their baseline name. ValueError when an alias matches no function of the table or
+    two functions end up under one name."""
+    unused = set(aliases) - set(func for _, func in table)
+    if unused:
+        raise ValueError("the alias %s matches no function of the candidate" % sorted(unused)[0])
+    out = {}
+    for (arch, func), value in table.items():
+        key = (arch, aliases.get(func, func))
+        if key in out:
+            raise ValueError("%s %s: two functions of the candidate end up under this name" % key)
+        out[key] = value
+    return out
+
+
 def _selected(key, functions):
     return not functions or any(s in key[1] for s in functions)
 
@@ -118,13 +135,20 @@ def main(argv=None):
     ap.add_argument("--base-sass", default=None)
     ap.add_argument("--cand-sass", default=None)
     ap.add_argument("--functions", nargs="*", default=None, help="only functions whose (mangled) name contains one of these substrings")
+    ap.add_argument("--alias", action="append", default=[], metavar="CANDIDATE=BASE", help="a function of the candidate under the name that the baseline has for it (mangled names)")
     a = ap.parse_args(argv)
     try:
         base_r, cand_r = parse_resource_usage(_read_text(a.base_regs)), parse_resource_usage(_read_text(a.cand_regs))
         base_s = parse_sass(_read_text(a.base_sass)) if a.base_sass else None
         cand_s = parse_sass(_read_text(a.cand_sass)) if a.cand_sass else None
-    except OSError as e:
-        print("cannot read the input: %s" % e, file=sys.stderr)
+        aliases = dict(x.split("=", 1) for x in a.alias if "=" in x)
+        if len(aliases) != len(a.alias):
+            raise ValueError("an alias is CANDIDATE=BASE, and each candidate name may be given once")
+        if aliases:
+            cand_r = apply_aliases(cand_r, aliases)
+            cand_s = apply_aliases(cand_s, aliases) if cand_s is not None else None
+    except (OSError, ValueError) as e:
+        print("cannot use the input: %s" % e, file=sys.stderr)
         return 2
     if not base_r or not cand_r:
         print("no resource-usage entries found in the input", file=sys.stderr)
