@@ -9,10 +9,14 @@ a build that defines no test macro reads it:
 * the hooks that the default build compiles to nothing are expanded the way the default macros define them (``ROWS_DELAY(n)`` and ``ROWS_DECODE_ARRIVED(old, heads)`` vanish,
   ``ROWS_POS_INDEX(access, slot)`` is ``(slot)``; the definitions themselves are pinned) and the text is cut into tokens, so spacing, line breaks and the name of a hook argument do not matter;
 * ``problems(texts)`` returns ``[(rule, message)]``: the rule that an edit breaks says which property of the protocol it endangers. ``R0`` (the whole decode entry equals ``GOLDEN``) is the
-  complete pin: a deliberate change of the protocol updates ``GOLDEN`` and the model of ``test_decode_pos_protocol_model.py`` together; ``R1 .. R12`` name the properties one by one.
+  complete pin: a deliberate change of the protocol updates ``GOLDEN`` and the model of ``test_decode_pos_protocol_model.py`` together; ``R1 .. R12`` name the properties one by one. R12 also keeps the pins honest about the preprocessor: the tokens that the pins read are what the compiler sees only if no macro
+  rewrites them, so every effective ``#define`` / ``#undef`` of every source file (and every ``-D`` / ``-U`` flag of the build) is read, per directive, and one that names an identifier of
+  a pinned snippet is a problem unless it is a modeled hook or the tunable ``CFBI_ROWS_MINB``; a quoted ``#include`` of a file that is not read (and a forced include of the build flags) could bring a macro
+  that no pin sees and is a problem as well.
 
 The model of the protocol reads its constants and its election from here (``constants``, ``election``), so that the model and the kernel cannot drift apart.
 """
+import posixpath
 import re
 from pathlib import Path
 
@@ -40,11 +44,10 @@ def macros_in(texts):
     return {m for m in found if is_test_macro(m)}
 
 
-def default_text(text, macros):
-    """The text as a build that defines none of ``macros`` reads it: the branch of ``#ifdef M`` is dropped and its ``#else`` branch kept (``#ifndef M`` the other way round), the
-    directive lines of those conditionals are dropped, every other line stays. Only ``#ifdef`` / ``#ifndef`` / ``#else`` / ``#endif`` of a test macro are read; ``#elif`` of one is refused."""
+def default_lines(text, macros):
+    """``[(line number in ``text``, line)]`` of the text as a build that defines none of ``macros`` reads it (see ``default_text``); the numbers are those of the file, not of the view."""
     out, stack = [], []
-    for line in text.splitlines():
+    for number, line in enumerate(text.splitlines(), 1):
         m = re.match(r"^\s*#\s*(ifdef|ifndef|if|elif|else|endif)\b\s*(\w+)?", line)
         skipping = any(f[1] for f in stack)
         if m:
@@ -63,9 +66,15 @@ def default_text(text, macros):
             elif d == "elif" and stack and stack[-1][0] == "test":
                 raise ValueError("#elif of a conditional on a test macro is not read by this preprocessor")
         if not skipping:
-            out.append(line)
+            out.append((number, line))
     assert not stack, "unbalanced preprocessor conditionals"
-    return "\n".join(out)
+    return out
+
+
+def default_text(text, macros):
+    """The text as a build that defines none of ``macros`` reads it: the branch of ``#ifdef M`` is dropped and its ``#else`` branch kept (``#ifndef M`` the other way round), the
+    directive lines of those conditionals are dropped, every other line stays. Only ``#ifdef`` / ``#ifndef`` / ``#else`` / ``#endif`` of a test macro are read; ``#elif`` of one is refused."""
+    return "\n".join(line for _, line in default_lines(text, macros))
 
 
 def strip_comments(text):
@@ -103,13 +112,50 @@ def norm(text):
     return " ".join(tokens(text))
 
 
+SOURCE_SUFFIXES = (".cu", ".cuh", ".h", ".cpp")
+FLAG_FILES = {"flags:_ext.py": ROOT / "flash_kda" / "cfbi" / "_ext.py", "flags:setup.py": ROOT / "setup.py"}      # where the nvcc flags of the build are written (texts under the keys "flags:...")
+
+
 def load(csrc=CSRC):
-    return {name: (Path(csrc) / name).read_text() for name in FILES}
+    """Every source file of ``csrc`` (relative path -> text: the macros of any of them can rewrite what the pins read) and, for the repository's own tree, the files that hold the build flags."""
+    root = Path(csrc)
+    texts = {str(f.relative_to(root)): f.read_text() for f in sorted(root.rglob("*")) if f.is_file() and f.suffix in SOURCE_SUFFIXES}
+    missing = [n for n in FILES if n not in texts]
+    if missing:
+        raise FileNotFoundError("the sources %s are not in %s" % (missing, root))
+    if root == CSRC:
+        texts.update({key: path.read_text() for key, path in FLAG_FILES.items() if path.exists()})
+    return texts
+
+
+def source_texts(texts):
+    """The C++ sources of ``texts`` (without the flag files)."""
+    return dict((k, v) for k, v in texts.items() if not k.startswith("flags:"))
+
+
+_VIEWS = {}
+
+
+def _views(texts):
+    srcs = source_texts(texts)
+    key = tuple(sorted((k, hash(v)) for k, v in srcs.items()))
+    if key not in _VIEWS:
+        if len(_VIEWS) > 16:
+            _VIEWS.clear()
+        macros = macros_in(srcs.values())
+        numbered = dict((name, default_lines(text, macros)) for name, text in srcs.items())
+        _VIEWS[key] = (dict((name, "\n".join(line for _, line in lines)) for name, lines in numbered.items()), numbered)
+    return _VIEWS[key]
 
 
 def default_view(texts):
-    macros = macros_in(texts.values())
-    return {name: default_text(text, macros) for name, text in texts.items()}
+    """Every source of ``texts`` as a build without test macros reads it (comments still in); remembered per content, the rules ask for it again and again."""
+    return _views(texts)[0]
+
+
+def default_numbered(texts):
+    """The same view as ``{file: [(line number in the file, line)]}``."""
+    return _views(texts)[1]
 
 
 def match_close(toks, i, open_, close):
@@ -265,6 +311,88 @@ def counter_limit_problems(texts):
     return []
 
 
+# ---- macros: what a #define can do to tokens that the pins read -----------------------------------------------------------------------------------------------
+SEQ_WINDOW_STATEMENT = norm("if (w.slot < 0) w.len = 0;")
+CONSTANT_NAMES = ("BT", "POS_COUNT_SHIFT", "POS_MASK")
+HEAD_NAMES = ("seq_window", "SeqWindow", "rows_entry", "rows_kernel", "RowsParams", "static_assert", "NTHREADS", "CFBI_ROWS_MINB", "__launch_bounds__", "__global__")
+
+
+def identifiers(snippet):
+    return set(t for t in snippet.split() if re.match(r"[A-Za-z_]\w*$", t))
+
+
+# the names that the pins read as code: the identifiers of every pinned snippet (so also the keywords and the generic names `n`, `old`, `p`: a macro of such a name would rewrite them), the
+# constants, the heads of the entry and of the kernel, and the hooks that the reader expands away
+PINNED = frozenset().union(*(identifiers(s) for s in (GOLDEN, SKIP, BLOCK_OPEN, ARRIVAL, FILL, ELECTION, STORE, BARRIER, STORE_HELPER, FUSED_TAIL, KERNEL_MAP, ENTRY_CALL, SEQ_WINDOW_STATEMENT,
+                                                    *LAUNCH)), CONSTANT_NAMES, HEAD_NAMES, HOOK_BODIES)
+ALLOWED_DEFINES = frozenset(HOOK_BODIES) | {"CFBI_ROWS_MINB"}     # the modeled hooks (their bodies are R11) and the tunable: each defined exactly once, never undefined
+DIRECTIVE = re.compile(r"^[ \t]*#[ \t]*(define|undef)[ \t]+([A-Za-z_]\w*)")
+FLAG = re.compile(r"-[DU]\s*([A-Za-z_]\w*)")
+INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"')
+FORCE_INCLUDE = re.compile(r"(?<![\w-])(?:--pre-include|-include|-imacros)(?![\w-])")
+
+
+def stripped_lines(numbered):
+    """``(file, line number in the file, line without its comments)`` of the default views (``default_numbered``): a directive in a comment is none, and the directives are still there (``tokens`` drops them)."""
+    for name in sorted(numbered):
+        lines = numbered[name]
+        text = strip_comments("\n".join(l for _, l in lines)).splitlines()
+        assert len(text) == len(lines), "%s: the comments were stripped without keeping the line structure" % name
+        for (number, _), line in zip(lines, text):
+            yield name, number, line
+
+
+def macro_directives(numbered):
+    """``(file, line number in the file, kind, name)`` of every ``#define`` and ``#undef`` of the default views; a directive in a test-macro branch that the default build does not take is not in the view."""
+    out = []
+    for name, number, line in stripped_lines(numbered):
+        m = DIRECTIVE.match(line)
+        if m:
+            out.append((name, number, m.group(1), m.group(2)))
+    return out
+
+
+def macro_problems(texts, numbered):
+    """R12: a macro whose name is read as code by the pins would change what the compiler sees while the tokens stay (``#define st_relaxed_gpu(ptr, v) (*(ptr) = (v))`` after the helper
+    turns the elected store into a plain assignment and every pin still reads a call of the relaxed helper). Every directive is judged on its own (not the last definition of a name): a
+    ``#undef`` of a pinned name, a ``#define`` of one that is not allowed, a second ``#define`` of an allowed one and an allowed one that is not defined once are problems; so is a
+    ``-D`` or ``-U`` flag of a pinned name."""
+    out, seen = [], {}
+    for f, ln, kind, name in macro_directives(numbered):
+        if name not in PINNED:
+            continue
+        if kind == "undef" or name not in ALLOWED_DEFINES:
+            out.append(("R12", "%s:%d `#%s %s`: %s is read as code by the protocol pins, so a macro of that name would rewrite it for the compiler while the tokens stay (only the hooks %s and the tunable CFBI_ROWS_MINB are defined, each once)" % (
+                f, ln, kind, name, name, ", ".join(sorted(HOOK_BODIES)))))
+        else:
+            seen.setdefault(name, []).append((f, ln))
+    for name in sorted(ALLOWED_DEFINES):
+        if len(seen.get(name, [])) != 1:
+            out.append(("R12", "the macro %s is defined %d times in the default view (%s), expected once" % (name, len(seen.get(name, [])), ", ".join("%s:%d" % x for x in seen.get(name, [])) or "nowhere")))
+    for key in sorted(k for k in texts if k.startswith("flags:")):
+        for m in FLAG.finditer(texts[key]):
+            if m.group(1) in PINNED and m.group(1) != "CFBI_ROWS_MINB":
+                out.append(("R12", "%s: the build flag `%s` names %s, which the protocol pins read as code" % (key, m.group(0), m.group(1))))
+        for m in FORCE_INCLUDE.finditer(texts[key]):
+            out.append(("R12", "%s: the build flag `%s` forces the include of a file that the pins do not read, and it could hold any macro" % (key, m.group(0))))
+    return out
+
+
+def include_problems(numbered):
+    """R12: every quoted ``#include`` of the default views names a file that the reader has loaded (``cfbi/x`` is the file ``x`` of the source directory, a name may also be relative to the including
+    file); any other file could define a macro that no pin sees. Angle-bracket includes are the toolchain's and the libraries' own."""
+    out = []
+    for name, number, line in stripped_lines(numbered):
+        m = INCLUDE.match(line)
+        if not m:
+            continue
+        target = m.group(1)
+        found = (target[len("cfbi/"):] if target.startswith("cfbi/") else target, posixpath.normpath(posixpath.join(posixpath.dirname(name), target)))
+        if not any(f in numbered for f in found):
+            out.append(("R12", "%s:%d `#include \"%s\"` names a file that the reader does not load, and it could hold a macro that no pin sees" % (name, number, target)))
+    return out
+
+
 # the conditionals that remain in the default view of a file (those on build tunables, which no variant build changes); any other one would hide text from the compiler that the rules still read
 ALLOWED_CONDITIONALS = {"cfbi_rows.cuh": {"ifndef CFBI_ROWS_PF_L1", "if CFBI_ROWS_PF_L1", "ifndef CFBI_ROWS_MINB"}, "cfbi_common.cuh": set(), "cfbi_launch.cu": set()}
 
@@ -288,6 +416,8 @@ def problems(texts):
     except (ValueError, AssertionError) as e:
         return [("R12", "the sources cannot be read as the default build reads them: %s" % e)]
     rows = view["cfbi_rows.cuh"]
+    out.extend(macro_problems(texts, default_numbered(texts)))
+    out.extend(include_problems(default_numbered(texts)))
     for name, allowed in ALLOWED_CONDITIONALS.items():
         for ln, line in stray_conditionals(view[name], allowed):
             out.append(("R12", "%s:%d holds the conditional `%s`, which the rules cannot resolve (an `#if 0` would hide a protocol line from the compiler and leave it in the text)" % (name, ln, line)))

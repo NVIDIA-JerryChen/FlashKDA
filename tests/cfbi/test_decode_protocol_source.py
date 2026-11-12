@@ -10,7 +10,8 @@ seen by any comparison of results (the bits of the output, E, the rows and pos a
 
 ``protocol_source.py`` reads the sources as a default build reads them (comments gone, test-macro branches resolved, default hooks expanded, tokens) and returns the broken rules, ``R0`` being the
 whole entry. Every rule is shown here to FAIL on a temporary copy of the sources with one edit (a rule that cannot fail proves nothing), and the pins are shown to hold under harmless edits
-(spacing, comments, the numbers of the delay sites, the variant branches). The host model (``test_decode_pos_protocol_model.py``) takes its constants and its election from the same reader.
+(spacing, comments, the numbers of the delay sites, the variant branches, a macro that no build takes). The preprocessor is part of what they read: a macro of a pinned name rewrites it for the
+compiler while the tokens stay, so every effective ``#define`` / ``#undef`` and every ``-D`` flag of such a name is a problem (R12). The host model (``test_decode_pos_protocol_model.py``) takes its constants and its election from the same reader.
 """
 import pytest
 
@@ -25,6 +26,10 @@ HOOK9 = "            ROWS_DELAY(9);   // test hook: before the arrival\n"
 SKIP_LINE = "        if (w.len == 0) return SeqPlan{0, 0, 0, 0, 0, 0, 0, w.slot};"
 BARRIER_LINES = "        }\n        __syncthreads();"
 ARRIVAL_ALL = "            ROWS_DECODE_ARRIVED(old, p.H);"
+HELPER_END = '    asm volatile("st.relaxed.gpu.global.b32 [%0], %1;" ::"l"(ptr), "r"(v) : "memory");\n}\n'
+DEFAULT_HOOKS = "#else\n#define ROWS_DELAY(n) do {} while (0)\n#define ROWS_DECODE_ARRIVED(old, heads) do {} while (0)\n#endif"
+FLAGS_ANCHOR = '    "-fmad=false",'
+PLAIN_STORE_MACRO = "#define st_relaxed_gpu(ptr, v) (*(ptr) = (v))\n"
 
 
 @pytest.fixture(scope="module")
@@ -36,12 +41,19 @@ def copy_with(tmp_path, texts, edits):
     """A copy of the sources on disk with the edits applied (each ``(file, old, new)`` must find ``old`` exactly once), read back through the reader."""
     d = tmp_path / "cfbi"
     d.mkdir()
+    flags = {}
     for name, text in texts.items():
         for f, old, new in edits:
             if f == name:
                 text = mutate(text, old, new)
+        if name.startswith("flags:"):
+            flags[name] = text              # the build flags live outside the source directory: they are read from memory
+            continue
+        (d / name).parent.mkdir(parents=True, exist_ok=True)
         (d / name).write_text(text)
-    return ps.load(d)
+    loaded = ps.load(d)
+    loaded.update(flags)
+    return loaded
 
 
 # ---- the real sources satisfy every rule ----------------------------------------------------------------------------------------------------------------------
@@ -145,6 +157,21 @@ MUTANTS = [
     ("the position index offset in the default build", [(R, "#else\n#define ROWS_POS_INDEX(access, slot) (slot)\n#endif", "#else\n#define ROWS_POS_INDEX(access, slot) ((slot) + 1)\n#endif")], {"R11"}),
     ("the arrival delays in the default build", [(R, "#else\n#define ROWS_DELAY(n) do {} while (0)\n#define ROWS_DECODE_ARRIVED(old, heads) do {} while (0)\n#endif",
                                                   "#else\n#define ROWS_DELAY(n) do {} while (0)\n#define ROWS_DECODE_ARRIVED(old, heads) rows_delay_arrived(old, heads)\n#endif")], {"R11"}),
+    # macros: what the compiler sees while the tokens stay
+    ("a macro that makes the elected store a plain assignment (the review's counterexample)", [(R, HELPER_END, HELPER_END + PLAIN_STORE_MACRO)], {"R12"}),
+    ("the same macro in another header of the directory", [("cfbi_policy.h", "#pragma once", "#pragma once\n" + PLAIN_STORE_MACRO.rstrip("\n"))], {"R12"}),
+    ("a second definition of a modeled hook", [(R, DEFAULT_HOOKS, DEFAULT_HOOKS + "\n#define ROWS_DELAY(n) rows_delay(n)")], {"R12", "R11"}),
+    ("an #undef of a modeled hook", [(R, DEFAULT_HOOKS, DEFAULT_HOOKS + "\n#undef ROWS_POS_INDEX")], {"R12"}),
+    ("a macro that rewrites the atomic", [(R, HELPER_END, HELPER_END + "#define atomicAdd(address, value) ((address)[0])\n")], {"R12"}),
+    ("a macro that rewrites the value that the atomic returned", [(R, HELPER_END, HELPER_END + "#define old 0\n")], {"R12"}),
+    ("a macro that rewrites the chunk length", [(P, "constexpr int BT = 64;", "constexpr int BT = 64;\n#define BT 128")], {"R12"}),
+    ("a macro that rewrites a keyword of the entry", [(R, HELPER_END, HELPER_END + "#define return (void)\n")], {"R12"}),
+    ("an #undef of the tunable that the kernel head reads", [(R, "#ifndef CFBI_ROWS_MINB\n#define CFBI_ROWS_MINB 2\n#endif", "#ifndef CFBI_ROWS_MINB\n#define CFBI_ROWS_MINB 2\n#endif\n#undef CFBI_ROWS_MINB")], {"R12"}),
+    ("a build flag that renames the store helper", [("flags:_ext.py", FLAGS_ANCHOR, FLAGS_ANCHOR + '\n    "-Dst_relaxed_gpu(p,v)=(*(p)=(v))",')], {"R12"}),
+    ("a build flag that removes a macro of a pinned name", [("flags:setup.py", "import os", "import os\n# -Uatomic\nFLAGS = ['-UBT']")], {"R12"}),
+    ("an include of a file that the reader does not load", [(R, '#include "cfbi/cfbi_common.cuh"', '#include "cfbi/cfbi_common.cuh"\n#include "cfbi/hidden_macros.inc"')], {"R12"}),
+    ("an include of a file next to the including file that does not exist", [("ref/ref_k1.cuh", '#include "cfbi/cfbi_common.cuh"', '#include "cfbi/cfbi_common.cuh"\n#include "hidden_macros.inc"')], {"R12"}),
+    ("a forced include in the build flags", [("flags:_ext.py", FLAGS_ANCHOR, FLAGS_ANCHOR + '\n    "-include", "hidden_macros.h",')], {"R12"}),
     # text that the compiler does not see but the reader does
     ("the real protocol under #if 0", [(R, STORE_LINE, "#if 0\n" + STORE_LINE + "#endif\n")], {"R12"}),
     ("a conditional on a test macro with #elif", [(R, "#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1)", "#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE\n#elif 1\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1)")], {"R12"}),
@@ -173,6 +200,14 @@ HARMLESS = [
     ("the snapshot variant", [(R, "pos_smem = ld_relaxed_gpu(p.pos + w.slot) & POS_MASK;", "pos_smem = ld_relaxed_gpu(p.pos + w.slot + 1) & POS_MASK;")]),
     ("the tail store of the every-CTA variant", [(R, "#ifdef CFBI_DECODE_TEST_EVERY_CTA_WRITES\n        if (tid == 0) p.pos[sp.slot] = ", "#ifdef CFBI_DECODE_TEST_EVERY_CTA_WRITES\n        if (tid == 0 && true) p.pos[sp.slot] = ")]),
     ("a comment in the header constants", [(C, "constexpr int POS_MASK = BT - 1;", "constexpr int POS_MASK = BT - 1;   // low bits")]),
+    ("the plain-store macro in a branch that no default build takes", [(R, HELPER_END, HELPER_END + "#ifdef CFBI_DECODE_TEST_SNAPSHOT_AFTER_ARRIVAL\n" + PLAIN_STORE_MACRO + "#endif\n")]),
+    ("the plain-store macro in a line comment", [(R, HELPER_END, HELPER_END + "// " + PLAIN_STORE_MACRO)]),
+    ("the plain-store macro in a block comment", [(R, HELPER_END, HELPER_END + "/*\n" + PLAIN_STORE_MACRO + "*/\n")]),
+    ("a macro of a name that no pin reads", [(R, HELPER_END, HELPER_END + "#define SOME_UNRELATED_TUNABLE 3\n")]),
+    ("a build flag of a name that no pin reads", [("flags:_ext.py", FLAGS_ANCHOR, FLAGS_ANCHOR + '\n    "-DSOME_UNRELATED_TUNABLE=3",')]),
+    ("an include of another file of the directory, by the path of the build and relative to the including file", [(R, '#include "cfbi/cfbi_common.cuh"', '#include "cfbi/cfbi_common.cuh"\n#include "cfbi/ref/ref_k2.cuh"'),
+                                                                                                                  ("ref/ref_k1.cuh", '#include "cfbi/cfbi_common.cuh"', '#include "cfbi/cfbi_common.cuh"\n#include "ref_k2.cuh"\n#include "../cfbi_primitives.cuh"')]),
+    ("an include in a comment and an angle-bracket include", [(R, '#include "cfbi/cfbi_common.cuh"', '#include "cfbi/cfbi_common.cuh"\n// #include "cfbi/hidden_macros.inc"\n#include <vector>')]),
 ]
 
 
@@ -191,3 +226,21 @@ def test_an_election_that_the_model_cannot_read_is_refused(tmp_path, real):
     texts = copy_with(tmp_path, real, [(R, "if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE", "if (blockIdx.y == 0) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE")])
     with pytest.raises(ValueError):
         ps.election(texts)
+
+
+# ---- the macro rule's reader --------------------------------------------------------------------------------------------------------------------------------
+def test_directives_are_read_per_directive_from_the_default_view_without_comments():
+    text = "#define KEEP 1\n// #define IN_LINE_COMMENT 2\n/*\n#define IN_BLOCK 3\n*/\n  #  undef  GONE\n#define MULTI(a) \\\n    (a)\nint x;\n"
+    assert ps.macro_directives({"a.cuh": list(enumerate(text.splitlines(), 1))}) == [("a.cuh", 1, "define", "KEEP"), ("a.cuh", 6, "undef", "GONE"), ("a.cuh", 7, "define", "MULTI")]
+    text = "#ifdef CFBI_DECODE_TEST_X\n#define TEST_ONLY 1\n#else\n#define DEFAULT_ONLY 1\n#endif\n"
+    lines = ps.default_lines(text, ps.macros_in([text]))
+    assert lines == [(4, "#define DEFAULT_ONLY 1")]                       # the numbers are those of the file, not of the view
+    assert ps.macro_directives({"b.cuh": lines}) == [("b.cuh", 4, "define", "DEFAULT_ONLY")]
+
+
+def test_the_names_that_the_pins_read_include_keywords_constants_hooks_and_the_generic_names_of_the_entry(real):
+    for name in ("return", "if", "old", "p", "n", "atomicAdd", "st_relaxed_gpu", "BT", "POS_MASK", "POS_COUNT_SHIFT", "ROWS_DELAY", "ROWS_DECODE_ARRIVED", "ROWS_POS_INDEX", "rows_kernel", "CFBI_ROWS_MINB"):
+        assert name in ps.PINNED, name
+    assert "SOME_UNRELATED_TUNABLE" not in ps.PINNED
+    defined = [d[3] for d in ps.macro_directives(ps.default_numbered(real)) if d[3] in ps.PINNED]
+    assert sorted(defined) == sorted(ps.ALLOWED_DEFINES), defined        # the real tree defines exactly the modeled hooks and the tunable, each once
