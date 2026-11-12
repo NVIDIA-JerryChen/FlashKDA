@@ -135,8 +135,8 @@ inline int resolve_mode(int mode, int impl) { return (mode == 0 && (impl & IMPL_
 
 // Whether a call that runs mode 1 of N sequences and H heads is ONE kernel launch of the optimised row engine (rows_kernel<true>) instead of the plan kernel followed by the row
 // engine: decode_single_launch_policy (cfbi_policy.h) with the SM count and the compute capability of `device` (< 0: the current one), `mode` and `impl` as resolve_mode /
-// resolve_impl return them. The binding uses the answer to skip the plan allocation, the launcher to skip the plan kernel: both call this function with the same arguments. A failed
-// device query keeps the plan kernel.
+// resolve_impl return them. The binding uses the answer to skip the plan allocation, the launcher to skip the plan kernel: both call this function with the same arguments. The SM count
+// and the compute capability of a device are read from the runtime once per process and device (not on every call); a failed device query keeps the plan kernel.
 bool decode_single_launch(int mode, int impl, int64_t N, int64_t H, int device = -1);
 // Hidden calibration control (not part of the documented API, and no build option: the default build contains no test macro): while it is on, decode_single_launch is true for every
 // call that decode_single_launch_eligible accepts (mode 1, the optimised row engine, no IMPL_DECODE_PLAN), whatever the size of the grid and the device's routing set. The correctness

@@ -203,17 +203,52 @@ static std::atomic<int> g_decode_single_force{0};   // the hidden calibration co
 
 int decode_single_force(int on) { return g_decode_single_force.exchange(on != 0 ? 1 : 0); }
 
-// The rule is decode_single_launch_policy (cfbi_policy.h), documented at the declaration (cfbi_launch.h); this reads the device (three attributes, on every decode call: the binding and
-// the launcher both ask). A failed device query keeps the plan kernel, the safe, old schedule. The calibration control applies the eligible part of the rule and nothing else.
+namespace {
+// What the policy needs of a device, its SM count and its compute capability (major * 10 + minor), read from the runtime once per process and kept: neither changes while a process runs.
+// Asking on every decode call (three attribute queries, and the binding and the launcher both ask) is a cost of the call itself wherever the host is on the critical path, for example the
+// first call after an idle GPU (about 1.4 us on B200 in a process that makes no other call in between; the interleaved A/B of the performance document, cold regime). A failed query is
+// not kept: the next call asks again, and the call that failed keeps the plan kernel. The slots are written once with the same value by whichever thread asks first; the SM count is
+// published last, so that a reader that sees it also sees the capability.
+constexpr int kRouteDevices = 64;                    // devices with a kept answer; a higher index asks the runtime on every call
+struct DeviceRoute {
+    std::atomic<int> sms{0};                         // 0: not read yet (a device has at least one SM)
+    std::atomic<int> cc{0};
+};
+DeviceRoute g_device_route[kRouteDevices];
+
+bool device_route(int device, int* sms, int* cc) {
+    DeviceRoute* kept = (device >= 0 && device < kRouteDevices) ? &g_device_route[device] : nullptr;
+    if (kept != nullptr) {
+        const int known = kept->sms.load(std::memory_order_acquire);
+        if (known > 0) {
+            *sms = known;
+            *cc = kept->cc.load(std::memory_order_relaxed);
+            return true;
+        }
+    }
+    int n = 0, major = 0, minor = 0;
+    if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess || n <= 0)
+        return false;
+    *sms = n;
+    *cc = 10 * major + minor;
+    if (kept != nullptr) {
+        kept->cc.store(*cc, std::memory_order_relaxed);
+        kept->sms.store(n, std::memory_order_release);
+    }
+    return true;
+}
+}  // namespace
+
+// The rule is decode_single_launch_policy (cfbi_policy.h), documented at the declaration (cfbi_launch.h); the device it reads is the one of `device_route` (once per process and device).
+// A failed device query keeps the plan kernel, the safe, old schedule. The calibration control applies the eligible part of the rule and nothing else.
 bool decode_single_launch(int mode, int impl, int64_t N, int64_t H, int device) {
     if (!decode_single_launch_eligible(mode, impl, N, H)) return false;
     if (g_decode_single_force.load() != 0) return true;
     if (device < 0 && cudaGetDevice(&device) != cudaSuccess) return false;
-    int sms = 0, major = 0, minor = 0;
-    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
-        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess)
-        return false;
-    return decode_single_launch_policy(mode, impl, N, H, sms, 10 * major + minor);
+    int sms = 0, cc = 0;
+    if (!device_route(device, &sms, &cc)) return false;
+    return decode_single_launch_policy(mode, impl, N, H, sms, cc);
 }
 
 void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
