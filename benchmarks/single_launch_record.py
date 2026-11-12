@@ -1176,6 +1176,12 @@ def _measured_lines(meta, sms, per_sm):
                per_sm, sms, per_sm * sms, ", ".join("%s %s" % (d, meta["devices"][d]["cc"]) for d in sorted(meta["devices"], key=device_order) if _is_gating(meta, d))),
            "- Regress gate: a cell fails when B is slower than A by more than %.2f %% of the median (%s mode), at least %d interleaved record files per side in the %s start order (blocks of four that are "
            "ABBA or BAAB), every trial's launch mapping asserted against the routing specification." % (meta["tol_pct"], meta["mode"], meta["min_repeats"], meta["order"]),
+           "- Module loading: every process of a gating device ran with CUDA_MODULE_LOADING=EAGER, which every record states and the table tool requires. With the default lazy loading the machine "
+           "code of a kernel is placed when it is first launched, and the two sides launch different kernels earlier in a long process (the default routing runs the single-launch kernel for the small "
+           "grids first): a first campaign under lazy loading (records t12a) measured identical kernels apart by up to about one percent per shape, and a process that measured one shape did not.",
+           "- Device query: the candidate keeps the SM count and the compute capability of a device from its first query (once per process and device). The first campaign found that asking the runtime on "
+           "every decode call is a cost of the call itself wherever the host work is on the critical path (a call after an idle GPU: the cold regime, about 1.5 microseconds on B200 and on B300), "
+           "which the two-launch path with bit 64 does not pay because it never asks.",
            "- A cell whose spread is above 0.3 % is re-run once with three times the calls per trial; one that stays above it is noise-limited and judged with the tolerance widened by its spread. "
            "A cell that FAILs in a gating metric on either gating device, noise-limited or not, is unsafe.",
            "- Gating metrics: %s. The evidence of a gain is a stable cell judged on the re-run in %s within the limit, on both devices; the kernel sum and the host times gate and are never that evidence." % (
