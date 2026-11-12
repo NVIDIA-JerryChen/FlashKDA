@@ -23,7 +23,10 @@ How samples are pooled: by default a cell's ``samples`` are in-process repeats a
 file and the spread is taken over those values (at least three interleaved record files per build).
 
 Rules enforced by ``compare``: a baseline record must carry the expected commit, a clean tree and the GPU / SM metadata; every record of a
-comparison comes from the same GPU model, SM count and host; each build has at least ``min_repeats`` record files that are interleaved in time;
+comparison comes from the same GPU model, SM count and host; each build has at least ``min_repeats`` record files that start in the required order (strict
+alternation A B A B ..., or blocks of four that are ABBA or BAAB; the start stamps are parsed, never compared as text, and a stamp that is missing, does not parse or is
+shared by two records, or one record file that is listed on both builds, leaves the order undefined and the comparison INVALID); a record can be required to carry the
+launch mapping of every trial (``require_nodes``), and ``route_problems`` checks those mappings against an independent specification;
 a metric that is absent or zero in a cell (a decode cell has no K2 stage) makes the comparison INVALID. The samples are validated per compared cell and metric,
 never by the number of files: cell keys are unique inside a file, every file of a side holds the same cells (the campaign cell set is not inferred from the
 first file), the two builds hold the same cells, every raw sample of the metric is finite (and positive for a derived or wall metric), a per-process-median
@@ -33,12 +36,15 @@ needs a re-run: the gate is INVALID until re-run records prove three times the c
 sides from the same snapshot and configuration, after which the cell is judged on the re-run and, if it stays above 0.3 %, as noise-limited with the tolerance
 widened by the larger of the two spreads; the rows of a first campaign without re-run stay available as a diagnostic (``needs_rerun``) for the runner.
 """
+import datetime
+import hashlib
 import json
 import math
 import os
 import re
 import statistics
 import subprocess
+from collections.abc import Mapping
 
 SCHEMA = "cfbi-bench-v1"
 UNSTABLE_SPREAD = 0.003  # 0.3 %: repeat-to-repeat spread above which a cell is unstable
@@ -51,11 +57,16 @@ PROCESS_MEDIAN = "process_median"
 MIN_TRIALS = 5  # trials per cell and process of a process-median record
 UNSTABLE_POLICIES = ("invalid", "worst", "widen")
 RERUN_SCALE = 3  # calls per trial (and profiled calls) of a re-run relative to the first campaign
-SIDE_META = ("commit", "tree", "src", "impl", "env_impl", "torch", "cuda", "cc", "trials", "sample_stat", "kind")  # meta fields that are one value for all record files of a side
+# meta fields that are one value for all record files of a side (the last two: whether the single-launch control was on, and the limit constant of the measured tree)
+SIDE_META = ("commit", "tree", "src", "impl", "env_impl", "torch", "cuda", "cc", "trials", "sample_stat", "kind", "single_force", "single_per_sm")
 RERUN_SAME_CONFIG = SIDE_META + ("gpu", "sm_count", "host")  # meta fields a re-run shares with its first campaign
 AB_META = ("trials", "torch", "cuda", "cc", "kind", "dm", "heads", "l2_cache_bytes", "eviction_bytes")  # the baseline and the candidate are measured under one contract and one toolchain
-BUILD_ARGS = ("impl", "kernels", "compute_nodes", "aux_nodes", "compute_kernels", "expect_compute", "expect_aux")  # cell arguments that describe a build, which A and B may differ in
+# cell arguments that describe a build, which A and B may differ in (the last two: the single-launch control, and whether the expected launches came from a per-cell specification)
+BUILD_ARGS = ("impl", "kernels", "compute_nodes", "aux_nodes", "compute_kernels", "expect_compute", "expect_aux", "single_force", "expect_route")
 SCALED_ARGS = ("calls_per_trial", "profile_calls", "profile_cycles", "calls_scale")  # cell arguments that a re-run multiplies
+ORDERS = ("alternate", "abba")  # the start orders of the record files of the two builds: strict alternation A B A B ..., or blocks of four that are ABBA or BAAB
+ABBA_BLOCKS = ("ABBA", "BAAB")  # the blocks of the abba order: the outer two record files of a block belong to one build, the inner two to the other
+STAMP_FORMATS = ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ")  # the start stamps of the record files (UTC): with a fraction of a second, as the benchmarks write them, and without
 
 
 # ---- kernel names and stages ---------------------------------------------------------------------------------------------------------------
@@ -210,6 +221,41 @@ def cell_node_problems(cell, expect_compute=None, expect_aux=None):
         problem = check_nodes(nodes["compute"], nodes["aux"], args["compute_nodes"], args["aux_nodes"])
         if problem:
             out.append("cell %r: trial %d: %s" % (key, i, problem))
+    return out
+
+
+def route_problems(records, expected_by_key, side="side"):
+    """Why the launches that the record files ``records`` of one build (named ``side`` in the messages) recorded are not the ones that an independent specification expects (an empty
+    list means every trial of every cell launched exactly the expected kernels). ``expected_by_key``: ``{cell key: {kernel: launches per call}}``, the mapping that a cell must show
+    whatever the record claims about itself. Every cell of every record needs a specification (a missing key is a problem, not a skipped cell) and the per-trial launch mappings (a
+    record of before they were recorded is a problem), and every trial must equal the specification (``cell_node_problems``): a cell that was measured on the other launch path is a
+    problem. A specification for a cell that no record holds is not examined here (which cells a campaign holds is the business of the cell-set checks). Without records there is
+    nothing to check."""
+    out = []
+    for rec in records:
+        where = "%s record %s" % (side, _path_of(rec))
+        cells = rec.get("cells") if isinstance(rec, dict) else None
+        if not isinstance(cells, list) or not cells:
+            out.append("%s: no cells" % where)
+            continue
+        bad = []
+        for cell in cells:
+            key = cell.get("key") if isinstance(cell, dict) else None
+            want = expected_by_key.get(key) if isinstance(expected_by_key, Mapping) and isinstance(key, str) else None
+            if not isinstance(key, str):
+                bad.append("a cell without a key")
+            elif not isinstance(want, Mapping):
+                bad.append("cell %r has no expected launch mapping" % key)
+            else:
+                try:
+                    found = cell_node_problems(cell, want)
+                except (AttributeError, KeyError, TypeError, ValueError) as e:      # a count that is no number, a sample that is no object: a problem, not an exception
+                    found = ["cell %r: the recorded launch mapping cannot be read (%s: %s)" % (key, type(e).__name__, e)]
+                if found:
+                    bad.append(found[0] + (" (and %d more problem(s) in this cell)" % (len(found) - 1) if len(found) > 1 else ""))
+        out.extend("%s: %s" % (where, p) for p in bad[:6])
+        if len(bad) > 6:
+            out.append("%s: ... and %d more cell(s) whose launches are not the expected ones" % (where, len(bad) - 6))
     return out
 
 
@@ -424,9 +470,163 @@ def format_summary(rows):
     return "\n".join(lines)
 
 
-def _interleave_switches(base, cand):
-    seq = sorted([(r["meta"].get("timestamp", ""), "A") for r in base] + [(r["meta"].get("timestamp", ""), "B") for r in cand])
-    return sum(1 for i in range(1, len(seq)) if seq[i][1] != seq[i - 1][1])
+# ---- the start order of the record files of the two builds -----------------------------------------------------------------------------------
+
+def parse_stamp(text):
+    """The ``datetime`` of a record's start stamp (``STAMP_FORMATS``), or None when it is not a string or does not parse. Stamps are compared as instants, never as text:
+    ``...:00.5Z`` is later than ``...:00Z`` although it sorts before it as a string."""
+    if not isinstance(text, str):
+        return None
+    for fmt in STAMP_FORMATS:
+        try:
+            return datetime.datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _path_of(rec):
+    return rec.get("_path", "?") if isinstance(rec, dict) else "?"
+
+
+def _start_order(base, cand):
+    """``(labels, [])`` or ``(None, why)``: the label string of the record files in start order (``"A"`` for a record of ``base``, ``"B"`` for one of ``cand``), or the reasons why the
+    order is not defined: a record without a start stamp, a stamp that does not parse, or two records that started at the same instant (whichever sides they are on)."""
+    why, stamped, seen = [], [], {}
+    for label, side, recs in (("A", "baseline", base), ("B", "candidate", cand)):
+        for rec in recs:
+            meta = rec.get("meta") if isinstance(rec, dict) else None
+            raw = meta.get("timestamp") if isinstance(meta, dict) else None
+            when = parse_stamp(raw)
+            who = "%s record %s" % (side, _path_of(rec))
+            if raw is None:
+                why.append("%s has no timestamp" % who)
+            elif when is None:
+                why.append("%s has the timestamp %r, which is not a UTC start stamp" % (who, raw))
+            else:
+                stamped.append((when, label))
+                seen.setdefault(when, []).append(who)
+    why.extend("%s start at the same instant, %s" % (" and ".join(who), when.isoformat()) for when, who in sorted(seen.items()) if len(who) > 1)
+    if why:
+        return None, why
+    return "".join(label for _, label in sorted(stamped)), []
+
+
+def run_labels(base, cand):
+    """The label string of the record files of ``base`` (A) and ``cand`` (B) in start order, e.g. ``"ABBA"``, from ``meta.timestamp`` parsed as an instant; None when the order is not
+    defined (a stamp is missing or does not parse, or two records share one)."""
+    return _start_order(base, cand)[0]
+
+
+def run_plan(samples, order="alternate"):
+    """The runs of one campaign in start order, ``[(side, index within the side)]`` with indices from 1. ``alternate``: A B A B ... (the baseline first); ``abba``: blocks of four, ABBA
+    for the even blocks and BAAB for the odd ones, so that the two builds start at the same mean position (for an even number of samples) and, for whole pairs of blocks (a number of
+    samples that is a multiple of four), at the same mean squared position. It needs an even number of samples of at least four."""
+    if order not in ORDERS:
+        raise ValueError("order must be one of %s, got %r" % (", ".join(ORDERS), order))
+    if not _positive_int(samples):
+        raise ValueError("samples must be a positive integer, got %r" % (samples,))
+    if order == "alternate":
+        return [(side, i) for i in range(1, samples + 1) for side in ("A", "B")]
+    if samples < 4 or samples % 2:
+        raise ValueError("the abba order needs an even number of samples of at least 4, got %d" % samples)
+    plan, taken = [], {"A": 0, "B": 0}
+    for j in range(samples // 2):
+        for side in ABBA_BLOCKS[j % 2]:
+            taken[side] += 1
+            plan.append((side, taken[side]))
+    return plan
+
+
+def _switches(labels):
+    """The number of places where two neighbouring record files of the label string belong to different builds."""
+    return sum(1 for i in range(1, len(labels)) if labels[i] != labels[i - 1])
+
+
+def _file_id(rec):
+    """``(device, inode)`` of the file that a loaded record came from; None when ``_path`` names no existing file (a record that was built in memory)."""
+    path = rec.get("_path") if isinstance(rec, dict) else None
+    if not isinstance(path, str):
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _digest(rec):
+    """SHA-256 of the content of a record, without the path that it was loaded from."""
+    body = dict((k, v) for k, v in rec.items() if k != "_path") if isinstance(rec, dict) else rec
+    try:
+        text = json.dumps(body, sort_keys=True, default=repr)
+    except (TypeError, ValueError):                                    # a record that was built in memory with keys that cannot be sorted
+        text = repr(body)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def shared_record_problems(base, cand, label):
+    """Why ``base`` and ``cand``, the record files of the two builds of the campaign ``label``, are not two sets of measurements: a record file that is listed on both sides, whether
+    it is named by the same path (the same file on disk, however it is spelled) or by the same content (a copy). One file measured once cannot be both builds."""
+    by_file, by_digest = {}, {}
+    for rec in base:
+        file_id = _file_id(rec)
+        if file_id is not None:
+            by_file.setdefault(file_id, rec)
+        by_digest.setdefault(_digest(rec), rec)
+    out = []
+    for rec in cand:
+        file_id, digest = _file_id(rec), _digest(rec)
+        if file_id is not None and file_id in by_file:
+            out.append("the baseline record %s and the candidate record %s of the %s are the same file" % (_path_of(by_file[file_id]), _path_of(rec), label))
+        elif digest in by_digest:
+            out.append("the baseline record %s and the candidate record %s of the %s have the same content" % (_path_of(by_digest[digest]), _path_of(rec), label))
+    return out[:4] + (["... and %d more record(s) of the %s are listed on both sides" % (len(out) - 4, label)] if len(out) > 4 else [])
+
+
+def _abba_problem(labels, label):
+    """None when the label string is a whole number of blocks of ``ABBA_BLOCKS`` with as many A as B, otherwise the message naming what breaks the grammar (the first violated rule: unequal
+    counts, a length that is not a multiple of four, the first block that is neither ABBA nor BAAB), the label string and its number of variant switches."""
+    n_a, n_b = labels.count("A"), labels.count("B")
+    reason = None
+    if n_a != n_b:
+        reason = "%d baseline and %d candidate record files, the same number is needed on both sides" % (n_a, n_b)
+    elif len(labels) % 4:
+        reason = "%d record files are not a whole number of blocks of four" % len(labels)
+    else:
+        for i in range(0, len(labels), 4):
+            if labels[i:i + 4] not in ABBA_BLOCKS:
+                reason = "the block of record files %d to %d is %s" % (i + 1, i + 4, labels[i:i + 4])
+                break
+    if reason is None:
+        return None
+    return "baseline and candidate records of the %s are not in blocks of %s in time (start order %s, %d variant switches): %s" % (
+        label, " or ".join(ABBA_BLOCKS), labels, _switches(labels), reason)
+
+
+def order_problems(base, cand, order, label):
+    """Why the record files of the two builds of one campaign (``label``: ``first campaign`` or ``re-run``) did not start in the required ``order`` (an empty list means they did).
+
+    Every order needs a defined start order (a parsed stamp on every record, no two records at one instant) and two disjoint sets of record files (``shared_record_problems``).
+    ``alternate``: the files alternate strictly, i.e. the label string has at least ``2 * min(len(base), len(cand)) - 1`` variant switches. ``abba``: the label string is a whole number of
+    blocks of four, every aligned block is ABBA or BAAB, and both builds have the same number of files (a switch count cannot tell the valid strings from the others: ABBAABBA has four
+    switches and ABBABAAB five, both are valid, and AABBABBA, which is not, has four as well)."""
+    out = shared_record_problems(base, cand, label)
+    labels, why = _start_order(base, cand)
+    if labels is None:
+        return out + ["the start order of the %s records is not defined (%s)" % (label, "; ".join(why[:4]) + (" ..." if len(why) > 4 else ""))]
+    if order == "alternate":
+        need = 2 * min(len(base), len(cand)) - 1
+        got = _switches(labels)
+        if got < need:
+            out.append("baseline and candidate records of the %s are not interleaved in time (%d variant switches, %d needed)" % (label, got, need))
+    elif order == "abba":
+        problem = _abba_problem(labels, label)
+        if problem:
+            out.append(problem)
+    else:
+        out.append("order must be one of %s, got %r" % (", ".join(ORDERS), order))
+    return out
 
 
 # ---- the comparison --------------------------------------------------------------------------------------------------------------------------
@@ -579,7 +779,7 @@ def ab_problems(base, cand, name):
 
 
 def compare(base, cand, metric="k2_stage_us", tol_pct=1.0, mode="regress", expect_base_commit=None, require_clean_cand=False,
-            min_repeats=3, require_interleaved=True, cells=None, baseline_unstable="invalid", base_rerun=None, cand_rerun=None):
+            min_repeats=3, require_interleaved=True, cells=None, baseline_unstable="invalid", base_rerun=None, cand_rerun=None, order="alternate", require_nodes=False):
     """Compare the record lists ``base`` (A) and ``cand`` (B).
 
     ``mode`` ``regress``: a cell FAILs when the candidate is more than ``tol_pct`` percent slower than the baseline median;
@@ -594,20 +794,30 @@ def compare(base, cand, metric="k2_stage_us", tol_pct=1.0, mode="regress", expec
     ``base_rerun`` / ``cand_rerun``: the record lists of a second campaign over some cells only (more calls per trial); the cells that both lists
     contain are judged on them (``judged_on`` = ``rerun``), the others on the first campaign. A re-run is judged as it is and is never repeated.
 
-    Returns ``{"verdict": "PASS" | "FAIL" | "INVALID", "problems": [...], "rows": [...]}``. INVALID wins over FAIL: a comparison on a
+    ``order``: the start order that the record files of the two builds must have (``ORDERS``; ``order_problems``): strict alternation (default) or ABBA blocks. The first campaign and
+    the re-run are judged by the same order; an unknown order is INVALID. Whatever the order, a start stamp that is missing, does not parse or is shared by two records, and a record
+    file that is listed on both sides, make the comparison INVALID (``require_interleaved=False``, a diagnostic that no checker uses, skips the order itself and keeps the check of the
+    shared files).
+    ``require_nodes``: every record of both builds and of the re-runs must carry the launch mapping of every trial of every cell (``validate_record``); a record of before the mappings
+    were recorded is INVALID. Which mapping a cell must show is the business of ``route_problems``.
+
+    Returns ``{"verdict": "PASS" | "FAIL" | "INVALID", "problems": [...], "rows": [...], "order": ...}``. INVALID wins over FAIL: a comparison on a
     wrong, dirty, unstable or incomplete baseline is not a measurement.
     """
     base_rerun, cand_rerun = list(base_rerun or []), list(cand_rerun or [])
     problems = []
     for rec in base + base_rerun:
-        problems.extend(validate_record(rec, "baseline", expect_base_commit, True))
+        problems.extend(validate_record(rec, "baseline", expect_base_commit, True, require_nodes))
     for rec in cand + cand_rerun:
-        problems.extend(validate_record(rec, "candidate", None, require_clean_cand))
+        problems.extend(validate_record(rec, "candidate", None, require_clean_cand, require_nodes))
     if mode not in ("regress", "within"):
         problems.append("mode must be regress or within, got %r" % mode)
     if baseline_unstable not in UNSTABLE_POLICIES:
         problems.append("baseline_unstable must be one of %s, got %r" % (", ".join(UNSTABLE_POLICIES), baseline_unstable))
-    invalid = {"verdict": "INVALID", "problems": problems, "rows": [], "metric": metric, "tol_pct": tol_pct, "mode": mode, "unstable_policy": baseline_unstable}
+    if order not in ORDERS:
+        problems.append("order must be one of %s, got %r" % (", ".join(ORDERS), order))
+    invalid = {"verdict": "INVALID", "problems": problems, "rows": [], "metric": metric, "tol_pct": tol_pct, "mode": mode, "unstable_policy": baseline_unstable, "order": order,
+               "require_nodes": bool(require_nodes)}
     if not base or not cand:
         problems.append("both a baseline and a candidate record list are required")
         return invalid
@@ -641,14 +851,13 @@ def compare(base, cand, metric="k2_stage_us", tol_pct=1.0, mode="regress", expec
     for name, recs in (("baseline", base), ("candidate", cand), ("baseline re-run", base_rerun), ("candidate re-run", cand_rerun)):
         if recs and len(recs) < min_repeats:
             problems.append("%s has %d record file(s), at least %d interleaved repeats are required" % (name, len(recs), min_repeats))
-    if require_interleaved:
-        for label, b, c in (("first campaign", base, cand), ("re-run", base_rerun, cand_rerun)):
-            if not b or not c:
-                continue
-            need = 2 * min(len(b), len(c)) - 1
-            got = _interleave_switches(b, c)
-            if got < need:
-                problems.append("baseline and candidate records of the %s are not interleaved in time (%d variant switches, %d needed)" % (label, got, need))
+    for label, b, c in (("first campaign", base, cand), ("re-run", base_rerun, cand_rerun)):    # the re-run is judged by the order of its first campaign
+        if not b or not c:
+            continue
+        if require_interleaved and order in ORDERS:
+            problems.extend(order_problems(b, c, order, label))
+        else:
+            problems.extend(shared_record_problems(b, c, label))
 
     # ---- the campaign: unique keys, the same cells in every file of a side, the same cells in both builds, a consistent re-run set -----------------------------
     sides, ragged = {}, set()
@@ -759,7 +968,8 @@ def compare(base, cand, metric="k2_stage_us", tol_pct=1.0, mode="regress", expec
         verdict = "FAIL"
     else:
         verdict = "PASS"
-    return {"verdict": verdict, "problems": problems, "rows": rows, "metric": metric, "tol_pct": tol_pct, "mode": mode, "unstable_policy": baseline_unstable}
+    return {"verdict": verdict, "problems": problems, "rows": rows, "metric": metric, "tol_pct": tol_pct, "mode": mode, "unstable_policy": baseline_unstable, "order": order,
+            "require_nodes": bool(require_nodes)}
 
 
 def classify_rows(result, tol_pct=None):
@@ -789,8 +999,10 @@ def classify_rows(result, tol_pct=None):
 
 
 def format_table(result):
-    lines = ["metric %s, tolerance %.2f %% (%s mode%s)" % (result["metric"], result["tol_pct"], result["mode"],
-                                                         ", widening of noise-limited cells" if result.get("unstable_policy") == "widen" else "")]
+    order = result.get("order", "alternate")                                   # the header names the start order only where it is not the strict alternation of every older result
+    lines = ["metric %s, tolerance %.2f %% (%s mode%s%s)" % (result["metric"], result["tol_pct"], result["mode"],
+                                                            ", widening of noise-limited cells" if result.get("unstable_policy") == "widen" else "",
+                                                            "" if order == "alternate" else ", %s start order" % order)]
     lines.append("%-44s %12s %7s %12s %7s %8s  %s" % ("cell", "base median", "sprd %", "cand median", "sprd %", "delta %", "status"))
     for r in result["rows"]:
         delta = "%+.2f" % r["delta_pct"] if r["delta_pct"] is not None else "n/a"

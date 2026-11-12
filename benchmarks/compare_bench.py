@@ -4,7 +4,8 @@
 usage: python benchmarks/compare_bench.py --summary R1.json R2.json R3.json [--metric ...] [--expect-base-commit HASH]
        python benchmarks/compare_bench.py --base A1.json A2.json A3.json --cand B1.json B2.json B3.json
            [--metric total_us|k1_us|k2_stage_us|k2_main_us|<kernel name> ...] [--tol PERCENT] [--mode regress|within]
-           [--expect-base-commit HASH] [--require-clean-cand] [--min-repeats N] [--no-interleave-check] [--unstable-baseline invalid|worst|widen]
+           [--expect-base-commit HASH] [--require-clean-cand] [--min-repeats N] [--order alternate|abba] [--require-nodes] [--no-interleave-check]
+           [--unstable-baseline invalid|worst|widen]
            [--rerun-base A1.json ... --rerun-cand B1.json ...] [--cells SUBSTR ...] [--json OUT]
 
 ``--mode regress`` (default): FAIL when a cell of the candidate is more than ``--tol`` percent slower than the baseline median (no-regression gate).
@@ -17,7 +18,12 @@ GPU / SM metadata, same hardware, interleaving, 0.3 % spread, absent or zero met
 the evidence of a gain). ``--rerun-base`` / ``--rerun-cand``: the records of a second campaign over some cells with more calls per trial; the cells they
 contain are judged on them. After every table the cells that are slower, faster or noise-limited beyond the plain tolerance are listed.
 
-exit status: 0 PASS, 1 FAIL, 2 INVALID (wrong, dirty or unstable baseline, missing data, not interleaved, mixed hardware, unusable input)
+``--order``: the start order that the record files of A and B must have, in the first campaign and in the re-run alike: ``alternate`` (default) is strict alternation A B A B ...;
+``abba`` is blocks of four that are ABBA or BAAB, with the same number of files on both sides (the order of a campaign that must not favour the build that always runs right after the
+other). A start stamp that is missing, does not parse or is shared by two records, and a record file that is listed on both sides, are INVALID in either order. ``--require-nodes``:
+every record must carry the launch mapping of every trial (records of before the mappings were recorded are INVALID). The result of every metric records the ``order`` it was judged by.
+
+exit status: 0 PASS, 1 FAIL, 2 INVALID (wrong, dirty or unstable baseline, missing data, not in the required order, mixed hardware, unusable input)
 """
 import argparse
 import json
@@ -41,7 +47,13 @@ def main(argv=None):
     ap.add_argument("--expect-base-commit", default=None, help="commit (prefix) every baseline record must carry")
     ap.add_argument("--require-clean-cand", action="store_true", help="refuse candidate records of a dirty tree")
     ap.add_argument("--min-repeats", type=int, default=3, help="minimum number of record files per build (default 3)")
-    ap.add_argument("--no-interleave-check", action="store_true", help="do not require the records of A and B to alternate in time")
+    ap.add_argument("--order", choices=br.ORDERS, default="alternate",
+                    help="start order of the records of A and B, in the first campaign and in the re-run: alternate = strict alternation A B A B ... (default); "
+                         "abba = blocks of four that are ABBA or BAAB, the same number of files on both sides")
+    ap.add_argument("--require-nodes", action="store_true",
+                    help="every record must carry the launch mapping of every trial of every cell (records of before the mappings were recorded are INVALID)")
+    ap.add_argument("--no-interleave-check", action="store_true",
+                    help="diagnostic only: do not require the records of A and B to follow the start order (a file that is listed on both sides is still INVALID)")
     ap.add_argument("--unstable-baseline", choices=br.UNSTABLE_POLICIES, default="invalid",
                     help="unstable cell (spread > 0.3 %%): invalid = an unstable baseline cell is not accepted as a gate baseline (default); "
                          "worst = judged on its worst repeat (baseline at its fastest repeat, unstable candidate at its slowest); "
@@ -94,7 +106,7 @@ def main(argv=None):
             res = br.compare(base, cand, metric=metric, tol_pct=a.tol, mode=a.mode, expect_base_commit=a.expect_base_commit,
                              require_clean_cand=a.require_clean_cand, min_repeats=a.min_repeats,
                              require_interleaved=not a.no_interleave_check, cells=a.cells, baseline_unstable=a.unstable_baseline,
-                             base_rerun=base_rerun, cand_rerun=cand_rerun)
+                             base_rerun=base_rerun, cand_rerun=cand_rerun, order=a.order, require_nodes=a.require_nodes)
         except (KeyError, TypeError, ValueError, IndexError) as e:  # an unforeseen record shape is unusable input, never a performance FAIL
             print("cannot compare the records: %s: %s" % (type(e).__name__, e), file=sys.stderr)
             return 2
