@@ -77,7 +77,7 @@ def run_meta(a, started, opts, device, torch_mod):
     commit, dirty, tree = records.tree_identity(ROOT)
     return {"commit": commit, "dirty": dirty, "tree": tree, "gpu": device["name"], "sm_count": device["sm_count"], "cc": device["cc"], "host": socket.gethostname(),
             "torch": torch_mod.__version__, "cuda": torch_mod.version.cuda, "timestamp": started, "kind": "chain-wall", "sample_stat": records.PROCESS_MEDIAN,
-            "impl": a.impl, "env_impl": os.environ.get("FLASH_KDA_CFBI_IMPL"), "dm": a.dm, "heads": a.heads, "trials": opts["trials"], "calls_per_trial": calls_per_trial(opts),
+            "impl": a.impl, "env_impl": os.environ.get("FLASH_KDA_CFBI_IMPL"), "cuda_module_loading": os.environ.get("CUDA_MODULE_LOADING"), "dm": a.dm, "heads": a.heads, "trials": opts["trials"], "calls_per_trial": calls_per_trial(opts),
             "profile_calls": profile_calls_of(opts), "profile_calls_option": opts["profile_calls"], "calls_scale": opts["calls_scale"], "cells_filter": a.cells,
             "label": a.label, "tag": os.environ.get("CFBI_BENCH_TAG"),
             "build_dir": os.environ.get("FLASH_KDA_CFBI_BUILD_DIR"), "src": str(ROOT), "argv": sys.argv[1:]}

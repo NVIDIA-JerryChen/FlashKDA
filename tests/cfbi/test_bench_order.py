@@ -534,7 +534,7 @@ def test_route_problems_accept_the_specified_launches_and_reject_a_flipped_route
 # ---- the control state and the route expectation: what a side shares, what a re-run shares with its first campaign, what A and B may differ in ----
 
 def test_the_single_launch_fields_are_side_meta_a_rerun_shares_and_build_arguments_that_a_and_b_may_differ_in():
-    assert br.SIDE_META[-3:] == ("single_force", "single_per_sm", "graph_nodes") and set(br.SIDE_META) <= set(br.RERUN_SAME_CONFIG)
+    assert br.SIDE_META[-4:] == ("single_force", "single_per_sm", "graph_nodes", "cuda_module_loading") and set(br.SIDE_META) <= set(br.RERUN_SAME_CONFIG)
     assert {"single_force", "single_per_sm"} <= set(br.RERUN_SAME_CONFIG) and not {"single_force", "single_per_sm"} & set(br.AB_META)
     assert "graph_nodes" in br.RERUN_SAME_CONFIG and br.AB_FLAGS == ("graph_nodes",) and "graph_nodes" not in br.AB_META
     assert {"single_force", "expect_route", "expect_compute"} <= set(br.BUILD_ARGS) and not {"single_force", "expect_route"} & set(br.SCALED_ARGS)
@@ -671,6 +671,37 @@ def test_both_builds_profile_the_graph_replay_or_neither_and_a_rerun_does_as_its
         edit_fields(side, {"graph_nodes": False})
     res = compare(*first, baseline_unstable="widen", base_rerun=rerun[0], cand_rerun=rerun[1])
     assert res["verdict"] == "INVALID" and has(res["problems"], "re-run does not come from the same snapshot / configuration as its first campaign", "meta graph_nodes")
+
+
+def test_both_builds_share_the_module_loading_mode_the_files_of_a_side_too_and_a_rerun_as_its_first_campaign_did():
+    """The module loading mode of the process (meta ``cuda_module_loading``, the environment variable CUDA_MODULE_LOADING) decides where the machine code of a kernel is placed: with the default
+    lazy loading in the order of the first launches, so a build that launches other kernels earlier in a long process places the kernels that both run elsewhere, and identical kernels measured
+    1 % apart per shape. A build that ran with another mode must not be compared with one that did not, the files of one side share it, a re-run shares it with its first campaign, and a record of
+    before the field says null on both sides."""
+    def pair(a, b, labels="ABABAB"):
+        base, cand = ordered_sets(labels)
+        edit_fields(base, {"cuda_module_loading": a})
+        edit_fields(cand, {"cuda_module_loading": b})
+        return compare(base, cand)
+    for a, b in (("EAGER", "EAGER"), ("LAZY", "LAZY"), (GONE, GONE), (None, GONE)):
+        assert pair(a, b)["verdict"] == "PASS", (a, b)
+    for a, b in (("EAGER", "LAZY"), ("EAGER", None), (GONE, "EAGER"), ("EAGER", GONE)):
+        res = pair(a, b)
+        assert res["verdict"] == "INVALID" and has(res["problems"], "differ in meta cuda_module_loading"), (a, b, res["problems"])
+    base, cand = ordered_sets("ABABAB")
+    edit_fields(base, {"cuda_module_loading": "EAGER"})
+    edit_fields(cand, {"cuda_module_loading": "EAGER"})
+    cand[1]["meta"]["cuda_module_loading"] = "LAZY"
+    res = compare(base, cand)
+    assert res["verdict"] == "INVALID" and has(res["problems"], "candidate records disagree on meta cuda_module_loading")
+    first = ordered_sets("ABABAB", meds_a=UNSTABLE_A, meds_b=UNSTABLE_B)
+    rerun = ordered_sets("ABABAB", hour="11", scale=3, meds_a=RERUN_A, meds_b=RERUN_B)
+    for side in first:
+        edit_fields(side, {"cuda_module_loading": "EAGER"})
+    for side in rerun:
+        edit_fields(side, {"cuda_module_loading": None})
+    res = compare(*first, baseline_unstable="widen", base_rerun=rerun[0], cand_rerun=rerun[1])
+    assert res["verdict"] == "INVALID" and has(res["problems"], "re-run does not come from the same snapshot / configuration as its first campaign", "meta cuda_module_loading")
 
 
 def test_the_comparison_cannot_tell_which_launch_path_ran_so_the_route_specification_has_to():

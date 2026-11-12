@@ -860,7 +860,8 @@ def all_records(ev):
 
 def meta_problems(rec, where, dev, arm, side):
     """What a record must say about the tree and the arm that it measured: one clean commit, side A at the explicit two-launch path (bit 64) and side B at the default path, the control off
-    except for the forced arm of side B, no environment override of the path, a limit constant, the device, and that every cell is a decode cell that carries the same path and control."""
+    except for the forced arm of side B, no environment override of the path, eager module loading on a gating device, a limit constant, the device, and that every cell is a decode cell
+    that carries the same path and control."""
     meta, out = rec.get("meta"), []
     if not isinstance(meta, dict):
         return ["%s: no meta" % where]
@@ -875,6 +876,9 @@ def meta_problems(rec, where, dev, arm, side):
         out.append("%s: side %s measured impl %r, the explicit two-launch path (64) is side A and the default path (0) side B" % (where, side, meta.get("impl")))
     if meta.get("env_impl") is not None:
         out.append("%s: the environment override of the path was set (%r)" % (where, meta.get("env_impl")))
+    if dev in GATING and meta.get("cuda_module_loading") != "EAGER":
+        out.append("%s: the process ran with CUDA_MODULE_LOADING %r, a campaign on a gating device needs EAGER (with the default lazy loading the machine code of a kernel is placed when it is first "
+                   "launched, so a side that launches other kernels earlier gets another placement of the kernels that both run)" % (where, meta.get("cuda_module_loading")))
     want_force = side == "B" and arm == "forced"
     if meta.get("single_force") is not want_force:
         out.append("%s: the single-launch control was %r, side %s of the %s arm needs %r" % (where, meta.get("single_force"), side, arm, want_force))

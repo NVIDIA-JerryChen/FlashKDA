@@ -615,6 +615,11 @@ def test_the_meta_carries_the_control_and_the_limit_of_the_measured_tree(tmp_pat
     meta = bd.run_meta(a, started, opts, DEVICE_B200, FakeTorchVersion)
     assert (meta["single_force"], meta["single_per_sm"], meta["boundary_sms"], meta["graph_nodes"]) == (True, 8, 148, True)
     assert bd.run_meta(parse("--boundary"), started, opts, DEVICE_H100, FakeTorchVersion)["boundary_sms"] == 132
+    monkeypatch.delenv("CUDA_MODULE_LOADING", raising=False)
+    assert meta["cuda_module_loading"] is None                                                                  # the module loading mode of the process, as the environment says it
+    monkeypatch.setenv("CUDA_MODULE_LOADING", "EAGER")
+    assert bd.run_meta(a, started, opts, DEVICE_B200, FakeTorchVersion)["cuda_module_loading"] == "EAGER"
+    monkeypatch.delenv("CUDA_MODULE_LOADING")
     for field in br.REQUIRED_META + ("cc", "sm_count", "impl", "env_impl", "trials", "sample_stat"):
         assert field in meta, field
     monkeypatch.setattr(bd, "ROOT", tree_with_header(tmp_path, "constexpr int64_t DECODE_SINGLE_MAX_CTAS_PER_SM = 12;\n"))

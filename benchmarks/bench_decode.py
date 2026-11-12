@@ -250,7 +250,9 @@ def cell_line(spec, cell):
 def run_meta(a, started, opts, device, torch_mod):
     """The metadata of a record. ``single_force`` (the calibration control was on for the whole process) and ``single_per_sm`` (the limit constant of the measured tree: None for a tree that has
     none) are what the comparison of two sides binds; ``boundary_sms`` is the SM count that the cells of ``--boundary`` were made for (None without it), ``graph_nodes`` whether one graph replay
-    per trial was profiled."""
+    per trial was profiled, ``cuda_module_loading`` the module loading mode of the process (the environment variable CUDA_MODULE_LOADING, None when unset): with the default lazy loading the
+    machine code of a kernel is placed when it is first launched, so two builds that launch different kernels earlier in a long process get another placement of the kernels that both run
+    (graph replays of identical kernels differed by 1 % per shape); two sides of an A/B must share the mode."""
     commit, dirty, tree = records.tree_identity(ROOT)
     boundary = getattr(a, "boundary", None)
     return {"commit": commit, "dirty": dirty, "tree": tree, "gpu": device["name"], "sm_count": device["sm_count"], "cc": device["cc"], "host": socket.gethostname(),
@@ -259,7 +261,7 @@ def run_meta(a, started, opts, device, torch_mod):
             "calls_per_trial": {r: calls_per_trial(r, opts) for r in REGIMES}, "profile_calls": {r: profile_calls_of(r, opts) for r in REGIMES},
             "profile_calls_option": opts["profile_calls"], "calls_scale": opts["calls_scale"], "l2_cache_bytes": device["l2_bytes"], "eviction_bytes": device["eviction_bytes"],
             "single_force": bool(getattr(a, "single_force", False)), "single_per_sm": tree_per_sm(ROOT), "boundary_sms": None if boundary is None else (boundary or device["sm_count"]),
-            "graph_nodes": bool(getattr(a, "graph_nodes", False)),
+            "graph_nodes": bool(getattr(a, "graph_nodes", False)), "cuda_module_loading": os.environ.get("CUDA_MODULE_LOADING"),
             "cells_filter": a.cells, "label": a.label, "tag": os.environ.get("CFBI_BENCH_TAG"), "build_dir": os.environ.get("FLASH_KDA_CFBI_BUILD_DIR"),
             "src": str(ROOT), "argv": sys.argv[1:]}
 
