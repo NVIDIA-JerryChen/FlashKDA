@@ -318,9 +318,17 @@ def test_the_doubled_limit_is_rejected_by_the_data_alone_when_the_cells_and_the_
     assert slr.final_problems(t16, {"header": 16, "specification": 16}) != []                                  # and it is no final table either
 
 
-def test_a_table_whose_data_allow_a_larger_limit_is_not_the_table_of_the_smaller_one():
+def test_a_table_whose_data_allow_a_larger_limit_than_its_cells_straddle_is_the_table_of_the_limit_that_they_straddle(monkeypatch):
+    """Nothing loses before 3072 CTAs, so the data would allow 16 CTAs per SM, but the boundary cells of the campaign straddle 8 only: 8 is the limit that the table verifies, and 16 is not
+    (its cells are not there). The section says that the data allow more and that a higher limit is a campaign of its own."""
     t = synthetic_table(functools.partial(default_values, unsafe_from=3072))
-    assert has(problems_of(t, per_sm=8), "calibrates to 16 CTAs per SM")
+    assert slr.calibrate(t) == 16 and slr.verified_limits(t) == [8]
+    assert problems_of(t, per_sm=8) == []
+    assert has(problems_of(t, per_sm=16), "does not verify the 16 CTAs per SM under test") and has(problems_of(t, per_sm=16), "cells of the campaign for 16 CTAs per SM")
+    assert "The data allow more than that" in slr.render_section(t, t["decision"])
+    assert "The data allow more than that" not in slr.render_section(synthetic_table(), synthetic_table()["decision"])                  # the data of the right limit do not
+    monkeypatch.setattr(slr, "verified_limits", lambda table: [8, 16])                                                                  # a table that did straddle both limits
+    assert has(slr.calibration_problems(t, 8), "the table verifies 16 CTAs per SM, more than the 8 under test") and slr.calibration_problems(t, 16) == []
 
 
 def test_a_fail_within_the_limit_rejects_the_limit():

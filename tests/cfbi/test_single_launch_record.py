@@ -10,6 +10,7 @@ import functools
 import hashlib
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -335,6 +336,56 @@ def real_row(steps, table, revert=None):
 
 def step_check(steps, row):
     return rc.step_problems(row, None, steps.META)
+
+
+def make_repo(tmp_path):
+    """A repository whose commits are: ``first`` (every kind of file), ``tools`` (tests, benchmarks and documents change, the code does not), ``code`` (the extension's source changes) and
+    ``wrapper`` (the Python wrapper changes); ``{name: full hash}``."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args):
+        return subprocess.run(["git", "-c", "commit.gpgsign=false", "-C", str(repo)] + list(args), check=True, stdout=subprocess.PIPE, universal_newlines=True).stdout.strip()
+    git("init", "-q")
+    git("config", "user.email", "t@example.invalid")
+    git("config", "user.name", "t")
+    commits = {}
+    for name, edits in (("first", {"csrc/k.cu": "1", "flash_kda/api.py": "1", "setup.py": "1", "tests/t.py": "1", "benchmarks/b.py": "1", "docs/d.md": "1"}),
+                        ("tools", {"tests/t.py": "2", "benchmarks/b.py": "2", "docs/d.md": "2"}), ("code", {"csrc/k.cu": "2"}), ("wrapper", {"flash_kda/api.py": "2"})):
+        for path, text in edits.items():
+            (repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (repo / path).write_text(text)
+        git("add", "-A")
+        git("commit", "-q", "-m", name)
+        commits[name] = git("rev-parse", "HEAD")
+    return str(repo), commits
+
+
+def test_the_code_of_a_row_is_the_code_that_was_measured_when_the_paths_of_the_code_are_the_same_in_both_commits(tmp_path):
+    repo, c = make_repo(tmp_path)
+    assert slr.code_problems(None, c["first"], c["first"]) == [] and slr.code_problems(None, c["first"][:10], c["first"]) == []        # the same commit is the same code
+    assert slr.code_problems(repo, c["first"], c["tools"]) == [] and slr.code_problems(repo, c["tools"], c["first"]) == []             # tests, benchmarks and documents are not the code
+    assert has(slr.code_problems(None, c["first"], c["tools"]), "without a repository")
+    for other, path in (("code", "csrc/k.cu"), ("wrapper", "flash_kda/api.py")):
+        problems = slr.code_problems(repo, c["first"], c[other])
+        assert has(problems, "differ in the code that is measured") and has(problems, path), other
+    assert has(slr.code_problems(repo, c["first"], "f" * 40), "git cannot compare")
+    assert has(slr.code_problems(repo, None, c["first"]), "not a commit hash") and has(slr.code_problems(repo, "main", c["first"]), "not a commit hash")
+
+
+def test_the_row_may_name_another_commit_than_the_measured_one_only_when_the_code_is_the_same(steps, tmp_path):
+    repo, c = make_repo(tmp_path)
+    table = tdb.slr.table_of(tdb.campaign_results(default_values), tdb.facts_for(candidate=c["tools"]))             # measured at the commit that only added tools
+    codegen, resources = steps.gate_evidence(steps.C1, sid="single_launch")
+    row = slr.ledger_row(table, table["decision"], c["first"], ["m"], codegen, resources, None, repo)                # the row is of the commit whose code the dumps are of
+    assert row["commit"] == c["first"] and slr.row_problems(row, table, repo) == []
+    with pytest.raises(ValueError, match="without a repository"):
+        slr.ledger_row(table, table["decision"], c["first"], ["m"], codegen, resources)
+    with pytest.raises(ValueError, match="differ in the code that is measured"):
+        slr.ledger_row(table, table["decision"], c["code"], ["m"], codegen, resources, None, repo)
+    assert has(slr.row_problems(row, table), "without a repository to compare them in")
+    assert has(slr.row_problems(dict(row, commit=c["code"]), table, repo), "differ in the code that is measured")
+    assert has(slr.row_problems(dict(row, commit=None), table, repo), "not a commit hash")
 
 
 def test_the_row_of_an_adopted_step_is_accepted_by_the_record_checker(steps):

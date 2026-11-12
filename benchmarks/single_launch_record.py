@@ -13,8 +13,8 @@ The rules (the functions below are these rules and nothing else):
   * a cell is unsafe when a gating metric (GPU-elapsed graph replay, GPU-elapsed eager loop, kernel sum, host time of the graph loop, host time of the eager loop) is a comparator FAIL on either
     gating device, noise-limited or not, in either arm; a comparison that is INVALID is no verdict (``calibrate``)
   * the limit is the largest tested N * H below the smallest N * H of an unsafe cell, divided by the SM count and rounded down: an integer number of CTAs per SM (``calibrate``)
-  * a table is accepted for a limit when its rows are exactly the cells of the campaign, the limit equals the constant of the policy header and of the specification, no unsafe cell is within the limit,
-    the calibration of the table gives the limit and the boundary cells straddle it (``table_problems``)
+  * a table is accepted for a limit when its rows are exactly the cells of the campaign, the limit equals the constant of the policy header and of the specification, no unsafe cell is within the limit
+    and the limit is the largest one that the table verifies: its boundary cells straddle it (a limit that no boundary cell straddles is not verified, even where the data allow more) (``table_problems``)
   * the outcome is "adopted" when no gating metric regresses (every comparison of the default arm is PASS on both gating devices) and a confirmed gain exists on both: a GPU-elapsed graph or eager
     cell within the limit that is stable (not noise-limited), judged on the re-run and faster by the tolerance or more. The kernel sum and the host times gate but are never the evidence of a gain.
     The outcome is "not_adopted" when a comparison FAILs or a device has no confirmed gain. Any INVALID comparison leaves it "undecided": a repair, never "not adopted" (``decide``)
@@ -26,7 +26,7 @@ devices are b200 and b300 and both need both arms; any other device is recorded 
   single_launch_record.py build  --evidence MANIFEST --out TABLE
   single_launch_record.py render --table TABLE --document FILE [--number N]
   single_launch_record.py check  --table TABLE [--evidence MANIFEST] [--document FILE] [--row FILE] [--repo DIR]
-  single_launch_record.py row    --table TABLE --markers NAME ... --codegen-gate FILE --resource-gate FILE [--revert-commit HASH] [--commit HASH] --out FILE
+  single_launch_record.py row    --table TABLE --markers NAME ... --codegen-gate FILE --resource-gate FILE [--revert-commit HASH] [--commit HASH] [--repo DIR] --out FILE
 
 ``check`` without ``--evidence`` applies the rules to the table alone (what the tracked table test does); with it the table is derived again from the raw records as well. Exit status 0 pass,
 1 a check fails (an outcome that is undecided is a failure of the record: it is not final), 2 unusable input.
@@ -77,6 +77,7 @@ ROUND = 6                                                   # decimals of every 
 ROW_FIGURES = ("base_median", "cand_median", "delta_pct", "base_spread_pct", "cand_spread_pct", "tol_pct_effective")
 SLACK = 1e-3                                                # what a rounded figure may differ from the figure derived from other rounded figures (percent)
 LEDGER_STEP = "single_launch"
+CODE_PATHS = ("csrc", "flash_kda", "setup.py")              # what the measured extension is built from and called through: a commit that holds the same bytes there is the same code
 DRAFT_ESTIMATE = "1.5 to 2.2 us per call at N <= 64 and about nothing at N >= 128"
 
 
@@ -120,6 +121,26 @@ def hexcommit(x):
 
 def commit_matches(a, b):
     return isinstance(a, str) and isinstance(b, str) and bool(a) and bool(b) and (a.startswith(b) or b.startswith(a))
+
+
+def code_problems(repo, commit, candidate):
+    """Why the code of ``commit`` (the commit of a ledger row) is not the code that the campaign measured at ``candidate`` (an empty list: it is). The same commit is the same code. Otherwise ``repo``
+    (a git repository that has both commits) says whether the two commits differ in ``CODE_PATHS``: a commit that changes tests, benchmarks or documents only measures what its parent measured.
+    Without a repository only the same commit is accepted."""
+    if not hexcommit(commit):
+        return ["the commit %r of the row is not a commit hash" % (commit,)]
+    if commit_matches(commit, candidate):
+        return []
+    if repo is None:
+        return ["the row is of commit %s and the table was measured at %s: without a repository to compare them in only the same commit is accepted" % (commit, candidate)]
+    done = subprocess.run(["git", "-C", str(repo), "diff", "--name-only", "--no-renames", commit, candidate, "--"] + list(CODE_PATHS), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True)
+    if done.returncode != 0:
+        return ["git cannot compare the commit %s of the row with the commit %s that was measured: %s" % (commit, candidate, done.stderr.strip()[:200])]
+    changed = done.stdout.split()
+    if changed:
+        return ["the row is of commit %s and the table was measured at %s, which differ in the code that is measured (%d path(s): %s)" % (commit, candidate, len(changed), ", ".join(changed[:3]))]
+    return []
 
 
 def device_order(dev):
@@ -493,10 +514,26 @@ def unsafe_problems(table, per_sm):
         u["device"], u["arm"], u["key"], ", ".join(u["metrics"]), u["nh"], limit, per_sm, table["meta"]["sm_count"]) for u in calibration_of(table)["unsafe"] if u["nh"] <= limit]
 
 
+def verified_limits(table):
+    """The limits, in CTAs per SM, that the table can vouch for: those whose boundary cells it holds (``straddle_problems``) and within which no unsafe row lies. The campaign measures what its
+    cells straddle: a limit that no boundary cell straddles is not verified, even where the data would allow it (a higher limit is a campaign of its own)."""
+    sms = table["meta"]["sm_count"]
+    top = max((r["nh"] for r in table["rows"] if r["device"] in GATING), default=0) // sms
+    first = calibration_of(table)["first_unsafe_nh"]
+    return [p for p in range(1, top + 1) if not straddle_problems(table, p) and (first is None or first > p * sms)]
+
+
 def calibration_problems(table, per_sm):
+    """The limit under test is the largest limit that the table verifies (``verified_limits``). Otherwise the message says what the data give: the limit that they support (``calibrate``), or, when
+    that is the limit under test, that no boundary cell straddles it."""
+    verified = verified_limits(table)
+    if verified and per_sm == max(verified):
+        return []
+    if per_sm in verified:
+        return ["the table verifies %d CTAs per SM, more than the %d under test (its boundary cells straddle that limit and no unsafe cell lies within it)" % (max(verified), per_sm)]
     cal = calibration_of(table)
     if cal["per_sm"] == per_sm:
-        return []
+        return ["the table does not verify the %d CTAs per SM under test: its boundary cells do not straddle that limit" % per_sm]
     why = ("no cell is unsafe: the largest tested N * H is %d" % cal["limit_nh"]) if cal["first_unsafe_nh"] is None else (
         "the smallest unsafe N * H is %d, the largest tested N * H below it %d" % (cal["first_unsafe_nh"], cal["limit_nh"]))
     return ["the table calibrates to %d CTAs per SM (%s, %d SMs), not to the %d under test" % (cal["per_sm"], why, table["meta"]["sm_count"], per_sm)]
@@ -508,7 +545,7 @@ def table_problems(table, per_sm, constants=None, limit_rules=True):
       (a) the rows are exactly the cells of the campaign for ``per_sm`` (the matrix, the boundary cells, the probe) on both gating devices,
       (b) ``per_sm`` equals the constant of the policy header and of the specification (``constants``) and the limit that the table was measured at,
       (c) no unsafe row (a gating metric FAILs) is within the limit,
-      (d) the calibration of the table gives ``per_sm``,
+      (d) ``per_sm`` is the largest limit that the table verifies (its boundary cells straddle it and no unsafe row lies within it),
       (e) the boundary cells straddle the limit for every head count at the limit divided by two, the limit and twice the limit.
     ``limit_rules`` False leaves out (b) to (d), the rules that tie the table to a limit that a tree ships (a table of a step that was not adopted ships none)."""
     problems = structure_problems(table)
@@ -644,18 +681,20 @@ def reason_text(decision, limit=3):
     return "; ".join(reasons[:limit]) + ("; and %d more" % (len(reasons) - limit) if len(reasons) > limit else "")
 
 
-def ledger_row(table, decision, commit, markers=None, codegen_gate=None, resource_gate=None, revert_commit=None):
+def ledger_row(table, decision, commit, markers=None, codegen_gate=None, resource_gate=None, revert_commit=None, repo=None):
     """The ``single_launch`` row of the step ledger for the outcome that the table gives (``decision`` must be that outcome: the one of ``decide_table(table)``). The timing results are those of
     ``timing_of`` (the layer chain does not apply to this step), ``ab`` holds the figures of the table (``ab_figures``). The caller supplies what no table holds: the ``markers`` of the step, the
-    ``codegen_gate`` and ``resource_gate`` entries (the comparisons of the dumps), and for a step that was not adopted the ``revert_commit``. ValueError when the outcome is undecided (there is no
-    row to write until the evidence is repaired) or the arguments do not fit."""
+    ``codegen_gate`` and ``resource_gate`` entries (the comparisons of the dumps), and for a step that was not adopted the ``revert_commit``. The row is of the commit whose code the dumps are
+    of; the table may have been measured at another commit that holds the same code (``code_problems``, which needs ``repo``). ValueError when the outcome is undecided (there is no row to write
+    until the evidence is repaired) or the arguments do not fit."""
     want = decide_table(table)
     if decision != want:
         raise ValueError("the decision is not the one that the table gives")
     if want["outcome"] == "undecided":
         raise ValueError("the table decides nothing (%s): there is no row to write until the evidence is repaired" % reason_text(want, 2))
-    if not commit_matches(commit, table["meta"]["candidate"]):
-        raise ValueError("the row is of commit %s, the table was measured at %s" % (commit, table["meta"]["candidate"]))
+    problems = code_problems(repo, commit, table["meta"]["candidate"])
+    if problems:
+        raise ValueError(problems[0])
     if not (isinstance(markers, (list, tuple)) and markers and all(isinstance(m, str) and m for m in markers)):
         raise ValueError("the markers of the step must be a non-empty list of identifiers")
     if not isinstance(codegen_gate, dict) or not isinstance(resource_gate, dict):
@@ -669,9 +708,9 @@ def ledger_row(table, decision, commit, markers=None, codegen_gate=None, resourc
             "timing": {"vs_previous": vs_previous, "vs_base": vs_base, "chain": "not_applicable"}, "codegen_gate": codegen_gate, "resource_gate": resource_gate, "ab": ab_figures(table)}
 
 
-def row_problems(row, table):
+def row_problems(row, table, repo=None):
     """Why a ``single_launch`` ledger row is not the row of the table: its outcome, commit, timing results and ``ab`` figures (every median and the noise-limited keys) must be what the table gives,
-    and the table must decide something."""
+    and the table must decide something. The commit of the row is the one that the table was measured at or, with ``repo``, one that holds the same code (``code_problems``)."""
     if not isinstance(row, dict):
         return ["the row is not an object"]
     where = "step %s" % LEDGER_STEP
@@ -683,8 +722,7 @@ def row_problems(row, table):
         return out + ["%s: the table decides nothing (%s)" % (where, reason_text(want, 2))]
     if row.get("outcome") != want["outcome"]:
         out.append("%s: the table's outcome is %s, the row says %r" % (where, want["outcome"], row.get("outcome")))
-    if not commit_matches(row.get("commit"), table["meta"]["candidate"]):
-        out.append("%s: the row is of commit %r, the table was measured at %s" % (where, row.get("commit"), table["meta"]["candidate"]))
+    out.extend("%s: %s" % (where, p) for p in code_problems(repo, row.get("commit"), table["meta"]["candidate"]))
     vs_base, vs_previous = timing_of(want)
     if row.get("timing") != {"vs_previous": vs_previous, "vs_base": vs_base, "chain": "not_applicable"}:
         out.append("%s: the timing of the row is %r, the table gives vs_previous %s, vs_base %s, chain not_applicable" % (where, row.get("timing"), vs_previous, vs_base))
@@ -994,10 +1032,11 @@ def plan_markers(text):
     return [found.group(0)] if found else ([loop] if loop in text else [])
 
 
-def check_problems(table, ev=None, document_text=None, row=None, constants=None, results=None):
+def check_problems(table, ev=None, document_text=None, row=None, constants=None, results=None, repo=None):
     """Everything that is wrong with a table: the evidence it rests on (``evidence_problems``), a difference from the table that the evidence gives (the figures, the calibration, the
     decision), ``final_problems``, a plan identifier in it, a section of the performance document that is not the generated one and a ledger row that is not the row of the table. Without
-    ``ev`` the rules are applied to the table alone: its decision must be the one that its figures give. ``results``: the comparator results of ``ev`` when they are at hand already."""
+    ``ev`` the rules are applied to the table alone: its decision must be the one that its figures give. ``results``: the comparator results of ``ev`` when they are at hand already. ``repo``:
+    the repository in which the commit of the row is compared with the commit that was measured (``code_problems``)."""
     if not isinstance(table, dict):
         return ["the table is not an object"]
     given = json.loads(json.dumps(table))
@@ -1023,7 +1062,7 @@ def check_problems(table, ev=None, document_text=None, row=None, constants=None,
         if document_text is not None:
             problems += document_problems(want, document_text)
         if row is not None:
-            problems += row_problems(row, want)
+            problems += row_problems(row, want, repo)
     except (KeyError, TypeError, ValueError, IndexError, AttributeError) as e:     # a table whose parts do not fit each other is a problem of the table, not a crash
         problems.append("the table is malformed: %s: %s" % (type(e).__name__, e))
     return problems
@@ -1099,7 +1138,9 @@ def render_section(table, decision, number=SECTION_NUMBER):
             "Tested N * H: %s." % _fmt(cal["tested"]),
             "Unsafe cells: %s." % ("none" if not cal["unsafe"] else "%d on the two devices together (the smallest N * H is %d)" % (len(cal["unsafe"]), cal["first_unsafe_nh"])),
             "The largest tested N * H below the smallest unsafe one is %d; divided by the %d SMs and rounded down that is %d CTAs per SM. The tree's limit is %d CTAs per SM." % (
-                cal["limit_nh"], sms, cal["per_sm"], per_sm), ""]
+                cal["limit_nh"], sms, cal["per_sm"], per_sm) + (
+                "" if cal["per_sm"] <= per_sm else " The data allow more than that, but the boundary cells of the campaign straddle the limit of the tree only: no larger limit is verified here, and a "
+                "higher one needs a campaign whose cells straddle it."), ""]
     if cal["unsafe"]:
         out += _table(["device", "arm", "N", "H", "N * H", "regime", "metrics that FAIL"], [[u["device"], u["arm"], cell_fields(u["key"])["N"], cell_fields(u["key"])["H"], u["nh"],
                                                                                           cell_fields(u["key"])["regime"], u["metrics"]] for u in cal["unsafe"]]) + [""]
@@ -1216,7 +1257,8 @@ def main(argv=None):
     p.add_argument("--codegen-gate", required=True)
     p.add_argument("--resource-gate", required=True)
     p.add_argument("--revert-commit", default=None)
-    p.add_argument("--commit", default=None)
+    p.add_argument("--commit", default=None, help="the commit of the row (default: the commit that the table was measured at); another commit needs --repo to show that it holds the same code")
+    p.add_argument("--repo", default=REPO, help="the repository that has both commits (default: the tree of this tool)")
     p.add_argument("--out", required=True)
     a = ap.parse_args(argv)
     try:
@@ -1246,12 +1288,12 @@ def main(argv=None):
             doc = _read(a.document) if a.document else None
             row = _ledger_row_of(load_json(a.row)) if a.row else None
             constants = {"header": dp.header_per_sm(a.repo), "specification": dp.MAX_CTAS_PER_SM}
-            problems = check_problems(table, ev, doc, row, constants)
+            problems = check_problems(table, ev, doc, row, constants, repo=a.repo)
             print("OUTCOME: %s" % (table.get("decision") or {}).get("outcome"))
             return _report(problems)
         if a.cmd == "row":
             table = load_json(a.table)
-            row = ledger_row(table, table["decision"], a.commit or table["meta"]["candidate"], a.markers, load_json(a.codegen_gate), load_json(a.resource_gate), a.revert_commit)
+            row = ledger_row(table, table["decision"], a.commit or table["meta"]["candidate"], a.markers, load_json(a.codegen_gate), load_json(a.resource_gate), a.revert_commit, a.repo)
             _write_json(a.out, row)
             print("wrote %s: outcome %s" % (a.out, row["outcome"]))
             return 0
