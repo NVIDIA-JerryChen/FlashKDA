@@ -599,6 +599,26 @@ def test_an_a_cell_that_launches_the_row_engine_alone_is_rejected_by_the_launch_
     assert has(slr.check_problems(full["table"], ev, results=full["results"]), "not the expected")
 
 
+def test_a_graph_replay_that_a_record_does_not_describe_is_a_problem_and_never_an_exception(full):
+    """With the replay profiled (meta graph_nodes), every trial of every cell has to show the launches of the specification: a sample that is no object, a replay that is no object and one that
+    shows another route are problems, named, and no mistake of the record makes the check raise."""
+    def damage(ev):
+        rec = ev["devices"]["b200"]["default"]["first"]["B"][0]
+        rec["meta"]["graph_nodes"] = True
+        for cell in rec["cells"]:                                                                          # the replay of every trial shows the launches of the trial's eager pass ...
+            for sample in cell["samples"]:
+                sample["graph_nodes"] = {"compute": dict(sample["nodes"]["compute"]), "aux": {}}
+        cells = {c["key"]: c for c in rec["cells"]}                                                        # ... except in these three
+        cells[K_SMALL]["samples"][0] = 5
+        cells[K_SMALL]["samples"][1]["graph_nodes"] = ["rows_kernel"]
+        cells[K_ABOVE]["samples"][0]["graph_nodes"] = {"compute": {"rows_kernel": 1}}                    # the specification says two launches beyond the limit
+    problems = slr.launch_problems(mutated(full["ev"], damage))
+    assert has(problems, "b200 default first B record: cell %s, trial 0: the graph replay launched None" % K_SMALL)
+    assert has(problems, "cell %s, trial 1: the graph replay launched None" % K_SMALL)
+    assert has(problems, "cell %s, trial 0: the graph replay launched {'rows_kernel': 1}, the specification says {'plan_kernel': 1, 'rows_kernel': 1}" % K_ABOVE)
+    assert slr.launch_problems(mutated(full["ev"], lambda ev: ev["devices"]["b200"]["default"]["first"]["B"][0]["meta"].update(graph_nodes=False))) == []     # without the option nothing is asked
+
+
 @pytest.mark.parametrize("name,dev,arm,key,mapping,expected", [
     ("a cell that the limit routes to one launch ran two", "b200", "default", K_SMALL, {"plan_kernel": 1, "rows_kernel": 1}, "the recorded compute nodes {'plan_kernel': 1, 'rows_kernel': 1} are not the expected {'rows_kernel': 1}"),
     ("a cell beyond the limit ran one launch under the default routing", "b300", "default", K_ABOVE, {"rows_kernel": 1}, "the recorded compute nodes {'rows_kernel': 1} are not the expected {'plan_kernel': 1, 'rows_kernel': 1}"),

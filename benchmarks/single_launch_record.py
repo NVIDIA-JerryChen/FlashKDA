@@ -66,11 +66,10 @@ DEVICE_TAGS = {"b200": "B200", "b300": "B300", "h100": "H100"}      # what the G
 ARMS = ("default", "forced")
 PHASES = ("first", "rerun")
 SIDES = ("A", "B")
-STRADDLE_HEADS = (6, 12, 33)                                # the heads of the boundary cells: the plan's, written here again so that the generator of the benchmark is not its own witness
+STRADDLE_HEADS = (6, 12, 33)                                # the heads of the boundary cells, written here again so that the generator of the benchmark is not its own witness
 STRADDLE_FRACTIONS = ((1, 2), (1, 1), (2, 1))               # the limit divided by two, the limit and twice the limit
 STRADDLE_REGIMES = ("lockstep", "staggered", "cold")
-SINGLE_LAUNCH, TWO_LAUNCH = dp.SINGLE_LAUNCH, dp.TWO_LAUNCH
-OUTCOMES = ("adopted", "not_adopted", "undecided")
+TWO_LAUNCH = dp.TWO_LAUNCH
 STATUSES = ("PASS", "FAIL", "NEEDS_RERUN", "UNSTABLE_BASELINE")
 JUDGED = ("first", "rerun")
 ROUND = 6                                                   # decimals of every figure of the table: the rules read the rounded figures, so that the table alone gives the decision
@@ -79,6 +78,7 @@ SLACK = 1e-3                                                # what a rounded fig
 LEDGER_STEP = "single_launch"
 CODE_PATHS = ("csrc", "flash_kda", "setup.py")              # what the measured extension is built from and called through: a commit that holds the same bytes there is the same code
 DRAFT_ESTIMATE = "1.5 to 2.2 us per call at N <= 64 and about nothing at N >= 128"
+REASON_LINES = 20                                           # reasons that ``build`` prints (the table holds them all)
 
 
 # ---- small helpers -----------------------------------------------------------------------------------------------------------------------------
@@ -103,16 +103,17 @@ def figure(x):
     return round(float(x), ROUND) + 0.0
 
 
-def is_int(x):
-    return type(x) is int
-
-
 def is_count(x, minimum=0):
     return type(x) is int and x >= minimum
 
 
 def is_number(x):
     return type(x) in (int, float) and math.isfinite(x)
+
+
+def is_cc(x):
+    """Whether ``x`` is a compute capability written as ``"10.0"``."""
+    return isinstance(x, str) and re.fullmatch(r"[0-9]+\.[0-9]+", x) is not None
 
 
 def hexcommit(x):
@@ -145,6 +146,12 @@ def code_problems(repo, commit, candidate):
 
 def device_order(dev):
     return (GATING.index(dev) if dev in GATING else len(GATING), dev)
+
+
+def gate_parameters(tol_pct):
+    """``(name, value)`` of every parameter that a comparison of the gate is made under, named as the comparator result names it: the ABBA order, the tolerance ``tol_pct``, the
+    regress mode, the widening of noise-limited cells and the launch mappings required."""
+    return (("order", AB_ORDER), ("tol_pct", tol_pct), ("mode", "regress"), ("unstable_policy", "widen"), ("require_nodes", True))
 
 
 def cc_number(text):
@@ -284,7 +291,7 @@ def results_of_table(table):
     for dev, arms in table["comparisons"].items():
         for arm, metrics in arms.items():
             for metric, summary in metrics.items():
-                res = dict((k, summary[k]) for k in ("verdict", "problems", "order", "tol_pct", "mode", "unstable_policy", "require_nodes"))
+                res = {k: summary[k] for k in ("verdict", "problems", "order", "tol_pct", "mode", "unstable_policy", "require_nodes")}
                 res.update(metric=metric, rows=[])
                 out.setdefault(dev, {}).setdefault(arm, {})[metric] = res
     for row in table["rows"]:
@@ -296,10 +303,15 @@ def results_of_table(table):
 
 
 # ---- the calibration of the limit --------------------------------------------------------------------------------------------------------------
+def fails(entry):
+    """Whether the entry of one metric of a row is a comparator FAIL."""
+    return isinstance(entry, dict) and entry.get("status") == "FAIL"
+
+
 def unsafe_rows(table):
     """The rows of the gating devices (both arms) in which a gating metric is a comparator FAIL: the cells that are unsafe for the single launch. A noise-limited row counts when it is a FAIL (its
     tolerance was widened already); a row that only needs its re-run, or whose comparison is INVALID, is no FAIL."""
-    return [r for r in table["rows"] if r["device"] in GATING and any(isinstance(e, dict) and e.get("status") == "FAIL" for m, e in r["metrics"].items() if m in GATE_METRICS)]
+    return [r for r in table["rows"] if r["device"] in GATING and any(fails(e) for m, e in r["metrics"].items() if m in GATE_METRICS)]
 
 
 def calibration_of(table, tested=None):
@@ -313,9 +325,9 @@ def calibration_of(table, tested=None):
     first = min((nh(r["key"]) for r in unsafe), default=None)
     below = [t for t in tested if first is None or t < first]
     limit = max(below, default=0)
-    return {"tested": tested, "unsafe": [{"device": r["device"], "arm": r["arm"], "key": r["key"], "nh": nh(r["key"]), "metrics": sorted(m for m, e in r["metrics"].items() if isinstance(e, dict) and e.get("status") == "FAIL")}
-                                         for r in sorted(unsafe, key=lambda r: (device_order(r["device"]), r["arm"], cell_order(r["key"])))],
-            "first_unsafe_nh": first, "limit_nh": limit, "per_sm": limit // sms}
+    unsafe_cells = [{"device": r["device"], "arm": r["arm"], "key": r["key"], "nh": nh(r["key"]), "metrics": sorted(m for m, e in r["metrics"].items() if fails(e))}
+                    for r in sorted(unsafe, key=lambda r: (device_order(r["device"]), r["arm"], cell_order(r["key"])))]
+    return {"tested": tested, "unsafe": unsafe_cells, "first_unsafe_nh": first, "limit_nh": limit, "per_sm": limit // sms}
 
 
 def calibrate(table, tested=None):
@@ -345,7 +357,7 @@ def structure_problems(table):
         problems.append("meta.devices must describe the gating devices %s" % ", ".join(GATING))
     else:
         for dev, d in devices.items():
-            if not (isinstance(d, dict) and is_count(d.get("sm_count"), 1) and isinstance(d.get("cc"), str) and re.fullmatch(r"[0-9]+\.[0-9]+", d["cc"]) and isinstance(d.get("gpu"), str)):
+            if not (isinstance(d, dict) and is_count(d.get("sm_count"), 1) and is_cc(d.get("cc")) and isinstance(d.get("gpu"), str)):
                 problems.append("meta.devices.%s needs a GPU name, a positive SM count and a compute capability of the form 10.0" % dev)
     for part in ("rows", "calibration", "decision", "comparisons", "inputs"):
         if part not in table:
@@ -371,7 +383,6 @@ def row_consistency_problems(table):
     row that still needs its re-run has no verdict. A rounded figure that was edited by hand makes one of these fail."""
     meta = table["meta"]
     tol, out = meta["tol_pct"], []
-    limit_pct = 100 * br.UNSTABLE_SPREAD
     for row in table["rows"]:
         where = "%s %s %s" % (row["device"], row["arm"], row["key"])
         f = cell_fields(row["key"])
@@ -386,33 +397,38 @@ def row_consistency_problems(table):
         if extra or ((f["regime"] not in bd.LOOP_REGIMES) and any(m in row["metrics"] for m in LOOP_METRICS)):
             out.append("%s: the metrics %s are not judged in this cell" % (where, extra or [m for m in LOOP_METRICS if m in row["metrics"]]))
         for metric, e in sorted(row["metrics"].items()):
-            if metric not in GATE_METRICS:
-                continue
-            w = "%s: %s" % (where, metric)
-            if not (isinstance(e, dict) and all(is_number(e.get(k)) for k in ROW_FIGURES) and e.get("status") in STATUSES and e.get("judged_on") in JUDGED
-                    and type(e.get("noise_limited")) is bool and type(e.get("needs_rerun")) is bool):
-                out.append("%s: the entry is malformed" % w)
-                continue
-            if e["base_median"] <= 0 or e["cand_median"] <= 0:
-                out.append("%s: the medians must be positive" % w)
-                continue
-            if abs(e["delta_pct"] - 100.0 * (e["cand_median"] / e["base_median"] - 1.0)) > SLACK:
-                out.append("%s: the change of %.6f %% is not the change of the medians %.6f and %.6f" % (w, e["delta_pct"], e["base_median"], e["cand_median"]))
-            if e["needs_rerun"] != (e["status"] == "NEEDS_RERUN"):
-                out.append("%s: needs_rerun and the status %s disagree" % (w, e["status"]))
-            if e["needs_rerun"] and e["judged_on"] != "first":
-                out.append("%s: a cell that needs its re-run is judged on the first campaign" % w)
-            spread = max(e["base_spread_pct"], e["cand_spread_pct"])
-            if e["status"] in ("PASS", "FAIL"):
-                if e["judged_on"] == "first" and spread > limit_pct + SLACK:
-                    out.append("%s: a cell with a spread of %.3f %% was judged on the first campaign without a re-run" % (w, spread))
-                if abs(spread - limit_pct) > SLACK and e["noise_limited"] != (e["judged_on"] == "rerun" and spread > limit_pct):
-                    out.append("%s: noise_limited is %s for a spread of %.3f %% judged on the %s" % (w, e["noise_limited"], spread, e["judged_on"]))
-                want_tol = tol + (spread if e["noise_limited"] else 0.0)
-                if abs(e["tol_pct_effective"] - want_tol) > SLACK:
-                    out.append("%s: the tolerance is %.4f %%, a cell with this spread is judged with %.4f %%" % (w, e["tol_pct_effective"], want_tol))
-                if abs(e["delta_pct"] - e["tol_pct_effective"]) > SLACK and (e["status"] == "FAIL") != (e["delta_pct"] > e["tol_pct_effective"]):
-                    out.append("%s: the status is %s for a change of %.6f %% judged with %.4f %%" % (w, e["status"], e["delta_pct"], e["tol_pct_effective"]))
+            if metric in GATE_METRICS:
+                out.extend(entry_problems(e, tol, "%s: %s" % (where, metric)))
+    return out
+
+
+def entry_problems(e, tol, where):
+    """Why the figures of one cell and metric of a row (``e``; ``tol``: the plain tolerance of the table) are not consistent with each other (``row_consistency_problems``), each message
+    prefixed with ``where``."""
+    if not (isinstance(e, dict) and all(is_number(e.get(k)) for k in ROW_FIGURES) and e.get("status") in STATUSES and e.get("judged_on") in JUDGED
+            and type(e.get("noise_limited")) is bool and type(e.get("needs_rerun")) is bool):
+        return ["%s: the entry is malformed" % where]
+    if e["base_median"] <= 0 or e["cand_median"] <= 0:
+        return ["%s: the medians must be positive" % where]
+    out = []
+    unstable_pct = 100 * br.UNSTABLE_SPREAD                                 # the spread above which a cell needs its re-run, in percent
+    if abs(e["delta_pct"] - 100.0 * (e["cand_median"] / e["base_median"] - 1.0)) > SLACK:
+        out.append("%s: the change of %.6f %% is not the change of the medians %.6f and %.6f" % (where, e["delta_pct"], e["base_median"], e["cand_median"]))
+    if e["needs_rerun"] != (e["status"] == "NEEDS_RERUN"):
+        out.append("%s: needs_rerun and the status %s disagree" % (where, e["status"]))
+    if e["needs_rerun"] and e["judged_on"] != "first":
+        out.append("%s: a cell that needs its re-run is judged on the first campaign" % where)
+    spread = max(e["base_spread_pct"], e["cand_spread_pct"])
+    if e["status"] in ("PASS", "FAIL"):
+        if e["judged_on"] == "first" and spread > unstable_pct + SLACK:
+            out.append("%s: a cell with a spread of %.3f %% was judged on the first campaign without a re-run" % (where, spread))
+        if abs(spread - unstable_pct) > SLACK and e["noise_limited"] != (e["judged_on"] == "rerun" and spread > unstable_pct):
+            out.append("%s: noise_limited is %s for a spread of %.3f %% judged on the %s" % (where, e["noise_limited"], spread, e["judged_on"]))
+        want_tol = tol + (spread if e["noise_limited"] else 0.0)
+        if abs(e["tol_pct_effective"] - want_tol) > SLACK:
+            out.append("%s: the tolerance is %.4f %%, a cell with this spread is judged with %.4f %%" % (where, e["tol_pct_effective"], want_tol))
+        if abs(e["delta_pct"] - e["tol_pct_effective"]) > SLACK and (e["status"] == "FAIL") != (e["delta_pct"] > e["tol_pct_effective"]):
+            out.append("%s: the status is %s for a change of %.6f %% judged with %.4f %%" % (where, e["status"], e["delta_pct"], e["tol_pct_effective"]))
     return out
 
 
@@ -437,7 +453,7 @@ def comparison_problems(table):
                     continue
                 if s["verdict"] == "INVALID":
                     out.append("the comparison of %s is INVALID (%s): it is no verdict" % (where, "; ".join(str(p) for p in (s.get("problems") or ["no reason given"])[:2])))
-                for name, want in (("order", AB_ORDER), ("tol_pct", table["meta"]["tol_pct"]), ("mode", "regress"), ("unstable_policy", "widen"), ("require_nodes", True)):
+                for name, want in gate_parameters(table["meta"]["tol_pct"]):
                     if s.get(name) != want:
                         out.append("the comparison of %s was made with %s %r, the gate is %r" % (where, name, s.get(name), want))
                 if s["verdict"] == "FAIL" and not any(e.get("status") == "FAIL" for e in rows):
@@ -447,6 +463,11 @@ def comparison_problems(table):
                 if s.get("cells") != len(rows):
                     out.append("the comparison of %s counts %r cells, the table has %d rows" % (where, s.get("cells"), len(rows)))
     return out
+
+
+def first_keys(keys, shown=3):
+    """The first ``shown`` keys, separated by commas, and ``, ...`` when there are more."""
+    return ", ".join(keys[:shown]) + (", ..." if len(keys) > shown else "")
 
 
 def cell_set_problems(table, per_sm):
@@ -466,10 +487,9 @@ def cell_set_problems(table, per_sm):
             if dup:
                 out.append("%s %s: the cells %s have more than one row" % (dev, arm, dup[:3]))
             if missing:
-                out.append("%s %s: %d of the %d cells of the campaign for %d CTAs per SM have no row (%s%s)" % (dev, arm, len(missing), len(want[dev][arm]), per_sm, ", ".join(missing[:3]),
-                                                                                                           ", ..." if len(missing) > 3 else ""))
+                out.append("%s %s: %d of the %d cells of the campaign for %d CTAs per SM have no row (%s)" % (dev, arm, len(missing), len(want[dev][arm]), per_sm, first_keys(missing)))
             if extra:
-                out.append("%s %s: %d row(s) are not cells of the campaign for %d CTAs per SM (%s%s)" % (dev, arm, len(extra), per_sm, ", ".join(extra[:3]), ", ..." if len(extra) > 3 else ""))
+                out.append("%s %s: %d row(s) are not cells of the campaign for %d CTAs per SM (%s)" % (dev, arm, len(extra), per_sm, first_keys(extra)))
     return out
 
 
@@ -481,14 +501,15 @@ def straddle_problems(table, per_sm):
     for dev in GATING:
         for H in STRADDLE_HEADS:
             for num, den in STRADDLE_FRACTIONS:
-                x = per_sm * sms * num // den if (per_sm * sms * num) % den == 0 else None
-                lo = (per_sm * sms * num) // (den * H)                  # the largest N with N * H <= x (x need not be an integer: the floor of the quotient is the same)
+                ctas = per_sm * sms * num                               # x = ctas / den
+                x_text = str(ctas // den) if ctas % den == 0 else "%.1f" % (ctas / den)
+                lo = ctas // (den * H)                                  # the largest N with N * H <= x (x need not be an integer: the floor of the quotient is the same)
                 for N in (lo, lo + 1):
                     for regime in STRADDLE_REGIMES:
                         key = br.cell_key("decode", N=N, H=H, regime=regime)
                         if N >= 1 and (dev, key) not in have:
                             out.append("%s: the cell N=%d, H=%d, %s, which straddles %s CTAs (the limit times %d/%d), has no row in the default arm" % (
-                                dev, N, H, regime, x if x is not None else "%.1f" % (per_sm * sms * num / den), num, den))
+                                dev, N, H, regime, x_text, num, den))
     return out
 
 
@@ -551,7 +572,7 @@ def table_problems(table, per_sm, constants=None, limit_rules=True):
     problems = structure_problems(table)
     if problems:
         return problems
-    if not (is_int(per_sm) and per_sm >= 1):
+    if not is_count(per_sm, 1):
         return ["the limit must be an integer number of CTAs per SM of at least 1, got %r" % (per_sm,)]
     meta = table["meta"]
     problems += ["meta.devices.%s: %d SMs, the table says %d" % (dev, d["sm_count"], meta["sm_count"]) for dev, d in sorted(meta["devices"].items()) if dev in GATING and d["sm_count"] != meta["sm_count"]]
@@ -569,6 +590,26 @@ def table_problems(table, per_sm, constants=None, limit_rules=True):
 
 
 # ---- the decision ------------------------------------------------------------------------------------------------------------------------------
+def verdict_problem(res, tol_pct):
+    """None when the comparator result ``res`` is a verdict of the gate (PASS or FAIL, made under ``gate_parameters(tol_pct)``); otherwise why it is not: a verdict that is neither (with
+    the first problem that the comparator names), the parameters that are not the gate's, or both."""
+    verdict = res.get("verdict")
+    decided = verdict in ("PASS", "FAIL")
+    wrong = ["%s %r instead of %r" % (name, res.get(name), want) for name, want in gate_parameters(tol_pct) if res.get(name) != want]
+    if decided and not wrong:
+        return None
+    why = ([] if decided else ["the comparison is %s" % verdict]) + (["it was made with " + ", ".join(wrong)] if wrong else [])
+    problem = (res.get("problems") or [""])[0]
+    return "; ".join(why) + (" (%s)" % problem if problem and not decided else "")
+
+
+def confirmed_gain(metric, row, limit, tol_pct):
+    """Whether a row of a comparison of the gate is a confirmed gain: a GPU-elapsed metric (``GAIN_METRICS``), judged on the re-run, stable (not noise-limited, not in need of a re-run),
+    PASS, N * H within ``limit`` and faster by ``tol_pct`` or more."""
+    return (metric in GAIN_METRICS and row["judged_on"] == "rerun" and not row["noise_limited"] and not row["needs_rerun"] and row["status"] == "PASS" and nh(row["key"]) <= limit
+            and figure(row["median_delta_pct"]) <= -tol_pct)
+
+
 def decide(results, limit_by_device, tol_pct=TOL_PCT):
     """The outcome of the A/B: ``{"outcome": "adopted" | "not_adopted" | "undecided", "reasons": [...], "gains": [...], "per_device": {...}}``.
 
@@ -590,16 +631,14 @@ def decide(results, limit_by_device, tol_pct=TOL_PCT):
             res = (((results or {}).get(dev) or {}).get("default") or {}).get(metric)
             if not (isinstance(res, dict) and isinstance(res.get("rows"), list)):
                 invalid.append("%s %s: there is no comparison" % (dev, metric))
-                info["verdicts"][metric], info["invalid"] = None, info["invalid"] + 1
+                info["verdicts"][metric] = None
+                info["invalid"] += 1
                 continue
             verdict = res.get("verdict")
             info["verdicts"][metric] = verdict
-            wrong = ["%s %r instead of %r" % (name, res.get(name), want) for name, want in (("order", AB_ORDER), ("tol_pct", tol_pct), ("mode", "regress"), ("unstable_policy", "widen"),
-                                                                                         ("require_nodes", True)) if res.get(name) != want]
-            if verdict not in ("PASS", "FAIL") or wrong:
-                why = (["the comparison is %s" % verdict] if verdict != "PASS" and verdict != "FAIL" else []) + (["it was made with " + ", ".join(wrong)] if wrong else [])
-                problem = (res.get("problems") or [""])[0]
-                invalid.append("%s %s: %s%s" % (dev, metric, "; ".join(why), " (%s)" % problem if problem and verdict not in ("PASS", "FAIL") else ""))
+            problem = verdict_problem(res, tol_pct)
+            if problem:
+                invalid.append("%s %s: %s" % (dev, metric, problem))
                 info["invalid"] += 1
                 continue
             for r in sorted(res["rows"], key=lambda r: cell_order(r["key"])):
@@ -608,8 +647,7 @@ def decide(results, limit_by_device, tol_pct=TOL_PCT):
                     inside = nh(r["key"]) <= limit
                     regress.append("%s %s %s: B is %.2f %% slower than A, the tolerance of the cell is %.2f %% (%s the limit of %d CTAs)" % (
                         dev, metric, r["key"], figure(r["median_delta_pct"]), figure(r.get("tol_pct_effective", tol_pct)), "within" if inside else "beyond", limit))
-                elif metric in GAIN_METRICS and r["judged_on"] == "rerun" and not r["noise_limited"] and not r["needs_rerun"] and r["status"] == "PASS" and nh(r["key"]) <= limit \
-                        and figure(r["median_delta_pct"]) <= -tol_pct:
+                elif confirmed_gain(metric, r, limit, tol_pct):
                     info["gains"] += 1
                     gains.append({"device": dev, "metric": metric, "key": r["key"], "nh": nh(r["key"]), "base_median": figure(r["base_median"]), "cand_median": figure(r["cand_median"]),
                                   "delta_pct": figure(r["median_delta_pct"])})
@@ -648,6 +686,12 @@ def timing_of(decision):
         raise ValueError("an undecided outcome has no timing result")
     clean = all(v == "PASS" for info in decision["per_device"].values() for v in info["verdicts"].values())
     return ("pass" if clean else "fail"), ("pass" if decision["outcome"] == "adopted" else "fail")
+
+
+def timing_entry(decision):
+    """The ``timing`` entry of the ledger row of a decided outcome (``timing_of``; the layer chain does not apply to this step)."""
+    vs_base, vs_previous = timing_of(decision)
+    return {"vs_previous": vs_previous, "vs_base": vs_base, "chain": "not_applicable"}
 
 
 # ---- the ledger row ----------------------------------------------------------------------------------------------------------------------------
@@ -702,10 +746,10 @@ def ledger_row(table, decision, commit, markers=None, codegen_gate=None, resourc
     adopted = want["outcome"] == "adopted"
     if adopted == bool(revert_commit):
         raise ValueError("a step that was adopted has no revert commit and one that was not adopted names it")
-    vs_base, vs_previous = timing_of(want)
+    timing = timing_entry(want)
     return {"id": LEDGER_STEP, "outcome": want["outcome"], "commit": commit, "revert_commit": revert_commit if not adopted else None, "markers": list(markers),
             "failed_at": None if adopted else "timing", "reason": "" if adopted else reason_text(want), "gates": {"exactness": True, "codegen": True},
-            "timing": {"vs_previous": vs_previous, "vs_base": vs_base, "chain": "not_applicable"}, "codegen_gate": codegen_gate, "resource_gate": resource_gate, "ab": ab_figures(table)}
+            "timing": timing, "codegen_gate": codegen_gate, "resource_gate": resource_gate, "ab": ab_figures(table)}
 
 
 def row_problems(row, table, repo=None):
@@ -723,9 +767,9 @@ def row_problems(row, table, repo=None):
     if row.get("outcome") != want["outcome"]:
         out.append("%s: the table's outcome is %s, the row says %r" % (where, want["outcome"], row.get("outcome")))
     out.extend("%s: %s" % (where, p) for p in code_problems(repo, row.get("commit"), table["meta"]["candidate"]))
-    vs_base, vs_previous = timing_of(want)
-    if row.get("timing") != {"vs_previous": vs_previous, "vs_base": vs_base, "chain": "not_applicable"}:
-        out.append("%s: the timing of the row is %r, the table gives vs_previous %s, vs_base %s, chain not_applicable" % (where, row.get("timing"), vs_previous, vs_base))
+    timing = timing_entry(want)
+    if row.get("timing") != timing:
+        out.append("%s: the timing of the row is %r, the table gives vs_previous %s, vs_base %s, chain not_applicable" % (where, row.get("timing"), timing["vs_previous"], timing["vs_base"]))
     if row.get("failed_at") != (None if want["outcome"] == "adopted" else "timing"):
         out.append("%s: failed_at is %r" % (where, row.get("failed_at")))
     out.extend("%s: %s" % (where, d) for d in diff(ab_figures(table), row.get("ab"), "ab"))
@@ -838,7 +882,7 @@ def meta_problems(rec, where, dev, arm, side):
         out.append("%s: the limit constant of the measured tree (single_per_sm) is %r, a positive integer is needed" % (where, meta.get("single_per_sm")))
     if not is_count(meta.get("sm_count"), 1):
         out.append("%s: sm_count is %r" % (where, meta.get("sm_count")))
-    if not (isinstance(meta.get("cc"), str) and re.fullmatch(r"[0-9]+\.[0-9]+", meta["cc"])):
+    if not is_cc(meta.get("cc")):
         out.append("%s: the compute capability %r is not of the form 10.0" % (where, meta.get("cc")))
     if not (isinstance(meta.get("gpu"), str) and DEVICE_TAGS[dev] in meta["gpu"].upper()):
         out.append("%s: the GPU %r is not a %s" % (where, meta.get("gpu"), DEVICE_TAGS[dev]))
@@ -884,13 +928,20 @@ def identity_problems(ev):
 def facts_of(ev):
     """The identity of the campaign as the records state it (``identity_problems`` has to hold): the candidate commit, the limit constant, the SM count of the gating devices and per device the GPU
     name, the SM count and the compute capability."""
-    first = [rec for dev, arm, phase, side, rec, entry in all_records(ev)]
-    devices = {}
+    records, devices = [], {}
     for dev, arm, phase, side, rec, entry in all_records(ev):
+        records.append(rec)
         m = rec["meta"]
         devices.setdefault(dev, {"gpu": m["gpu"], "sm_count": m["sm_count"], "cc": m["cc"], "gating": dev in GATING})
-    return {"candidate": first[0]["meta"]["commit"], "per_sm": first[0]["meta"]["single_per_sm"], "sm_count": devices[GATING[0]]["sm_count"], "devices": devices,
-            "graph_nodes": all(rec["meta"].get("graph_nodes") is True for rec in first)}
+    first = records[0]["meta"]
+    return {"candidate": first["commit"], "per_sm": first["single_per_sm"], "sm_count": devices[GATING[0]]["sm_count"], "devices": devices,
+            "graph_nodes": all(rec["meta"].get("graph_nodes") is True for rec in records)}
+
+
+def graph_compute(sample):
+    """The compute launches that a trial recorded for its graph replay (None when it recorded none, or when the sample is not what the benchmark writes)."""
+    graph = sample.get("graph_nodes") if isinstance(sample, dict) else None
+    return graph.get("compute") if isinstance(graph, dict) else None
 
 
 def launch_problems(ev):
@@ -900,7 +951,7 @@ def launch_problems(ev):
     out = []
     for dev, arm, phase, side, rec, entry in all_records(ev):
         meta = rec["meta"]
-        if not (is_count(meta.get("single_per_sm"), 1) and is_count(meta.get("sm_count"), 1) and isinstance(meta.get("cc"), str) and re.fullmatch(r"[0-9]+\.[0-9]+", meta["cc"])):
+        if not (is_count(meta.get("single_per_sm"), 1) and is_count(meta.get("sm_count"), 1) and is_cc(meta.get("cc"))):
             continue                                                    # named by meta_problems
         want = {}
         for cell in rec.get("cells") or []:
@@ -912,9 +963,8 @@ def launch_problems(ev):
             want[cell["key"]] = dict(bd.CANONICAL_COMPUTE[route])
         out.extend(br.route_problems([rec], want, "%s %s %s %s" % (dev, arm, phase, side)))
         if meta.get("graph_nodes") is True:                              # the replay of the graph is what the graph metric times: when its launches were profiled they are held to the same route
-            bad = ["cell %s, trial %d: the graph replay launched %s, the specification says %s" % (cell["key"], i, (s.get("graph_nodes") or {}).get("compute"), want[cell["key"]])
-                   for cell in rec.get("cells") or [] if cell.get("key") in want for i, s in enumerate(cell.get("samples") or [])
-                   if not isinstance(s, dict) or (s.get("graph_nodes") or {}).get("compute") != want[cell["key"]]]
+            bad = ["cell %s, trial %d: the graph replay launched %s, the specification says %s" % (cell["key"], i, graph_compute(s), want[cell["key"]])
+                   for cell in rec.get("cells") or [] if cell.get("key") in want for i, s in enumerate(cell.get("samples") or []) if graph_compute(s) != want[cell["key"]]]
             out.extend("%s %s %s %s record: %s" % (dev, arm, phase, side, b) for b in bad[:3])
     return out
 
@@ -932,14 +982,12 @@ def evidence_problems(ev):
         out.extend(meta_problems(rec, where, dev, arm, side))
     for dev in GATING:
         for arm in ARMS:
-            if not (ev["devices"].get(dev, {}).get(arm, {}).get("first", {}).get("A") and ev["devices"][dev][arm]["first"].get("B")):
+            first_campaign = ev["devices"].get(dev, {}).get(arm, {}).get("first", {})
+            if not (first_campaign.get("A") and first_campaign.get("B")):
                 out.append("%s has no first campaign of the %s arm" % (dev, arm))
     if out:
         return out
-    out = identity_problems(ev)
-    if out:
-        return out
-    return launch_problems(ev)
+    return identity_problems(ev) or launch_problems(ev)
 
 
 def candidate_commit(ev):
@@ -982,7 +1030,7 @@ def table_of(results, facts, inputs=None, not_run=None):
     table = {"schema": SCHEMA,
              "meta": {"candidate": facts["candidate"], "per_sm": per_sm, "sm_count": sms, "tol_pct": TOL_PCT, "mode": "regress", "unstable_policy": "widen", "order": AB_ORDER, "min_repeats": MIN_REPEATS,
                       "gate_metrics": list(GATE_METRICS), "gain_metrics": list(GAIN_METRICS), "loop_metrics": list(LOOP_METRICS), "graph_nodes": bool(facts.get("graph_nodes")),
-                      "devices": dict((dev, dict(d)) for dev, d in sorted(facts["devices"].items(), key=lambda kv: device_order(kv[0]))), "not_run": dict(sorted((not_run or {}).items()))},
+                      "devices": {dev: dict(d) for dev, d in sorted(facts["devices"].items(), key=lambda kv: device_order(kv[0]))}, "not_run": dict(sorted((not_run or {}).items()))},
              "inputs": inputs or {},
              "comparisons": comparisons_of(results),
              "rows": table_rows(results, per_sm, facts["devices"])}
@@ -1095,13 +1143,102 @@ def _change(e):
     return "%+.2f%s" % (e["delta_pct"], flags)
 
 
+def _medians(metrics, metric):
+    """``[A, B]``: the medians of one metric of a row (``[None, None]`` when the row has no figure for the metric)."""
+    if metric not in metrics:
+        return [None, None]
+    return [metrics[metric]["base_median"], metrics[metric]["cand_median"]]
+
+
 def _cell_rows(rows):
     out = []
     for r in rows:
         m = r["metrics"]
-        out.append([r["N"], r["H"], r["nh"], r["regime"], r["pos"], r["route"],
-                    m["gpu_graph_us"]["base_median"] if "gpu_graph_us" in m else None, m["gpu_graph_us"]["cand_median"] if "gpu_graph_us" in m else None,
-                    m["gpu_eager_us"]["base_median"] if "gpu_eager_us" in m else None, m["gpu_eager_us"]["cand_median"] if "gpu_eager_us" in m else None] + [_change(m.get(x)) for x in GATE_METRICS])
+        out.append([r["N"], r["H"], r["nh"], r["regime"], r["pos"], r["route"]] + _medians(m, "gpu_graph_us") + _medians(m, "gpu_eager_us") + [_change(m.get(x)) for x in GATE_METRICS])
+    return out
+
+
+def _is_gating(meta, dev):
+    """Whether the device ``dev`` of the table gates (a device that does not say so gates when it is one of ``GATING``)."""
+    return meta["devices"][dev].get("gating", dev in GATING)
+
+
+def _measured_lines(meta, sms, per_sm):
+    """The subsection "What was measured": the sides and the arms, the limit of the tree, the gate, the re-run rule, the gating metrics and the devices that do not gate or were not run."""
+    out = ["### What was measured", "",
+           "- Candidate commit %s. Side A is the candidate tree at the explicit two-launch path (bit 64), side B the same tree at its default routing on every cell of the campaign (arm default) and with the "
+           "calibration control on for the cells that the default rule does not route (arm forced), so that the single launch is also timed beyond the limit." % meta["candidate"][:12],
+           "- Limit of the tree: %d CTAs per SM on %d SMs, N * H at most %d. Compute capability of the devices: %s." % (
+               per_sm, sms, per_sm * sms, ", ".join("%s %s" % (d, meta["devices"][d]["cc"]) for d in sorted(meta["devices"], key=device_order) if _is_gating(meta, d))),
+           "- Regress gate: a cell fails when B is slower than A by more than %.2f %% of the median (%s mode), at least %d interleaved record files per side in the %s start order (blocks of four that are "
+           "ABBA or BAAB), every trial's launch mapping asserted against the routing specification." % (meta["tol_pct"], meta["mode"], meta["min_repeats"], meta["order"]),
+           "- A cell whose spread is above 0.3 % is re-run once with three times the calls per trial; one that stays above it is noise-limited and judged with the tolerance widened by its spread. "
+           "A cell that FAILs in a gating metric on either gating device, noise-limited or not, is unsafe.",
+           "- Gating metrics: %s. The evidence of a gain is a stable cell judged on the re-run in %s within the limit, on both devices; the kernel sum and the host times gate and are never that evidence." % (
+               ", ".join(meta["gate_metrics"]), " or ".join(meta["gain_metrics"])), ""]
+    for dev in sorted(meta["devices"], key=device_order):
+        if not _is_gating(meta, dev):
+            info = meta["devices"][dev]
+            out += ["- %s (%s, %d SMs, compute capability %s) is recorded and does not gate." % (dev, info["gpu"], info["sm_count"], info["cc"])]
+    out += ["- Not run: %s: %s." % (dev, why) for dev, why in sorted(meta["not_run"].items())]
+    return out + [""]
+
+
+def _comparison_lines(comparisons):
+    """The subsection "Comparisons": the verdict and the counts of the cells of every comparison of the table."""
+    rows = []
+    for dev in sorted(comparisons, key=device_order):
+        for arm in ARMS:
+            for metric in GATE_METRICS:
+                s = comparisons[dev].get(arm, {}).get(metric)
+                if s:
+                    rows.append([dev, arm, metric, s["verdict"], s["cells"], s["noise_limited"], s["rerun"], s["needs_rerun"]])
+    return ["### Comparisons", ""] + _table(["device", "arm", "metric", "verdict", "cells", "noise-limited", "judged on the re-run", "still need a re-run"], rows) + [""]
+
+
+def _calibration_lines(cal, sms, per_sm):
+    """The subsection "Calibration of the limit": the tested grids, the unsafe cells and the limit that they calibrate, next to the limit of the tree (``per_sm`` CTAs on each of ``sms`` SMs)."""
+    out = ["### Calibration of the limit", "",
+           "Tested N * H: %s." % _fmt(cal["tested"]),
+           "Unsafe cells: %s." % ("none" if not cal["unsafe"] else "%d on the two devices together (the smallest N * H is %d)" % (len(cal["unsafe"]), cal["first_unsafe_nh"])),
+           "The largest tested N * H below the smallest unsafe one is %d; divided by the %d SMs and rounded down that is %d CTAs per SM. The tree's limit is %d CTAs per SM." % (
+               cal["limit_nh"], sms, cal["per_sm"], per_sm) + (
+               "" if cal["per_sm"] <= per_sm else " The data allow more than that, but the boundary cells of the campaign straddle the limit of the tree only: no larger limit is verified here, and a "
+               "higher one needs a campaign whose cells straddle it."), ""]
+    if cal["unsafe"]:
+        unsafe = []
+        for u in cal["unsafe"]:
+            device, arm, f = u["device"], u["arm"], cell_fields(u["key"])
+            unsafe.append([device, arm, f["N"], f["H"], u["nh"], f["regime"], u["metrics"]])
+        out += _table(["device", "arm", "N", "H", "N * H", "regime", "metrics that FAIL"], unsafe) + [""]
+    return out
+
+
+def _gain_lines(gains):
+    """The subsection "Confirmed gains": every confirmed gain of the decision with the medians of A and B."""
+    rows = []
+    for g in gains:
+        device, metric, f = g["device"], g["metric"], cell_fields(g["key"])
+        rows.append([device, metric, f["N"], f["H"], g["nh"], f["regime"], g["base_median"], g["cand_median"], figure(g["base_median"] - g["cand_median"]), "%+.2f" % g["delta_pct"]])
+    return (["### Confirmed gains", "",
+             "GPU-elapsed graph or eager cells of the default arm within the limit that are stable, judged on the re-run and faster by the tolerance or more (A minus B in microseconds per call). The draft "
+             "estimated %s: a direction, not a gate." % DRAFT_ESTIMATE, ""]
+            + _table(["device", "metric", "N", "H", "N * H", "regime", "A us", "B us", "A - B us", "change %"], rows) + [""])
+
+
+def _device_lines(meta, rows):
+    """One subsection per device and arm that has rows: the medians and the changes of every cell."""
+    out = []
+    for dev in sorted(meta["devices"], key=device_order):
+        for arm, what in (("default", "the default routing"), ("forced", "the control on, the cells that the default rule does not route")):
+            sel = [r for r in rows if r["device"] == dev and r["arm"] == arm]
+            if not sel:
+                continue
+            out += ["### %s, %s" % (dev, what), "",
+                    "Medians of A and B in microseconds per call for the two GPU-elapsed metrics and the change of the median in percent for every gating metric; F: the cell FAILs, n: noise-limited, r: judged "
+                    "on the re-run, ?: still needs its re-run. Route: the launches that the specification gives to B.", ""]
+            out += _table(["N", "H", "N * H", "regime", "pos", "route", "graph A", "graph B", "eager A", "eager B"] + ["%s %%" % m.replace("_us", "").replace("_", " ") for m in GATE_METRICS],
+                          _cell_rows(sel)) + [""]
     return out
 
 
@@ -1114,52 +1251,11 @@ def render_section(table, decision, number=SECTION_NUMBER):
            "(it is checked by deriving it again).", "",
            "### Outcome", "", "Single-launch decode is **%s**." % decision["outcome"].replace("_", " "), ""]
     out += ["- " + s for s in decision["reasons"]] + [""]
-    out += ["### What was measured", "",
-            "- Candidate commit %s. Side A is the candidate tree at the explicit two-launch path (bit 64), side B the same tree at its default routing on every cell of the campaign (arm default) and with the "
-            "calibration control on for the cells that the default rule does not route (arm forced), so that the single launch is also timed beyond the limit." % meta["candidate"][:12],
-            "- Limit of the tree: %d CTAs per SM on %d SMs, N * H at most %d. Compute capability of the devices: %s." % (
-                per_sm, sms, per_sm * sms, ", ".join("%s %s" % (d, meta["devices"][d]["cc"]) for d in sorted(meta["devices"], key=device_order) if meta["devices"][d].get("gating", d in GATING))),
-            "- Regress gate: a cell fails when B is slower than A by more than %.2f %% of the median (%s mode), at least %d interleaved record files per side in the %s start order (blocks of four that are "
-            "ABBA or BAAB), every trial's launch mapping asserted against the routing specification." % (meta["tol_pct"], meta["mode"], meta["min_repeats"], meta["order"]),
-            "- A cell whose spread is above 0.3 % is re-run once with three times the calls per trial; one that stays above it is noise-limited and judged with the tolerance widened by its spread. "
-            "A cell that FAILs in a gating metric on either gating device, noise-limited or not, is unsafe.",
-            "- Gating metrics: %s. The evidence of a gain is a stable cell judged on the re-run in %s within the limit, on both devices; the kernel sum and the host times gate and are never that evidence." % (
-                ", ".join(meta["gate_metrics"]), " or ".join(meta["gain_metrics"])), ""]
-    for dev in sorted(meta["devices"], key=device_order):
-        if not meta["devices"][dev].get("gating", dev in GATING):
-            out += ["- %s (%s, %d SMs, compute capability %s) is recorded and does not gate." % (dev, meta["devices"][dev]["gpu"], meta["devices"][dev]["sm_count"], meta["devices"][dev]["cc"])]
-    out += ["- Not run: %s: %s." % (dev, why) for dev, why in sorted(meta["not_run"].items())]
-    out += [""]
-    out += ["### Comparisons", ""]
-    out += _table(["device", "arm", "metric", "verdict", "cells", "noise-limited", "judged on the re-run", "still need a re-run"],
-                  [[dev, arm, metric, s["verdict"], s["cells"], s["noise_limited"], s["rerun"], s["needs_rerun"]]
-                   for dev in sorted(table["comparisons"], key=device_order) for arm in ARMS for metric in GATE_METRICS for s in [table["comparisons"][dev].get(arm, {}).get(metric)] if s]) + [""]
-    out += ["### Calibration of the limit", "",
-            "Tested N * H: %s." % _fmt(cal["tested"]),
-            "Unsafe cells: %s." % ("none" if not cal["unsafe"] else "%d on the two devices together (the smallest N * H is %d)" % (len(cal["unsafe"]), cal["first_unsafe_nh"])),
-            "The largest tested N * H below the smallest unsafe one is %d; divided by the %d SMs and rounded down that is %d CTAs per SM. The tree's limit is %d CTAs per SM." % (
-                cal["limit_nh"], sms, cal["per_sm"], per_sm) + (
-                "" if cal["per_sm"] <= per_sm else " The data allow more than that, but the boundary cells of the campaign straddle the limit of the tree only: no larger limit is verified here, and a "
-                "higher one needs a campaign whose cells straddle it."), ""]
-    if cal["unsafe"]:
-        out += _table(["device", "arm", "N", "H", "N * H", "regime", "metrics that FAIL"], [[u["device"], u["arm"], cell_fields(u["key"])["N"], cell_fields(u["key"])["H"], u["nh"],
-                                                                                          cell_fields(u["key"])["regime"], u["metrics"]] for u in cal["unsafe"]]) + [""]
-    out += ["### Confirmed gains", "",
-            "GPU-elapsed graph or eager cells of the default arm within the limit that are stable, judged on the re-run and faster by the tolerance or more (A minus B in microseconds per call). The draft "
-            "estimated %s: a direction, not a gate." % DRAFT_ESTIMATE, ""]
-    out += _table(["device", "metric", "N", "H", "N * H", "regime", "A us", "B us", "A - B us", "change %"],
-                  [[g["device"], g["metric"], cell_fields(g["key"])["N"], cell_fields(g["key"])["H"], g["nh"], cell_fields(g["key"])["regime"], g["base_median"], g["cand_median"],
-                    figure(g["base_median"] - g["cand_median"]), "%+.2f" % g["delta_pct"]] for g in decision["gains"]]) + [""]
-    for dev in sorted(meta["devices"], key=device_order):
-        for arm, what in (("default", "the default routing"), ("forced", "the control on, the cells that the default rule does not route")):
-            sel = [r for r in rows if r["device"] == dev and r["arm"] == arm]
-            if not sel:
-                continue
-            out += ["### %s, %s" % (dev, what), "",
-                    "Medians of A and B in microseconds per call for the two GPU-elapsed metrics and the change of the median in percent for every gating metric; F: the cell FAILs, n: noise-limited, r: judged "
-                    "on the re-run, ?: still needs its re-run. Route: the launches that the specification gives to B.", ""]
-            out += _table(["N", "H", "N * H", "regime", "pos", "route", "graph A", "graph B", "eager A", "eager B"] + ["%s %%" % m.replace("_us", "").replace("_", " ") for m in GATE_METRICS],
-                          _cell_rows(sel)) + [""]
+    out += _measured_lines(meta, sms, per_sm)
+    out += _comparison_lines(table["comparisons"])
+    out += _calibration_lines(cal, sms, per_sm)
+    out += _gain_lines(decision["gains"])
+    out += _device_lines(meta, rows)
     return "\n".join(out).rstrip("\n") + "\n"
 
 
@@ -1188,6 +1284,8 @@ def replace_section(document_text, section):
 
 
 def document_problems(table, document_text):
+    """Why the section of the performance document is not the one that ``render_section`` generates from the table and its decision, at the number that the document gives the section (an
+    empty list: it is); the message names the first line that differs."""
     b = section_bounds(document_text)
     if b is None:
         return ["the performance document has no section headed %r" % SECTION_TITLE]
@@ -1211,9 +1309,6 @@ def _report(problems):
     return 1 if problems else 0
 
 
-REASON_LINES = 20                                           # reasons that ``build`` prints (the table holds them all)
-
-
 def _read(path):
     with open(path, encoding="utf-8") as f:
         return f.read()
@@ -1235,7 +1330,53 @@ def _ledger_row_of(obj):
     return obj
 
 
-def main(argv=None):
+def _build(a):
+    ev = load_evidence(a.evidence)
+    problems = evidence_problems(ev)
+    if problems:
+        return _report(problems)
+    table = build_table(ev, recompute(ev))
+    _write_json(a.out, table)
+    print("wrote %s (%d bytes)" % (a.out, os.path.getsize(a.out)))
+    cal = table["calibration"]
+    print("OUTCOME: %s" % table["decision"]["outcome"])
+    print("CALIBRATED CTAs PER SM: %d (the tree has %d)" % (cal["per_sm"], table["meta"]["per_sm"]))
+    for reason in table["decision"]["reasons"][:REASON_LINES]:
+        print("REASON: %s" % reason)
+    return _report(final_problems(table))
+
+
+def _render(a):
+    table = load_json(a.table)
+    doc = _read(a.document)
+    with open(a.document, "w", encoding="utf-8") as f:
+        f.write(replace_section(doc, render_section(table, table["decision"], a.number)))
+    return 0
+
+
+def _check(a):
+    table = load_json(a.table)
+    ev = load_evidence(a.evidence) if a.evidence else None
+    doc = _read(a.document) if a.document else None
+    row = _ledger_row_of(load_json(a.row)) if a.row else None
+    constants = {"header": dp.header_per_sm(a.repo), "specification": dp.MAX_CTAS_PER_SM}
+    problems = check_problems(table, ev, doc, row, constants, repo=a.repo)
+    print("OUTCOME: %s" % (table.get("decision") or {}).get("outcome"))
+    return _report(problems)
+
+
+def _row(a):
+    table = load_json(a.table)
+    row = ledger_row(table, table["decision"], a.commit or table["meta"]["candidate"], a.markers, load_json(a.codegen_gate), load_json(a.resource_gate), a.revert_commit, a.repo)
+    _write_json(a.out, row)
+    print("wrote %s: outcome %s" % (a.out, row["outcome"]))
+    return 0
+
+
+COMMANDS = {"build": _build, "render": _render, "check": _check, "row": _row}
+
+
+def _parser():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd")
     p = sub.add_parser("build")
@@ -1260,48 +1401,20 @@ def main(argv=None):
     p.add_argument("--commit", default=None, help="the commit of the row (default: the commit that the table was measured at); another commit needs --repo to show that it holds the same code")
     p.add_argument("--repo", default=REPO, help="the repository that has both commits (default: the tree of this tool)")
     p.add_argument("--out", required=True)
+    return ap
+
+
+def main(argv=None):
+    ap = _parser()
     a = ap.parse_args(argv)
+    if a.cmd not in COMMANDS:
+        ap.print_help()
+        return 2
     try:
-        if a.cmd == "build":
-            ev = load_evidence(a.evidence)
-            problems = evidence_problems(ev)
-            if problems:
-                return _report(problems)
-            table = build_table(ev, recompute(ev))
-            _write_json(a.out, table)
-            print("wrote %s (%d bytes)" % (a.out, os.path.getsize(a.out)))
-            cal = table["calibration"]
-            print("OUTCOME: %s" % table["decision"]["outcome"])
-            print("CALIBRATED CTAs PER SM: %d (the tree has %d)" % (cal["per_sm"], table["meta"]["per_sm"]))
-            for reason in table["decision"]["reasons"][:REASON_LINES]:
-                print("REASON: %s" % reason)
-            return _report(final_problems(table))
-        if a.cmd == "render":
-            table = load_json(a.table)
-            doc = _read(a.document)
-            with open(a.document, "w", encoding="utf-8") as f:
-                f.write(replace_section(doc, render_section(table, table["decision"], a.number)))
-            return 0
-        if a.cmd == "check":
-            table = load_json(a.table)
-            ev = load_evidence(a.evidence) if a.evidence else None
-            doc = _read(a.document) if a.document else None
-            row = _ledger_row_of(load_json(a.row)) if a.row else None
-            constants = {"header": dp.header_per_sm(a.repo), "specification": dp.MAX_CTAS_PER_SM}
-            problems = check_problems(table, ev, doc, row, constants, repo=a.repo)
-            print("OUTCOME: %s" % (table.get("decision") or {}).get("outcome"))
-            return _report(problems)
-        if a.cmd == "row":
-            table = load_json(a.table)
-            row = ledger_row(table, table["decision"], a.commit or table["meta"]["candidate"], a.markers, load_json(a.codegen_gate), load_json(a.resource_gate), a.revert_commit, a.repo)
-            _write_json(a.out, row)
-            print("wrote %s: outcome %s" % (a.out, row["outcome"]))
-            return 0
+        return COMMANDS[a.cmd](a)
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
         print("unusable input: %s" % e, file=sys.stderr)
         return 2
-    ap.print_help()
-    return 2
 
 
 if __name__ == "__main__":

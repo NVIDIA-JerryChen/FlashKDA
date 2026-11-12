@@ -215,9 +215,15 @@ def route_binding_problems(ext, specs, impl, routes):
             continue
         seen.add((s["N"], s["H"]))
         want = routes[s["key"]] == spec.SINGLE_LAUNCH
-        if bool(ext.decode_single_launch(1, resolved, s["N"], s["H"])) != want:
-            out.append("N=%d H=%d: the extension says %s, the specification %s" % (s["N"], s["H"], "two launches" if want else "one launch", "one launch" if want else "two launches"))
+        got = bool(ext.decode_single_launch(1, resolved, s["N"], s["H"]))
+        if got != want:
+            out.append("N=%d H=%d: the extension says %s, the specification %s" % (s["N"], s["H"], _launches_text(got), _launches_text(want)))
     return out
+
+
+def _launches_text(single):
+    """The route of one decode call in words: ``"one launch"`` (``single``) or ``"two launches"``."""
+    return "one launch" if single else "two launches"
 
 
 def trial_wall(gpu_eager, gpu_graph, cpu_eager=None, cpu_graph=None):

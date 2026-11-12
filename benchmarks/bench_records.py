@@ -243,18 +243,19 @@ def route_problems(records, expected_by_key, side="side"):
         bad = []
         for cell in cells:
             key = cell.get("key") if isinstance(cell, dict) else None
-            want = expected_by_key.get(key) if isinstance(expected_by_key, Mapping) and isinstance(key, str) else None
             if not isinstance(key, str):
                 bad.append("a cell without a key")
-            elif not isinstance(want, Mapping):
+                continue
+            want = expected_by_key.get(key) if isinstance(expected_by_key, Mapping) else None
+            if not isinstance(want, Mapping):
                 bad.append("cell %r has no expected launch mapping" % key)
-            else:
-                try:
-                    found = cell_node_problems(cell, want)
-                except (AttributeError, KeyError, TypeError, ValueError) as e:      # a count that is no number, a sample that is no object: a problem, not an exception
-                    found = ["cell %r: the recorded launch mapping cannot be read (%s: %s)" % (key, type(e).__name__, e)]
-                if found:
-                    bad.append(found[0] + (" (and %d more problem(s) in this cell)" % (len(found) - 1) if len(found) > 1 else ""))
+                continue
+            try:
+                found = cell_node_problems(cell, want)
+            except (AttributeError, KeyError, TypeError, ValueError) as e:      # a count that is no number, a sample that is no object: a problem, not an exception
+                found = ["cell %r: the recorded launch mapping cannot be read (%s: %s)" % (key, type(e).__name__, e)]
+            if found:
+                bad.append(found[0] + (" (and %d more problem(s) in this cell)" % (len(found) - 1) if len(found) > 1 else ""))
         out.extend("%s: %s" % (where, p) for p in bad[:6])
         if len(bad) > 6:
             out.append("%s: ... and %d more cell(s) whose launches are not the expected ones" % (where, len(bad) - 6))
