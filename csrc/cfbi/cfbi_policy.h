@@ -49,11 +49,11 @@ constexpr int ROWS_SMEM_NEED_BYTES = ROWS_STATIC_SMEM_BYTES + ROWS_DYNAMIC_SMEM_
 // ---- single-launch decode -----------------------------------------------------------------------------------------------------------------------------------------------
 // Whether a call that runs mode 1 (`mode` and `impl` as resolve_mode / resolve_impl return them: the caller maps mode 0 + IMPL_ROWS_ONLY to 1 and resolves the device's bits) of N
 // sequences and H heads is ONE kernel launch of the optimised row engine (rows_kernel<true>, cfbi_rows.cuh) instead of the plan kernel followed by the row engine. The plan kernel
-// is one more dependent launch on every decode call (its recorded cost is in the performance document); what the single launch pays instead (expected, not measured) is one more
+// is one more dependent launch on every decode call (its recorded cost is in the performance document); what the single launch pays instead is one more
 // dependent global access per CTA (slot_ids, then the pos word) that every CTA of a multi-wave grid repeats, so the rule keeps the plan kernel for grids of more than
-// DECODE_SINGLE_MAX_CTAS_PER_SM CTAs per SM (N * H CTAs; four waves of the two CTAs per SM that fit). It is a starting rule: the limit and the routing set are calibrated by an
-// interleaved A/B against IMPL_DECODE_PLAN, which the benchmark decides. The single launch is correct on every device that runs the optimised row engine; the routing set only
-// says where it is the default.
+// DECODE_SINGLE_MAX_CTAS_PER_SM CTAs per SM (N * H CTAs; four waves of the two CTAs per SM that fit). The limit and the routing set are the result of an interleaved A/B against
+// IMPL_DECODE_PLAN (the performance document records it, with the cells that straddle the limit). The single launch is correct on every device that runs the optimised row engine;
+// the routing set only says where it is the default.
 constexpr int64_t DECODE_SINGLE_MAX_CTAS_PER_SM = 8;
 constexpr int DECODE_SINGLE_ROUTING_CC_MAJOR = 10;   // B200 (cc 100) and B300 (cc 103); Hopper (cc 90) and the others keep the plan kernel by default
 

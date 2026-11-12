@@ -131,6 +131,27 @@ def test_a_routed_k2_condition_that_does_not_mask_bit_64_is_caught(binding, name
     assert any(expect in p for p in routing_problems(mutate(binding, old, new))), name
 
 
+def device_route_problems(launch):
+    """The kept answer of the policy's device query: the SM count and the compute capability are read from the runtime once per process and device, not on every decode call (a cost of the
+    call itself where the host is on the critical path). Looked at: the kept SM count is read first, with acquire order, and answers before the runtime is asked; what is read is stored
+    capability first and SM count last with release order, so that a reader that sees the SM count sees the capability."""
+    route = re.search(r"bool device_route\(int device, int\* sms, int\* cc\) \{(.*?)\n\}", launch, re.S)
+    if route is None:
+        return ["the helper device_route (the kept SM count and capability) is not found"]
+    body, probs = route.group(1), []
+    kept, answer, query = body.find("sms.load(std::memory_order_acquire)"), body.find("if (known > 0)"), body.find("cudaDeviceGetAttribute")
+    if kept < 0:
+        probs.append("device_route reads the kept SM count without acquire order")
+    if not 0 <= kept < answer < query or "return true" not in body[answer:query]:
+        probs.append("device_route asks the runtime before it looks at the kept answer")
+    cc_store, sms_store = body.find("cc.store("), body.find("sms.store(")
+    if not 0 <= cc_store < sms_store:
+        probs.append("device_route does not publish the SM count last (after the capability)")
+    elif "std::memory_order_release" not in body[sms_store:]:
+        probs.append("device_route publishes the SM count without release order")
+    return probs
+
+
 def exposure_problems(binding, launch, launch_h):
     probs = []
     for name in ("decode_single_launch", "decode_single_launch_policy", "decode_single_force"):
@@ -147,11 +168,14 @@ def exposure_problems(binding, launch, launch_h):
         probs.append("the wrapper decode_single_launch is not found")
     else:
         body = wrapper.group(1)
-        eligible, force, query, policy = (body.find(s) for s in ("decode_single_launch_eligible(", "g_decode_single_force.load()", "cudaDeviceGetAttribute", "return decode_single_launch_policy("))
+        eligible, force, query, policy = (body.find(s) for s in ("decode_single_launch_eligible(", "g_decode_single_force.load()", "device_route(", "return decode_single_launch_policy("))
         if not 0 <= eligible < force < query < policy:
             probs.append("the wrapper does not apply the eligible part first, then the control, then the device and the policy")
         if "return true" not in body[force:query]:
             probs.append("the control does not return true for an eligible call")
+        if "cudaDeviceGetAttribute" in body:
+            probs.append("the wrapper asks the runtime for the device on every call (it must go through the kept answer of device_route)")
+    probs += device_route_problems(launch)
     for text, name in ((launch, "cfbi_launch.cu"), (launch_h, "cfbi_launch.h")):
         for m in re.finditer(r"#\s*(?:ifdef|ifndef|if)\b[^\n]*\bCFBI_\w*(?:FORCE|CALIBRAT)\w*", text):
             probs.append("%s: the calibration control is a build option (%s)" % (name, m.group(0).strip()))
@@ -169,6 +193,14 @@ def test_the_binding_exposes_the_policy_and_the_hidden_control(binding, launch):
     ("launch", "the control before the eligible part", "    if (!decode_single_launch_eligible(mode, impl, N, H)) return false;\n    if (g_decode_single_force.load() != 0) return true;",
      "    if (g_decode_single_force.load() != 0) return true;\n    if (!decode_single_launch_eligible(mode, impl, N, H)) return false;", "eligible part first"),
     ("launch", "the control after the device query", "    if (g_decode_single_force.load() != 0) return true;\n    if (device < 0", "    if (device < 0", "eligible part first"),
+    ("launch", "the wrapper asks the runtime on every call", "    int sms = 0, cc = 0;\n    if (!device_route(device, &sms, &cc)) return false;",
+     "    int sms = 0, cc = 0;\n    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);\n    if (!device_route(device, &sms, &cc)) return false;", "on every call"),
+    ("launch", "the kept answer is not consulted", "        if (known > 0) {", "        if (known > 1 << 30) {", "before it looks at the kept answer"),
+    ("launch", "the SM count is published before the capability", "        kept->cc.store(*cc, std::memory_order_relaxed);\n        kept->sms.store(n, std::memory_order_release);",
+     "        kept->sms.store(n, std::memory_order_release);\n        kept->cc.store(*cc, std::memory_order_relaxed);", "publish the SM count last"),
+    ("launch", "the SM count is published without release order", "kept->sms.store(n, std::memory_order_release);", "kept->sms.store(n, std::memory_order_relaxed);", "without release order"),
+    ("launch", "the kept SM count is read without acquire order", "kept->sms.load(std::memory_order_acquire)", "kept->sms.load(std::memory_order_relaxed)", "without acquire order"),
+    ("launch", "the helper is gone", "bool device_route(int device, int* sms, int* cc) {", "bool device_route_x(int device, int* sms, int* cc) {", "device_route (the kept SM count and capability) is not found"),
 ])
 def test_a_binding_without_the_pure_policy_or_the_control_in_its_place_is_caught(binding, launch, which, name, old, new, expect):
     texts = {"binding": binding, "launch": launch}
