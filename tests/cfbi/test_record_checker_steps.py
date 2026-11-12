@@ -7,6 +7,7 @@ hand-off checks run against synthetic source trees and real git histories built 
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1657,16 +1658,58 @@ def test_the_final_command_line_rejects_a_reverted_run_on_another_route(tmp_path
 
 
 # ---- the consolidated baseline ---------------------------------------------------------------------------------------------------------------
-def campaign(d, name, bench="decode", cand_scale=1.0, samples=3):
-    """An A/A campaign: ``samples`` interleaved records per side written to ``d``; the entry that a consolidated baseline holds for it."""
-    base, cand = tbt.interleaved([10.0] * 5, [10.0 * cand_scale] * 5, base_commit=tbt.BASE_COMMIT, cand_commit=tbt.BASE_COMMIT)
-    pa = tbt.write_records(str(d), "%s-A-r" % name, base[:samples])
-    pb = tbt.write_records(str(d), "%s-B-r" % name, cand[:samples])
-    verdict = "PASS" if cand_scale == 1.0 else "FAIL"
-    return {"a": "at-2dcb4f8", "b": "at-2dcb4f8", "bench": bench, "cells": ["c"], "metrics": ["k2_stage_us"], "tolerance_pct": 1.0, "samples_per_side": samples,
-            "records_first": {"A": pa, "B": pb}, "records_rerun": {"A": [], "B": []}, "first_campaign_verdicts": {"k2_stage_us": verdict}, "final_verdicts": {"k2_stage_us": verdict},
-            "noise_limited_cells": {"k2_stage_us": []}, "rerun_cells": {"k2_stage_us": []}, "cells_needing_rerun": {"k2_stage_us": 0}, "worst_abs_median_delta_pct": {"k2_stage_us": 0.0},
-            "host": "node1", "stamp": "x", "report": "none", "tools": {}}
+# A baseline as the campaign driver and the assembler leave it: the raw records of a decode campaign (the 38 cells of the benchmark, three records per side in start order A B A B A B, and a re-run of
+# the two cells that were unstable with three times the calls, three records per side) and of a layer-chain campaign (its 2 cells, three records per side, stable: no re-run). The figures that the
+# baseline saves about them are written out in SAVED by hand from the way the cells are built, never computed by the code under test.
+BASELINE_HOST = "node-a-b200"
+NOISY = "decode;N=16;H=12;regime=lockstep;"           # a lock-step cell: unstable in the first campaign (a 2 % spread) and still above 0.3 % after the re-run: noise-limited
+SETTLING = "decode;N=4;H=12;regime=cold;"             # a cold cell: unstable in the first campaign, steady in the re-run
+SHIFTED = "decode;N=64;H=12;regime=lockstep;"         # side B is 0.4 % slower than side A in gpu_graph_us in every file: the worst difference of the campaign
+COLD_128 = "decode;N=128;H=12;regime=cold;"
+CHAIN_64 = "chain;N=64;H=12;Dm=2048;regime=lockstep;"
+UNSTABLE = {NOISY: 0.01, SETTLING: 0.01}              # the relative step of the per-process median from one record file of a side to the next in the first campaign (0.01: 1 %)
+LOOP_CELLS_OF_FIXTURE = [NOISY]                       # the unstable cells that the host loop metrics judge (the lock-step and the staggered cells)
+SAVED = {
+    "decode": {
+        "first_campaign_verdicts": {"cpu_eager_us": "INVALID", "cpu_graph_us": "INVALID", "gpu_eager_us": "INVALID", "gpu_graph_us": "INVALID", "total_us": "PASS"},   # an unstable cell has no verdict yet
+        "final_verdicts": {"cpu_eager_us": "PASS", "cpu_graph_us": "PASS", "gpu_eager_us": "PASS", "gpu_graph_us": "PASS", "total_us": "PASS"},
+        "cells_needing_rerun": {"cpu_eager_us": 1, "cpu_graph_us": 1, "gpu_eager_us": 2, "gpu_graph_us": 2, "total_us": 0},       # the kernel sum is the same in every file: stable
+        "rerun_cells": {"cpu_eager_us": [NOISY], "cpu_graph_us": [NOISY], "gpu_eager_us": [NOISY, SETTLING], "gpu_graph_us": [NOISY, SETTLING], "total_us": [NOISY, SETTLING]},
+        "noise_limited_cells": {"cpu_eager_us": [NOISY], "cpu_graph_us": [NOISY], "gpu_eager_us": [NOISY], "gpu_graph_us": [NOISY], "total_us": []},
+        "worst_abs_median_delta_pct": {"cpu_eager_us": 0.0, "cpu_graph_us": 0.0, "gpu_eager_us": 0.0, "gpu_graph_us": 0.4, "total_us": 0.0}},
+    "chain": {
+        "first_campaign_verdicts": {"cpu_graph_us": "PASS", "gpu_graph_us": "PASS", "total_us": "PASS"}, "final_verdicts": {"cpu_graph_us": "PASS", "gpu_graph_us": "PASS", "total_us": "PASS"},
+        "cells_needing_rerun": {"cpu_graph_us": 0, "gpu_graph_us": 0, "total_us": 0}, "rerun_cells": {"cpu_graph_us": [], "gpu_graph_us": [], "total_us": []},
+        "noise_limited_cells": {"cpu_graph_us": [], "gpu_graph_us": [], "total_us": []}, "worst_abs_median_delta_pct": {"cpu_graph_us": 0.0, "gpu_graph_us": 0.0, "total_us": 0.0}},
+}
+
+SAVED_CHAIN_NOISY = {          # the chain campaign with its first cell unstable in the first campaign and still above 0.3 % after the re-run
+    "first_campaign_verdicts": {"cpu_graph_us": "INVALID", "gpu_graph_us": "INVALID", "total_us": "PASS"}, "final_verdicts": {"cpu_graph_us": "PASS", "gpu_graph_us": "PASS", "total_us": "PASS"},
+    "cells_needing_rerun": {"cpu_graph_us": 1, "gpu_graph_us": 1, "total_us": 0}, "rerun_cells": {"cpu_graph_us": [CHAIN_CELL], "gpu_graph_us": [CHAIN_CELL], "total_us": [CHAIN_CELL]},
+    "noise_limited_cells": {"cpu_graph_us": [CHAIN_CELL], "gpu_graph_us": [CHAIN_CELL], "total_us": []}, "worst_abs_median_delta_pct": {"cpu_graph_us": 0.0, "gpu_graph_us": 0.0, "total_us": 0.0}}
+DECODE_METRICS_OF_FIXTURE = ["cpu_eager_us", "cpu_graph_us", "gpu_eager_us", "gpu_graph_us", "total_us"]
+
+
+def baseline_campaign(d, campaign, keys=None, rerun_keys=None, noisy=None, saved=None):
+    """The entry of a consolidated baseline for an A/A campaign of ``keys`` (the benchmark's cells by default) with its raw records written to ``d``. ``noisy``: ``{cell: step}``, the cells whose
+    per-process medians step by that fraction from one file of a side to the next in the first campaign (the two unstable decode cells by default, none in the chain campaign); the campaign is
+    re-run over ``rerun_keys`` (the unstable cells by default) with three times the calls, and the cells of ``NOISY`` and ``CHAIN_CELL`` are still unstable there. ``saved``: the figures that
+    the baseline says about it, by default the literal ``SAVED`` ones."""
+    commit, name = tbt.BASE_COMMIT, "bl-" + campaign
+    noisy = (UNSTABLE if campaign == "decode" else {}) if noisy is None else noisy
+
+    def make(hour, offset, cells, spreads, slows, scale):
+        return [final_rec(campaign, "b200", commit, "2026-11-10T%s:%02d:00Z" % (hour, 2 * i + offset), BASELINE_HOST, slows=slows, scale=scale, cells=cells, spreads=spreads, idx=i) for i in range(3)]
+
+    shifted = {SHIFTED: 1.004} if campaign == "decode" else None
+    first = {"A": tbt.write_records(str(d), name + "-A-r", make("10", 0, keys, noisy, None, 1)), "B": tbt.write_records(str(d), name + "-B-r", make("10", 1, keys, noisy, shifted, 1))}
+    again = {"A": [], "B": []}
+    if noisy:
+        redo, still = rerun_keys or sorted(noisy), dict((k, 0.01) for k in (NOISY, CHAIN_CELL))
+        again = {"A": tbt.write_records(str(d), name + "-A-x", make("11", 0, redo, still, None, 3)), "B": tbt.write_records(str(d), name + "-B-x", make("11", 1, redo, still, None, 3))}
+    every = keys or (DECODE_KEYS if campaign == "decode" else CHAIN_KEYS)
+    return dict(copy.deepcopy(saved or SAVED[campaign]), a="at-2dcb4f8", b="at-2dcb4f8", bench=campaign, cells=sorted(every), metrics=list(rc.CANONICAL_METRICS[campaign]), tolerance_pct=1.0, samples_per_side=3,
+                records_first=first, records_rerun=again, host=BASELINE_HOST, stamp=name, report="none", tools={})
 
 
 def baseline_record(d):
@@ -1678,15 +1721,44 @@ def baseline_record(d):
         Path(paths[name]).write_text(json.dumps(rec))
     checks = [{"name": "decode campaign: working tree clean", "ok": True, "detail": ""}, {"name": "chain campaign: working tree clean", "ok": True, "detail": ""}]
     return {"schema": rc.BASELINE_SCHEMA, "tag": "b200", "gpu": "NVIDIA B200", "sm_count": 148, "commit": tbt.BASE_COMMIT, "tree": "at-2dcb4f8", "torch": "2.14", "cuda": "13.4",
-            "created": "2026-11-11T05:10:30Z", "round": 1, "self_check": {"checks": 2, "failed": 0, "list": checks, "ok": True, "problems": []},
-            "decode_matrix": campaign(d, "decode"), "layer_chain": campaign(d, "chain", "chain"),
-            "suites": {"S": {"record": paths["S"], "totals": suite_s["totals"]}, "gate": {"record": paths["gate"], "totals": suite_gate["totals"]},
-                       "S_round0_subset": {"note": "a first run without the sanitizer file", "record": str(d / "none.json")}}, "_path": "mem"}
+            "created": "2026-11-11T05:10:30Z", "self_check": {"checks": 2, "failed": 0, "list": checks, "ok": True, "problems": []},
+            "decode_matrix": baseline_campaign(d, "decode"), "layer_chain": baseline_campaign(d, "chain"),
+            "suites": {"S": {"record": paths["S"], "totals": suite_s["totals"]}, "gate": {"record": paths["gate"], "totals": suite_gate["totals"]}}, "_path": "mem"}
+
+
+@pytest.fixture(scope="module")
+def baseline_original(tmp_path_factory):
+    d = tmp_path_factory.mktemp("baseline-original")
+    return baseline_record(d), d
 
 
 @pytest.fixture()
-def baseline(tmp_path):
-    return baseline_record(tmp_path), tmp_path
+def baseline(baseline_original, tmp_path):
+    """The baseline in a directory of its own (its raw records copied): a test may rewrite them."""
+    rec, src = baseline_original
+    dst = tmp_path / "baseline"
+    shutil.copytree(src, dst)
+    moved = json.loads(json.dumps(rec).replace(str(src), str(dst)))
+    return moved, dst
+
+
+def damage(rec, campaign, edit, sides="AB"):
+    """Rewrite every raw record file (first campaign and re-run) of the ``sides`` of a campaign of the baseline after ``edit(record)``."""
+    for side in sides:
+        rewrite_records(rec[campaign], side, edit)
+
+
+def drop_cell(key):
+    return lambda rec: rec.update(cells=[c for c in rec["cells"] if c["key"] != key])
+
+
+def claim_less(rec):
+    """A baseline that declares one decode cell and claims that nothing was noisy or re-run (every list empty, every count 0): consistent in itself, and not the benchmark's coverage."""
+    d = rec["decode_matrix"]
+    d["cells"] = d["cells"][:1]
+    for field in ("noise_limited_cells", "rerun_cells"):
+        d[field] = dict((m, []) for m in d[field])
+    d["cells_needing_rerun"] = dict((m, 0) for m in d["cells_needing_rerun"])
 
 
 def test_a_consolidated_baseline_passes_when_its_raw_records_reproduce_its_verdicts(baseline):
@@ -1702,18 +1774,18 @@ BASELINE_MUTANTS = [
     ("a self-check with a failed check", lambda r: r["self_check"].update(failed=1), "self-check of the assembler did not pass"),
     ("a self-check list that does not match", lambda r: r["self_check"].update(checks=5), "lists 5 checks"),
     ("a self-check entry that failed", lambda r: r["self_check"]["list"][0].update(ok=False), "not every one passed"),
-    ("a final verdict that is not PASS", lambda r: r["decode_matrix"]["final_verdicts"].update(k2_stage_us="INVALID"), "needs PASS on every metric"),
-    ("an unknown first verdict", lambda r: r["decode_matrix"]["first_campaign_verdicts"].update(k2_stage_us="MAYBE"), "first-campaign verdict"),
+    ("a final verdict that is not PASS", lambda r: r["decode_matrix"]["final_verdicts"].update(gpu_graph_us="INVALID"), "needs PASS on every metric"),
+    ("an unknown first verdict", lambda r: r["decode_matrix"]["first_campaign_verdicts"].update(gpu_graph_us="MAYBE"), "first-campaign verdict"),
     ("a baseline of two different trees", lambda r: r["decode_matrix"].update(b="at-other"), "A/A campaign"),
     ("another bench", lambda r: r["layer_chain"].update(bench="prefill"), "bench must be decode or chain"),
-    ("a metric without verdicts", lambda r: r["decode_matrix"]["final_verdicts"].pop("k2_stage_us"), "must have an entry for every metric"),
-    ("a noise-limited cell that is not a cell", lambda r: r["decode_matrix"]["noise_limited_cells"].update(k2_stage_us=["ghost"]), "must list cells of the campaign"),
-    ("a re-run count that the re-run cells do not cover", lambda r: r["decode_matrix"]["cells_needing_rerun"].update(k2_stage_us=2), "cells_needing_rerun"),
+    ("a metric without verdicts", lambda r: r["decode_matrix"]["final_verdicts"].pop("gpu_graph_us"), "must have an entry for every metric"),
+    ("a noise-limited cell that is not a cell", lambda r: r["decode_matrix"]["noise_limited_cells"].update(gpu_graph_us=["ghost"]), "must list cells of the campaign"),
+    ("a re-run count that the re-run cells do not cover", lambda r: r["decode_matrix"]["cells_needing_rerun"].update(gpu_graph_us=3), "cells_needing_rerun"),
     ("fewer samples than declared", lambda r: r["decode_matrix"].update(samples_per_side=5), "records_first holds 3 record(s)"),
     ("fewer than three samples", lambda r: r["decode_matrix"].update(samples_per_side=2), "at least 3"),
     ("a tolerance that is not positive", lambda r: r["decode_matrix"].update(tolerance_pct=0), "tolerance_pct"),
     ("a re-run on one side only", lambda r: r["decode_matrix"]["records_rerun"].update(A=["x.json"]), "as many records for A as for B"),
-    ("cells that need a re-run without re-run records", lambda r: r["decode_matrix"].update(cells_needing_rerun={"k2_stage_us": 1}, rerun_cells={"k2_stage_us": ["c"]}),
+    ("cells that need a re-run without re-run records", lambda r: (r["layer_chain"]["cells_needing_rerun"].update(gpu_graph_us=1), r["layer_chain"]["rerun_cells"].update(gpu_graph_us=[CHAIN_CELL])),
      "no re-run record is named"),
     ("a suite without a record", lambda r: r["suites"]["gate"].pop("record"), "suite gate has no record"),
     ("suite totals that are not the record's", lambda r: r["suites"]["gate"].update(totals={"passed": 1}), "totals of the baseline are not those of its record"),
@@ -1743,13 +1815,23 @@ def test_a_raw_record_that_cannot_be_read_again_or_does_not_validate_is_rejected
         assert has(rc.baseline_problems(bad), expected), (field, value)
 
 
-def test_a_verdict_that_the_raw_records_do_not_reproduce_is_rejected(tmp_path):
-    slow = baseline_record(tmp_path)
-    slow["decode_matrix"] = campaign(tmp_path, "slow", cand_scale=1.05)                       # B is 5 % slower than A: a gate FAIL, not an A/A baseline
-    slow["decode_matrix"].update(final_verdicts={"k2_stage_us": "PASS"}, first_campaign_verdicts={"k2_stage_us": "PASS"})
-    problems = rc.baseline_problems(slow)
-    assert has(problems, "the final verdict of k2_stage_us is FAIL when recomputed from the raw records, the baseline says PASS")
-    assert has(problems, "the first-campaign verdict of k2_stage_us is FAIL when recomputed")
+def scale_gpu_graph(key, factor):
+    """Multiply the ``gpu_graph_us`` of every trial of the cell ``key``."""
+    def edit(rec):
+        for cell in rec["cells"]:
+            if cell["key"] == key:
+                for sample in cell["samples"]:
+                    sample["gpu_graph_us"] *= factor
+    return edit
+
+
+def test_a_verdict_that_the_raw_records_do_not_reproduce_is_rejected(baseline):
+    """Side B of the chain campaign 5 % slower than side A in gpu_graph_us (a gate FAIL, not an A/A baseline), under verdicts that say PASS."""
+    rec, _ = baseline
+    damage(rec, "layer_chain", scale_gpu_graph(CHAIN_CELL, 1.05), "B")
+    problems = rc.baseline_problems(rec)
+    assert has(problems, "the final verdict of gpu_graph_us is FAIL when recomputed from the raw records, the baseline says PASS")
+    assert has(problems, "the first-campaign verdict of gpu_graph_us is FAIL when recomputed")
 
 
 def test_suite_records_of_a_baseline_are_validated_with_the_strengthened_rules(baseline):
@@ -1793,3 +1875,282 @@ def test_the_baseline_and_suite_command_lines(baseline, tmp_path, capsys):
     other.write_text(json.dumps(broken))
     assert rc.main(["suite", "--baseline", s, "--candidate", str(other)]) == 1
     assert "not comparable: gpu" in capsys.readouterr().out
+
+
+# ---- a consolidated baseline is recomputed from its raw records: the cells, the declared coverage, every saved figure ---------------------------------------------------
+def test_the_figures_that_the_campaign_driver_derives_from_the_raw_records_are_the_fixtures(baseline):
+    """``campaign_summary`` on the raw records of the fixture gives the figures that SAVED states by hand: the first campaign alone and with the re-run, per metric."""
+    rec, _ = baseline
+
+    def summary(campaign, rerun=True):
+        entry = rec[campaign]
+        load = lambda paths: [br.load_record(p) for p in paths]
+        again = (load(entry["records_rerun"]["A"]), load(entry["records_rerun"]["B"])) if rerun else ([], [])
+        return rc.campaign_summary((load(entry["records_first"]["A"]), load(entry["records_first"]["B"])), again, entry["metrics"], 1.0, tbt.BASE_COMMIT, entry["bench"])
+
+    s = summary("decode_matrix")
+    assert sorted(s) == DECODE_METRICS_OF_FIXTURE
+    assert dict((m, len(v["judged"])) for m, v in s.items()) == {"cpu_eager_us": 12, "cpu_graph_us": 12, "gpu_eager_us": 38, "gpu_graph_us": 38, "total_us": 38}      # the host loop metrics: the 12 loop cells
+    assert dict((m, v["first"]) for m, v in s.items()) == SAVED["decode"]["first_campaign_verdicts"] and dict((m, v["final"]) for m, v in s.items()) == SAVED["decode"]["final_verdicts"]
+    assert dict((m, len(v["needing"])) for m, v in s.items()) == SAVED["decode"]["cells_needing_rerun"] and s["cpu_graph_us"]["needing"] == LOOP_CELLS_OF_FIXTURE and s["gpu_graph_us"]["needing"] == [NOISY, SETTLING]
+    assert dict((m, v["rerun"]) for m, v in s.items()) == SAVED["decode"]["rerun_cells"] and dict((m, v["noise_limited"]) for m, v in s.items()) == SAVED["decode"]["noise_limited_cells"]
+    assert s["gpu_graph_us"]["worst"] == pytest.approx(0.4) and all(s[m]["worst"] == 0.0 for m in s if m != "gpu_graph_us")
+    assert dict((m, v["final"]) for m, v in summary("decode_matrix", rerun=False).items()) == dict((m, "INVALID" if SAVED["decode"]["cells_needing_rerun"][m] else "PASS") for m in s)      # without the re-run
+    c = summary("layer_chain")
+    assert dict((m, len(v["judged"])) for m, v in c.items()) == {"cpu_graph_us": 2, "gpu_graph_us": 2, "total_us": 2}
+    assert all(v["first"] == v["final"] == "PASS" and v["needing"] == v["rerun"] == v["noise_limited"] == [] and v["worst"] == 0.0 for v in c.values())
+
+
+def test_a_cell_missing_from_every_raw_record_of_a_consolidated_campaign_is_rejected(baseline):
+    """The cold N=128 cell removed from every first-campaign and re-run record while the baseline still says that it holds every cell of the benchmark."""
+    rec, _ = baseline
+    assert rc.baseline_problems(rec) == []
+    damage(rec, "decode_matrix", drop_cell(COLD_128))
+    problems = rc.baseline_problems(rec)
+    assert has(problems, "holds 37 cell(s), the benchmark's definition holds 38") and has(problems, "missing ['%s']" % COLD_128)
+    damage(rec, "layer_chain", drop_cell(CHAIN_64))
+    assert has(rc.baseline_problems(rec), "holds 1 cell(s), the benchmark's definition holds 2")
+
+
+DECLARED_CASES = [
+    ("the declared cells cut to one, the noise and re-run lists and the counts cleared", claim_less, "the baseline's cells are not the benchmark's 38 cells"),
+    ("a declared cell that is not the benchmark's", lambda r: r["decode_matrix"].update(cells=r["decode_matrix"]["cells"] + ["decode;N=9;H=9;regime=cold;"]), "unexpected ['decode;N=9;H=9;regime=cold;']"),
+    ("a chain campaign declared with one cell", lambda r: (r["layer_chain"].update(cells=[CHAIN_CELL]), [r["layer_chain"][f].update((m, 0 if f == "cells_needing_rerun" else []) for m in r["layer_chain"][f])
+                                                         for f in ("cells_needing_rerun", "rerun_cells", "noise_limited_cells")]), "the baseline's cells are not the benchmark's 2 cells"),
+    ("a metric missing from the declared metrics", lambda r: r["decode_matrix"].update(metrics=[m for m in r["decode_matrix"]["metrics"] if m != "cpu_eager_us"]),
+     "the baseline's metrics ['cpu_graph_us', 'gpu_eager_us', 'gpu_graph_us', 'total_us'] are not the campaign's"),
+    ("a metric that the benchmark does not have", lambda r: r["layer_chain"].update(metrics=["k2_stage_us"], final_verdicts={"k2_stage_us": "PASS"}, first_campaign_verdicts={"k2_stage_us": "PASS"},
+                                                                                      noise_limited_cells={"k2_stage_us": []}, rerun_cells={"k2_stage_us": []}, cells_needing_rerun={"k2_stage_us": 0},
+                                                                                      worst_abs_median_delta_pct={"k2_stage_us": 0.0}), "the baseline's metrics ['k2_stage_us'] are not the campaign's"),
+    ("a tolerance of 3 %", lambda r: r["decode_matrix"].update(tolerance_pct=3.0), "the baseline's tolerance is 3.0 %, the regress gate is 1.0 %"),
+    ("a tolerance of 50 %", lambda r: r["layer_chain"].update(tolerance_pct=50), "the baseline's tolerance is 50 %, the regress gate is 1.0 %"),
+    ("a decode campaign under the name of the chain's", lambda r: r["layer_chain"].update(bench="decode"), "the baseline's layer_chain campaign is of the benchmark 'decode'"),
+]
+
+
+@pytest.mark.parametrize("name,edit,expected", DECLARED_CASES, ids=[c[0] for c in DECLARED_CASES])
+def test_a_declared_cell_metric_or_tolerance_that_is_not_the_benchmarks_is_rejected(baseline, name, edit, expected):
+    rec, _ = baseline
+    problems = rc.baseline_problems(mutated(rec, edit))
+    assert has(problems, expected), (name, problems[:3])
+
+
+def test_the_declared_coverage_is_checked_without_the_raw_records_too(baseline):
+    """Raw records that are not there cannot excuse a baseline that declares less than the benchmark: ``allow_missing_raw`` skips the raw records, not the declared coverage."""
+    rec, _ = baseline
+    cut = mutated(rec, claim_less)
+    for path in rec["decode_matrix"]["records_first"]["A"] + rec["decode_matrix"]["records_rerun"]["B"]:
+        Path(path).unlink()
+    assert has(rc.baseline_problems(cut, allow_missing_raw=True), "the baseline's cells are not the benchmark's 38 cells")
+    assert rc.baseline_problems(rec, allow_missing_raw=True) == []                                      # an honest baseline without a part of its raw records passes
+    assert has(rc.baseline_problems(rec), "cannot be read again")
+
+
+def foreign_cell_everywhere(source=NOISY, key="decode;N=9;H=12;regime=lockstep;"):
+    """A cell that the benchmark does not have, a copy of ``source`` under another key, in the record: where a record file holds ``source`` it holds the foreign cell too."""
+    def edit(rec):
+        for cell in [c for c in rec["cells"] if c["key"] == source]:
+            rec["cells"].append(dict(copy.deepcopy(cell), key=key))
+    return edit
+
+
+def test_the_cell_sets_per_file_and_per_metric_are_cross_checked(baseline):
+    rec, _ = baseline
+    rerun_a = rec["decode_matrix"]["records_rerun"]["A"][0]
+    original = Path(rerun_a).read_text()
+    data = json.loads(original)
+    data["cells"] = []
+    Path(rerun_a).write_text(json.dumps(data))
+    assert has(rc.baseline_problems(rec), "no cells")                                                          # a re-run file that holds no cell
+    data["cells"] = json.loads(original)["cells"] + [dict(json.loads(original)["cells"][0], key="decode;N=9;H=9;regime=lockstep;")]
+    Path(rerun_a).write_text(json.dumps(data))
+    problems = rc.baseline_problems(rec)
+    assert has(problems, "holds cell(s) that the benchmark's definition does not have: ['decode;N=9;H=9;regime=lockstep;']")       # a re-run file with a foreign cell
+    Path(rerun_a).write_text(original)
+    assert rc.baseline_problems(rec) == []
+    damage(rec, "decode_matrix", foreign_cell_everywhere())                                                   # the same cell in every file of the campaign: the comparator is satisfied
+    problems = rc.baseline_problems(rec)
+    assert has(problems, "holds 39 cell(s), the benchmark's definition holds 38") and has(problems, "unexpected ['decode;N=9;H=12;regime=lockstep;']")
+    assert has(problems, "the re-run record") and has(problems, "does not have")
+
+
+SUMMARY_CASES = [
+    ("a noise list emptied", lambda r: r["decode_matrix"]["noise_limited_cells"].update(gpu_graph_us=[]), "noise_limited_cells of gpu_graph_us lists 0 cell(s), the raw records give 1"),
+    ("a steady cell in the noise list", lambda r: r["decode_matrix"]["noise_limited_cells"].update(gpu_graph_us=[NOISY, SETTLING]), "noise_limited_cells of gpu_graph_us lists 2 cell(s), the raw records give 1"),
+    ("a noisy cell that the host loop metrics do not judge", lambda r: r["decode_matrix"]["noise_limited_cells"].update(cpu_graph_us=[SETTLING]), "noise_limited_cells of cpu_graph_us"),
+    ("a noise list for the kernel sum, which is steady", lambda r: r["decode_matrix"]["noise_limited_cells"].update(total_us=[NOISY]), "noise_limited_cells of total_us lists 1 cell(s), the raw records give 0"),
+    ("a re-run list emptied together with its count", lambda r: (r["decode_matrix"]["rerun_cells"].update(gpu_graph_us=[]), r["decode_matrix"]["cells_needing_rerun"].update(gpu_graph_us=0)),
+     "rerun_cells of gpu_graph_us lists 0 cell(s), the raw records give 2"),
+    ("a cell in the re-run list that was not re-run", lambda r: r["decode_matrix"]["rerun_cells"].update(gpu_graph_us=[NOISY, SETTLING, SHIFTED]), "rerun_cells of gpu_graph_us lists 3 cell(s), the raw records give 2"),
+    ("a cell missing from the re-run list (and the count lowered to the list)", lambda r: (r["decode_matrix"]["rerun_cells"].update(gpu_eager_us=[NOISY]), r["decode_matrix"]["cells_needing_rerun"].update(gpu_eager_us=1)),
+     "rerun_cells of gpu_eager_us lists 1 cell(s), the raw records give 2"),
+    ("no cell needing a re-run in gpu_graph_us", lambda r: r["decode_matrix"]["cells_needing_rerun"].update(gpu_graph_us=0), "cells_needing_rerun of gpu_graph_us is 0, the raw records give 2"),
+    ("two cells needing a re-run in the kernel sum, which is steady", lambda r: r["decode_matrix"]["cells_needing_rerun"].update(total_us=2), "cells_needing_rerun of total_us is 2, the raw records give 0"),
+    ("a worst difference of 0.0 where the raw records give 0.4", lambda r: r["decode_matrix"]["worst_abs_median_delta_pct"].update(gpu_graph_us=0.0),
+     "worst_abs_median_delta_pct of gpu_graph_us is 0.0, the raw records give "),
+    ("a worst difference that is a little too small", lambda r: r["decode_matrix"]["worst_abs_median_delta_pct"].update(gpu_graph_us=0.39), "worst_abs_median_delta_pct of gpu_graph_us is 0.39"),
+    ("a worst difference for a metric that has none", lambda r: r["decode_matrix"]["worst_abs_median_delta_pct"].update(cpu_graph_us=0.4), "worst_abs_median_delta_pct of cpu_graph_us is 0.4, the raw records give 0.0"),
+]
+
+
+@pytest.mark.parametrize("name,edit,expected", SUMMARY_CASES, ids=[c[0] for c in SUMMARY_CASES])
+def test_every_saved_summary_is_recomputed_from_the_raw_records(baseline, name, edit, expected):
+    rec, _ = baseline
+    problems = rc.baseline_problems(mutated(rec, edit))
+    assert has(problems, expected), (name, problems[:3])
+
+
+def test_the_rerun_files_hold_the_cells_that_needed_a_rerun(baseline_original, tmp_path):
+    """The driver re-runs the cells that were unstable in some metric: a re-run of a steady cell (the comparator judges it on its re-run and finds nothing wrong) is not what was measured."""
+    rec, _ = baseline_original
+    extra = "decode;N=1;H=12;regime=lockstep;"
+    extra_rerun = mutated(rec, lambda r: r["decode_matrix"].update(baseline_campaign(tmp_path, "decode", rerun_keys=[NOISY, SETTLING, extra])))
+    problems = rc.baseline_problems(extra_rerun)
+    assert has(problems, "the re-run records hold 3 cell(s), the cells that needed a re-run are 2: missing [], unexpected ['%s']" % extra)
+    assert has(problems, "rerun_cells of gpu_graph_us lists 2 cell(s), the raw records give 3")
+
+
+def test_a_noisy_chain_cell_with_its_rerun_is_recomputed_like_a_decode_cell(tmp_path):
+    entry = baseline_campaign(tmp_path, "chain", noisy={CHAIN_CELL: 0.01}, rerun_keys=[CHAIN_CELL], saved=SAVED_CHAIN_NOISY)
+    assert rc.campaign_problems(entry, "layer_chain", tbt.BASE_COMMIT) == []
+    for name, edit, expected in (
+            ("a noise list emptied", lambda e: e["noise_limited_cells"].update(gpu_graph_us=[]), "noise_limited_cells of gpu_graph_us lists 0 cell(s), the raw records give 1"),
+            ("a steady kernel sum in the noise list", lambda e: e["noise_limited_cells"].update(total_us=[CHAIN_CELL]), "noise_limited_cells of total_us lists 1 cell(s), the raw records give 0"),
+            ("no cell needing a re-run", lambda e: e["cells_needing_rerun"].update(cpu_graph_us=0), "cells_needing_rerun of cpu_graph_us is 0, the raw records give 1"),
+            ("the second cell in the re-run list", lambda e: e["rerun_cells"].update(total_us=[CHAIN_CELL, CHAIN_KEYS[1]]), "rerun_cells of total_us lists 2 cell(s), the raw records give 1")):
+        assert has(rc.campaign_problems(mutated(entry, lambda e: edit(e)), "layer_chain", tbt.BASE_COMMIT), expected), name
+    quiet = baseline_campaign(tmp_path, "chain")                                                                  # the stable campaign says that a re-run took place: it did not
+    assert has(rc.campaign_problems(dict(quiet, **dict((f, copy.deepcopy(SAVED_CHAIN_NOISY[f])) for f in ("rerun_cells", "cells_needing_rerun"))), "layer_chain", tbt.BASE_COMMIT), "no re-run record is named")
+
+
+def test_the_same_raw_files_listed_for_both_sides_are_not_a_baseline(baseline):
+    """With the files of side A named for side B too, the interleaving rule is met by ties, every difference is 0 and every verdict is PASS: no comparison was made."""
+    rec, d = baseline
+    first = rec["decode_matrix"]["records_first"]
+    problems = rc.baseline_problems(mutated(rec, lambda r: r["decode_matrix"]["records_first"].update(B=list(first["A"]))))
+    assert has(problems, "is listed 2 times (records_first A, records_first B)")
+    problems = rc.baseline_problems(mutated(rec, lambda r: r["decode_matrix"]["records_rerun"].update(B=list(r["decode_matrix"]["records_rerun"]["A"]))))
+    assert has(problems, "is listed 2 times (records_rerun A, records_rerun B)")
+    problems = rc.baseline_problems(mutated(rec, lambda r: r["layer_chain"]["records_first"].update(A=[r["layer_chain"]["records_first"]["A"][0]] * 3)))
+    assert has(problems, "is listed 3 times (records_first A, records_first A, records_first A)")
+    spelled = [os.path.join(os.path.dirname(first["A"][0]), ".", os.path.basename(first["A"][0]))] + first["A"][1:]                    # the same file under another spelling of its path
+    problems = rc.baseline_problems(mutated(rec, lambda r: r["decode_matrix"]["records_first"].update(B=spelled)))
+    assert has(problems, "is listed 2 times")
+    gone = [str(d / "gone.json")] * 3
+    assert has(rc.baseline_problems(mutated(rec, lambda r: r["layer_chain"]["records_first"].update(A=gone)), allow_missing_raw=True), "is listed 3 times")        # no raw record is read for it
+
+
+def test_a_self_check_label_cannot_vouch_for_contradicting_raw_records(baseline):
+    rec, _ = baseline
+    assert rec["self_check"]["ok"] is True and rc.baseline_problems(rec) == []
+    problems = rc.baseline_problems(mutated(rec, lambda r: r.update(tag="b300")))                               # a defect outside the campaigns: no raw record contradicts the label
+    assert has(problems, "does not occur in the GPU name") and not has(problems, "the self-check says ok")
+    damage(rec, "decode_matrix", drop_cell(COLD_128))
+    problems = rc.baseline_problems(rec)
+    assert has(problems, "the self-check says ok but the raw records contradict it") and has(problems, "holds 37 cell(s)")
+    problems = rc.baseline_problems(mutated(rec, lambda r: r["self_check"].update(ok=False)))                    # a self-check that did not pass says so itself
+    assert has(problems, "self-check of the assembler did not pass") and not has(problems, "the self-check says ok")
+
+
+CONTRACT_CASES = [
+    ("one-trial pooled records on both sides", "decode_matrix", one_trial_pooled, "process_median"),
+    ("pooled records of five trials", "decode_matrix", set_meta(sample_stat="pooled"), "process_median"),
+    ("three trials declared and held", "decode_matrix", both(set_meta(trials=3), keep_samples(3)), "at least 5 are required for a per-process median"),
+    ("five trials declared, four held", "layer_chain", keep_samples(4), "holds 4 trial(s) but the record declares 5"),
+    ("records of another kind", "layer_chain", set_meta(kind="decode-wall"), "is not a chain-wall record"),
+    ("no calls per trial", "decode_matrix", drop_arg("calls_per_trial"), "positive integer"),
+    ("every cell measures N = 1, H = 1, lock-step, position 0", "decode_matrix", set_args({"N": 1, "H": 1, "regime": "lockstep", "pos": 0}), "workload its key names"),
+    ("a chain cell of another model width", "layer_chain", set_args({"Dm": 4096}, [CHAIN_CELL]), "workload its key names"),
+]
+
+
+@pytest.mark.parametrize("name,campaign,edit,expected", CONTRACT_CASES, ids=[c[0][:70] for c in CONTRACT_CASES])
+def test_the_raw_records_of_a_consolidated_campaign_meet_the_campaign_contract(baseline, name, campaign, edit, expected):
+    rec, _ = baseline
+    assert rc.baseline_problems(rec) == []
+    damage(rec, campaign, edit)
+    problems = rc.baseline_problems(rec)
+    assert has(problems, expected), (name, problems[:3])
+
+
+def test_the_host_and_the_device_of_the_raw_records_are_the_baselines(baseline):
+    rec, _ = baseline
+    assert has(rc.baseline_problems(mutated(rec, lambda r: r["decode_matrix"].update(host="node-z"))), "the baseline says the campaign ran on 'node-z', the raw records are of the host %s" % BASELINE_HOST)
+    assert has(rc.baseline_problems(mutated(rec, lambda r: r["layer_chain"].pop("host"))), "host must name the node")
+    damage(rec, "decode_matrix", set_meta(host="node-y"), "A")                                                 # two nodes inside one campaign
+    assert has(rc.baseline_problems(rec), "the raw records come from 2 hosts (node-a-b200, node-y)")
+    damage(rec, "decode_matrix", set_meta(host=BASELINE_HOST), "A")
+    damage(rec, "layer_chain", set_meta(host="node-z"))                                                        # the chain campaign on another node, its raw records and its claim moved there together
+    other = mutated(rec, lambda r: r["layer_chain"].update(host="node-z"))
+    assert has(rc.baseline_problems(other), "the decode matrix ran on '%s' and the layer chain on 'node-z'" % BASELINE_HOST)
+    damage(rec, "layer_chain", set_meta(host=BASELINE_HOST))
+    assert rc.baseline_problems(rec) == []
+    damage(rec, "decode_matrix", set_meta(gpu="NVIDIA B300 SXM6 AC"))                                          # the raw records of another device under this device's baseline
+    assert has(rc.baseline_problems(rec), "12 raw record(s) are not of the baseline's device 'NVIDIA B200' with 148 SMs, the first, ")
+    damage(rec, "decode_matrix", set_meta(gpu="NVIDIA B200", sm_count=132))
+    assert has(rc.baseline_problems(rec), "is of 'NVIDIA B200' with 132 SMs")
+
+
+def test_a_campaign_over_other_cells_is_judged_against_the_cells_its_caller_expects(tmp_path):
+    """A campaign of four of the benchmark's cells that its caller expects (a parameter of the caller: the record cannot say what the coverage is); the host loop metrics judge the lock-step cells."""
+    four, loop = [NOISY, SETTLING, SHIFTED, COLD_128], [NOISY, SHIFTED]
+    expected = {"gpu_graph_us": sorted(four), "gpu_eager_us": sorted(four), "total_us": sorted(four), "cpu_graph_us": sorted(loop), "cpu_eager_us": sorted(loop)}
+    entry = baseline_campaign(tmp_path, "decode", keys=four)
+    assert rc.campaign_problems(entry, "decode_matrix", tbt.BASE_COMMIT, expected=expected) == []
+    assert has(rc.campaign_problems(entry, "decode_matrix", tbt.BASE_COMMIT), "the baseline's cells are not the benchmark's 38 cells")           # by default the coverage is the benchmark's own
+    three = dict((m, [k for k in v if k != COLD_128]) for m, v in expected.items())                                                  # the caller expects one cell less than the campaign declares
+    assert has(rc.campaign_problems(entry, "decode_matrix", tbt.BASE_COMMIT, expected=three), "the baseline's cells are not the expected 3 cells (missing [], unexpected ['%s'])" % COLD_128)
+    five = dict(expected, gpu_graph_us=sorted(four + [PROBE_CELL]), gpu_eager_us=sorted(four + [PROBE_CELL]), total_us=sorted(four + [PROBE_CELL]))     # one cell more than the raw records hold
+    problems = rc.campaign_problems(dict(entry, cells=sorted(four + [PROBE_CELL])), "decode_matrix", tbt.BASE_COMMIT, expected=five)
+    assert has(problems, "holds 4 cell(s), the expected cell set holds 5: missing ['%s']" % PROBE_CELL)
+    no_eager = dict((m, v) for m, v in expected.items() if m != "cpu_eager_us")                                                      # the metrics are the caller's too
+    assert has(rc.campaign_problems(entry, "decode_matrix", tbt.BASE_COMMIT, expected=no_eager), "the baseline's metrics")
+
+
+def test_the_cell_set_and_judged_cells_rules_of_the_final_record_are_shared(tmp_path):
+    """The two rules that the final record and the baseline share, on literal inputs: the messages are the final record's."""
+    cells = ["decode;N=1;H=12;regime=cold;", "decode;N=4;H=12;regime=cold;"]
+    rec = lambda keys: {"cells": [{"key": k} for k in keys]}
+    loaded = {"a1": rec(cells), "a2": rec(cells[:1]), "x1": rec(cells[:1]), "x2": rec([]), "x3": rec(cells + ["decode;N=9;H=9;regime=cold;"]), "b1": rec(cells)}
+    problems = rc.cell_set_problems(loaded, {"A": ["a1", "a2"], "B": ["b1"]}, {"A": ["x1", "x2", "x3"], "B": []}, cells, "benchmark's definition", "w")
+    assert problems == ["w: the raw record a2 holds 1 cell(s), the benchmark's definition holds 2: missing ['decode;N=4;H=12;regime=cold;'], unexpected []",
+                        "w: the re-run record x2 holds no cell: a re-run file holds the cells that were re-run",
+                        "w: the re-run record x3 holds cell(s) that the benchmark's definition does not have: ['decode;N=9;H=9;regime=cold;']"]
+    assert rc.cell_set_problems(loaded, {"A": ["a1"], "B": ["b1"]}, {"A": ["x1"], "B": []}, cells, "flagged set", "w") == []
+    assert rc.judged_cells_problems(cells, list(reversed(cells)), "flagged set", "w, m") == []
+    assert rc.judged_cells_problems(cells[:1], cells, "flagged set", "w, m") == ["w, m: the raw records judge 1 cell(s), the flagged set has 2: missing ['decode;N=4;H=12;regime=cold;'], unexpected []"]
+
+
+def test_the_declared_coverage_is_the_benchmarks_or_the_callers():
+    spec = {"bench": "chain", "tolerance_pct": 1.0, "metrics": list(rc.CANONICAL_METRICS["chain"]), "cells": sorted(CHAIN_KEYS)}
+    assert rc.declared_coverage_problems(spec, "chain", "w") == []
+    assert rc.declared_coverage_problems(dict(spec, tolerance_pct=1), "chain", "w") == []                      # the integer 1 is the same tolerance
+    assert rc.declared_coverage_problems(dict(spec, bench="decode"), "chain", "w") == ["w: the baseline's layer_chain campaign is of the benchmark 'decode'"]
+    assert rc.declared_coverage_problems(dict(spec, tolerance_pct=2.0), "chain", "w") == ["w: the baseline's tolerance is 2.0 %, the regress gate is 1.0 %"]
+    assert rc.declared_coverage_problems(dict(spec, metrics=["gpu_graph_us"]), "chain", "w") == ["w: the baseline's metrics ['gpu_graph_us'] are not the campaign's ['cpu_graph_us', 'gpu_graph_us', 'total_us']"]
+    assert rc.declared_coverage_problems(dict(spec, cells=CHAIN_KEYS[:1]), "chain", "w")[0].startswith("w: the baseline's cells are not the benchmark's 2 cells (missing")
+    mine = {"gpu_graph_us": [CHAIN_CELL]}
+    assert rc.declared_coverage_problems(dict(spec, metrics=["gpu_graph_us"], cells=[CHAIN_CELL]), "chain", "w", expected=mine) == []
+    assert rc.declared_coverage_problems(dict(spec, metrics=["gpu_graph_us"]), "chain", "w", expected=mine) == ["w: the baseline's cells are not the expected 1 cells (missing [], unexpected ['%s'])" % CHAIN_KEYS[1]]
+
+
+def test_the_baseline_command_line_rejects_a_missing_cell(baseline, capsys):
+    rec, d = baseline
+    rec.pop("_path")
+    path = d / "baseline.json"
+    path.write_text(json.dumps(rec))
+    assert rc.main(["baseline", "--record", str(path)]) == 0
+    capsys.readouterr()
+    damage(rec, "decode_matrix", drop_cell(COLD_128))                                                          # the raw records change under the same baseline: it said complete
+    assert rc.main(["baseline", "--record", str(path)]) == 1
+    out = capsys.readouterr().out
+    assert "VERDICT: FAIL" in out and "holds 37 cell(s), the benchmark's definition holds 38" in out
+    cut = d / "baseline-cut.json"
+    cut.write_text(json.dumps(mutated(rec, claim_less)))
+    for p in rec["decode_matrix"]["records_first"]["A"]:
+        Path(p).unlink()
+    assert rc.main(["baseline", "--record", str(cut), "--allow-missing-raw"]) == 1                              # the raw records are gone: the declared coverage is still not the benchmark's
+    assert "the baseline's cells are not the benchmark's 38 cells" in capsys.readouterr().out
+    assert rc.main(["baseline", "--record", str(path), "--allow-missing-raw"]) == 0                             # and a baseline that declares the benchmark's coverage passes without its raw records
+    with pytest.raises(SystemExit):                                                                              # the coverage that a campaign is expected to have is a parameter of the caller, not an option
+        rc.main(["baseline", "--record", str(path), "--expected", "x"])

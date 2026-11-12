@@ -25,8 +25,12 @@ ncu      ``cfbi-ncu-segments-v1`` records (``benchmarks/micro/ncu_segments.py --
          sampling interval), the hashes of the report and of the source page, segments that add up to the totals, and enough stall samples (a launch with fewer than 1000 says nothing
          about a segment); ``--device`` demands every shape at the required position for every device.
 suite    two ``cfbi-suite-v1`` records: both valid, of the same suite, device, environment and toolchain, no file with fewer passed tests, no failure that is not allowed.
-baseline ``cfbi-baseline-v2`` (the consolidated baseline of one device): its own consistency (the self-check of the assembler passed, every A/A verdict is PASS), every raw record it
-         names loaded again and validated with the committed validators, every verdict recomputed with the committed comparator, the suite records validated.
+baseline ``cfbi-baseline-v2`` (the consolidated baseline of one device): its own consistency (the self-check of the assembler passed, every A/A verdict is PASS) and the coverage that it declares
+         (the benchmark's own cells, metrics and tolerance, which no raw record is needed to check); every raw record it names listed once, loaded again and validated with the committed
+         validators (Method M records of the benchmark's own workload, every cell of the benchmark in each first-campaign file, the device's GPU, one host); everything that it saves about a
+         campaign (the verdicts, the judged cells, the cells that needed a re-run, the cells that were re-run, the noise-limited cells, the worst difference, the host) recomputed from those
+         records with the committed comparator under the campaign driver's parameters, and the cells of the re-run files equal to the cells that needed one; a self-check that says ok does not
+         vouch for a campaign whose raw records contradict it; the suite records validated. ``--allow-missing-raw`` skips only what needs a raw record.
 commit   the record commit rule of the final validation records: the commit that a record names differs from HEAD only under ``docs/``. Historical records (profile, baseline, per-step
          A/B) are checked against their own snapshot commit instead, never against HEAD.
 markers  the step ledger names for every step the identifiers that only that step adds (or ``none``); the checker reads the names from the ledger and never hard-codes them. It searches
@@ -481,9 +485,30 @@ def _paths(listing):
     return [p for side in ("A", "B") for p in (listing.get(side) or [])] if isinstance(listing, dict) else []
 
 
-def campaign_problems(c, name, commit, allow_missing_raw=False):
-    """One A/A campaign of a consolidated baseline (the decode matrix or the layer chain): keys and types, the verdicts, the raw records loaded again and validated, and every
-    verdict recomputed with the committed comparator."""
+def campaign_summary(first, rerun, metrics, tolerance, commit, bench, cells=None):
+    """What the campaign driver derives from the raw records of a campaign, per metric, with its own parameters (``compare_kwargs``). ``first`` and ``rerun`` are ``(baseline records, candidate
+    records)`` of the first campaign and of the re-run (empty lists: no re-run). The first campaign alone gives the verdict ``first`` and the cells that need a re-run (``needing``); with the re-run
+    it gives the verdict ``final`` (and its ``problems``), the cells it judged (``judged``), the ones judged on the re-run (``rerun``), the noise-limited ones (``noise_limited``) and the largest
+    absolute difference of the medians in percent (``worst``, None without a row). ``cells``: ``{metric: [cell keys]}`` that a campaign over other cells judges; by default every metric is judged on
+    the cells that the benchmark's campaign gives it (``metric_cells``)."""
+    out = {}
+    for m in metrics:
+        kw = compare_kwargs(m, tolerance, commit, metric_cells(bench, m) if cells is None else list(cells[m]))
+        initial = br.compare(first[0], first[1], **kw)
+        final = br.compare(first[0], first[1], base_rerun=rerun[0] or None, cand_rerun=rerun[1] or None, **kw)
+        out[m] = {"first": initial["verdict"], "final": final["verdict"], "problems": final["problems"], "judged": sorted(r["key"] for r in final["rows"]),
+                  "needing": sorted(r["key"] for r in initial["rows"] if r.get("needs_rerun")), "rerun": sorted(r["key"] for r in final["rows"] if r["judged_on"] == "rerun"),
+                  "noise_limited": sorted(r["key"] for r in final["rows"] if r["noise_limited"]), "worst": max((abs(r["median_delta_pct"]) for r in final["rows"]), default=None)}
+    return out
+
+
+def campaign_problems(c, name, commit, allow_missing_raw=False, expected=None, device=None):
+    """One A/A campaign of a consolidated baseline (the decode matrix or the layer chain), recomputed from its raw records. Keys and types; the declared coverage, which is the benchmark's own
+    (``declared_coverage_problems``; ``expected`` = ``{metric: [cell keys]}`` is the coverage of a campaign over other cells, a parameter of the caller and never read from the record); every raw
+    file listed once; the raw records loaded again and validated (the commit, the clean tree, one configuration per side, Method M records of the benchmark's own workload, the cells of the coverage
+    in every first-campaign file, the host, and ``device`` = ``(GPU, SM count)`` when given); and every saved figure compared with the same figure recomputed from the raw records with the campaign
+    driver's parameters (``campaign_summary``): the verdicts, the judged cells, the cells that needed a re-run, the cells that were re-run, the noise-limited cells, the worst difference, and the
+    cells of the re-run files, which are the cells that needed one. The declared coverage and the listing need no raw record, so ``allow_missing_raw`` does not skip them."""
     where = "baseline campaign %s" % name
     if not isinstance(c, dict):
         return ["%s: missing" % where]
@@ -503,12 +528,18 @@ def campaign_problems(c, name, commit, allow_missing_raw=False):
         problems.append("%s: bench must be decode or chain, got %r" % (where, c.get("bench")))
     if c.get("a") != c.get("b") or not text(c.get("a")):
         problems.append("%s: a baseline is an A/A campaign: both sides must be the same tree (a=%r, b=%r)" % (where, c.get("a"), c.get("b")))
+    if not text(c.get("host")):
+        problems.append("%s: host must name the node that the campaign ran on" % where)
     for field in ("final_verdicts", "first_campaign_verdicts", "noise_limited_cells", "rerun_cells", "cells_needing_rerun", "worst_abs_median_delta_pct"):
         got = c.get(field)
         if not isinstance(got, dict) or any(m not in got for m in metrics):
             problems.append("%s: %s must have an entry for every metric" % (where, field))
     if problems:
         return problems
+    campaign = CAMPAIGN_OF.get(name, c["bench"])
+    problems.extend(declared_coverage_problems(c, campaign, where, expected))          # before any raw record is read: a baseline without its raw records still declares the benchmark's coverage
+    wanted = canonical_coverage(campaign) if expected is None else dict((m, sorted(keys)) for m, keys in expected.items())
+    every, what = sorted(set(k for keys in wanted.values() for k in keys)), "benchmark's definition" if expected is None else "expected cell set"
     for m in metrics:
         if c["final_verdicts"][m] != "PASS":
             problems.append("%s: the final verdict of %s is %r: a baseline needs PASS on every metric" % (where, m, c["final_verdicts"][m]))
@@ -524,45 +555,89 @@ def campaign_problems(c, name, commit, allow_missing_raw=False):
     first, rerun = c.get("records_first"), c.get("records_rerun")
     if not (isinstance(first, dict) and isinstance(rerun, dict)):
         return problems + ["%s: records_first and records_rerun must be given as {A: [...], B: [...]}" % where]
+    first, rerun = [dict((s, d[s] if isinstance(d.get(s), list) else []) for s in ("A", "B")) for d in (first, rerun)]        # a side that is not a list holds no record
     for side in ("A", "B"):
-        if len(first.get(side) or []) != c["samples_per_side"]:
-            problems.append("%s: records_first holds %d record(s) for %s, samples_per_side is %d" % (where, len(first.get(side) or []), side, c["samples_per_side"]))
-    if len(rerun.get("A") or []) != len(rerun.get("B") or []):
+        if len(first[side]) != c["samples_per_side"]:
+            problems.append("%s: records_first holds %d record(s) for %s, samples_per_side is %d" % (where, len(first[side]), side, c["samples_per_side"]))
+    if len(rerun["A"]) != len(rerun["B"]):
         problems.append("%s: records_rerun must hold as many records for A as for B" % where)
-    if any(c["cells_needing_rerun"][m] for m in metrics) and not rerun.get("A"):
+    if any(c["cells_needing_rerun"][m] for m in metrics) and not rerun["A"]:
         problems.append("%s: cells need a re-run and no re-run record is named" % where)
+    paths = _paths(first) + _paths(rerun)
+    if not all(text(p) for p in paths):
+        return problems + ["%s: records_first and records_rerun must name the raw records by their paths" % where]
+    listed = {}
+    for label, listing in (("records_first", first), ("records_rerun", rerun)):
+        for side in ("A", "B"):
+            for path in listing[side]:
+                listed.setdefault(os.path.realpath(path), []).append("%s %s" % (label, side))
+    for path, uses in sorted(listed.items()):
+        if len(uses) > 1:                                              # one file is one process of one side: the same file for both sides is no comparison at all
+            problems.append("%s: the raw record %s is listed %d times (%s): a record file is one process of one side of one campaign" % (where, path, len(uses), ", ".join(uses)))
     loaded = {}
-    for path in _paths(first) + _paths(rerun):
+    for path in paths:
         try:
             loaded[path] = br.load_record(path)
         except (OSError, ValueError) as e:
             if not allow_missing_raw:
                 problems.append("%s: the raw record %s cannot be read again (%s)" % (where, path, e))
-    if problems or len(loaded) != len(_paths(first) + _paths(rerun)):
+    if problems or len(loaded) != len(paths):
         return problems
     for path, rec in sorted(loaded.items()):
         problems.extend(br.validate_record(rec, "baseline", commit, True))
     for label, listing in (("first campaign", first), ("re-run", rerun)):
         for side in ("A", "B"):
-            if listing.get(side):
+            if listing[side]:
                 problems.extend("%s: %s %s: %s" % (where, label, side, p) for p in br.side_config_problems([loaded[p] for p in listing[side]], "side %s" % side))
     if problems:
         return problems
+    hosts = sorted(set(str((r.get("meta") or {}).get("host")) for r in loaded.values()))
+    if len(hosts) != 1:
+        problems.append("%s: the raw records come from %d hosts (%s): a campaign runs on one allocation" % (where, len(hosts), ", ".join(hosts)))
+    elif c.get("host") != hosts[0]:
+        problems.append("%s: the baseline says the campaign ran on %r, the raw records are of the host %s" % (where, c.get("host"), hosts[0]))
+    wrong = sorted(p for p, r in loaded.items() if device is not None and (r["meta"].get("gpu"), r["meta"].get("sm_count")) != tuple(device))
+    if wrong:
+        meta = loaded[wrong[0]]["meta"]
+        problems.append("%s: %d raw record(s) are not of the baseline's device %r with %r SMs, the first, %s, is of %r with %r SMs" % (where, len(wrong), device[0], device[1], wrong[0], meta.get("gpu"), meta.get("sm_count")))
+    problems.extend(cell_set_problems(loaded, first, rerun, every, what, where))
+    if problems:
+        return problems
+    problems.extend(campaign_contract_problems([loaded[p] for p in paths], campaign, where))        # before the comparator: it judges what it is given, the contract says what is to be given
+    if problems:
+        return problems
     base_first, cand_first = [loaded[p] for p in first["A"]], [loaded[p] for p in first["B"]]
-    base_rerun, cand_rerun = [loaded[p] for p in rerun.get("A") or []], [loaded[p] for p in rerun.get("B") or []]
+    base_rerun, cand_rerun = [loaded[p] for p in rerun["A"]], [loaded[p] for p in rerun["B"]]
+    summary = campaign_summary((base_first, cand_first), (base_rerun, cand_rerun), metrics, TOLERANCE_PCT, commit, campaign, expected)
     for m in metrics:
-        kw = compare_kwargs(m, c["tolerance_pct"], commit, metric_cells(c.get("bench"), m))
-        final = br.compare(base_first, cand_first, base_rerun=base_rerun or None, cand_rerun=cand_rerun or None, **kw)["verdict"]
-        if final != c["final_verdicts"][m]:
-            problems.append("%s: the final verdict of %s is %s when recomputed from the raw records, the baseline says %s" % (where, m, final, c["final_verdicts"][m]))
-        initial = br.compare(base_first, cand_first, **kw)["verdict"]
-        if initial != c["first_campaign_verdicts"][m]:
-            problems.append("%s: the first-campaign verdict of %s is %s when recomputed from the raw records, the baseline says %s" % (where, m, initial, c["first_campaign_verdicts"][m]))
+        s = summary[m]
+        if s["final"] != c["final_verdicts"][m]:
+            problems.append("%s: the final verdict of %s is %s when recomputed from the raw records, the baseline says %s%s"
+                            % (where, m, s["final"], c["final_verdicts"][m], " (%s)" % "; ".join(s["problems"][:2]) if s["final"] == "INVALID" and s["problems"] else ""))
+        if s["first"] != c["first_campaign_verdicts"][m]:
+            problems.append("%s: the first-campaign verdict of %s is %s when recomputed from the raw records, the baseline says %s" % (where, m, s["first"], c["first_campaign_verdicts"][m]))
+        if s["final"] not in ("PASS", "FAIL"):                         # not a measurement: no cell and no figure of it is defined
+            continue
+        problems.extend(judged_cells_problems(s["judged"], wanted[m], what, "%s, %s" % (where, m)))
+        if len(s["needing"]) != c["cells_needing_rerun"][m]:
+            problems.append("%s: cells_needing_rerun of %s is %r, the raw records give %d: %s" % (where, m, c["cells_needing_rerun"][m], len(s["needing"]), s["needing"][:3]))
+        for field, key in (("rerun_cells", "rerun"), ("noise_limited_cells", "noise_limited")):
+            if s[key] != sorted(c[field][m]):
+                problems.append("%s: %s of %s lists %d cell(s), the raw records give %d: %s" % (where, field, m, len(c[field][m]), len(s[key]), _missing_unexpected(s[key], c[field][m])))
+        if not _same(s["worst"], c["worst_abs_median_delta_pct"][m]):
+            problems.append("%s: worst_abs_median_delta_pct of %s is %r, the raw records give %r" % (where, m, c["worst_abs_median_delta_pct"][m], s["worst"]))
+    if all(summary[m]["final"] in ("PASS", "FAIL") for m in metrics):
+        reran = sorted(set(k for r in base_rerun + cand_rerun for k in _cell_keys(r)))
+        needed = sorted(set(k for m in metrics for k in summary[m]["needing"]))
+        if reran != needed:                                            # the driver re-runs exactly the cells that were unstable in some metric of the first campaign
+            problems.append("%s: the re-run records hold %d cell(s), the cells that needed a re-run are %d: %s" % (where, len(reran), len(needed), _missing_unexpected(needed, reran)))
     return problems
 
 
 def baseline_problems(rec, allow_missing_raw=False):
-    """Problems of one ``cfbi-baseline-v2`` record (the consolidated baseline of one device)."""
+    """Problems of one ``cfbi-baseline-v2`` record (the consolidated baseline of one device): its own fields, both campaigns recomputed from their raw records (``campaign_problems``: the declared
+    coverage, the cells, every saved figure; the raw records are of the baseline's device and both campaigns ran on one node), the suite records. A self-check that says ok does not vouch for a
+    campaign whose raw records contradict the record: the self-check is a label, the raw records are the evidence."""
     where = "baseline record %s" % (rec.get("_path", "?") if isinstance(rec, dict) else "?")
     if not isinstance(rec, dict) or rec.get("schema") != BASELINE_SCHEMA:
         return ["%s: not a %s record" % (where, BASELINE_SCHEMA)]
@@ -572,14 +647,24 @@ def baseline_problems(rec, allow_missing_raw=False):
             problems.append("%s: field %r must be a non-empty string" % (where, field))
     if not (text(rec.get("tag")) and rec["tag"].lower() in str(rec.get("gpu", "")).lower()):
         problems.append("%s: the device tag %r does not occur in the GPU name %r" % (where, rec.get("tag"), rec.get("gpu")))
-    check = rec.get("self_check")
+    check, vouches = rec.get("self_check"), False
     if not isinstance(check, dict) or check.get("ok") is not True or check.get("failed") != 0 or check.get("problems") != []:
         problems.append("%s: the self-check of the assembler did not pass" % where)
     elif not (count(check.get("checks"), 1) and isinstance(check.get("list"), list) and len(check["list"]) == check["checks"] and all(isinstance(x, dict) and x.get("ok") is True for x in check["list"])):
         problems.append("%s: the self-check lists %r checks of which not every one passed" % (where, check.get("checks")))
+    else:
+        vouches = True
     commit = rec.get("commit") if hexcommit(rec.get("commit")) else None
+    device = (rec["gpu"], rec["sm_count"]) if text(rec.get("gpu")) and count(rec.get("sm_count"), 1) else None
+    found = []
     for name in ("decode_matrix", "layer_chain"):
-        problems.extend("%s: %s" % (where, p) for p in campaign_problems(rec.get(name), name, commit, allow_missing_raw))
+        found.extend("%s: %s" % (where, p) for p in campaign_problems(rec.get(name), name, commit, allow_missing_raw, device=device))
+    hosts = [rec[name].get("host") for name in ("decode_matrix", "layer_chain") if isinstance(rec.get(name), dict)]
+    if len(hosts) == 2 and hosts[0] != hosts[1]:
+        found.append("%s: the decode matrix ran on %r and the layer chain on %r: a baseline is measured on one node" % (where, hosts[0], hosts[1]))
+    if found and vouches:
+        found.append("%s: the self-check says ok but the raw records contradict it (%d problem(s) in the campaigns)" % (where, len(found)))
+    problems.extend(found)
     suites = rec.get("suites")
     if not isinstance(suites, dict):
         return problems + ["%s: no suites" % where]
@@ -1251,6 +1336,7 @@ def handoff_problems(rec, repo=None, single_launch_adopted=None):
 FINAL_SCHEMA = "cfbi-final-v1"
 CAMPAIGNS = ("decode", "chain")
 CAMPAIGN_KEY = {"decode": "decode_matrix", "chain": "layer_chain"}          # where the consolidated baseline of a device lists the cells and metrics of a campaign
+CAMPAIGN_OF = dict((section, campaign) for campaign, section in CAMPAIGN_KEY.items())      # the benchmark whose campaign a section of a consolidated baseline holds
 TOLERANCE_PCT = 1.0                                                          # the regress gate of Method M
 CANONICAL_METRICS = {"decode": tuple(sorted(br.WALL_METRICS + ("total_us",))), "chain": ("cpu_graph_us", "gpu_graph_us", "total_us")}
 DEVICE_GPU = {"b200": "B200", "b300": "B300"}                                # what the GPU name of the raw records of a device must contain
@@ -1406,25 +1492,61 @@ def report_problems(report, result, where):
     return out
 
 
-def baseline_contract_problems(baseline, dev, campaign, where):
-    """What the consolidated baseline of a device must say about a campaign: the benchmark, the tolerance, the metrics and the cells of the benchmark's own definition (the final
-    campaigns are judged on that coverage, so a baseline that declares less is not an authority for it), and a GPU that is the device."""
-    spec = baseline.get(CAMPAIGN_KEY[campaign])
-    if not isinstance(spec, dict):
-        return ["%s: the baseline has no %s campaign" % (where, CAMPAIGN_KEY[campaign])]
+def declared_coverage_problems(spec, campaign, where, expected=None):
+    """What the consolidated baseline of a device declares about a campaign (``spec``, a campaign entry of the benchmark ``campaign``): the benchmark, the tolerance, the metrics and the cells of the
+    benchmark's own definition, or of ``expected`` = ``{metric: [cell keys]}`` for a campaign over other cells (a parameter of the caller, never read from a record). The final campaigns are judged on
+    that coverage, so a baseline that declares less is not an authority for it. Nothing here reads a raw record."""
+    wanted = canonical_coverage(campaign) if expected is None else expected
+    every = sorted(set(k for keys in wanted.values() for k in keys))
+    owner = "benchmark's" if expected is None else "expected"
     out = []
     if spec.get("bench") != campaign:
         out.append("%s: the baseline's %s campaign is of the benchmark %r" % (where, CAMPAIGN_KEY[campaign], spec.get("bench")))
     if spec.get("tolerance_pct") != TOLERANCE_PCT:
         out.append("%s: the baseline's tolerance is %r %%, the regress gate is %s %%" % (where, spec.get("tolerance_pct"), TOLERANCE_PCT))
-    if sorted(spec.get("metrics") or []) != sorted(CANONICAL_METRICS[campaign]):
-        out.append("%s: the baseline's metrics %s are not the campaign's %s" % (where, sorted(spec.get("metrics") or []), sorted(CANONICAL_METRICS[campaign])))
-    want = sorted(canonical_cells(campaign))
-    if sorted(spec.get("cells") or []) != want:
-        out.append("%s: the baseline's cells are not the benchmark's %d cells (%s)" % (where, len(want), _missing_unexpected(want, spec.get("cells") or [])))
+    if sorted(spec.get("metrics") or []) != sorted(wanted):
+        out.append("%s: the baseline's metrics %s are not the campaign's %s" % (where, sorted(spec.get("metrics") or []), sorted(wanted)))
+    if sorted(spec.get("cells") or []) != every:
+        out.append("%s: the baseline's cells are not the %s %d cells (%s)" % (where, owner, len(every), _missing_unexpected(every, spec.get("cells") or [])))
+    return out
+
+
+def baseline_contract_problems(baseline, dev, campaign, where):
+    """What the consolidated baseline of a device must say about a campaign: the declared coverage (``declared_coverage_problems``: the benchmark, the tolerance, the metrics and the cells of the
+    benchmark's own definition) and a GPU that is the device."""
+    spec = baseline.get(CAMPAIGN_KEY[campaign])
+    if not isinstance(spec, dict):
+        return ["%s: the baseline has no %s campaign" % (where, CAMPAIGN_KEY[campaign])]
+    out = declared_coverage_problems(spec, campaign, where)
     if DEVICE_GPU[dev] not in str(baseline.get("gpu")):
         out.append("%s: the baseline is of the GPU %r, the device is %s" % (where, baseline.get("gpu"), dev))
     return out
+
+
+def cell_set_problems(loaded, first, rerun, every, what, where):
+    """The cells that the raw record files of a campaign hold. ``loaded``: ``{path: record}``; ``first`` and ``rerun``: the ``{A: [paths], B: [paths]}`` listings of the first campaign and of the
+    re-run; ``every``: the sorted keys of the cells of the campaign, whose source ``what`` is named in the messages. A first-campaign file holds every cell of the campaign. A re-run file holds the
+    cells that were re-run: some of them, and none that the campaign does not have."""
+    problems = []
+    for side in ("A", "B"):
+        for path in first[side]:                                  # a first-campaign file holds every cell of the campaign
+            got = _cell_keys(loaded[path])
+            if got != every:
+                problems.append("%s: the raw record %s holds %d cell(s), the %s holds %d: %s" % (where, path, len(got), what, len(every), _missing_unexpected(every, got)))
+        for path in rerun[side]:                                  # a re-run file holds the cells that were re-run: some of them, and none that the campaign does not have
+            got = _cell_keys(loaded[path])
+            if not got:
+                problems.append("%s: the re-run record %s holds no cell: a re-run file holds the cells that were re-run" % (where, path))
+            elif set(got) - set(every):
+                problems.append("%s: the re-run record %s holds cell(s) that the %s does not have: %s" % (where, path, what, sorted(set(got) - set(every))[:3]))
+    return problems
+
+
+def judged_cells_problems(rows, wanted, what, where):
+    """The cells that a comparison recomputed from the raw records judged (``rows``: their keys) are exactly the cells that it must judge (``wanted``, from the source ``what``)."""
+    if sorted(rows) == sorted(wanted):
+        return []
+    return ["%s: the raw records judge %d cell(s), the %s has %d: %s" % (where, len(rows), what, len(wanted), _missing_unexpected(wanted, rows))]
 
 
 def campaign_evidence_problems(entry, where, campaign, dev, baseline, base, a_commit, b_commit, scope=None, allow_rerun=True):
@@ -1487,17 +1609,7 @@ def campaign_evidence_problems(entry, where, campaign, dev, baseline, base, a_co
         wanted = dict((m, sorted(c)) for m, c in scope.items())
         every = sorted(set(k for cells in wanted.values() for k in cells))
         what = "flagged set"
-    for side in ("A", "B"):
-        for path in first[side]:                                  # a first-campaign file holds every cell of the campaign
-            got = _cell_keys(loaded[path])
-            if got != every:
-                problems.append("%s: the raw record %s holds %d cell(s), the %s holds %d: %s" % (where, path, len(got), what, len(every), _missing_unexpected(every, got)))
-        for path in rerun[side]:                                  # a re-run file holds the cells that were re-run: some of them, and none that the campaign does not have
-            got = _cell_keys(loaded[path])
-            if not got:
-                problems.append("%s: the re-run record %s holds no cell: a re-run file holds the cells that were re-run" % (where, path))
-            elif set(got) - set(every):
-                problems.append("%s: the re-run record %s holds cell(s) that the %s does not have: %s" % (where, path, what, sorted(set(got) - set(every))[:3]))
+    problems.extend(cell_set_problems(loaded, first, rerun, every, what, where))
     if problems:
         return problems, info
     problems.extend(campaign_contract_problems([loaded[p] for p in paths], campaign, where))        # before the comparator: it judges what it is given, the contract says what is to be given
@@ -1520,9 +1632,7 @@ def campaign_evidence_problems(entry, where, campaign, dev, baseline, base, a_co
         if res["verdict"] not in ("PASS", "FAIL"):
             problems.append("%s: the comparison recomputed from the raw records is %s, not a measurement: %s" % (w, res["verdict"], "; ".join(res["problems"][:3])))
             continue
-        rows = [r["key"] for r in res["rows"]]
-        if sorted(rows) != sorted(wanted[metric]):
-            problems.append("%s: the raw records judge %d cell(s), the %s has %d: %s" % (w, len(rows), what, len(wanted[metric]), _missing_unexpected(wanted[metric], rows)))
+        problems.extend(judged_cells_problems([r["key"] for r in res["rows"]], wanted[metric], what, w))
         for row in res["rows"]:
             info["rows"][(metric, row["key"])] = row
         if metric in by_metric:
