@@ -829,7 +829,7 @@ def comparison_problems(row, key, entry, resources, meta, where, repo=None):
     identity = row.get("id") in IDENTITY_STEPS
     if identity and entry.get("mode") != "identity":
         problems.append("%s: the mode of the comparison of %s is identity (it changes no kernel of the base and adds an instantiation that gate R bounds), got %r" % (w, row.get("id"), entry.get("mode")))
-    if not identity and entry.get("mode") != "change":
+    elif not identity and entry.get("mode") != "change":
         problems.append("%s: the mode of a step's comparison is change (the row engine differs from the base), got %r" % (w, entry.get("mode")))
     if problems:
         return problems, None

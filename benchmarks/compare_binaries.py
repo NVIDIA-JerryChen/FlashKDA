@@ -146,7 +146,8 @@ def main(argv=None):
             raise ValueError("an alias is CANDIDATE=BASE, and each candidate name may be given once")
         if aliases:
             cand_r = apply_aliases(cand_r, aliases)
-            cand_s = apply_aliases(cand_s, aliases) if cand_s is not None else None
+            if cand_s is not None:
+                cand_s = apply_aliases(cand_s, aliases)
     except (OSError, ValueError) as e:
         print("cannot use the input: %s" % e, file=sys.stderr)
         return 2

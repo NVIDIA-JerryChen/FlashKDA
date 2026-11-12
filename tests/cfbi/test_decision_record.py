@@ -486,14 +486,22 @@ def instantiate_dump(dump):
         kernels["cfbi::rows_kernel<Lb1E>"] = copy.deepcopy(plain)
 
 
+def then(first, second):
+    """One edit of a loaded file: ``first``, then ``second``."""
+    def edit(content):
+        first(content)
+        second(content)
+    return edit
+
+
 def instantiated(record_edit=None, dump_edit=None, dev="b200"):
     """The evidence files of the instantiated commit for both devices; ``record_edit`` / ``dump_edit`` edit the one of ``dev`` after it was instantiated."""
-    files = dict((("occupancy", d), instantiate_record) for d in rc.DEVICES)
-    files.update(dict((("container", d), instantiate_dump) for d in rc.DEVICES))
+    files = {("occupancy", d): instantiate_record for d in rc.DEVICES}
+    files.update({("container", d): instantiate_dump for d in rc.DEVICES})
     if record_edit:
-        files[("occupancy", dev)] = lambda rec: (instantiate_record(rec), record_edit(rec))[0]
+        files[("occupancy", dev)] = then(instantiate_record, record_edit)
     if dump_edit:
-        files[("container", dev)] = lambda d: (instantiate_dump(d), dump_edit(d))[0]
+        files[("container", dev)] = then(instantiate_dump, dump_edit)
     return files
 
 

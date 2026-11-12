@@ -71,10 +71,15 @@ def default_lines(text, macros):
     return out
 
 
+def _joined(numbered_lines):
+    """The text of ``[(line number, line)]``."""
+    return "\n".join(line for _, line in numbered_lines)
+
+
 def default_text(text, macros):
     """The text as a build that defines none of ``macros`` reads it: the branch of ``#ifdef M`` is dropped and its ``#else`` branch kept (``#ifndef M`` the other way round), the
     directive lines of those conditionals are dropped, every other line stays. Only ``#ifdef`` / ``#ifndef`` / ``#else`` / ``#endif`` of a test macro are read; ``#elif`` of one is refused."""
-    return "\n".join(line for _, line in default_lines(text, macros))
+    return _joined(default_lines(text, macros))
 
 
 def strip_comments(text):
@@ -143,8 +148,8 @@ def _views(texts):
         if len(_VIEWS) > 16:
             _VIEWS.clear()
         macros = macros_in(srcs.values())
-        numbered = dict((name, default_lines(text, macros)) for name, text in srcs.items())
-        _VIEWS[key] = (dict((name, "\n".join(line for _, line in lines)) for name, lines in numbered.items()), numbered)
+        numbered = {name: default_lines(text, macros) for name, text in srcs.items()}
+        _VIEWS[key] = ({name: _joined(lines) for name, lines in numbered.items()}, numbered)
     return _VIEWS[key]
 
 
@@ -336,7 +341,7 @@ def stripped_lines(numbered):
     """``(file, line number in the file, line without its comments)`` of the default views (``default_numbered``): a directive in a comment is none, and the directives are still there (``tokens`` drops them)."""
     for name in sorted(numbered):
         lines = numbered[name]
-        text = strip_comments("\n".join(l for _, l in lines)).splitlines()
+        text = strip_comments(_joined(lines)).splitlines()
         assert len(text) == len(lines), "%s: the comments were stripped without keeping the line structure" % name
         for (number, _), line in zip(lines, text):
             yield name, number, line
@@ -367,8 +372,9 @@ def macro_problems(texts, numbered):
         else:
             seen.setdefault(name, []).append((f, ln))
     for name in sorted(ALLOWED_DEFINES):
-        if len(seen.get(name, [])) != 1:
-            out.append(("R12", "the macro %s is defined %d times in the default view (%s), expected once" % (name, len(seen.get(name, [])), ", ".join("%s:%d" % x for x in seen.get(name, [])) or "nowhere")))
+        places = seen.get(name, [])
+        if len(places) != 1:
+            out.append(("R12", "the macro %s is defined %d times in the default view (%s), expected once" % (name, len(places), ", ".join("%s:%d" % x for x in places) or "nowhere")))
     for key in sorted(k for k in texts if k.startswith("flags:")):
         for m in FLAG.finditer(texts[key]):
             if m.group(1) in PINNED and m.group(1) != "CFBI_ROWS_MINB":
@@ -387,8 +393,9 @@ def include_problems(numbered):
         if not m:
             continue
         target = m.group(1)
-        found = (target[len("cfbi/"):] if target.startswith("cfbi/") else target, posixpath.normpath(posixpath.join(posixpath.dirname(name), target)))
-        if not any(f in numbered for f in found):
+        in_source_dir = target[len("cfbi/"):] if target.startswith("cfbi/") else target
+        next_to_includer = posixpath.normpath(posixpath.join(posixpath.dirname(name), target))
+        if in_source_dir not in numbered and next_to_includer not in numbered:
             out.append(("R12", "%s:%d `#include \"%s\"` names a file that the reader does not load, and it could hold a macro that no pin sees" % (name, number, target)))
     return out
 
@@ -416,8 +423,9 @@ def problems(texts):
     except (ValueError, AssertionError) as e:
         return [("R12", "the sources cannot be read as the default build reads them: %s" % e)]
     rows = view["cfbi_rows.cuh"]
-    out.extend(macro_problems(texts, default_numbered(texts)))
-    out.extend(include_problems(default_numbered(texts)))
+    numbered = default_numbered(texts)
+    out.extend(macro_problems(texts, numbered))
+    out.extend(include_problems(numbered))
     for name, allowed in ALLOWED_CONDITIONALS.items():
         for ln, line in stray_conditionals(view[name], allowed):
             out.append(("R12", "%s:%d holds the conditional `%s`, which the rules cannot resolve (an `#if 0` would hide a protocol line from the compiler and leave it in the text)" % (name, ln, line)))

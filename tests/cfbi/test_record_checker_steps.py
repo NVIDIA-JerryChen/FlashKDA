@@ -115,7 +115,8 @@ def comparison(key, commit, instantiations=None, sid="trims", templated=None, **
     instantiations = tuple(instantiations or ((LB0, LB1) if templated else (ROWS,)))
     base, cand = dump_file(key, BASE, "base"), dump_file(key, commit, "cand", templated=templated, **kw)
     bd, cd = cg.load_dump(base), cg.load_dump(cand)
-    allow, mode = SINGLE_ALLOW if templated else None, "identity" if single else "change"
+    allow = SINGLE_ALLOW if templated else None
+    mode = "identity" if single else "change"
     report = cg.compare_dumps(bd, cd, cg.load_allow(allow), mode)
     entry = {"base_dump": base, "cand_dump": cand, "prev_dump": None, "allow": allow, "mode": mode, "instantiations": list(instantiations),
              "verdict": "PASS" if report["exit"] == 0 else "FAIL", "compared": report["compared"], "differences": len(report["differences"])}

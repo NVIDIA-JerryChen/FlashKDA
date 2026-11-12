@@ -217,14 +217,21 @@ def row_names(rec):
 
 def dump_name(name):
     """The key of the machine-code dump for the name that the occupancy API gives an instance (``cfbi::rows_kernel<true>`` is ``cfbi::rows_kernel<Lb1E>``; a plain name stays)."""
-    head, sep, arg = name.partition("<")
-    return head + DUMP_SPELLING.get("<" + arg, "<" + arg) if sep else name
+    head, sep, args = name.partition("<")
+    template_args = sep + args                                     # empty for a plain name
+    return head + DUMP_SPELLING.get(template_args, template_args)
 
 
 def base_row_name(rec):
     """The instance of an occupancy record that is the base's optimised row engine: the plain name, else the instantiation behind the plan kernel (``<false>``); None when it has neither."""
     names = row_names(rec)
     return next((n for n in (ROWS_KERNEL, ROWS_KERNEL + "<false>") if n in names), None)
+
+
+def base_row_instance(rec):
+    """The occupancy instance of the base's optimised row engine (``base_row_name``), or None."""
+    name = base_row_name(rec)
+    return instance(rec, name) if name else None
 
 
 def dump_row_keys(dump, arch):
@@ -404,16 +411,18 @@ def occupancy_problems(rec, dev, container, launch=None, commit=None):
     if not all(rc.count(dv[k], 1) for k in ("registers_per_sm", "shared_per_sm", "threads_per_sm", "reserve_per_cta", "sm_count")) or rec.get("sm_count") != dv["sm_count"]:
         out.append("%s: the device limits (registers, shared memory, threads, reserve, SM count) must be positive integers and the SM count the record's own" % where)
         return out
-    if label_commit(rec, dev) is None:
+    label = label_commit(rec, dev)
+    if label is None:
         out.append("%s: the label %r does not name the device and the commit (%s-<commit>)" % (where, rec.get("label"), dev))
-    elif commit is not None and not rc.commit_matches(label_commit(rec, dev), commit):
-        out.append("%s: the record is of commit %s, the evidence it belongs to is of commit %s" % (where, label_commit(rec, dev), commit))
+    elif commit is not None and not rc.commit_matches(label, commit):
+        out.append("%s: the record is of commit %s, the evidence it belongs to is of commit %s" % (where, label, commit))
     names = row_names(rec)
     if sorted(names) not in ROW_ENGINE_SHAPES:
         out.append("%s: the optimised row engine is named %s: either the plain %s or both of its instantiations <false> and <true>, each once (an instantiation without an occupancy figure is unchecked)"
                    % (where, names or "nowhere", ROWS_KERNEL))
-    covered = set(dump_name(n) for n in names)
-    out.extend("%s: the production dump has the row-engine kernel %s, the record has no instance for it" % (where, key) for key in dump_row_keys(container, DEVICE_ARCH[dev]) if key not in covered)
+    covered = {dump_name(n) for n in names}
+    out.extend("%s: the production dump has the row-engine kernel %s, the record has no instance for it" % (where, key)
+               for key in dump_row_keys(container, DEVICE_ARCH[dev]) if key not in covered)
     for name in (names or [ROWS_KERNEL]) + [REFERENCE_KERNEL]:
         inst = instance(rec, name)
         want = kernel(container, DEVICE_ARCH[dev], dump_name(name))
@@ -442,7 +451,7 @@ def occupancy_problems(rec, dev, container, launch=None, commit=None):
 def retained_launch_problems(rec, dev, launch):
     """The retained Nsight Compute launches of a device against the occupancy instance of the optimised row engine, figure by figure (static, driver and dynamic shared memory, threads,
     registers: a sum alone would let a dynamic figure hide behind a static one)."""
-    inst = instance(rec, base_row_name(rec)) if isinstance(rec, dict) else None            # the profiled launch is the base's row engine
+    inst = base_row_instance(rec) if isinstance(rec, dict) else None                       # the profiled launch is the base's row engine
     dv = occupancy_device(rec) if isinstance(rec, dict) else {}
     if inst is None or not isinstance(launch, dict) or not all(rc.count(inst.get(f)) for f in INSTANCE_FIGURES) or not rc.count(dv.get("reserve_per_cta"), 1):
         return []                                                  # named by the other checks
@@ -539,7 +548,8 @@ def evidence_problems(ev, repo=None):
                 out.append("occupancy record of %s: the launch cannot be read from the sources at commit %s: %s" % (dev, commit, e))
         out.extend(occupancy_problems(rec, dev, (ev.get("container") or {}).get(dev) or {}, launch))
         out.extend(retained_launch_problems(rec, dev, ev.get("launch")))
-    configs = set((inst["threads"], inst["dynamic_smem"]) for r in (ev.get("occupancy") or {}).values() for inst in (instance(r, n) for n in row_names(r)) if inst and inst.get("threads") is not None)
+    row_instances = (instance(r, n) for r in (ev.get("occupancy") or {}).values() for n in row_names(r))
+    configs = {(inst["threads"], inst["dynamic_smem"]) for inst in row_instances if inst and inst.get("threads") is not None}
     if len(configs) > 1:
         out.append("the occupancy records of the two devices describe different launches of the row engine (threads, dynamic shared memory): %s" % sorted(configs))
     return out
@@ -590,7 +600,7 @@ def value_split_inputs(occupancy, heads):
     capacity = []
     for dev in rc.DEVICES:
         d = occupancy_device(occupancy[dev])
-        ctas = instance(occupancy[dev], base_row_name(occupancy[dev]))["ctas_per_sm"]
+        ctas = base_row_instance(occupancy[dev])["ctas_per_sm"]
         slots = d["sm_count"] * ctas
         capacity.append({"device": dev, "sm_count": d["sm_count"], "ctas_per_sm": ctas, "resident_slots": slots,
                          "max_nh_by_slices": [{"slices": s, "one_cta_per_sm": d["sm_count"] // s, "resident_slots": slots // s} for s in (2, 4, 8)]})
@@ -636,8 +646,7 @@ def budget_table(ev, facts, launches):
     for dev in rc.DEVICES:
         rec = occupancy[dev]
         base_name = base_row_name(rec)
-        out["api_instances"][dev] = [{"name": n, "registers": instance(rec, n)["registers"], "static_smem": instance(rec, n)["static_smem"], "dynamic_smem": instance(rec, n)["dynamic_smem"],
-                                      "threads": instance(rec, n)["threads"], "ctas_per_sm": instance(rec, n)["ctas_per_sm"], "label": "api"} for n in row_names(rec) + [REFERENCE_KERNEL]]
+        out["api_instances"][dev] = [{"name": n, **{f: instance(rec, n)[f] for f in INSTANCE_FIGURES}, "label": "api"} for n in row_names(rec) + [REFERENCE_KERNEL]]
         values = [r["launch"]["shared_mem_config_size"] for r in ev["launch"]["reports"] if r["device"] == dev]
         out["carveout"][dev] = {"shared_mem_config_bytes": values[0], "reports": len(values), "label": "measured", "kernel": base_name}
         k = kernel(container[dev], DEVICE_ARCH[dev], dump_name(base_name))
@@ -690,7 +699,7 @@ def budget_table(ev, facts, launches):
                    "ctas_per_sm": ctas_per_sm(GATE_REGISTERS, THREADS, static, dynamic, dv), "ctas_per_sm_label": "arithmetic_at_the_register_ceiling",
                    "l1_upper_bound_bytes": UNIFIED_BYTES - 2 * per_cta, "l1_label": "arithmetic", "label": label}
             if cid == "base" and dv["device"] is not None:
-                api = instance(occupancy[dv["device"]], base_row_name(occupancy[dv["device"]]))
+                api = base_row_instance(occupancy[dv["device"]])
                 carve = out["carveout"][dv["device"]]["shared_mem_config_bytes"]
                 row.update(ctas_per_sm=api["ctas_per_sm"], ctas_per_sm_label="api", l1_after_measured_carveout_bytes=UNIFIED_BYTES - carve, l1_after_measured_carveout_label="model")
             rows.append(row)
