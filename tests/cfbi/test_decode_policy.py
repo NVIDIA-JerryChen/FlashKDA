@@ -5,6 +5,9 @@
   (10, 3) / (12, 0) and H in {6, 12, 33} (and 1, 8: a limit that the grid reaches exactly), the largest N whose grid holds at most the limit and the next larger N, plus mode 0,
   ``IMPL_REF_ROWS``, bit 64, the other bits and grids that do not exist;
 * controls: a gate that is one CTA looser or tighter, another number of CTAs per SM, another routing set, a missing exclusion and mode 0 allowed are each a difference on the matrix;
+* the route specification (``expected_route``: the launches of a decode call as the preset names of the decode benchmark) equals the C++ function on the decode rows of the matrix with the
+  hidden calibration control off, and with it on equals the part of the rule that the control leaves (the C++ eligibility, which the same probe evaluates); the limit that it takes is the
+  one that ``header_per_sm`` reads from the header of the tree that is measured, and a tree with another limit gives another route that the C++ function of that tree agrees with;
 * the shared-memory need of the header covers the static figure that ptxas reports for the row engine on every architecture of the gate (compile control: a need below the layout, or more
   than an allocation unit above it, fails the build of the row engine).
 """
@@ -43,8 +46,8 @@ def header_text():
 
 
 def header_values(text):
-    """The integer literals of the ``constexpr`` constants of the header (a constant that is an expression of others is not listed)."""
-    return {m.group(1): int(m.group(2)) for m in re.finditer(r"constexpr\s+(?:int|int64_t)\s+(\w+)\s*=\s*(\d+)\s*;", text)}
+    """The integer literals of the ``constexpr`` constants of the header (a constant that is an expression of others is not listed): the reader of the specification module."""
+    return dp.header_values(text)
 
 
 # ---- the header and the specification ---------------------------------------------------------------------------------------------------------------------
@@ -111,13 +114,19 @@ def host_compiler():
     return None
 
 
-def run_probe(csrc, rows, tmp):
-    """Compile the probe against the policy header in ``csrc`` with the host compiler alone (no CUDA include path) and run it on ``rows``: ``[0 | 1]``."""
+POLICY_CALL = "cfbi::decode_single_launch_policy((int)mode, (int)impl, N, H, (int)sms, (int)cc)"
+ELIGIBLE_CALL = "cfbi::decode_single_launch_eligible((int)mode, (int)impl, N, H)"      # what the launcher answers with the hidden calibration control on (cfbi_launch.cu)
+
+
+def run_probe(csrc, rows, tmp, eligible=False):
+    """Compile the probe against the policy header in ``csrc`` with the host compiler alone (no CUDA include path) and run it on ``rows``: ``[0 | 1]`` for the policy function, or for the
+    eligible part of the rule (the part that the calibration control leaves) when ``eligible`` is true."""
     cxx = host_compiler()
     if cxx is None:
         pytest.skip("no host compiler on this machine")
     src, exe = Path(tmp) / "probe.cpp", Path(tmp) / "probe"
-    src.write_text(PROBE)
+    assert PROBE.count(POLICY_CALL) == 1
+    src.write_text(PROBE.replace(POLICY_CALL, ELIGIBLE_CALL) if eligible else PROBE)
     built = subprocess.run([cxx, "-std=c++17", "-Wall", "-I", str(csrc), str(src), "-o", str(exe)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
     assert built.returncode == 0, built.stdout[-2000:]
     run = subprocess.run([str(exe)], input="\n".join(" ".join(str(x) for x in r) for r in rows) + "\n", stdout=subprocess.PIPE, universal_newlines=True, check=True)
@@ -168,6 +177,116 @@ def test_the_probe_judges_the_header_it_is_given(tmp_path):
     target.write_text(text.replace("DECODE_SINGLE_MAX_CTAS_PER_SM = 8;", "DECODE_SINGLE_MAX_CTAS_PER_SM = 9;"))
     rows = dp.shape_matrix()
     assert run_probe(csrc, rows, tmp_path) != [int(dp.policy(*r)) for r in rows]
+
+
+# ---- the route specification and the limit of a tree -------------------------------------------------------------------------------------------------
+def route_of(row, **knobs):
+    """The route of a row of the matrix (mode, impl, N, H, sms, cc) as ``expected_route`` gives it."""
+    mode, impl, N, H, sms, cc = row
+    return dp.expected_route(impl, N, H, sms, cc, **knobs)
+
+
+def route_name(answer):
+    return dp.SINGLE_LAUNCH if answer else dp.TWO_LAUNCH
+
+
+def decode_rows(rows, got):
+    """The (row, answer) pairs of the decode calls: the route specification is for mode 1, a mode 0 call is no decode call."""
+    return [(r, g) for r, g in zip(rows, got) if r[0] == 1]
+
+
+@pytest.fixture(scope="module")
+def cpp_eligible_on_the_matrix(tmp_path_factory):
+    rows = dp.shape_matrix()
+    return rows, run_probe(CSRC.parent, rows, tmp_path_factory.mktemp("eligible_probe"), eligible=True)
+
+
+def test_the_route_specification_equals_the_cpp_function_on_the_matrix(cpp_on_the_matrix):
+    """With the control off a decode call is one launch exactly where the C++ function says so."""
+    rows, got = cpp_on_the_matrix
+    decode = decode_rows(rows, got)
+    assert len(rows) - len(decode) == 2 * len(dp.SM_COUNTS) * len(dp.CAPABILITIES)                  # only the two mode 0 rows of every (SM count, capability) are left out
+    wrong = [(r, g, route_of(r)) for r, g in decode if route_of(r) != route_name(g)]
+    assert wrong == [], wrong[:5]
+    assert {route_of(r) for r, g in decode} == {dp.SINGLE_LAUNCH, dp.TWO_LAUNCH}                      # both answers occur: the equality is not vacuous
+
+
+def test_the_route_specification_with_the_control_on_is_the_eligible_part_of_the_rule(cpp_eligible_on_the_matrix):
+    """With the control on the call is one launch whatever the grid and the device: the eligibility, which the specification and the header's function both state."""
+    rows, got = cpp_eligible_on_the_matrix
+    decode = decode_rows(rows, got)
+    assert [(r, g, route_of(r, force=True)) for r, g in decode if route_of(r, force=True) != route_name(g)] == []
+    assert [(r, g) for r, g in decode if bool(g) != dp.eligible(*r[:4])] == []                        # the Python eligibility is the header's
+    assert {route_of(r, force=True) for r, g in decode} == {dp.SINGLE_LAUNCH, dp.TWO_LAUNCH}
+
+
+def test_the_control_overrides_the_limit_and_the_routing_set_and_nothing_else(cpp_on_the_matrix):
+    rows, got = cpp_on_the_matrix
+    decode = decode_rows(rows, got)
+    forced_only = [r for r, g in decode if route_of(r, force=True) != route_of(r)]
+    assert any(r[2] * r[3] > dp.MAX_CTAS_PER_SM * r[4] and dp.routed(r[5]) for r in forced_only)      # a grid beyond the limit on a device of the routing set
+    assert any(not dp.routed(r[5]) and r[2] * r[3] <= dp.MAX_CTAS_PER_SM * r[4] for r in forced_only)   # a grid within the limit on a device outside it
+    assert all(route_of(r) == dp.TWO_LAUNCH and route_of(r, force=True) == dp.SINGLE_LAUNCH for r in forced_only)
+    kept = [r for r, g in decode if r[1] & (dp.IMPL_REF_ROWS | dp.IMPL_DECODE_PLAN) or r[2] < 1 or r[3] < 1]
+    assert kept and all(route_of(r, force=True) == dp.TWO_LAUNCH for r in kept)                       # bit 64, the reference row engine and a grid that does not exist: never one launch
+
+
+@pytest.mark.parametrize("name,knobs", [("nine CTAs per SM", dict(per_sm=9)), ("seven CTAs per SM", dict(per_sm=7)), ("the control on", dict(force=True))])
+def test_a_route_specification_with_another_rule_differs_from_the_cpp_function_on_the_matrix(cpp_on_the_matrix, name, knobs):
+    rows, got = cpp_on_the_matrix
+    assert [r for r, g in decode_rows(rows, got) if route_of(r, **knobs) != route_name(g)], name
+
+
+def policy_tree(tmp_path, replace=None, name="tree"):
+    """A copy of ``csrc/cfbi`` under a root of its own; ``replace`` is ``(old, new)``: a text of the policy header to change."""
+    root = tmp_path / name
+    shutil.copytree(CSRC, root / "csrc" / "cfbi")
+    if replace:
+        target = root / "csrc" / "cfbi" / "cfbi_policy.h"
+        text = target.read_text()
+        assert text.count(replace[0]) == 1, replace[0]
+        target.write_text(text.replace(*replace))
+    return root
+
+
+LIMIT_LINE = "constexpr int64_t DECODE_SINGLE_MAX_CTAS_PER_SM = 8;"
+
+
+def test_the_limit_of_a_tree_is_what_its_header_defines():
+    assert dp.header_per_sm(ROOT) == dp.MAX_CTAS_PER_SM == header_values(header_text())["DECODE_SINGLE_MAX_CTAS_PER_SM"]
+
+
+def test_the_limit_of_another_tree_is_its_own_and_so_is_its_route(tmp_path):
+    """A tree with 9 CTAs per SM: the reader gives 9, the specification that takes it agrees with the C++ function of that tree on the decode rows, and the limit of this tree does not."""
+    root = policy_tree(tmp_path, (LIMIT_LINE, LIMIT_LINE.replace("= 8;", "= 9;")))
+    per_sm = dp.header_per_sm(root)
+    assert per_sm == 9
+    rows = dp.shape_matrix()
+    got = run_probe(root / "csrc", rows, tmp_path)
+    decode = decode_rows(rows, got)
+    assert [(r, g) for r, g in decode if route_of(r, per_sm=per_sm) != route_name(g)] == []
+    assert [r for r, g in decode if route_of(r) != route_name(g)]                                    # the limit of 8 is another route, on some row
+
+
+UNREADABLE_LIMITS = [
+    ("no policy header", None, OSError),
+    ("a limit that is an expression", (LIMIT_LINE, "constexpr int64_t DECODE_SINGLE_MAX_CTAS_PER_SM = 4 * 2;"), ValueError),
+    ("a limit that is only in a comment", (LIMIT_LINE, "// " + LIMIT_LINE), ValueError),
+    ("a limit that is only in a block comment", (LIMIT_LINE, "/* " + LIMIT_LINE + " */"), ValueError),
+]
+
+
+@pytest.mark.parametrize("what,replace,error", UNREADABLE_LIMITS, ids=[c[0] for c in UNREADABLE_LIMITS])
+def test_a_tree_without_a_readable_limit_is_an_error_not_a_default(tmp_path, what, replace, error):
+    root = tmp_path / "empty" if replace is None else policy_tree(tmp_path, replace)
+    root.mkdir(exist_ok=True)
+    with pytest.raises(error):
+        dp.header_per_sm(root)
+
+
+def test_a_commented_out_definition_does_not_change_the_limit(tmp_path):
+    root = policy_tree(tmp_path, (LIMIT_LINE, "/* constexpr int64_t DECODE_SINGLE_MAX_CTAS_PER_SM = 5; */\n// constexpr int64_t DECODE_SINGLE_MAX_CTAS_PER_SM = 6;\n" + LIMIT_LINE))
+    assert dp.header_per_sm(root) == 8
 
 
 # ---- the shared-memory need of the header ----------------------------------------------------------------------------------------------------------------------
