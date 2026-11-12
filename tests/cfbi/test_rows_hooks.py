@@ -23,7 +23,7 @@ import pytest
 import helpers
 import rows_workload as rw
 import test_rows_profile as trp
-from protocol_source import TEST_PREFIXES, default_text, is_test_macro, macros_in  # noqa: F401
+from protocol_source import HASH, TEST_PREFIXES, default_text, is_test_macro, logical_lines, macros_in  # noqa: F401
 from test_rows_profile import mutate
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -185,8 +185,8 @@ def test_the_mini_preprocessor_drops_the_branches_of_test_macros_only():
 def macro_guard_problems(srcs, flag_texts, nvcc_flags):
     probs = []
     for name, text in srcs.items():
-        for ln, line in enumerate(text.splitlines(), 1):
-            m = re.match(r"\s*#\s*define\s+(CFBI_\w+)", line)
+        for ln, line in logical_lines(text):                       # the lines that the preprocessor reads: a spliced or digraph directive is read too
+            m = re.match(HASH + r"define[ \t\v\f]+(CFBI_\w+)", line)
             if m and is_test_macro(m.group(1)):
                 probs.append("%s:%d defines the test macro %s: a test macro must only come from a -D flag of a variant build" % (name, ln, m.group(1)))
     for name, text in flag_texts.items():
@@ -199,7 +199,8 @@ def macro_guard_problems(srcs, flag_texts, nvcc_flags):
             probs.append("NVCC_FLAGS carries %s" % f)
     classified = set()
     for text in srcs.values():
-        classified |= set(re.findall(r"#\s*(?:ifdef|ifndef)\s+(CFBI_\w+)", text)) | set(re.findall(r"defined\s*\(?\s*(CFBI_\w+)", text))
+        code = "\n".join(line for _, line in logical_lines(text))
+        classified |= set(re.findall(HASH + r"(?:ifdef|ifndef)[ \t\v\f]+(CFBI_\w+)", code)) | set(re.findall(r"defined\s*\(?\s*(CFBI_\w+)", code))
     for name in sorted(classified):
         if not is_test_macro(name) and name not in TUNABLES:
             probs.append("the macro %s is neither a test macro of a known prefix nor a tunable: add it to the macro guard" % name)

@@ -11,8 +11,10 @@ seen by any comparison of results (the bits of the output, E, the rows and pos a
 ``protocol_source.py`` reads the sources as a default build reads them (comments gone, test-macro branches resolved, default hooks expanded, tokens) and returns the broken rules, ``R0`` being the
 whole entry. Every rule is shown here to FAIL on a temporary copy of the sources with one edit (a rule that cannot fail proves nothing), and the pins are shown to hold under harmless edits
 (spacing, comments, the numbers of the delay sites, the variant branches, a macro that no build takes). The preprocessor is part of what they read: a macro of a pinned name rewrites it for the
-compiler while the tokens stay, so every effective ``#define`` / ``#undef`` and every ``-D`` flag of such a name is a problem (R12). The host model (``test_decode_pos_protocol_model.py``) takes its constants and its election from the same reader.
+compiler while the tokens stay, so every effective ``#define`` / ``#undef`` and every ``-D`` flag of such a name is a problem (R12). A directive is read as the preprocessor reads it: on logical lines (a backslash before a line break, a comment over lines, a digraph or a form feed do not hide it), and the reader and the real preprocessor (``g++ -E -dM``) are shown to agree on which macros a text defines. The host model (``test_decode_pos_protocol_model.py``) takes its constants and its election from the same reader.
 """
+import re
+
 import pytest
 
 import protocol_source as ps
@@ -172,6 +174,20 @@ MUTANTS = [
     ("an include of a file that the reader does not load", [(R, '#include "cfbi/cfbi_common.cuh"', '#include "cfbi/cfbi_common.cuh"\n#include "cfbi/hidden_macros.inc"')], {"R12"}),
     ("an include of a file next to the including file that does not exist", [("ref/ref_k1.cuh", '#include "cfbi/cfbi_common.cuh"', '#include "cfbi/cfbi_common.cuh"\n#include "hidden_macros.inc"')], {"R12"}),
     ("a forced include in the build flags", [("flags:_ext.py", FLAGS_ANCHOR, FLAGS_ANCHOR + '\n    "-include", "hidden_macros.h",')], {"R12"}),
+    # the same macro in the other spellings of a directive (the preprocessor joins the lines first: logical lines)
+    ("a continued #define of the store helper (the review's second counterexample)", [(R, HELPER_END, HELPER_END + "#define \\\nst_relaxed_gpu(ptr, v) (*(ptr) = (v))\n")], {"R12"}),
+    ("a #define whose keyword is split by a continuation", [(R, HELPER_END, HELPER_END + "#def\\\nine st_relaxed_gpu(ptr, v) (*(ptr) = (v))\n")], {"R12"}),
+    ("a #define whose hash is split from the keyword", [(R, HELPER_END, HELPER_END + "#\\\ndefine st_relaxed_gpu(ptr, v) (*(ptr) = (v))\n")], {"R12"}),
+    ("a continuation with blanks before the line break (gcc joins it too)", [(R, HELPER_END, HELPER_END + "#define \\  \nst_relaxed_gpu(ptr, v) (*(ptr) = (v))\n")], {"R12"}),
+    ("a #define over a block comment that spans lines", [(R, HELPER_END, HELPER_END + "#define /* the name\nfollows */ st_relaxed_gpu(ptr, v) (*(ptr) = (v))\n")], {"R12"}),
+    ("a #define in the digraph spelling", [(R, HELPER_END, HELPER_END + "%:define st_relaxed_gpu(ptr, v) (*(ptr) = (v))\n")], {"R12"}),
+    ("a #define with a form feed in the directive", [(R, HELPER_END, HELPER_END + "#\fdefine st_relaxed_gpu(ptr, v) (*(ptr) = (v))\n")], {"R12"}),
+    ("a spliced #if 0 that hides the elected store from the compiler", [(R, STORE_LINE, "#i\\\nf 0\n" + STORE_LINE + "#endif\n")], {"R12"}),
+    ("a conditional that hides the real chunk length from the compiler", [(P, "constexpr int BT = 64;", "#if 0\nconstexpr int BT = 64;\n#else\nconstexpr int BT = 128;\n#endif")], {"R12"}),
+    ("an include of an unread file in the angle form", [(R, '#include "cfbi/cfbi_common.cuh"', '#include "cfbi/cfbi_common.cuh"\n#include <cfbi/hidden_macros.inc>')], {"R12"}),
+    ("an include whose target is a macro", [(R, '#include "cfbi/cfbi_common.cuh"', '#include "cfbi/cfbi_common.cuh"\n#define HIDDEN_NAME "hidden_macros.inc"\n#include HIDDEN_NAME')], {"R12"}),
+    ("a directive of a form that the reader does not know", [(R, HELPER_END, HELPER_END + "#assign st_relaxed_gpu 1\n")], {"R12"}),
+    ("a trigraph that spells a line splice", [(R, HELPER_END, HELPER_END + "#define ??/\nst_relaxed_gpu(ptr, v) (*(ptr) = (v))\n")], {"R12"}),
     # text that the compiler does not see but the reader does
     ("the real protocol under #if 0", [(R, STORE_LINE, "#if 0\n" + STORE_LINE + "#endif\n")], {"R12"}),
     ("a conditional on a test macro with #elif", [(R, "#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1)", "#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE\n#elif 1\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1)")], {"R12"}),
@@ -207,6 +223,11 @@ HARMLESS = [
     ("a build flag of a name that no pin reads", [("flags:_ext.py", FLAGS_ANCHOR, FLAGS_ANCHOR + '\n    "-DSOME_UNRELATED_TUNABLE=3",')]),
     ("an include of another file of the directory, by the path of the build and relative to the including file", [(R, '#include "cfbi/cfbi_common.cuh"', '#include "cfbi/cfbi_common.cuh"\n#include "cfbi/ref/ref_k2.cuh"'),
                                                                                                                   ("ref/ref_k1.cuh", '#include "cfbi/cfbi_common.cuh"', '#include "cfbi/cfbi_common.cuh"\n#include "ref_k2.cuh"\n#include "../cfbi_primitives.cuh"')]),
+    ("a macro hidden inside a continued line comment", [(R, HELPER_END, HELPER_END + "// a comment that goes on \\\n#define st_relaxed_gpu(ptr, v) (*(ptr) = (v))\n")]),
+    ("a legitimate continued macro of an unrelated name", [(R, HELPER_END, HELPER_END + "#define SOME_UNRELATED_TUNABLE(a, b) \\\n    ((a) + (b))\n")]),
+    ("a continued macro whose body calls the helper without defining it", [(R, HELPER_END, HELPER_END + "#define UNRELATED_STORE(p, v) \\\n    st_relaxed_gpu((p), (v))\n")]),
+    ("a block comment over several lines before a directive of an unrelated name", [(R, HELPER_END, HELPER_END + "/* a comment\nover lines */ #define SOME_UNRELATED_TUNABLE 3\n")]),
+    ("the continued plain-store macro in a branch that no default build takes", [(R, HELPER_END, HELPER_END + "#ifdef CFBI_DECODE_TEST_SNAPSHOT_AFTER_ARRIVAL\n#define \\\nst_relaxed_gpu(ptr, v) (*(ptr) = (v))\n#endif\n")]),
     ("an include in a comment and an angle-bracket include", [(R, '#include "cfbi/cfbi_common.cuh"', '#include "cfbi/cfbi_common.cuh"\n// #include "cfbi/hidden_macros.inc"\n#include <vector>')]),
 ]
 
@@ -231,11 +252,87 @@ def test_an_election_that_the_model_cannot_read_is_refused(tmp_path, real):
 # ---- the macro rule's reader --------------------------------------------------------------------------------------------------------------------------------
 def test_directives_are_read_per_directive_from_the_default_view_without_comments():
     text = "#define KEEP 1\n// #define IN_LINE_COMMENT 2\n/*\n#define IN_BLOCK 3\n*/\n  #  undef  GONE\n#define MULTI(a) \\\n    (a)\nint x;\n"
-    assert ps.macro_directives({"a.cuh": list(enumerate(text.splitlines(), 1))}) == [("a.cuh", 1, "define", "KEEP"), ("a.cuh", 6, "undef", "GONE"), ("a.cuh", 7, "define", "MULTI")]
+    assert ps.macro_directives({"a.cuh": ps.default_lines(text, set())}) == [("a.cuh", 1, "define", "KEEP"), ("a.cuh", 6, "undef", "GONE"), ("a.cuh", 7, "define", "MULTI")]
     text = "#ifdef CFBI_DECODE_TEST_X\n#define TEST_ONLY 1\n#else\n#define DEFAULT_ONLY 1\n#endif\n"
     lines = ps.default_lines(text, ps.macros_in([text]))
     assert lines == [(4, "#define DEFAULT_ONLY 1")]                       # the numbers are those of the file, not of the view
     assert ps.macro_directives({"b.cuh": lines}) == [("b.cuh", 4, "define", "DEFAULT_ONLY")]
+
+
+def test_logical_lines_are_what_the_first_three_phases_of_translation_leave():
+    ll = ps.logical_lines
+    assert ll("a\nb\n") == ((1, "a"), (2, "b")) and ll("x") == ((1, "x"),) and ll("\n\nx\n") == ((1, ""), (2, ""), (3, "x")) and ll("a\r\nb\r\n") == ((1, "a"), (2, "b"))
+    assert ll("a\\\nb\n") == ((1, "ab"),)                                                  # a backslash before a line break joins the lines
+    assert ll("#define \\\n  X 1\nY\n") == ((1, "#define   X 1"), (3, "Y"))                  # the second line gets the number of its first physical line
+    assert ll("a \\  \nb\n") == ((1, "a b"),)                                                # blanks between the backslash and the line break (gcc joins these too)
+    assert ll("a /* x\ny */ b\nc\n") == ((1, "a   b"), (3, "c"))                              # a comment is one space and takes its line break with it
+    assert ll("a // b \\\nc\nd\n") == ((1, "a  "), (3, "d"))                                  # a line comment goes on over a continuation
+    assert ll("/* only\na comment */\nx\n") == ((1, " "), (3, "x"))
+    assert ll('s = "//" + "/*"; // x\n') == ((1, 's = "//" + "/*";  '),)                       # comment markers inside a string are no comment
+    assert ll("c = '\"'; // x\n") == ((1, "c = '\"';  "),)                                     # a quote inside a character literal starts no string
+    assert ll("n = 1'000'000; // x\n") == ((1, "n = 1'000'000;  "),)                           # digit separators are no character literals
+    text = "#ifndef T\n#define \\\n X 1\n#else\nA\n#endif\nB\n"
+    assert ps.default_lines(text, {"T"}) == [(2, "#define  X 1"), (7, "B")]                    # the conditionals are resolved on the logical lines, numbers stay those of the file
+    assert ps.default_lines(text.replace("ifndef", "ifdef"), {"T"}) == [(5, "A"), (7, "B")]    # a default build defines no test macro: the #else branch of #ifdef is the one that stays
+    assert ps.tokens("#define X \\\n  y z\nint a; /* c\n */ int b;\n") == ["int", "a", ";", "int", "b", ";"]       # a directive that runs over lines is no code
+
+
+# the same macro spelled in every way that matters: the reader and the real preprocessor must agree on which macros a text defines
+SPELLINGS = [
+    ("plain", "#define PIN_A 1\n", {"PIN_A"}),
+    ("a continuation after the keyword", "#define \\\nPIN_A 1\n", {"PIN_A"}),
+    ("the keyword split by a continuation", "#def\\\nine PIN_A 1\n", {"PIN_A"}),
+    ("the hash split from the keyword", "#\\\ndefine PIN_A 1\n", {"PIN_A"}),
+    ("blanks between the backslash and the line break", "#define \\  \nPIN_A 1\n", {"PIN_A"}),
+    ("a block comment over lines inside the directive", "#define /* a\ncomment */ PIN_A 1\n", {"PIN_A"}),
+    ("a comment between the hash and the keyword", "# /* c */ define PIN_A 1\n", {"PIN_A"}),
+    ("the digraph for the hash", "%:define PIN_A 1\n", {"PIN_A"}),
+    ("a form feed in the directive", "#\fdefine PIN_A 1\n", {"PIN_A"}),
+    ("tabs and blanks", "\t#\tdefine\tPIN_A 1\n", {"PIN_A"}),
+    ("a block comment before the directive", "/* a\ncomment */ #define PIN_A 1\n", {"PIN_A"}),
+    ("a directive after a continued line comment is part of the comment", "// a comment \\\n#define PIN_A 1\nint x;\n", set()),
+    ("a directive in a block comment", "/*\n#define PIN_A 1\n*/\n", set()),
+    ("a directive in a string", 'const char* s = "#define PIN_A 1";\n', set()),
+    ("an unrelated continued macro", "#define PIN_B(a) \\\n  ((a) + 1)\n", {"PIN_B"}),
+    ("two directives around a comment that ends on the first", "#define PIN_A 1 /* x\n*/\n#define PIN_B 2\n", {"PIN_A", "PIN_B"}),
+]
+
+
+def host_cxx():
+    import shutil
+    return shutil.which("g++") or shutil.which("c++")
+
+
+def gcc_defined(text):
+    """The names of the macros named ``PIN_*`` that the real preprocessor (``g++ -E -dM``) has defined after reading ``text``."""
+    import subprocess
+    cxx = host_cxx()
+    if cxx is None:
+        pytest.skip("no host compiler on this machine")
+    run = subprocess.run([cxx, "-E", "-dM", "-x", "c++", "-"], input=text, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True)
+    return {m.group(1) for m in (re.match(r"#define (PIN_\w+)", line) for line in run.stdout.splitlines()) if m}
+
+
+@pytest.mark.parametrize("name,text,expected", SPELLINGS, ids=[s[0] for s in SPELLINGS])
+def test_the_reader_and_the_real_preprocessor_agree_on_which_macros_a_text_defines(name, text, expected):
+    read = {d[3] for d in ps.macro_directives({"x.cuh": ps.default_lines(text, set())}) if d[2] == "define"}
+    assert read == expected, (name, read)
+    assert gcc_defined(text) == expected, name
+
+
+@pytest.mark.parametrize("spelling", [s for s in SPELLINGS if s[2] == {"PIN_A"} and s[0] != "plain"][:6], ids=lambda s: s[0])
+def test_the_continued_spellings_of_the_reviews_macro_really_change_the_call(spelling):
+    """The review's counterexample under the real preprocessor: the elected call becomes a plain assignment in every one of these spellings."""
+    import subprocess
+    cxx = host_cxx()
+    if cxx is None:
+        pytest.skip("no host compiler on this machine")
+    macro = spelling[1].replace("PIN_A 1", "st_relaxed_gpu(ptr, v) (*(ptr) = (v))")
+    source = "static inline void st_relaxed_gpu(int* ptr, int v) { *ptr = v; }\n" + macro + "void f(int* pos, int old, int len) { if (old == 3) st_relaxed_gpu(pos + 1, old + len); }\n"
+    out = subprocess.run([cxx, "-E", "-P", "-x", "c++", "-"], input=source, stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout
+    call = out.strip().splitlines()[-1]
+    assert "st_relaxed_gpu" not in call and "(*(pos + 1) = (old + len))" in call, call
+    assert {d[3] for d in ps.macro_directives({"x.cuh": ps.default_lines(macro, set())})} == {"st_relaxed_gpu"}
 
 
 def test_the_names_that_the_pins_read_include_keywords_constants_hooks_and_the_generic_names_of_the_entry(real):

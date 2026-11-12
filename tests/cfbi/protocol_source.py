@@ -4,7 +4,10 @@ No comparison of results can see most of what the protocol relies on: a plain st
 read of the ``pos`` word, a fence, a spin-wait. They are rules about the text of ``rows_entry<true>`` (csrc/cfbi/cfbi_rows.cuh) and what it relies on, and this module reads that text the way
 a build that defines no test macro reads it:
 
-* comments are removed and the conditionals of the test macros are resolved (``default_text``: the branch of ``#ifdef M`` is dropped, the ``#else`` branch kept); a string that a rule asks for
+* the text is first cut into LOGICAL lines the way the first three phases of translation do it (``logical_lines``: a backslash before a line break joins the two lines, also when blanks sit between
+  them, a comment is one space and a block comment takes its line breaks with it, string and character literals are left alone; a line keeps the number of its first physical line), so that a
+  directive spelled over several lines is one directive, here as for the compiler;
+* the conditionals of the test macros are resolved on those lines (``default_text``: the branch of ``#ifdef M`` is dropped, the ``#else`` branch kept); a string that a rule asks for
   therefore cannot be satisfied by a comment or by a variant branch;
 * the hooks that the default build compiles to nothing are expanded the way the default macros define them (``ROWS_DELAY(n)`` and ``ROWS_DECODE_ARRIVED(old, heads)`` vanish,
   ``ROWS_POS_INDEX(access, slot)`` is ``(slot)``; the definitions themselves are pinned) and the text is cut into tokens, so spacing, line breaks and the name of a hook argument do not matter;
@@ -16,6 +19,7 @@ a build that defines no test macro reads it:
 
 The model of the protocol reads its constants and its election from here (``constants``, ``election``), so that the model and the kernel cannot drift apart.
 """
+import functools
 import posixpath
 import re
 from pathlib import Path
@@ -36,19 +40,77 @@ def is_test_macro(name):
     return any(name.startswith(p) for p in TEST_PREFIXES)
 
 
+# a directive starts with a ``#`` or its digraph ``%:`` (blanks may stand before it, between it and the keyword and, as form feeds and vertical tabs too, inside the line)
+HASH = r"[ \t\v\f]*(?:#|%:)[ \t\v\f]*"
+DIRECTIVE_START = re.compile(r"^[ \t\v\f]*(?:#|%:)")
+CONDITIONAL = re.compile(r"^" + HASH + r"(ifdef|ifndef|if|elifdef|elifndef|elif|else|endif)\b[ \t\v\f]*(\w+)?")
+_SPLICE = re.compile(r"\\[ \t\f\v]*\n")                  # a backslash, blanks (which gcc accepts too) and a line break
+_LEX = re.compile(r'"(?:[^"\\\n]|\\[^\n])*"?|(?<![A-Za-z0-9_])\'(?:\\[^\n]|[^\'\\\n])+\'|//[^\n]*|/\*.*?(?:\*/|\Z)|\n|[^"\'/\n]+|["\'/]', re.S)
+
+
+@functools.lru_cache(maxsize=512)
+def logical_lines(text):
+    """``((first physical line, line), ...)``: the text as the first three phases of translation read it. A backslash before a line break (also with blanks between them: gcc joins those too) joins
+    the two lines, inside comments and literals as everywhere; a comment is replaced by one space and a block comment takes the line breaks inside it with it, so a directive can run over a
+    comment that spans lines; string and character literals are not touched (a ``//`` in a string starts no comment); the lines that are left are cut at the remaining line breaks. A line is
+    numbered by the physical line of its first character, an empty one by its own. Digit separators (``1'000``) are no character literals."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    pieces, starts, line, pos = [], [], 1, 0      # starts[k]: the physical line that begins after the (k+1)-th kept line break
+    for m in _SPLICE.finditer(text):
+        piece = text[pos:m.start()]
+        pieces.append(piece)
+        for _ in range(piece.count("\n")):
+            line += 1
+            starts.append(line)
+        line += 1                                    # the spliced break advances the physical line and cuts nothing
+        pos = m.end()
+    piece = text[pos:]
+    pieces.append(piece)
+    for _ in range(piece.count("\n")):
+        line += 1
+        starts.append(line)
+    spliced = "".join(pieces)
+
+    def at(k):
+        return 1 if k == 0 else starts[k - 1]
+    out, parts, start, breaks = [], [], None, 0
+    for m in _LEX.finditer(spliced):
+        tok = m.group()
+        if tok == "\n":
+            out.append((at(breaks) if start is None else start, "".join(parts)))
+            parts, start = [], None
+            breaks += 1
+            continue
+        if start is None:
+            start = at(breaks)
+        if tok.startswith("/*"):
+            parts.append(" ")
+            breaks += tok.count("\n")
+        elif tok.startswith("//"):
+            parts.append(" ")
+        else:
+            parts.append(tok)
+    if parts:
+        out.append((start, "".join(parts)))
+    return tuple(out)
+
+
 def macros_in(texts):
-    """The macro names of the variants that some text tests (derived, not listed): every ``#ifdef`` / ``#ifndef`` / ``defined()`` of a name with a test prefix."""
+    """The macro names of the variants that some text tests (derived, not listed): every ``#ifdef`` / ``#ifndef`` / ``defined()`` of a name with a test prefix, read on logical lines (no comment,
+    a directive that is spelled over several lines counts)."""
     found = set()
     for t in texts:
-        found |= set(re.findall(r"#\s*(?:ifdef|ifndef)\s+(CFBI_\w+)", t)) | set(re.findall(r"defined\s*\(?\s*(CFBI_\w+)", t))
+        code = "\n".join(line for _, line in logical_lines(t))
+        found |= set(re.findall(HASH + r"(?:ifdef|ifndef)[ \t\v\f]+(CFBI_\w+)", code)) | set(re.findall(r"defined\s*\(?\s*(CFBI_\w+)", code))
     return {m for m in found if is_test_macro(m)}
 
 
 def default_lines(text, macros):
-    """``[(line number in ``text``, line)]`` of the text as a build that defines none of ``macros`` reads it (see ``default_text``); the numbers are those of the file, not of the view."""
+    """``[(first physical line in ``text``, logical line)]`` of the text as a build that defines none of ``macros`` reads it (see ``default_text``); the numbers are those of the file, not of the view,
+    and the lines are the logical lines of ``logical_lines`` (no comment is left, a directive is one line)."""
     out, stack = [], []
-    for number, line in enumerate(text.splitlines(), 1):
-        m = re.match(r"^\s*#\s*(ifdef|ifndef|if|elif|else|endif)\b\s*(\w+)?", line)
+    for number, line in logical_lines(text):
+        m = CONDITIONAL.match(line)
         skipping = any(f[1] for f in stack)
         if m:
             d, name = m.group(1), m.group(2)
@@ -58,13 +120,15 @@ def default_lines(text, macros):
             if d in ("ifdef", "ifndef", "if"):
                 stack.append(["other", False])
             elif d == "endif":
+                if not stack:
+                    raise ValueError("%d: #endif without a conditional" % number)
                 if stack.pop()[0] == "test":
                     continue
             elif d == "else" and stack and stack[-1][0] == "test":
                 stack[-1][1] = not stack[-1][1]
                 continue
-            elif d == "elif" and stack and stack[-1][0] == "test":
-                raise ValueError("#elif of a conditional on a test macro is not read by this preprocessor")
+            elif d in ("elif", "elifdef", "elifndef") and stack and stack[-1][0] == "test":
+                raise ValueError("#%s of a conditional on a test macro is not read by this preprocessor" % d)
         if not skipping:
             out.append((number, line))
     assert not stack, "unbalanced preprocessor conditionals"
@@ -78,7 +142,8 @@ def _joined(numbered_lines):
 
 def default_text(text, macros):
     """The text as a build that defines none of ``macros`` reads it: the branch of ``#ifdef M`` is dropped and its ``#else`` branch kept (``#ifndef M`` the other way round), the
-    directive lines of those conditionals are dropped, every other line stays. Only ``#ifdef`` / ``#ifndef`` / ``#else`` / ``#endif`` of a test macro are read; ``#elif`` of one is refused."""
+    directive lines of those conditionals are dropped, every other logical line stays (without its comments). Only ``#ifdef`` / ``#ifndef`` / ``#else`` / ``#endif`` of a test macro are read;
+    ``#elif`` of one is refused."""
     return _joined(default_lines(text, macros))
 
 
@@ -107,8 +172,8 @@ def strip_comments(text):
 
 
 def tokens(text):
-    """The tokens of the code in ``text`` (comments dropped; preprocessor lines are not code and are dropped as well)."""
-    code = "\n".join(line for line in strip_comments(text).splitlines() if not line.lstrip().startswith("#"))
+    """The tokens of the code in ``text`` (comments dropped; the logical lines of the preprocessor, a directive that runs over several lines included, are not code and are dropped as well)."""
+    code = "\n".join(line for _, line in logical_lines(text) if not DIRECTIVE_START.match(line))
     return TOKEN.findall(code)
 
 
@@ -154,12 +219,12 @@ def _views(texts):
 
 
 def default_view(texts):
-    """Every source of ``texts`` as a build without test macros reads it (comments still in); remembered per content, the rules ask for it again and again."""
+    """Every source of ``texts`` as a build without test macros reads it (logical lines, no comment left); remembered per content, the rules ask for it again and again."""
     return _views(texts)[0]
 
 
 def default_numbered(texts):
-    """The same view as ``{file: [(line number in the file, line)]}``."""
+    """The same view as ``{file: [(first physical line in the file, logical line)]}``."""
     return _views(texts)[1]
 
 
@@ -179,7 +244,7 @@ def match_close(toks, i, open_, close):
 def macro_definitions(view_text):
     """The ``#define`` lines of a default view: name -> (parameters, body text)."""
     defs = {}
-    for m in re.finditer(r"^\s*#\s*define\s+(\w+)\(([^)]*)\)\s*(.*)$", view_text, re.M):
+    for m in re.finditer(r"^" + HASH + r"define[ \t\v\f]+(\w+)\(([^)]*)\)\s*(.*)$", view_text, re.M):
         defs[m.group(1)] = ([a.strip() for a in m.group(2).split(",")], m.group(3).strip())
     return defs
 
@@ -268,7 +333,7 @@ def evaluate(expr, names):
 
 def constants(texts):
     """``BT``, ``POS_COUNT_SHIFT`` and ``POS_MASK`` as the sources define them (evaluated, not copied)."""
-    code = [strip_comments(text) for text in default_view(texts).values()]
+    code = list(default_view(texts).values())
     found = {}
     for name in ("BT", "POS_COUNT_SHIFT", "POS_MASK"):
         for text in code:
@@ -307,7 +372,7 @@ def election(texts):
 def counter_limit_problems(texts):
     """The arrival counter must never wrap the word: heads * 2^POS_COUNT_SHIFT + POS_MASK < 2^31 for every H that the binding admits (``H < N`` in its size check)."""
     c = constants(texts)
-    m = re.search(r"H\s*<\s*(\d+)\s*,\s*\"problem too large", strip_comments(texts["cfbi_binding.cpp"]))
+    m = re.search(r"H\s*<\s*(\d+)\s*,\s*\"problem too large", default_view(texts)["cfbi_binding.cpp"])
     if not m:
         return [("R10", "the binding has no size check of the form H < <limit> that the counter capacity can be tied to")]
     limit, shift = int(m.group(1)), c["POS_COUNT_SHIFT"]
@@ -331,19 +396,20 @@ def identifiers(snippet):
 PINNED = frozenset().union(*(identifiers(s) for s in (GOLDEN, SKIP, BLOCK_OPEN, ARRIVAL, FILL, ELECTION, STORE, BARRIER, STORE_HELPER, FUSED_TAIL, KERNEL_MAP, ENTRY_CALL, SEQ_WINDOW_STATEMENT,
                                                     *LAUNCH)), CONSTANT_NAMES, HEAD_NAMES, HOOK_BODIES)
 ALLOWED_DEFINES = frozenset(HOOK_BODIES) | {"CFBI_ROWS_MINB"}     # the modeled hooks (their bodies are R11) and the tunable: each defined exactly once, never undefined
-DIRECTIVE = re.compile(r"^[ \t]*#[ \t]*(define|undef)[ \t]+([A-Za-z_]\w*)")
+DIRECTIVE = re.compile(r"^" + HASH + r"(define|undef)[ \t\v\f]+([A-Za-z_]\w*)")
 FLAG = re.compile(r"-[DU]\s*([A-Za-z_]\w*)")
-INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"')
+INCLUDE = re.compile(r"^" + HASH + r"(?:include_next|include|import)\b[ \t\v\f]*(.*)$")
+KEYWORD = re.compile(r"^" + HASH + r"([A-Za-z_]\w*)?")
 FORCE_INCLUDE = re.compile(r"(?<![\w-])(?:--pre-include|-include|-imacros)(?![\w-])")
+TRIGRAPH = re.compile(r"\?\?[=/'()!<>-]")
+# what a directive may be called; any other keyword is a form that this reader does not read
+DIRECTIVES = frozenset(("define", "undef", "include", "include_next", "import", "if", "ifdef", "ifndef", "elif", "elifdef", "elifndef", "else", "endif", "pragma", "error", "warning", "line"))
 
 
 def stripped_lines(numbered):
-    """``(file, line number in the file, line without its comments)`` of the default views (``default_numbered``): a directive in a comment is none, and the directives are still there (``tokens`` drops them)."""
+    """``(file, first physical line, logical line)`` of the default views (``default_numbered``; the lines have no comment and a directive is one line, see ``logical_lines``)."""
     for name in sorted(numbered):
-        lines = numbered[name]
-        text = strip_comments(_joined(lines)).splitlines()
-        assert len(text) == len(lines), "%s: the comments were stripped without keeping the line structure" % name
-        for (number, _), line in zip(lines, text):
+        for number, line in numbered[name]:
             yield name, number, line
 
 
@@ -385,33 +451,57 @@ def macro_problems(texts, numbered):
 
 
 def include_problems(numbered):
-    """R12: every quoted ``#include`` of the default views names a file that the reader has loaded (``cfbi/x`` is the file ``x`` of the source directory, a name may also be relative to the including
-    file); any other file could define a macro that no pin sees. Angle-bracket includes are the toolchain's and the libraries' own."""
+    """R12: every ``#include`` of the default views names a file that the reader has loaded (``cfbi/x`` is the file ``x`` of the source directory, a quoted name may also be relative to the
+    including file); any other file could define a macro that no pin sees, and so could an include whose target is a macro (it cannot be read). An angle-bracket include of a file outside
+    ``cfbi/`` is the toolchain's and the libraries' own."""
     out = []
     for name, number, line in stripped_lines(numbered):
         m = INCLUDE.match(line)
         if not m:
             continue
-        target = m.group(1)
+        rest = m.group(1).strip()
+        quoted, angled = re.match(r'"([^"]*)"', rest), re.match(r"<([^>]*)>", rest)
+        if not quoted and not angled:
+            out.append(("R12", "%s:%d `%s` is an include whose target is not a file name (a macro could stand for any file), which this reader does not read" % (name, number, line.strip())))
+            continue
+        target = (quoted or angled).group(1)
+        if angled and not target.startswith("cfbi/"):
+            continue
         in_source_dir = target[len("cfbi/"):] if target.startswith("cfbi/") else target
-        next_to_includer = posixpath.normpath(posixpath.join(posixpath.dirname(name), target))
+        next_to_includer = posixpath.normpath(posixpath.join(posixpath.dirname(name), target)) if quoted else None
         if in_source_dir not in numbered and next_to_includer not in numbered:
-            out.append(("R12", "%s:%d `#include \"%s\"` names a file that the reader does not load, and it could hold a macro that no pin sees" % (name, number, target)))
+            out.append(("R12", "%s:%d `#include %s` names a file that the reader does not load, and it could hold a macro that no pin sees" % (name, number, rest)))
+    return out
+
+
+def directive_problems(texts, numbered):
+    """R12: a directive that is not one of ``DIRECTIVES`` (the reader would not know what it does) and a trigraph (``??/`` is a backslash, ``??=`` a ``#``: a spelling of a line splice or a
+    directive that this reader does not read; the build does not translate trigraphs in C++17 mode, but nothing here may depend on that)."""
+    out = []
+    for name, number, line in stripped_lines(numbered):
+        m = KEYWORD.match(line) if DIRECTIVE_START.match(line) else None
+        if m and m.group(1) is not None and m.group(1) not in DIRECTIVES:
+            out.append(("R12", "%s:%d `%s` is a directive that this reader does not read" % (name, number, line.strip()[:60])))
+    for name in sorted(source_texts(texts)):
+        if TRIGRAPH.search(texts[name]):
+            out.append(("R12", "%s holds a trigraph, which could spell a line splice or a directive that this reader does not read" % name))
     return out
 
 
 # the conditionals that remain in the default view of a file (those on build tunables, which no variant build changes); any other one would hide text from the compiler that the rules still read
-ALLOWED_CONDITIONALS = {"cfbi_rows.cuh": {"ifndef CFBI_ROWS_PF_L1", "if CFBI_ROWS_PF_L1", "ifndef CFBI_ROWS_MINB"}, "cfbi_common.cuh": set(), "cfbi_launch.cu": set()}
+# (every file that a pin reads: the constants come from cfbi_primitives.cuh, the counter limit from cfbi_binding.cpp)
+ALLOWED_CONDITIONALS = {"cfbi_rows.cuh": {"ifndef CFBI_ROWS_PF_L1", "if CFBI_ROWS_PF_L1", "ifndef CFBI_ROWS_MINB"}, "cfbi_common.cuh": set(), "cfbi_launch.cu": set(), "cfbi_primitives.cuh": set(),
+                       "cfbi_binding.cpp": set()}
+STRAY = re.compile(r"^" + HASH + r"(if|ifdef|ifndef|elifdef|elifndef|elif)\b[ \t\v\f]*(.*)$")
 
 
-def stray_conditionals(view_text, allowed):
+def stray_conditionals(lines, allowed):
+    """``[(first physical line, line)]`` of the conditionals of ``lines`` (``[(number, logical line)]`` of a default view) that are not in ``allowed``."""
     out = []
-    for i, line in enumerate(view_text.splitlines(), 1):
-        m = re.match(r"^\s*#\s*(if|ifdef|ifndef|elif)\b\s*(.*)$", line)
-        if m:
-            key = re.sub(r"\s*(//.*|/\*.*)$", "", "%s %s" % m.groups()).strip()
-            if key not in allowed:
-                out.append((i, line.strip()))
+    for number, line in lines:
+        m = STRAY.match(line)
+        if m and ("%s %s" % m.groups()).strip() not in allowed:
+            out.append((number, line.strip()))
     return out
 
 
@@ -426,8 +516,9 @@ def problems(texts):
     numbered = default_numbered(texts)
     out.extend(macro_problems(texts, numbered))
     out.extend(include_problems(numbered))
+    out.extend(directive_problems(texts, numbered))
     for name, allowed in ALLOWED_CONDITIONALS.items():
-        for ln, line in stray_conditionals(view[name], allowed):
+        for ln, line in stray_conditionals(numbered[name], allowed):
             out.append(("R12", "%s:%d holds the conditional `%s`, which the rules cannot resolve (an `#if 0` would hide a protocol line from the compiler and leave it in the text)" % (name, ln, line)))
     # R11: the default hooks are what the expansion assumes
     defs = macro_definitions(rows)
