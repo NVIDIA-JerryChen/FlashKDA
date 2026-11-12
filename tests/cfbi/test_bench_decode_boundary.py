@@ -21,11 +21,15 @@ from pathlib import Path
 
 import pytest
 
-import bench_decode as bd
-import bench_records as br
-import decode_policy as dp
-
 ROOT = Path(__file__).resolve().parents[2]
+for _p in (ROOT / "benchmarks", ROOT / "tests" / "cfbi"):                      # the modules under test, whatever the working directory and the PYTHONPATH of the run
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+import bench_decode as bd  # noqa: E402
+import bench_records as br  # noqa: E402
+import decode_policy as dp  # noqa: E402
+
 B200, B300, H100, SM120 = 100, 103, 90, 120                          # compute capabilities as the policy takes them (major * 10 + minor)
 DEVICE_B200 = {"name": "NVIDIA B200", "sm_count": 148, "cc": "10.0", "l2_bytes": 126 * 2 ** 20, "eviction_bytes": 2 * 126 * 2 ** 20 + 2 ** 20}
 DEVICE_H100 = dict(DEVICE_B200, name="NVIDIA H100", sm_count=132, cc="9.0")
