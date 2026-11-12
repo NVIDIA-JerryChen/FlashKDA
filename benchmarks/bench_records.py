@@ -57,10 +57,12 @@ PROCESS_MEDIAN = "process_median"
 MIN_TRIALS = 5  # trials per cell and process of a process-median record
 UNSTABLE_POLICIES = ("invalid", "worst", "widen")
 RERUN_SCALE = 3  # calls per trial (and profiled calls) of a re-run relative to the first campaign
-# meta fields that are one value for all record files of a side (the last two: whether the single-launch control was on, and the limit constant of the measured tree)
-SIDE_META = ("commit", "tree", "src", "impl", "env_impl", "torch", "cuda", "cc", "trials", "sample_stat", "kind", "single_force", "single_per_sm")
+# meta fields that are one value for all record files of a side (the last three: whether the single-launch control was on, the limit constant of the measured tree, and whether one graph
+# replay per trial was profiled)
+SIDE_META = ("commit", "tree", "src", "impl", "env_impl", "torch", "cuda", "cc", "trials", "sample_stat", "kind", "single_force", "single_per_sm", "graph_nodes")
 RERUN_SAME_CONFIG = SIDE_META + ("gpu", "sm_count", "host")  # meta fields a re-run shares with its first campaign
 AB_META = ("trials", "torch", "cuda", "cc", "kind", "dm", "heads", "l2_cache_bytes", "eviction_bytes")  # the baseline and the candidate are measured under one contract and one toolchain
+AB_FLAGS = ("graph_nodes",)  # boolean options of the benchmark that both builds must share (a record of before the option counts as False): profiling a replay is no neutral act for the next trial
 # cell arguments that describe a build, which A and B may differ in (the last two: the single-launch control, and whether the expected launches came from a per-cell specification)
 BUILD_ARGS = ("impl", "kernels", "compute_nodes", "aux_nodes", "compute_kernels", "expect_compute", "expect_aux", "single_force", "expect_route")
 SCALED_ARGS = ("calls_per_trial", "profile_calls", "profile_cycles", "calls_scale")  # cell arguments that a re-run multiplies
@@ -726,6 +728,11 @@ def _meta_values(records, field):
     return sorted(set(json.dumps((r.get("meta") or {}).get(field), sort_keys=True) for r in records))
 
 
+def _flag_values(records, field):
+    """The sorted values that a boolean meta field takes over the records; a record without the field (of before the option) counts as False."""
+    return sorted(set(bool((r.get("meta") or {}).get(field)) for r in records))
+
+
 def config_differences(first, other, fields):
     """``[(field, values of first, values of other)]`` for the meta ``fields`` that do not hold one value that both record lists share (the values are the sorted JSON texts of the field in
     each list): the configuration that two campaigns must share (the snapshot, the routing, the toolchain, the statistic, the device) to measure the same thing."""
@@ -775,6 +782,8 @@ def ab_problems(base, cand, name):
     workload / call / profiled-call counts. Their commit, source directory and implementation may differ, that is what is compared."""
     out = ["the baseline and the candidate %s differ in meta %s (%s vs %s)" % (name, field, ", ".join(_meta_values(base, field)), ", ".join(_meta_values(cand, field)))
            for field in AB_META if _meta_values(base, field) != _meta_values(cand, field)]
+    out += ["the baseline and the candidate %s differ in meta %s (%s vs %s)" % (name, field, ", ".join(map(str, _flag_values(base, field))), ", ".join(map(str, _flag_values(cand, field))))
+            for field in AB_FLAGS if _flag_values(base, field) != _flag_values(cand, field)]
     return out + workload_problems(base, cand, "the baseline %s" % name, "the candidate %s" % name, BUILD_ARGS)
 
 
