@@ -203,7 +203,9 @@ def exactness_problems(m, repo=None):
             if not rc.commit_matches(str((base.get("meta") or {}).get("commit")), m["base"]):
                 out.append("%s: the baseline record is of commit %s, the base is %s" % (where, (base.get("meta") or {}).get("commit"), m["base"][:10]))
             base_files, why = suite_files(repo, m["base"], name)
-            out.extend("%s: the baseline record is not complete: %s" % (where, p) for p in sr.completeness_problems(base, base_files if not why else None))
+            if why:
+                out.append("%s: %s" % (where, why))
+            out.extend("%s: the baseline record is not complete: %s" % (where, p) for p in sr.completeness_problems(base, base_files))
             out.extend("%s: %s" % (where, p) for p in sr.check(base, cand))
     return out
 

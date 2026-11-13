@@ -403,6 +403,14 @@ def test_the_expected_collection_is_the_one_of_the_suite_commit_and_of_the_envir
     assert any("collection" in p and "cannot be read" in p and "suite gate" in p for p in sp.exactness_problems(m, repo))
 
 
+def test_a_commit_that_the_repository_does_not_have_is_a_named_problem_not_a_skipped_check(tmp_path):
+    m, repo, _ = exactness_world(tmp_path)
+    found = sp.exactness_problems(dict(m, base="1" * 40), repo)
+    assert any("cannot list tests/cfbi of the commit 1111111111" in p and p.startswith("b200, suite S") for p in found), found[:3]          # the base: its files cannot be read
+    found = sp.exactness_problems(dict(m, suite_commit="2" * 40), repo)
+    assert any("cannot list tests/cfbi of the commit 2222222222" in p or "does not have the commit of the suites" in p for p in found), found[:3]       # the commit of the suites
+
+
 def test_gate_g_is_held_to_its_own_file_and_ids_and_the_manifest_names_a_collection_for_each_suite(tmp_path):
     m, repo, _ = exactness_world(tmp_path)
     edit_record(m, "b200", "gate", "candidate", lambda rec: (rec["tests"].update({"tests/cfbi/test_vs_ref.py::test_extra": "passed"}), rec["files"]["tests/cfbi/test_vs_ref.py"].update(passed=3, total=3),
