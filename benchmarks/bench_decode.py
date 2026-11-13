@@ -653,8 +653,8 @@ def main(argv=None):
     print("device %s  impl=%s  %d cell(s)  trials=%d  calls/trial: lockstep %d, cold %d, probe %d%s" % (
         device["name"], a.impl, len(specs), opts["trials"], calls_per_trial("lockstep", opts), calls_per_trial("cold", opts), calls_per_trial("probe", opts),
         "  [%s]" % "; ".join(notes) if notes else ""), flush=True)
-    ext = load_binding() if (a.single_force or a.expect_route) else None
-    with single_launch_control(ext, a.single_force):
+    ext = load_binding()                                            # every run loads the extension here, before the control is switched on and before the first shape environment:
+    with single_launch_control(ext, a.single_force):                # the two sides of an A/B have one history up to their first call (side A used to load it at its first warm call)
         routes = None
         if a.expect_route:
             routes = route_expectations(specs, a.impl, device, per_sm, a.single_force)

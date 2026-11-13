@@ -528,6 +528,33 @@ def test_a_run_without_the_option_leaves_the_control_alone(world, tmp_path):
     assert rec["meta"]["single_force"] is False and rec["cells"][0]["args"]["single_force"] is False and rec["cells"][0]["args"]["expect_route"] is None
 
 
+# ---- both sides of an A/B load the extension at the same point -------------------------------------------------------------------------------------------------
+LOAD_ORDER_RUNS = [
+    ("side A, the explicit two launches", ["--impl", "64", "--expect-compute", "two-launch", "--cells", "N=4;H=12;regime=lockstep;"]),
+    ("side B, the default routing", ["--boundary", "148", "--expect-route", "spec", "--cells", "N=4;H=12;regime=lockstep;", "N=99;H=12;regime=lockstep;"]),
+    ("side B, the control on", ["--boundary", "148", "--single-force", "--expect-route", "spec", "--cells", "N=99;H=12;regime=lockstep;"]),
+    ("a run with none of the options of an A/B", ["--cells", "N=4;H=12;regime=lockstep;"])]
+
+
+@pytest.mark.parametrize("what,argv", LOAD_ORDER_RUNS, ids=[r[0] for r in LOAD_ORDER_RUNS])
+def test_every_run_loads_the_extension_once_before_its_first_shape_environment(world, tmp_path, monkeypatch, what, argv):
+    """The two sides of an A/B have one history up to their first call: the extension, and its machine code with it, is loaded at the same point of both, before the first shape environment,
+    whatever options a side runs with (side A used to load it at its first warm call, side B before the control was switched on). An ordering rule shows in no result, so the order is recorded."""
+    events = []
+    monkeypatch.setattr(bd, "load_binding", lambda: (events.append(("load",)), world.ext)[1])
+
+    class Recording(FakeShapeEnv):
+        def __init__(self, N, H, impl):
+            events.append(("env", N, H))
+            super(Recording, self).__init__(N, H, impl)
+
+    monkeypatch.setattr(bd, "ShapeEnv", Recording)
+    code, rec = run_main(tmp_path, *argv)
+    assert code == 0
+    assert events.count(("load",)) == 1 and events[0] == ("load",), (what, events)
+    assert [e[0] for e in events[1:]] and set(e[0] for e in events[1:]) == {"env"}               # and the shapes were measured after it
+
+
 # ---- the route specification, per cell -----------------------------------------------------------------------------------------------------------------------
 def test_each_cell_is_asserted_against_the_route_that_the_specification_gives_for_it(world, tmp_path, capsys):
     cells = ["N=4;H=12;regime=lockstep;", "N=99;H=12;regime=lockstep;", "N=128;H=12;regime=staggered;", "N=395;H=6;regime=cold;", "N=1;H=12;regime=probe;pos=63;"]
