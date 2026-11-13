@@ -155,22 +155,14 @@ DeviceCaps device_caps(int device) {
 
 size_t k1_smem_bytes(int impl) { return (impl & IMPL_REF_CHUNK) ? ref::K1_SMEM_BYTES : K1_SMEM_BYTES; }
 
+// What a forward call needs of a device, per CTA (the pure resolution compares it with the opt-in limit, cfbi_policy.h): K1 of the optimised and of the reference chunk kernels, which need
+// 204 KiB / 218 KiB of dynamic shared memory (the opt-in limit is 227 KiB on sm_90 / 100 / 103, but 163 KiB on sm_80 and 99 KiB on sm_86 / 89 / 120: the chunk kernels cannot run there),
+// and the optimised row engine.
+constexpr ImplNeeds kImplNeeds{static_cast<int64_t>(K1_SMEM_BYTES), static_cast<int64_t>(ref::K1_SMEM_BYTES), ROWS_SMEM_NEED_BYTES};
+
 int resolve_impl(int requested, int device) {
     const DeviceCaps c = device_caps(device);
-    int impl = requested & (IMPL_REF_ROWS | IMPL_REF_CHUNK | IMPL_ROWS_ONLY | IMPL_K2_UMMA | IMPL_K2_DYN | IMPL_DECODE_PLAN);
-    // The tcgen05 K2 only exists in the sm_100a / sm_103a code (cfbi_tcgen05.cuh): drop the request everywhere else
-    // (the mma.sync K2 computes the same bits).
-    if (c.major != 10) impl &= ~IMPL_K2_UMMA;
-    // The optimised kernels use sm_90+ instructions (cfbi_async.cuh); below that they are compiled as traps.
-    if (c.major < 9) impl |= IMPL_REF_ROWS | IMPL_REF_CHUNK;
-    // K1 needs 204 KiB (optimised) / 218 KiB (reference) of dynamic shared memory per CTA; where the device cannot
-    // provide it the row engine (which needs 7 KiB) evaluates every row - the same program, just row by row. That
-    // fallback uses the reference row engine, the one validated on such devices (sm_80 / 86 / 89).
-    if (!(impl & IMPL_ROWS_ONLY) && static_cast<size_t>(c.smem_optin) < k1_smem_bytes(impl)) impl |= IMPL_ROWS_ONLY | IMPL_REF_ROWS;
-    // The dynamic-schedule K2 runs on top of the optimised K1: the reference chunk kernels (also what sm < 90 gets) and the row-engine-only schedule
-    // have no K2 stage of this kind, and when the UMMA K2 is requested as well it wins (also where it is dropped: the request alone clears the bit).
-    if ((impl & (IMPL_REF_CHUNK | IMPL_ROWS_ONLY)) || (requested & IMPL_K2_UMMA)) impl &= ~IMPL_K2_DYN;
-    return impl;
+    return resolve_impl_for(requested, c.major * 10 + c.minor, c.smem_optin, kImplNeeds);
 }
 
 // Duration of the schedule builder (units of 0.1 ns) for N sequences and `pairs` = N * H pairs: an upper envelope of the medians measured on B200 / B300, the larger of
