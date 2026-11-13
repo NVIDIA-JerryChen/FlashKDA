@@ -26,7 +26,10 @@ run only claims:
   row: the ledger row (``record_checker.step_problems``) built from the dumps and the decision: the comparison entries in change mode with the previous accepted dump and the allow-list,
     the resource figures of the row engine, the A/B medians and the noise-limited cells of the comparison against the previous accepted state, and the timing results.
 
-usage: step_record.py decide|row|check --evidence MANIFEST [--out FILE] [--repo DIR]
+  render: the section of the performance document for the step (outcome, what was measured, the timing of every device and side, the resource figures of the row engine per toolchain), generated
+    from the same recomputed evidence, so that the document holds no number that the raw records do not give.
+
+usage: step_record.py decide|row|check|render --evidence MANIFEST [--out FILE] [--repo DIR] [--number N]
 """
 import argparse
 import json
@@ -297,6 +300,83 @@ def row_problems(m, row, repo=None):
     return rc.step_problems(row, None, meta, repo)
 
 
+# ---- the document ----------------------------------------------------------------------------------------------------------------------------------------------
+STEP_TITLES = {"trims": "Row engine step 1: the schedule trims", "e_tile": "Row engine step 2: the staged E tile", "a_fragments": "Row engine step 3: the once-per-row A fragments",
+               "kd_tile": "Row engine step 4: the chunk-end KD tile"}
+SHOWN_METRICS = (GATE_METRIC,) + tuple(br.WALL_METRICS)       # the kernel sum decides, the wall metrics are reported
+
+
+def median_of(values):
+    v = sorted(values)
+    n = len(v)
+    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0
+
+
+def timing_rows(m, infos):
+    """``[(device, kind, metric, cells, slower, faster, median change, lowest, highest, noise-limited, judged on the re-run)]``: the recomputed comparison of every device and side, the change being B
+    against A in percent of A's median (negative is faster); ``slower`` and ``faster`` are the confirmed cells."""
+    out = []
+    for dev in GATING:
+        for kind in KINDS:
+            info = infos[dev][kind][1]
+            commit = m["previous"] if kind == "previous" else m["base"]
+            for metric in SHOWN_METRICS:
+                rows = dict((key, row) for (mm, key), row in info["rows"].items() if mm == metric)
+                if not rows:
+                    continue
+                firsts = first_deltas(info, metric, commit)
+                deltas = [figure(r["median_delta_pct"]) for r in rows.values() if is_number(r.get("median_delta_pct"))]
+                out.append((dev, kind, metric, len(rows), sum(1 for r in rows.values() if r["status"] == "FAIL"), sum(1 for k, r in rows.items() if confirmed_gain(r, firsts.get(k), TOL_PCT)),
+                            median_of(deltas) if deltas else float("nan"), min(deltas) if deltas else float("nan"), max(deltas) if deltas else float("nan"),
+                            sum(1 for r in rows.values() if r.get("noise_limited")), sum(1 for r in rows.values() if r.get("judged_on") == "rerun")))
+    return out
+
+
+def _figures(rec):
+    return " / ".join(str(rec.get(f)) for f in rc.RESOURCE_FIGURES) if isinstance(rec, dict) else "-"
+
+
+def resource_rows(m):
+    """``[(toolchain, architecture, instantiation, base reference, previous accepted state, step)]`` as ``registers / spill loads / spill stores / stack``: the base figure is the kernel that the
+    resource gate holds the instantiation to (``codegen_gate.gate_r_reference``)."""
+    out = []
+    for key in rc.COMPARISONS:
+        spec = m["codegen"][key]
+        base, cand, prev = (cg.load_dump(spec[name]) for name in ("base", "cand", "prev"))
+        for arch in rc.COMPARISON_ARCHS[key]:
+            for inst in sorted(k for k in cand["kernels"][arch] if cg.family(k) in cg.DEFAULT_OWNED):
+                out.append((key, arch, inst, _figures(cg.gate_r_reference(base["kernels"][arch], inst)), _figures(prev["kernels"][arch].get(inst)), _figures(cand["kernels"][arch][inst])))
+    return out
+
+
+def render_section(m, decision, row, infos, number=10):
+    """The section of the performance document for the step: only numbers of ``decide`` / ``timing_rows`` / ``resource_rows`` / the ledger row, i.e. of the raw evidence."""
+    hosts = dict((dev, infos[dev]["previous"][1].get("host")) for dev in GATING)
+    adopted = decision["outcome"] == "adopted"
+    lines = ["## %d. %s" % (number, STEP_TITLES.get(m["step"], m["step"])), "",
+             "Generated from the evidence of the step by `benchmarks/step_record.py render`; every number below is recomputed from the raw record files (the campaigns by the admission of the record "
+             "checker, the dumps by the code-generation gate).", "", "### Outcome", "", "The step is **%s**." % ("adopted" if adopted else "not adopted"), ""]
+    lines += ["- %s" % r for r in decision["reasons"]] + ["", "### What was measured", ""]
+    lines.append("- Step commit %s, previous accepted state %s, base %s; Gate G and Suite S (without the sanitizer file) ran on %s, which has the sources of the step's kernels." % (
+        m["commit"][:12], m["previous"][:12], m["base"][:12], (m.get("suite_commit") or m["commit"])[:12]))
+    lines.append("- Campaigns: per device two interleaved A/B campaigns, A the previous accepted state or the base and B the step, both sides at the default routing with CUDA_MODULE_LOADING=EAGER, "
+                 "at least 3 record files per side in the abba start order, a cell with a spread above %.1f %% re-run once with %d times the calls; hosts %s." % (
+                     100 * br.UNSTABLE_SPREAD, br.RERUN_SCALE, ", ".join("%s on %s" % (dev, hosts[dev]) for dev in GATING)))
+    lines.append("- Gating metric of the step: the kernel sum (`%s`); a cell fails when B is slower than A by more than %.2f %% of the median (more with its spread when it is noise-limited). The wall "
+                 "metrics are measured and reported, they do not decide." % (GATE_METRIC, TOL_PCT))
+    lines += ["", "### Timing", "", "Change of B against A in percent of the median of A (negative is faster); slower and faster count the confirmed cells.", "",
+              "| device | against | metric | cells | confirmed slower | confirmed faster | median change | range | noise-limited | judged on the re-run |", "|---|---|---|---|---|---|---|---|---|---|"]
+    for dev, kind, metric, cells, slower, faster, med, low, high, noisy, rerun in timing_rows(m, infos):
+        lines.append("| %s | %s | %s | %d | %d | %d | %+.2f %% | %+.2f %% to %+.2f %% | %d | %d |" % (dev, AGAINST[kind], metric, cells, slower, faster, med, low, high, noisy, rerun))
+    lines += ["", "### Code generation and resources", ""]
+    lines.append("Gate X in change mode (every kernel but the row engine identical to the base): " + "; ".join(
+        "%s %s (%d kernels compared, %d differences)" % (key, e["verdict"], e["compared"], e["differences"]) for key, e in sorted(row["codegen_gate"].items())) + ".")
+    lines += ["", "Registers / spill loads / spill stores / stack bytes of the row engine; the base column is the kernel that the resource gate holds the instantiation to.", "",
+              "| toolchain | architecture | instantiation | base | previous accepted state | step |", "|---|---|---|---|---|---|"]
+    lines += ["| %s | %s | %s | %s | %s | %s |" % r for r in resource_rows(m)]
+    return "\n".join(lines) + "\n"
+
+
 # ---- the command line ------------------------------------------------------------------------------------------------------------------------------------------
 def _report(problems):
     for p in problems:
@@ -317,10 +397,11 @@ def _print_decision(decision):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("decide", "row", "check"))
+    ap.add_argument("cmd", choices=("decide", "row", "check", "render"))
     ap.add_argument("--evidence", required=True)
     ap.add_argument("--out", default=None)
     ap.add_argument("--repo", default=None)
+    ap.add_argument("--number", type=int, default=10, help="render: the number of the section")
     a = ap.parse_args(argv)
     try:
         m = load_json(a.evidence)
@@ -340,6 +421,9 @@ def main(argv=None):
             with open(a.out or "-", "w") if a.out else sys.stdout as f:
                 json.dump(row, f, indent=1, sort_keys=True)
                 f.write("\n")
+        if a.cmd == "render":
+            with open(a.out or "-", "w") if a.out else sys.stdout as f:
+                f.write(render_section(m, decision, row, infos, a.number))
         return _report(["exactness: %s" % p for p in exact] + row_problems(m, row, a.repo))
     except (OSError, ValueError, KeyError, cg.Unusable) as e:
         print("unusable input: %s" % e, file=sys.stderr)

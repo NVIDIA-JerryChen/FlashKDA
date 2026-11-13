@@ -162,9 +162,8 @@ def test_the_manifest_names_what_the_decision_needs():
         assert any(needle in p for p in sp.manifest_problems(bad)), needle
 
 
-def test_an_adopted_row_built_from_the_evidence_passes_the_record_checker(tmp_path, monkeypatch):
-    """The row of an adopted step (dumps in change mode with the previous accepted dump, the occupancy records, the A/B medians, the timing results) is accepted by ``step_problems``; the
-    same row with a failed resource gate or a regression is not."""
+def adopted_case(tmp_path, monkeypatch):
+    """The manifest, the recomputed campaigns, the decision and the row of an adopted step whose dumps are those of the record checker's own tests."""
     m = manifest(tmp_path, {"b200": EVERYWHERE, "b300": EVERYWHERE})
     codegen = {}
     for key in rc.COMPARISONS:
@@ -178,7 +177,33 @@ def test_an_adopted_row_built_from_the_evidence_passes_the_record_checker(tmp_pa
     monkeypatch.setattr(sp, "exactness_problems", lambda *args, **kwargs: [])
     infos = sp.campaign_infos(m)
     decision = sp.decide(m, infos)
-    row = sp.build_row(m, decision, infos)
+    return m, infos, decision, sp.build_row(m, decision, infos)
+
+
+def test_the_section_of_the_document_holds_the_numbers_of_the_recomputed_evidence(tmp_path, monkeypatch):
+    m, infos, decision, row = adopted_case(tmp_path, monkeypatch)
+    text = sp.render_section(m, decision, row, infos, number=10)
+    lines = text.split("\n")
+    assert lines[0] == "## 10. Row engine step 1: the schedule trims" and "The step is **adopted**." in lines
+    assert any("%s: 2 confirmed faster cell(s) of the kernel sum" % dev in line for dev in rc.DEVICES for line in lines)
+    for dev in rc.DEVICES:                                                           # the table: one row per device, side and metric, with the counts that the decision has
+        mine = [line for line in lines if line.startswith("| %s | the previous accepted state | total_us |" % dev)]
+        assert len(mine) == 1 and mine[0].split("|")[5:7] == [" 0 ", " 2 "], mine
+        assert any(line.startswith("| %s | the base | total_us |" % dev) for line in lines)
+    assert all(not line.startswith("| b200 | the base | total_us | ") or " 0 | 0 |" in line for line in lines)               # the base campaign is flat: nothing slower, nothing faster
+    assert any(line.startswith("| conda | sm_100a | cfbi::rows_kernel |") for line in lines)                                       # the resource table names the row engine of every toolchain
+    assert sum(1 for line in lines if line.startswith("| container_b200 |")) == 1 and sum(1 for line in lines if line.startswith("| conda |")) == 3
+    assert any(line.startswith("Gate X in change mode") and "conda PASS" in line and "container_b300 PASS" in line for line in lines)
+    assert text.endswith("\n") and not text.endswith("\n\n")
+    refused = json.loads(json.dumps(decision))
+    refused["outcome"], refused["reasons"] = "not_adopted", ["b200, against the base, some cell: B is 3.00 % slower than A in the kernel sum"]
+    assert "The step is **not adopted**." in sp.render_section(m, refused, row, infos).split("\n")
+
+
+def test_an_adopted_row_built_from_the_evidence_passes_the_record_checker(tmp_path, monkeypatch):
+    """The row of an adopted step (dumps in change mode with the previous accepted dump, the occupancy records, the A/B medians, the timing results) is accepted by ``step_problems``; the
+    same row with a failed resource gate or a regression is not."""
+    m, infos, decision, row = adopted_case(tmp_path, monkeypatch)
     assert row["outcome"] == "adopted" and row["gates"] == {"exactness": True, "codegen": True} and row["timing"]["chain"] == "not_applicable"
     meta = {"base": trs.BASE}
     assert rc.step_problems(row, None, meta) == []
