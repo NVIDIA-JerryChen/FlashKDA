@@ -16,7 +16,10 @@
 //   * the cross-block part of O (M2 = dot3(Aqk row, cached U rows)) does not need the new U, so it is computed with
 //     the UT / W cross-block products; what is left after P1 is one subtraction and a short FMA chain over
 //     preloaded cached rows;
-//   * the cache append of khat / G2 and the reference-row copy no longer cost a barrier.
+//   * the cache append of khat / G2 and the reference-row copy no longer cost a barrier;
+//   * schedule trims (no operand and no operation changes): the plan entry arrives in one round trip, the tokens of a row are loaded before the cached rows and the L2 prefetch (which walks one
+//     plane at a time and divides nothing), the lines of the first row's tokens are prefetched into L1 in front of the arrival atomic of the single launch, the accumulators of the B and D epilogues
+//     are picked with selects (no local memory), and the last row of a call has no end-of-row barrier.
 // The cache planes (khat, G2, UT, W, U) and E live in global memory (fp32); plain (non-const, non-restrict)
 // pointers are used so the compiler never turns reads of freshly written rows into .nc loads.
 //
@@ -135,6 +138,47 @@ __device__ __forceinline__ void prefetch_state(const void* ptr) {
 #else
     prefetch_l2(ptr);
 #endif
+}
+
+// 8 consecutive bf16 held in one uint4 -> 8 fp32 (exact): the unpacking half of load8_bf16 (cfbi_common.cuh), so that the 16-byte load can be issued early and converted where it is used.
+__device__ __forceinline__ void unpack8_bf16(const uint4& u, float (&x)[8]) {
+    const uint32_t w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        x[2 * i] = __uint_as_float(w[i] << 16);
+        x[2 * i + 1] = __uint_as_float(w[i] & 0xFFFF0000u);
+    }
+}
+
+// The global loads of a row that need only its token, its head and the role of the thread, none of the state and none of pos: warp 0 holds 16 bytes of k (lanes 0-15) or of q (lanes 16-31),
+// channels 8 * (lane & 15) ..+7; thread tid < HEAD_K the g of channel tid, thread HEAD_K the beta logit, thread tid < HEAD_V the v of channel tid. They stay raw (the bf16 pairs of k / q are
+// unpacked where phase A uses them). The arguments are the tensors, not the parameter block: only the entry of the kernel is handed the block (the protocol rules of the single launch).
+struct RowTokens {
+    uint4 kq;
+    float g, beta, v;
+};
+__device__ __forceinline__ RowTokens rows_load_tokens(const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* g, const __nv_bfloat16* beta, const __nv_bfloat16* v, int64_t tok,
+                                                      int h, int H, int tid, int lane) {
+    const int64_t off = (tok * H + h) * HEAD_K;   // q/k/v/g row offset
+    RowTokens t;
+    t.kq = make_uint4(0u, 0u, 0u, 0u);
+    t.g = 0.f;
+    t.beta = 0.f;
+    t.v = 0.f;
+    if (tid < 32) t.kq = *reinterpret_cast<const uint4*>((lane >= 16 ? q : k) + off + 8 * (lane & 15));
+    if (tid < HEAD_K) t.g = bf16_to_f32(g[off + tid]);
+    if (tid == HEAD_K) t.beta = bf16_to_f32(beta[tok * H + h]);
+    if (tid < HEAD_V) t.v = bf16_to_f32(v[off + tid]);
+    return t;
+}
+// The L1 prefetch of the lines that rows_load_tokens loads (the same addresses): a prefetch holds no register, the loaded values would.
+__device__ __forceinline__ void rows_prefetch_tokens(const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* g, const __nv_bfloat16* beta, const __nv_bfloat16* v, int64_t tok, int h,
+                                                     int H, int tid, int lane) {
+    const int64_t off = (tok * H + h) * HEAD_K;
+    if (tid < 32) prefetch_l1((lane >= 16 ? q : k) + off + 8 * (lane & 15));
+    if (tid < HEAD_K) prefetch_l1(g + off + tid);
+    if (tid == HEAD_K) prefetch_l1(beta + tok * H + h);
+    if (tid < HEAD_V) prefetch_l1(v + off + tid);
 }
 
 // Cross-sub-block products of the current row for KS = 2s k-steps: M[which][v] = dot3(A row, X[which][0:16s][v]) with
@@ -278,11 +322,23 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
     __shared__ RowSmem S;
     __shared__ int dec_pos0;   // DECODE only: the fill of the open chunk, from thread 0 (unused, hence not allocated, with DECODE = false)
     const int n = blockIdx.x, h = blockIdx.y, H = p.H;
-    const SeqPlan sp = rows_entry<DECODE>(p, n, dec_pos0);
-    const int nrows = sp.hrows;
-    if (nrows == 0) return;
     const int tid = threadIdx.x, warp = tid >> 5;
     const LaneIdx L;
+    if constexpr (DECODE) {
+        // What the first row loads and needs only the slot's token start and the head, nothing of the fill of the open chunk, is requested here, in front of the arrival atomic of rows_entry: the
+        // lines are prefetched into L1, so their round trip overlaps the atomic's and the loads of the row, right behind the entry, hit L1. A prefetch holds no register across the entry; the loaded
+        // values would (the first row's tokens are 7 registers, and the single-launch instantiation then spills where it did not). What depends on the fill (the cached rows b..pos-1 and the
+        // previous G2 row, whose addresses and masks are functions of pos) stays behind the entry: the atomic is the only read of pos. The entry derives the same window (the inputs are read-only
+        // during a call, as the protocol already needs for the heads of a sequence to agree).
+        const SeqWindow w0 = seq_window(p.cu_seqlens, p.fixed_len, p.slot_ids, n);
+        if (w0.len != 0) rows_prefetch_tokens(p.q, p.k, p.g, p.beta, p.v, (int64_t)w0.tok0, h, H, tid, L.lane);   // uniform over the CTA: the entry returns for an empty window
+    }
+    const SeqPlan sp = rows_entry<DECODE>(p, n, dec_pos0);
+    // DECODE = false: the whole plan entry in one global round trip. Left alone, the compiler sinks every load of the entry but `hrows` below the exit that follows, so the fields that every address
+    // below needs (tok0, pos0, slot) cost a second dependent round trip. The empty volatile asm pins their loads in front of the test; it emits no instruction.
+    if constexpr (!DECODE) asm volatile("" ::"r"(sp.tok0), "r"(sp.len), "r"(sp.pos0), "r"(sp.slot));
+    const int nrows = sp.hrows;
+    if (nrows == 0) return;
     const int g = L.g, t = L.t;
 
     float* R = p.rows + ((int64_t)sp.slot * H + h) * ROWS_PER_HEAD_FLOATS;
@@ -321,14 +377,11 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
         const bool mine = g == (slot & 7);
 
         // ---- early loads: nothing here depends on this row's prep ------------------------------------
-        float gprev = 0.f, vraw = 0.f;
+        // Issue order: the loads of the critical path first (the row's own tokens, the cached rows of the recursion and the previous G2 row), then the L2 prefetch of the state: a run of
+        // instructions that only has to be issued before the state is needed, not in front of the loads that the first phases wait for.
+        const RowTokens tk = rows_load_tokens(p.q, p.k, p.g, p.beta, p.v, tok, h, H, tid, L.lane);
+        float gprev = 0.f;
         if (i == 0) {
-            // pull the whole state this CTA will touch towards L2 so later phases do not pay HBM latency
-            const char* eb = reinterpret_cast<const char*>(Eg);
-            prefetch_state(eb + tid * 128);
-            prefetch_state(eb + (tid + NTHREADS) * 128);
-            const int lines = pos * 4;   // 512 B per row = 4 lines of 128 B, five planes
-            for (int l = tid; l < 5 * lines; l += NTHREADS) prefetch_state(R + (l / lines) * ROW_PLANE_FLOATS + (l % lines) * 32);
 #pragma unroll
             for (int jj = 0; jj < 16; ++jj) xpre[jj] = (b + jj < pos) ? Xg[(b + jj) * HEAD_K + col] : 0.f;
             if (tid < HEAD_V) {
@@ -337,17 +390,25 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
                 if (pos > 0) gprev = Rg[(pos - 1) * HEAD_K + tid];
                 if (b < pos) gref_pre = Rg[b * HEAD_K + tid];
             }
+            // pull the whole state this CTA will touch towards L2 so later phases do not pay HBM latency
+            const char* eb = reinterpret_cast<const char*>(Eg);
+            prefetch_state(eb + tid * 128);
+            prefetch_state(eb + (tid + NTHREADS) * 128);
+            const int lines = pos * 4;   // 512 B per row = 4 lines of 128 B per plane, five planes: one plane at a time, so that no index is divided
+            // (not unrolled: five copies of the loop hold registers that the row loop does not have)
+#pragma unroll 1
+            for (int pl = 0; pl < NPLANES; ++pl)
+                for (int l = tid; l < lines; l += NTHREADS) prefetch_state(R + pl * ROW_PLANE_FLOATS + l * 32);
         } else if (tid < HEAD_V) {
             gprev = S.g2[tid];   // the previous row's G2 (written by this very thread last iteration)
         }
-        if (tid < HEAD_V) vraw = bf16_to_f32(p.v[off + tid]);
 
         // ---- A. token-local prep -------------------------------------------------------------
         if (warp == 0) {   // lanes 0-15: k, lanes 16-31: q (channels 8*(lane&15) ..+7)
             const bool is_q = L.lane >= 16;
             const int c0 = 8 * (L.lane & 15);
             float x[8];
-            load8_bf16((is_q ? p.q : p.k) + off + c0, x);
+            unpack8_bf16(tk.kq, x);
             const float inv = l2norm_inv(x);
             float* dst = is_q ? S.q : S.k;
 #pragma unroll
@@ -357,13 +418,13 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
             }
         }
         if (tid < HEAD_K) {
-            const float a2 = gate_a2(bf16_to_f32(p.g[off + tid]), dtb, ale, p.scale2);
+            const float a2 = gate_a2(tk.g, dtb, ale, p.scale2);
             const float g2v = (pos == 0) ? a2 : fadd(gprev, a2);
             S.g2[tid] = g2v;
             S.gref[tid] = (b == pos) ? g2v : gref_pre;
             gref_pre = (b == pos) ? g2v : gref_pre;
         }
-        if (tid == HEAD_K) S.beta = beta_act(bf16_to_f32(p.beta[tok * H + h]));
+        if (tid == HEAD_K) S.beta = beta_act(tk.beta);
         ROWS_SYNC(1);
         ROWS_TS(1);
 
@@ -412,8 +473,12 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
 #pragma unroll
                 for (int e = 0; e < 2; ++e) {
                     const int c = j0 + 2 * t + e;
-                    S.akk[c] = fmul(S.beta, fadd(big[2 * slot_hi + e], sml[2 * slot_hi + e]));
-                    S.aqk[c] = fadd(big[2 * (1 - slot_hi) + e], sml[2 * (1 - slot_hi) + e]);
+                    // tile row slot holds ks (-> Akk), row slot ^ 8 holds qs (-> Aqk). Selects, not an index 2 * slot_hi + e into big / sml: a run-time index puts both arrays into local
+                    // memory (a store / load round trip per row)
+                    const float bk = slot_hi ? big[2 + e] : big[e], sk = slot_hi ? sml[2 + e] : sml[e];
+                    const float bq = slot_hi ? big[e] : big[2 + e], sq = slot_hi ? sml[e] : sml[2 + e];
+                    S.akk[c] = fmul(S.beta, fadd(bk, sk));
+                    S.aqk[c] = fadd(bq, sq);
                 }
             }
         }
@@ -431,7 +496,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
         float x_row = 0.f, u_row = 0.f;
         {   // right-hand side, cross-block subtraction, in-sub-block FMA chain over the cached rows; thread = (UT|W, column)
             float rhs;
-            if (which == 0) rhs = fmul(S.beta, vraw);
+            if (which == 0) rhs = fmul(S.beta, tk.v);
             else rhs = fmul(S.beta, fmul(ex2_ftz(S.g2[col]), S.k[col]));
             float x = (s > 0) ? fsub(rhs, S.m[which][col]) : rhs;
 #pragma unroll
@@ -479,7 +544,11 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
                     const int kk = 8 * ks + t + 4 * (ii >> 1);
                     const float wv = S.x[1][kk], gv = S.gq[kk];
                     const float v = mine ? (((ii & 1) == slot_hi) ? wv : gv) : 0.f;
+#ifdef CFBI_ROWS_TEST_ALTER_SPLIT
+                    split_tf32(v * 1.0000001f, ah[ii], al[ii]);   // negative control for the test harness: an altered input of the split (deliberately WRONG)
+#else
                     split_tf32(v, ah[ii], al[ii]);
+#endif
                 }
 #pragma unroll
                 for (int tl = 0; tl < 2; ++tl) {
@@ -497,8 +566,11 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
 #pragma unroll
                     for (int e = 0; e < 2; ++e) {
                         const int c = 8 * (warp + 8 * tl) + 2 * t + e;
-                        S.p1[c] = fadd(big[tl][2 * slot_hi + e], sml[tl][2 * slot_hi + e]);
-                        S.p2[c] = fadd(big[tl][2 * (1 - slot_hi) + e], sml[tl][2 * (1 - slot_hi) + e]);
+                        // W in tile row slot (-> P1), GQ in row slot ^ 8 (-> P2): selects, see phase B
+                        const float b1 = slot_hi ? big[tl][2 + e] : big[tl][e], s1 = slot_hi ? sml[tl][2 + e] : sml[tl][e];
+                        const float b2 = slot_hi ? big[tl][e] : big[tl][2 + e], s2 = slot_hi ? sml[tl][e] : sml[tl][2 + e];
+                        S.p1[c] = fadd(b1, s1);
+                        S.p2[c] = fadd(b2, s2);
                     }
             }
         }
@@ -598,7 +670,9 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
         } else {
             pos += 1;
         }
-        ROWS_SYNC_END();
+        // The barrier keeps the next row's prep (it overwrites S.k / S.q / S.g2 ...) and its global loads of what this row stored behind this row's reads and stores. With no next row (decode: always)
+        // nothing follows but a global store of thread 0, so the last row has no barrier. The condition is uniform: every thread of the CTA executes the same number of end-of-row barriers.
+        if (i + 1 < nrows) ROWS_SYNC_END();
 #ifdef CFBI_ROWS_PROFILE
         ROWS_TS(7);
         prof_last = prof_pos;

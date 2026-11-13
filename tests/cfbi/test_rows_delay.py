@@ -1,7 +1,8 @@
 """The delay variant of the row engine (``-DCFBI_ROWS_DELAY_NS``, a separate JIT build of the extension, see ``rows_workload.build_variant``): bits that do not depend on timing.
 
 A build with the delay hook lets a chosen warp of chosen CTAs sleep (``__nanosleep``) at the delay sites of the row engine: the kernel entry before the first loads (site 0), before each
-of the barriers of a row (sites 1 .. 7, barrier 7 ends the row) and right after barrier 6, inside the chunk-end phase (site 8). The host chooses sites, warp, CTAs and length at run time
+of the barriers of a row (sites 1 .. 7, barrier 7 ends the row and is skipped on the last row of a call: a launch of single-row sequences never passes site 7, and the hit counter shows
+exactly which rows skipped it) and right after barrier 6, inside the chunk-end phase (site 8). The host chooses sites, warp, CTAs and length at run time
 (``rows_test_delay_config``) and reads back how many warps slept (``rows_test_delay_hits``), so one build covers every configuration.
 
 * The default build has no hook: its setters raise (a test of a variant that ran on the wrong build would otherwise pass without having delayed anything).
@@ -77,8 +78,10 @@ def rows_through(step, warm, n, site):
         return 0
     pos0 = int(warm.pos[step.slot(n)])
     positions = [(pos0 + r) % rw.BT for r in range(step.lens[n])]
-    if site in (1, 2, 4, 5, 7):
+    if site in (1, 2, 4, 5):
         return len(positions)
+    if site == 7:
+        return len(positions) - 1                          # the barrier that ends a row is skipped on the last row of the call, always in single-row decode: nobody passes the site there
     if site == 3:
         return sum(1 for p in positions if p >= 16)        # the cross-sub-block barrier runs for rows beyond the first 16 positions
     if site in (6, 8):
@@ -131,7 +134,8 @@ def site_case(dly, shaped, ns, site, path):
     mask = ALL_SITES if site == "all_sites" else 1 << SITES[site]
     for tname, target in TARGETS.items():
         want = expected_hits(step, warm, mask, target)
-        assert want > 0, (site, tname, "the configuration cannot hit anything on this workload: the test would be vacuous")
+        if want == 0:                                      # only the barrier that ends a row on a launch of single-row sequences: the last row has none, so the delay must never run
+            assert site == "end_of_row" and max(step.lens) <= 1, (site, tname, "the configuration cannot hit anything on this workload: the test would be vacuous")
         for rep in range(REPS):
             dly.rows_test_delay_config(ns, target[0], target[1], target[2], mask)
             out = rw.run_arm(dly, path, warm, step)

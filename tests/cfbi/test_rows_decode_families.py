@@ -47,7 +47,7 @@ BY_NAME = {f.name: f for f in FAMILIES}
 HEADS = [12, 3]
 PATH_NAMES = ["single", "two_launch"]                                                              # the paths that the families run on (rows_workload.PATHS)
 FLIPS = [("out", "out"), ("out32", "out32"), ("E", "E"), ("row", "rows"), ("pos", "pos")]       # the object that is corrupted, the field that must report it
-GROUP_TIMEOUT_S = 600     # per group: the families of one head count and path take under a minute and the controls about 2 minutes on a B200 (a first run adds the JIT builds); a hang ends here
+GROUP_TIMEOUT_S = 900     # per group: the families of one head count and path take under a minute and the controls about 2 minutes on a B200 (a first run adds the JIT builds, two variants); a hang ends here
 
 
 @pytest.fixture(autouse=True)
@@ -120,17 +120,22 @@ def stale_state_case(ext, two_steps):
     assert sum(m.values()) > 0, m
 
 
-def sabotaged_case(ext, path_name):
-    """The row engine built with the sabotaged fma (a module of its own: its calibration control is switched on here), run on the path ``path_name``, differs from the oracle on a decode
-    family."""
+SABOTAGES = {"sabotaged_build": ("negctl", ("CFBI_NEG_CONTROL=1",)),            # two roundings instead of one fma
+             "altered_split": ("altsplit", ("CFBI_ROWS_TEST_ALTER_SPLIT=1",))}   # an altered input of the TF32 split of the P1 / P2 phase
+
+
+def sabotaged_case(ext, path_name, kind="sabotaged_build"):
+    """The row engine built with a sabotage (``SABOTAGES``: the sabotaged fma, or an altered input of the TF32 split; a module of its own: its calibration control is switched on here), run on
+    the path ``path_name``, differs from the oracle on a decode family."""
     path = rw.PATHS[path_name]
-    bad = rw.build_variant("negctl", ("CFBI_NEG_CONTROL=1",))
+    variant, defines = SABOTAGES[kind]
+    bad = rw.build_variant(variant, defines)
     bad.decode_single_force(True)
     results = rw.run_family(ext, BY_NAME["decode_pool_padding"], 12, seed=31, path=path)
     step, opt, ref, warm = results[0]
     sab = rw.run_arm(bad, path, warm, step)
     m = rw.mismatch(sab, ref)
-    assert m["out32"] > 0 or m["out"] > 0 or m["E"] > 0 or m["rows"] > 0, "the sabotaged build matches the reference: the workload cannot see a changed row engine (%s)" % m
+    assert m["out32"] > 0 or m["out"] > 0 or m["E"] > 0 or m["rows"] > 0, "the %s build matches the reference: the workload cannot see a changed row engine (%s)" % (kind, m)
 
 
 # ---- the groups (one child process each) ------------------------------------------------------------------------------------------------------------------
@@ -150,8 +155,9 @@ def group_controls(ext):
     cases = {"flipped:" + what: rb.capture(flip_case, two_steps, what, field) for what, field in FLIPS}
     cases["stale_row"] = rb.capture(stale_row_case, two_steps)
     cases["stale_state"] = rb.capture(stale_state_case, ext, two_steps)
-    for name in PATH_NAMES:
-        cases["sabotaged_build:" + name] = rb.capture(sabotaged_case, ext, name)
+    for kind in SABOTAGES:
+        for name in PATH_NAMES:
+            cases["%s:%s" % (kind, name)] = rb.capture(sabotaged_case, ext, name, kind)
     return {"cases": cases, "reps": 1}
 
 
@@ -199,6 +205,12 @@ def test_a_launch_from_a_stale_state_differs(control_group):
 @pytest.mark.parametrize("path", PATH_NAMES)
 def test_the_sabotaged_row_engine_build_differs_from_the_reference_on_these_workloads(control_group, path):
     outcome = control_group["cases"]["sabotaged_build:" + path]
+    assert outcome is None, outcome
+
+
+@pytest.mark.parametrize("path", PATH_NAMES)
+def test_a_row_engine_build_with_an_altered_input_of_the_split_differs_from_the_reference_on_these_workloads(control_group, path):
+    outcome = control_group["cases"]["altered_split:" + path]
     assert outcome is None, outcome
 
 

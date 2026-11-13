@@ -270,8 +270,8 @@ def test_the_stamps_keep_their_barriers(rows_text):
     ("stamp 1 before its barrier", "        ROWS_SYNC(1);\n        ROWS_TS(1);\n", "        ROWS_TS(1);\n        ROWS_SYNC(1);\n"),
     ("stamp 2 dropped", "        ROWS_TS(2);\n", ""),
     ("stamp 5 moved behind a statement", "        ROWS_TS(5);\n", "        const int prof_dummy = 0; (void)prof_dummy;\n        ROWS_TS(5);\n"),
-    ("stamp 7 before the last barrier", "        ROWS_SYNC_END();\n#ifdef CFBI_ROWS_PROFILE\n        ROWS_TS(7);\n",
-     "#ifdef CFBI_ROWS_PROFILE\n        ROWS_TS(7);\n#endif\n        ROWS_SYNC_END();\n#ifdef CFBI_ROWS_PROFILE\n"),
+    ("stamp 7 before the last barrier", "        if (i + 1 < nrows) ROWS_SYNC_END();\n#ifdef CFBI_ROWS_PROFILE\n        ROWS_TS(7);\n",
+     "#ifdef CFBI_ROWS_PROFILE\n        ROWS_TS(7);\n#endif\n        if (i + 1 < nrows) ROWS_SYNC_END();\n#ifdef CFBI_ROWS_PROFILE\n"),
 ])
 def test_a_moved_stamp_is_caught(rows_text, name, old, new):
     assert order_problems(mutate(rows_text, old, new)), name
