@@ -820,6 +820,40 @@ def test_the_markers_of_a_step_that_was_not_adopted_or_skipped_are_absent_everyw
         assert check(row("a_fragments", outcome, ["checker_test_marker"])) == []
 
 
+DECISION_TREE = {"benchmarks/decision_record.py": "decision_checker_marker\n", "tests/cfbi/test_record_checker_decision.py": "decision_test_marker\n",
+                 "benchmarks/decision_record_extra.py": "extra_residue_marker\n", "tests/cfbi/test_decision_record.py": "old_name_residue_marker\n"}
+
+
+def test_the_decision_checker_and_its_synthetic_tests_are_no_residue_but_a_file_with_a_similar_name_is(tmp_path):
+    """The decision checker reads the constants of the E and KD prototypes from their commits and its tests plant them in synthetic trees, so the names of the markers of a step are spelt
+    in files that are no code of the step: they must neither adopt a step nor count as the residue of one that was not adopted. A neighbour of the checker is ordinary code."""
+    tree = make_tree(tmp_path / "t", dict(TREE, **DECISION_TREE))
+    searched = [rel for rel, _ in rc.scope_files(tree)]
+    assert "benchmarks/decision_record.py" not in searched and "tests/cfbi/test_record_checker_decision.py" not in searched
+    assert all(p in searched for p in ("benchmarks/decision_record_extra.py", "tests/cfbi/test_decision_record.py", "csrc/k.cu", "flash_kda/api.py", "tests/test_a.py", "benchmarks/bench.py"))
+    check = lambda *rows: rc.marker_problems(marker_ledger(*rows), tree)
+    for marker in ("decision_checker_marker", "decision_test_marker"):
+        assert has(check(row("e_tile", "adopted", [marker])), "found in: nowhere"), marker                       # it is no code: it does not show that the step is in csrc/ or flash_kda/
+        for outcome in ("not_adopted", "skipped"):
+            assert check(row("e_tile", outcome, [marker])) == [], (marker, outcome)                              # and it is no residue of a step that was not adopted
+    assert has(check(row("e_tile", "not_adopted", ["extra_residue_marker"])), "is still in the tree: benchmarks/decision_record_extra.py")        # a neighbour of the checker is code
+    assert has(check(row("e_tile", "not_adopted", ["old_name_residue_marker"])), "is still in the tree: tests/cfbi/test_decision_record.py")      # so is a test under another name
+    assert has(check(row("e_tile", "adopted", ["extra_residue_marker"])), "is not in csrc/ or flash_kda/")
+    assert has(check(row("e_tile", "not_adopted", ["stage_e_tile"])), "is still in the tree: csrc/k.cu")                                           # real residue is still found in csrc/ and tests/
+    assert has(check(row("e_tile", "not_adopted", ["marker_in_tests_only"])), "is still in the tree: tests/test_a.py")
+
+
+def test_the_prototype_literals_of_the_decision_checker_are_no_residue_in_the_real_tree():
+    """On the real repository: ``marker_search`` of the constants that the decision checker reads from the E and KD prototypes names no file of the checker or of its tests."""
+    markers = ("ROWS_DYN_SMEM_BYTES", "ROWS_KD_FRAGS", "ROWS_E_STRIDE")
+    checker = (_ROOT / "benchmarks" / "decision_record.py").read_text()
+    synthetic = _ROOT / "tests" / "cfbi" / "test_record_checker_decision.py"       # the tests of the decision checker live under the name that the search excludes
+    assert synthetic.is_file() and all(m in checker and m in synthetic.read_text() for m in markers)          # the literals are there: only the exclusion keeps them out of the search
+    found = rc.marker_search(markers, _ROOT)
+    for m in markers:
+        assert not [f for f in found[m] if f == "benchmarks/decision_record.py" or Path(f).name.startswith(("test_record_checker", "test_decision_record"))], (m, found[m])
+
+
 def test_marker_lists_are_validated(tmp_path):
     tree = make_tree(tmp_path / "t", TREE)
     check = lambda r: rc.marker_problems(marker_ledger(r), tree)

@@ -1,6 +1,6 @@
 """Self-tests of the decision record of the row engine (benchmarks/decision_record.py): the record is derived from the raw evidence, the checker derives it again and rejects every difference.
 
-Plain Python, no GPU and no torch (``pytest --noconftest tests/cfbi/test_decision_record.py``). The evidence is synthetic and has numbers that can be computed by hand: a clock profile whose
+Plain Python, no GPU and no torch (``pytest --noconftest tests/cfbi/test_record_checker_decision.py``). The evidence is synthetic and has numbers that can be computed by hand: a clock profile whose
 phases are constants (so that every share is a ratio of small integers), compile dumps with chosen register / stack / spill figures, occupancy-API records, Nsight Compute launch metrics and a
 git history whose sources define the tile sizes. Every rule has a mutant of the record and a mutant of the evidence.
 """
@@ -586,7 +586,7 @@ def test_a_prototype_that_breaks_the_resource_gate_is_data_and_the_container_too
     assert world["ev"]["container"]["b200"]["meta"]["toolchain"]["label"] != world["ev"]["compile"]["base"]["meta"]["toolchain"]["label"]
 
 
-# ---- B14: the occupancy figures are the figures of the launch --------------------------------------------------------------------------------------------------
+# ---- the occupancy figures are the figures of the launch --------------------------------------------------------------------------------------------------------
 @pytest.mark.parametrize("dynamic", [1, 32768])
 def test_an_occupancy_dynamic_shared_memory_that_the_launch_does_not_use_is_rejected(world, dynamic):
     """The review's control: the CTAs per SM stay 2 (the register file allows two whatever the dynamic memory), so the arithmetic alone cannot see which configuration they are the count of."""
@@ -637,7 +637,7 @@ def test_the_base_configuration_is_derived_from_the_validated_launch(world):
 
 
 def test_the_decision_command_rejects_the_review_controls_of_the_evidence(world, tmp_path, capsys):
-    """B13 and B14 at the command line: the same label with other flags, and the base's dynamic shared memory written as 32 KiB: exit 1 and VERDICT: FAIL (both were exit 0 and PASS)."""
+    """The compile inputs and the launch figures at the command line: the same label with other flags, and the base's dynamic shared memory written as 32 KiB: exit 1 and VERDICT: FAIL (both were exit 0 and PASS)."""
     rec_path, doc_path = tmp_path / "record.json", tmp_path / "perf.md"
     rec_path.write_text(json.dumps(world["rec"]))
     doc_path.write_text(dr.render_section(world["rec"]))

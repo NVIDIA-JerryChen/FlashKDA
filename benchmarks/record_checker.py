@@ -34,7 +34,8 @@ baseline ``cfbi-baseline-v2`` (the consolidated baseline of one device): its own
 commit   the record commit rule of the final validation records: the commit that a record names differs from HEAD only under ``docs/``. Historical records (profile, baseline, per-step
          A/B) are checked against their own snapshot commit instead, never against HEAD.
 markers  the step ledger names for every step the identifiers that only that step adds (or ``none``); the checker reads the names from the ledger and never hard-codes them. It searches
-         ``csrc/``, ``flash_kda/``, ``tests/`` and ``benchmarks/`` of the tree, without this script and every ``test_record_checker*`` file and never ``docs/``: the markers of an adopted
+         ``csrc/``, ``flash_kda/``, ``tests/`` and ``benchmarks/`` of the tree, without the two checker scripts (this one and ``decision_record.py``, which read the constants of the E and KD
+         prototypes from their commits) and every ``test_record_checker*`` file (the tests of the checkers, whose synthetic trees spell the same names) and never ``docs/``: the markers of an adopted
          step must be in ``csrc/`` or ``flash_kda/``, those of a step that was not adopted or was skipped nowhere. For a step without symbols the commit decides: an adopted step's commit
          is an ancestor of HEAD and no later revert commit names it, a step that was not adopted or skipped has no commit or its revert commit is an ancestor of HEAD and names it.
 ledger   ``cfbi-step-ledger-v1``: one row for each step (``single_launch``, ``trims``, ``e_tile``, ``a_fragments``, ``kd_tile``) with its outcome (``adopted``, ``not_adopted``, ``skipped`` by the
@@ -362,17 +363,20 @@ SCOPE_DIRS = ("csrc", "flash_kda", "tests", "benchmarks")
 CODE_DIRS = ("csrc", "flash_kda")
 TEXT_SUFFIXES = (".py", ".cu", ".cuh", ".h", ".hpp", ".cpp", ".cc", ".c", ".txt", ".md", ".json", ".yaml", ".yml", ".toml", ".cfg", ".cmake", ".sh")
 MARKER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_:]*$")
+CHECKER_SOURCES = ("benchmarks/record_checker.py", "benchmarks/decision_record.py")      # the tools that judge the steps: they spell the markers of a step (the constants of its prototype), they are no code of it
+CHECKER_TEST_PREFIX = "test_record_checker"                                                # the tests of those tools (their synthetic trees plant the same names); a file that only looks like one is code
 
 
 def scope_files(tree):
-    """``[(path relative to tree, absolute path)]`` of the searched files: the source directories, without this script, without every ``test_record_checker*`` file, never ``docs/``."""
+    """``[(path relative to tree, absolute path)]`` of the searched files: the source directories, without the checker scripts (``CHECKER_SOURCES``, named exactly), without every file of the
+    tests of the checkers (``CHECKER_TEST_PREFIX``), never ``docs/``."""
     out = []
     for d in SCOPE_DIRS:
         for dirpath, dirnames, filenames in os.walk(os.path.join(str(tree), d)):
             dirnames[:] = sorted(x for x in dirnames if x not in ("__pycache__", ".git"))
             for name in sorted(filenames):
                 rel = os.path.relpath(os.path.join(dirpath, name), str(tree)).replace(os.sep, "/")
-                if not name.endswith(TEXT_SUFFIXES) or rel == "benchmarks/record_checker.py" or name.startswith("test_record_checker"):
+                if not name.endswith(TEXT_SUFFIXES) or rel in CHECKER_SOURCES or name.startswith(CHECKER_TEST_PREFIX):
                     continue
                 out.append((rel, os.path.join(dirpath, name)))
     return out
