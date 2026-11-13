@@ -49,6 +49,8 @@ GATE_METRIC = "total_us"                                     # the kernel sum: t
 KINDS = ("previous", "base")                                 # the two campaigns of a device: against the previous accepted state and against the base
 AGAINST = {"previous": "the previous accepted state", "base": "the base"}
 TOL_PCT = rc.TOLERANCE_PCT
+AB_ORDER = "abba"                                           # the start order of the record files of a step campaign: blocks of four that are ABBA or BAAB
+REQUIRE_NODES = True                                         # every trial of every cell carries the launch mapping that the benchmark asserted
 
 
 def figure(x):
@@ -171,7 +173,7 @@ def campaign_infos(m):
             entry = load_json(m["devices"][dev][kind])
             a_commit = m["previous"] if kind == "previous" else m["base"]
             where = "%s, %s, against %s" % (dev, m["step"], AGAINST[kind])
-            problems, info = rc.campaign_evidence_problems(entry, where, "decode", dev, baseline, a_commit, a_commit, m["commit"])
+            problems, info = rc.campaign_evidence_problems(entry, where, "decode", dev, baseline, a_commit, a_commit, m["commit"], order=AB_ORDER, require_nodes=REQUIRE_NODES)
             for field, want in (("a_commit", a_commit), ("b_commit", m["commit"])):
                 if entry.get(field) is not None and not rc.commit_matches(entry.get(field), want):
                     problems.append("%s: the entry says %s = %s, the manifest %s" % (where, field, entry.get(field), want))
@@ -185,7 +187,7 @@ def first_deltas(info, metric, commit):
     """The median difference of every cell in the first campaign alone (the comparison without its re-run), by cell key."""
     if not info.get("first"):
         return {}
-    res = br.compare(info["first"]["A"], info["first"]["B"], **rc.compare_kwargs(metric, TOL_PCT, commit, rc.metric_cells("decode", metric)))
+    res = br.compare(info["first"]["A"], info["first"]["B"], **rc.compare_kwargs(metric, TOL_PCT, commit, rc.metric_cells("decode", metric), AB_ORDER, REQUIRE_NODES))
     return dict((r["key"], r["median_delta_pct"]) for r in res["rows"])
 
 
@@ -352,6 +354,8 @@ def resource_rows(m):
 def render_section(m, decision, row, infos, number=10):
     """The section of the performance document for the step: only numbers of ``decide`` / ``timing_rows`` / ``resource_rows`` / the ledger row, i.e. of the raw evidence."""
     hosts = dict((dev, infos[dev]["previous"][1].get("host")) for dev in GATING)
+    sizes = sorted(set(len(infos[dev][kind][1]["first"][side]) for dev in GATING for kind in KINDS for side in ("A", "B")))
+    counts = str(sizes[0]) if len(sizes) == 1 else "%d to %d" % (sizes[0], sizes[-1])
     adopted = decision["outcome"] == "adopted"
     lines = ["## %d. %s" % (number, STEP_TITLES.get(m["step"], m["step"])), "",
              "Generated from the evidence of the step by `benchmarks/step_record.py render`; every number below is recomputed from the raw record files (the campaigns by the admission of the record "
@@ -360,8 +364,8 @@ def render_section(m, decision, row, infos, number=10):
     lines.append("- Step commit %s, previous accepted state %s, base %s; Gate G and Suite S (without the sanitizer file) ran on %s, which has the sources of the step's kernels." % (
         m["commit"][:12], m["previous"][:12], m["base"][:12], (m.get("suite_commit") or m["commit"])[:12]))
     lines.append("- Campaigns: per device two interleaved A/B campaigns, A the previous accepted state or the base and B the step, both sides at the default routing with CUDA_MODULE_LOADING=EAGER, "
-                 "at least 3 record files per side in the abba start order, a cell with a spread above %.1f %% re-run once with %d times the calls; hosts %s." % (
-                     100 * br.UNSTABLE_SPREAD, br.RERUN_SCALE, ", ".join("%s on %s" % (dev, hosts[dev]) for dev in GATING)))
+                 "%s record files per side in the abba start order, a cell with a spread above %.1f %% re-run once with %d times the calls; hosts %s." % (
+                     counts, 100 * br.UNSTABLE_SPREAD, br.RERUN_SCALE, ", ".join("%s on %s" % (dev, hosts[dev]) for dev in GATING)))
     lines.append("- Gating metric of the step: the kernel sum (`%s`); a cell fails when B is slower than A by more than %.2f %% of the median (more with its spread when it is noise-limited). The wall "
                  "metrics are measured and reported, they do not decide." % (GATE_METRIC, TOL_PCT))
     lines += ["", "### Timing", "", "Change of B against A in percent of the median of A (negative is faster); slower and faster count the confirmed cells.", "",

@@ -470,10 +470,12 @@ LOOP_METRICS = ("cpu_eager_us", "cpu_graph_us")                       # host tim
 LOOP_CELLS = tuple("regime=%s;" % r for r in bd.LOOP_REGIMES)
 
 
-def compare_kwargs(metric, tolerance, base_commit, cells):
+def compare_kwargs(metric, tolerance, base_commit, cells, order="alternate", require_nodes=False):
     """The parameters of the campaign driver's comparison, which every recomputation of a verdict from raw records uses (the producer's: the regress gate, three interleaved repeats,
-    the widening of noise-limited cells, a clean candidate, the cell filter of the metric)."""
-    return dict(metric=metric, tol_pct=tolerance, mode="regress", expect_base_commit=base_commit, require_clean_cand=True, min_repeats=3, baseline_unstable="widen", cells=cells)
+    the widening of noise-limited cells, a clean candidate, the cell filter of the metric). ``order`` is the start order of the record files (strict alternation, or the ABBA blocks of a campaign
+    that was run in them) and ``require_nodes`` whether every trial must carry its launch mapping: the caller says which contract the campaign was run under, a record never does."""
+    return dict(metric=metric, tol_pct=tolerance, mode="regress", expect_base_commit=base_commit, require_clean_cand=True, min_repeats=3, baseline_unstable="widen", cells=cells,
+                order=order, require_nodes=require_nodes)
 
 
 def metric_cells(bench, metric):
@@ -1640,7 +1642,7 @@ def judged_cells_problems(rows, wanted, what, where):
     return ["%s: the raw records judge %d cell(s), the %s has %d: %s" % (where, len(rows), what, len(wanted), _missing_unexpected(wanted, rows))]
 
 
-def campaign_evidence_problems(entry, where, campaign, dev, baseline, base, a_commit, b_commit, scope=None, allow_rerun=True):
+def campaign_evidence_problems(entry, where, campaign, dev, baseline, base, a_commit, b_commit, scope=None, allow_rerun=True, order="alternate", require_nodes=False):
     """One measured campaign of the final record (the final A/B, a confirmation, the run with every change reverted), recomputed from its raw records.
 
     ``entry``: ``{allocation, report, records_first: {A, B}, records_rerun: {A, B}}``: the raw record files of the first campaign and of the re-run over the unstable cells, side A (the
@@ -1650,6 +1652,8 @@ def campaign_evidence_problems(entry, where, campaign, dev, baseline, base, a_co
     gives, row by row. The sides' commits are ``a_commit`` / ``b_commit``, the GPU of every file the device's (and the
     baseline's), the coverage the benchmark's own: ``scope`` None means the complete campaign (every canonical metric on its cells), else ``{metric: [cells]}``, which the campaign
     must judge exactly (a confirmation or a reverted run covers the flagged cells and no others). ``allow_rerun`` False: the campaign is itself the three-times campaign and is never re-run.
+    ``order`` / ``require_nodes``: the contract that the campaign was run under (``compare_kwargs``): the final A/B of the loop is strict alternation, a row-engine step runs in ABBA blocks with the
+    launch mapping of every trial.
     Returns ``(problems, info)``; ``info`` holds the host, the first-campaign records by side and the recomputed rows by ``(metric, cell)``."""
     info = {"host": None, "rows": {}, "first": None}
     if not isinstance(entry, dict):
@@ -1719,7 +1723,7 @@ def campaign_evidence_problems(entry, where, campaign, dev, baseline, base, a_co
     for metric in sorted(wanted):
         w = "%s, %s" % (where, metric)
         cells = metric_cells(campaign, metric) if scope is None else list(wanted[metric])
-        res = br.compare(a_first, b_first, base_rerun=a_rerun or None, cand_rerun=b_rerun or None, **compare_kwargs(metric, TOLERANCE_PCT, base, cells))
+        res = br.compare(a_first, b_first, base_rerun=a_rerun or None, cand_rerun=b_rerun or None, **compare_kwargs(metric, TOLERANCE_PCT, base, cells, order, require_nodes))
         if res["verdict"] not in ("PASS", "FAIL"):
             problems.append("%s: the comparison recomputed from the raw records is %s, not a measurement: %s" % (w, res["verdict"], "; ".join(res["problems"][:3])))
             continue

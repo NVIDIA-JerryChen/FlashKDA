@@ -19,6 +19,7 @@ for _p in (_ROOT / "benchmarks", _ROOT / "tests" / "cfbi"):
 import bench_records as br  # noqa: E402
 import record_checker as rc  # noqa: E402
 import step_record as sp  # noqa: E402
+import test_bench_order as tbo  # noqa: E402
 import test_bench_tools as tbt  # noqa: E402
 import test_record_checker_steps as trs  # noqa: E402
 from test_record_checker import commit_file, git  # noqa: E402
@@ -51,16 +52,26 @@ def record(dev, commit, ts, host, factors, scale=1, cells=None, idx=0, wall=None
     return {"schema": br.SCHEMA, "meta": meta, "cells": [kernel_cell(k, trs.MEDIANS["decode"][k], (factors or {}).get(k, 1.0), scale, idx=idx, wall_factor=(wall or {}).get(k, 1.0)) for k in keys]}
 
 
-def campaign(d, name, dev, a_commit, b_commit, factors=None, rerun=None, rerun_factors=None, wall=None, allocation=None):
-    """One campaign: three interleaved record files per side, the cells ``rerun`` re-run with three times the calls, the comparator's report, and the entry of the step tool."""
+START_ORDER = "ABBABAAB"                                                                     # the start order of the eight record files of a campaign: two blocks of four, ABBA and BAAB
+NODES = {"A": {"plan_kernel": 1, "rows_kernel": 1}, "B": {"rows_kernel": 1}}                   # the launch mapping that every trial of a side records (the content is not judged here)
+
+
+def campaign(d, name, dev, a_commit, b_commit, factors=None, rerun=None, rerun_factors=None, wall=None, allocation=None, order=None):
+    """One campaign as a step runs it: four record files per side in the ABBA start order with the launch mapping of every trial, the cells ``rerun`` re-run with three times the calls in the same
+    order, the comparator's report under the same contract, and the entry of the step tool."""
     host = "node-%s-%s" % (dev, name)
-    a1 = [record(dev, a_commit, "2026-11-13T10:%02d:00Z" % (2 * i), host, None, idx=i) for i in range(3)]
-    b1 = [record(dev, b_commit, "2026-11-13T10:%02d:00Z" % (2 * i + 1), host, factors, idx=i, wall=wall) for i in range(3)]
-    a2 = [record(dev, a_commit, "2026-11-13T11:%02d:00Z" % (2 * i), host, None, scale=3, cells=rerun, idx=i) for i in range(3)] if rerun else []
-    b2 = [record(dev, b_commit, "2026-11-13T11:%02d:00Z" % (2 * i + 1), host, rerun_factors if rerun_factors is not None else factors, scale=3, cells=rerun, idx=i, wall=wall) for i in range(3)] if rerun else []
+
+    def side(label, hour, commit, side_factors, scale, cells):
+        slots = [slot for slot, x in enumerate(order or START_ORDER) if x == label]
+        recs = [record(dev, commit, "2026-11-13T%s:%02d:00Z" % (hour, slot), host, side_factors, scale=scale, cells=cells, idx=i, wall=wall if label == "B" else None) for i, slot in enumerate(slots)]
+        return tbo.with_nodes(recs, NODES[label])
+    a1, b1 = side("A", "10", a_commit, None, 1, None), side("B", "10", b_commit, factors, 1, None)
+    a2 = side("A", "11", a_commit, None, 3, rerun) if rerun else []
+    b2 = side("B", "11", b_commit, rerun_factors if rerun_factors is not None else factors, 3, rerun) if rerun else []
     files = {"A": tbt.write_records(str(d), name + "-first-a", a1), "B": tbt.write_records(str(d), name + "-first-b", b1)}
     again = {"A": tbt.write_records(str(d), name + "-again-a", a2) if a2 else [], "B": tbt.write_records(str(d), name + "-again-b", b2) if b2 else []}
-    results = [br.compare(a1, b1, base_rerun=a2 or None, cand_rerun=b2 or None, **rc.compare_kwargs(m, rc.TOLERANCE_PCT, a_commit, rc.metric_cells("decode", m))) for m in sorted(rc.canonical_coverage("decode"))]
+    kwargs = lambda m: rc.compare_kwargs(m, rc.TOLERANCE_PCT, a_commit, rc.metric_cells("decode", m), sp.AB_ORDER, sp.REQUIRE_NODES)        # noqa: E731
+    results = [br.compare(a1, b1, base_rerun=a2 or None, cand_rerun=b2 or None, **kwargs(m)) for m in sorted(rc.canonical_coverage("decode"))]
     report = Path(d) / (name + "-report.json")
     report.write_text(json.dumps(results, default=str))
     entry = {"report": str(report), "records_first": files, "records_rerun": again, "allocation": allocation or "sc-%s-%s" % (dev, name), "a_commit": a_commit, "b_commit": b_commit}
@@ -79,7 +90,7 @@ def manifest(d, per_device, wall=None):
         devices[dev] = {"baseline": str(baseline),
                         "previous": campaign(d, "%s-previous" % dev, dev, PREV, STEP, wall=wall, **per_device[dev]["previous"]),
                         "base": campaign(d, "%s-base" % dev, dev, BASE, STEP, wall=wall, **per_device[dev]["base"])}
-    return {"schema": sp.SCHEMA, "step": "trims", "commit": STEP, "previous": PREV, "base": BASE, "markers": ["unpack8_bf16"], "devices": devices}
+    return {"schema": sp.SCHEMA, "step": "trims", "commit": STEP, "previous": PREV, "base": BASE, "markers": ["step_marker_example"], "devices": devices}
 
 
 GAIN = {"factors": {GAIN_A: 0.9, GAIN_B: 0.95}, "rerun": [GAIN_A, GAIN_B]}                       # the kernel sum of two cells falls by about 8 % and 4 %, and both are re-run
@@ -162,9 +173,9 @@ def test_the_manifest_names_what_the_decision_needs():
         assert any(needle in p for p in sp.manifest_problems(bad)), needle
 
 
-def adopted_case(tmp_path, monkeypatch):
-    """The manifest, the recomputed campaigns, the decision and the row of an adopted step whose dumps are those of the record checker's own tests."""
-    m = manifest(tmp_path, {"b200": EVERYWHERE, "b300": EVERYWHERE})
+def adopted_case(tmp_path, monkeypatch, per_device=None):
+    """The manifest, the recomputed campaigns, the decision and the row of a step (adopted unless ``per_device`` says otherwise) whose dumps are those of the record checker's own tests."""
+    m = manifest(tmp_path, per_device or {"b200": EVERYWHERE, "b300": EVERYWHERE})
     codegen = {}
     for key in rc.COMPARISONS:
         entry, _ = trs.comparison(key, STEP, sid="trims")
@@ -194,6 +205,7 @@ def test_the_section_of_the_document_holds_the_numbers_of_the_recomputed_evidenc
     assert any(line.startswith("| conda | sm_100a | cfbi::rows_kernel |") for line in lines)                                       # the resource table names the row engine of every toolchain
     assert sum(1 for line in lines if line.startswith("| container_b200 |")) == 1 and sum(1 for line in lines if line.startswith("| conda |")) == 3
     assert any(line.startswith("Gate X in change mode") and "conda PASS" in line and "container_b300 PASS" in line for line in lines)
+    assert any(line.startswith("- Campaigns:") and " 4 record files per side in the abba start order" in line for line in lines)      # the number of record files of the campaigns, not their minimum
     assert text.endswith("\n") and not text.endswith("\n\n")
     refused = json.loads(json.dumps(decision))
     refused["outcome"], refused["reasons"] = "not_adopted", ["b200, against the base, some cell: B is 3.00 % slower than A in the kernel sum"]
@@ -292,3 +304,44 @@ def test_the_exactness_gate_reads_the_suite_records_of_both_devices(tmp_path):
     other = json.loads(json.dumps(m))
     other["suite_commit"] = PREV                              # the suites ran on a commit that is not the one of the records
     assert any("the candidate record is of commit" in p for p in sp.exactness_problems(other, tmp_path / "nowhere"))
+
+
+def test_a_campaign_is_recomputed_under_the_contract_it_was_run_under(tmp_path):
+    """The checker recomputes a campaign from its raw records under the start order and the launch-mapping requirement that the CALLER names; a step runs in ABBA blocks, and the same records are
+    not a measurement under the strict alternation of the final A/B (nor under a requirement of mappings that the records do not carry)."""
+    m = manifest(tmp_path, {"b200": EVERYWHERE, "b300": EVERYWHERE})
+    entry = json.loads(Path(m["devices"]["b200"]["previous"]).read_text())
+    baseline = json.loads(Path(m["devices"]["b200"]["baseline"]).read_text())
+    args = (entry, "x", "decode", "b200", baseline, PREV, PREV, STEP)
+    problems, info = rc.campaign_evidence_problems(*args, order="abba", require_nodes=True)
+    assert problems == [] and info["rows"], problems[:2]
+    problems, _ = rc.campaign_evidence_problems(*args)                                          # the defaults of the final A/B: strict alternation, no mappings required
+    assert problems and all("not interleaved in time" in p for p in problems), problems[:2]
+    assert rc.compare_kwargs("total_us", 1.0, PREV, None)["order"] == "alternate" and rc.compare_kwargs("total_us", 1.0, PREV, None)["require_nodes"] is False
+    plain = manifest(tmp_path / "plain" if (tmp_path / "plain").mkdir() is None else tmp_path, {"b200": EVERYWHERE, "b300": EVERYWHERE})
+    for path in json.loads(Path(plain["devices"]["b200"]["previous"]).read_text())["records_first"]["A"][:1]:
+        rec = json.loads(Path(path).read_text())
+        for cell in rec["cells"]:
+            for sample in cell["samples"]:
+                sample.pop("nodes", None)                                                          # one record whose trials lost their launch mappings
+        Path(path).write_text(json.dumps(rec))
+    problems, _ = rc.campaign_evidence_problems(json.loads(Path(plain["devices"]["b200"]["previous"]).read_text()), "x", "decode", "b200", baseline, PREV, PREV, STEP, order="abba", require_nodes=True)
+    assert problems and any("node mapping" in p or "compute_nodes" in p for p in problems), problems[:2]
+
+
+def test_a_step_that_a_confirmed_slower_cell_stops_gets_a_not_adopted_row_that_the_record_checker_accepts(tmp_path, monkeypatch):
+    """The row of a step that failed at the timing phase: not adopted, failed_at timing, the revert commit, the reason naming the cell, every earlier gate passed, the A/B medians kept; it is
+    refused without the revert commit and with a failed_at that contradicts the gates."""
+    per = {"b200": EVERYWHERE, "b300": dict(EVERYWHERE, previous={"factors": dict(GAIN["factors"], **SLOWER["factors"]), "rerun": GAIN["rerun"]})}
+    m, infos, decision, row = adopted_case(tmp_path, monkeypatch, per)
+    assert decision["outcome"] == "not_adopted" and row["outcome"] == "not_adopted" and row["failed_at"] == "timing", decision["reasons"][:2]
+    assert GAIN_B in row["reason"] and "b300" in row["reason"] and row["gates"] == {"exactness": True, "codegen": True}
+    assert row["timing"]["vs_previous"] == "fail" and row["revert_commit"] is None
+    meta = {"base": trs.BASE}
+    assert any("not reverted" in p for p in rc.step_problems(row, None, meta)), rc.step_problems(row, None, meta)[:2]
+    m["revert_commit"] = "%07x%033x" % (14, 14)
+    row = sp.build_row(m, decision, infos)
+    assert rc.step_problems(row, None, meta) == [], rc.step_problems(row, None, meta)
+    wrong = json.loads(json.dumps(row))
+    wrong["failed_at"] = "codegen"                                                                   # the gates say that the code generation passed
+    assert any("failed at codegen" in p for p in rc.step_problems(wrong, None, meta)), rc.step_problems(wrong, None, meta)[:2]
