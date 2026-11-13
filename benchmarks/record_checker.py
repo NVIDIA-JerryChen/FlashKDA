@@ -1371,11 +1371,16 @@ def key_fields(key):
     return dict(part.split("=", 1) for part in key.split(";")[1:] if "=" in part)
 
 
+def spec_workloads(specs):
+    """``{cell key: {N, H, regime, pos}}`` of decode cell specs (``bench_decode.cell_specs`` or ``campaign_cell_specs``): what each of those cells must measure."""
+    return dict((s["key"], {"N": s["N"], "H": s["H"], "regime": s["regime"], "pos": s["pos"]}) for s in specs)
+
+
 def canonical_workloads(campaign):
     """``{cell key: {argument: value}}`` of a campaign, from the benchmark that defines its cells (never from a record): what each cell must measure. A decode cell: N, H, the regime and
     the probe position (None outside the probe regime); a chain cell: N, H, the model width Dm and the regime that its key names (the chain benchmark runs one)."""
     if campaign == "decode":
-        return dict((s["key"], {"N": s["N"], "H": s["H"], "regime": s["regime"], "pos": s["pos"]}) for s in bd.cell_specs())
+        return spec_workloads(bd.cell_specs())
     return dict((s["key"], {"N": s["N"], "H": s["H"], "Dm": s["Dm"], "regime": key_fields(s["key"])["regime"]}) for s in bl.cell_specs())
 
 
@@ -1384,13 +1389,26 @@ def _exactly(a, b):
     return a == b and type(a) is type(b)
 
 
-def campaign_contract_problems(records, campaign, where):
+def _is_cold(cell):
+    """Whether a raw cell is a cold-regime cell by its key or by what it says it measured (either is enough: a record does not escape the cold rules by naming the regime in one place only)."""
+    if not isinstance(cell, dict):
+        return False
+    args = cell.get("args") if isinstance(cell.get("args"), dict) else {}
+    key = cell.get("key")
+    return args.get("regime") == "cold" or (isinstance(key, str) and key_fields(key).get("regime") == "cold")
+
+
+def campaign_contract_problems(records, campaign, where, workloads=None):
     """What the raw records of a final campaign must be, whatever the comparator is willing to judge (``br.compare`` takes pooled records and records of any workload, on purpose): the
     process-median records of the campaign's benchmark (meta kind, sample statistic ``process_median``), at least ``br.MIN_TRIALS`` trials that each record declares and each cell holds,
-    and cells that are of the campaign's kind, measure the workload that their key names (``canonical_workloads``) and record their effective counts as positive integers. The first
-    offence of a kind in a record is named, with the number of the others."""
+    and cells that are of the campaign's kind, measure the workload that their key names and record their effective counts as positive integers; a decode record that holds cold cells
+    also states the size of the L2 cache and an eviction buffer of at least twice that size (the cold regime evicts the cache before every call, so a record without that measured
+    something else). The first offence of a kind in a record is named, with the number of the others.
+
+    ``workloads``: ``{cell key: {argument: value}}`` that the cells must measure (``spec_workloads`` of the cells that a campaign defines); by default the cells of the benchmark's own
+    matrix (``canonical_workloads``), which is what every retained baseline and final campaign is checked against."""
     out = []
-    want, kind = canonical_workloads(campaign), META_KIND[campaign]
+    want, kind = (canonical_workloads(campaign) if workloads is None else workloads), META_KIND[campaign]
     for rec in records:
         name = rec.get("_path", "?")
         meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
@@ -1402,6 +1420,12 @@ def campaign_contract_problems(records, campaign, where):
             out.append("%s: the raw record %s declares %r trials per cell: Method M needs at least %d trials" % (where, name, trials, br.MIN_TRIALS))
         if meta.get("kind") != kind:
             out.append("%s: the raw record %s is not a %s record (meta kind %r)" % (where, name, kind, meta.get("kind")))
+        if campaign == "decode" and any(_is_cold(cell) for cell in rec.get("cells", [])):
+            l2, evict = meta.get("l2_cache_bytes"), meta.get("eviction_bytes")
+            if not count(l2, 1):
+                out.append("%s: the raw record %s holds cold cells and declares an L2 cache of %r bytes: the cold regime needs the size of the cache that it evicts" % (where, name, l2))
+            elif not count(evict, 2 * l2):
+                out.append("%s: the raw record %s holds cold cells and an eviction buffer of %r bytes, less than twice the L2 cache (%d bytes): the cache is not evicted before a call" % (where, name, evict, l2))
         found = {}
         for cell in rec.get("cells", []):
             key, args = cell.get("key"), cell.get("args") or {}

@@ -906,6 +906,20 @@ def meta_problems(rec, where, dev, arm, side):
     return out[:8]
 
 
+def contract_problems(ev):
+    """The Method M contract of every raw record, checked by the checker of the final campaigns (``record_checker.campaign_contract_problems``) against the cells that the campaign generates
+    for its limit constant and for the SM count of its gating devices (``identity_problems`` has to hold: they are one value each): process-median samples, at least five trials that
+    the record declares and every cell holds, decode cells that measure the workload that their key names, positive effective counts and, for a record with cold cells, an eviction
+    buffer of at least twice the L2 cache. The comparator takes pooled records and any workload on purpose, so what it judges is not evidence of the campaign until this holds."""
+    facts = facts_of(ev)
+    import record_checker as rc                                           # imported here: the rest of this module does not need the checker
+    work = rc.spec_workloads(bd.campaign_cell_specs(facts["per_sm"], facts["sm_count"]))
+    out = []
+    for dev, arm, phase, side, rec, entry in all_records(ev):
+        out.extend(rc.campaign_contract_problems([dict(rec, _path=entry["name"])], "decode", "%s %s %s %s" % (dev, arm, phase, side), workloads=work))
+    return out
+
+
 def identity_problems(ev):
     """One commit, one limit constant and one SM count for the whole campaign; one GPU, host and compute capability for all the records of a device (all arms of a device run on one allocation)."""
     out, commits, per_sms, sms, boundary = [], set(), set(), {}, set()
@@ -977,8 +991,9 @@ def launch_problems(ev):
 
 
 def evidence_problems(ev):
-    """Why the evidence cannot be the basis of a table (the table is not written, a check fails): a record file that is named twice, the identity and the path of every record (``meta_problems``), the
-    identity of the campaign (``identity_problems``) and the launches of every cell against the routing specification (``launch_problems``). What the comparator finds (the start order, the counts of
+    """Why the evidence cannot be the basis of a table (the table is not written, a check fails): a record file that is named twice, the identity and the path of every record (``meta_problems``),
+    the identity of the campaign (``identity_problems``), the Method M contract of every record and the cells that it measures (``contract_problems``) and the launches of every cell against
+    the routing specification (``launch_problems``). What the comparator finds (the start order, the counts of
     a re-run, a missing cell sample) is not listed here: it makes a comparison INVALID, and the outcome undecided."""
     out, seen = [], {}
     for dev, arm, phase, side, rec, entry in all_records(ev):
@@ -994,7 +1009,10 @@ def evidence_problems(ev):
                 out.append("%s has no first campaign of the %s arm" % (dev, arm))
     if out:
         return out
-    return identity_problems(ev) or launch_problems(ev)
+    out = identity_problems(ev)
+    if out:
+        return out
+    return contract_problems(ev) or launch_problems(ev)
 
 
 def candidate_commit(ev):

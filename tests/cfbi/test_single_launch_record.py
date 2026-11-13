@@ -706,6 +706,53 @@ def test_one_record_file_is_one_measurement_and_both_arms_of_both_devices_are_ne
     assert has(slr.evidence_problems(mutated(full["ev"], lambda ev: ev["devices"]["b200"]["default"]["first"].update(B=[]))), "b200 has no first campaign of the default arm")
 
 
+def every_record(ev):
+    return [r for arms in ev["devices"].values() for phases in arms.values() for ph in phases.values() for side in ph.values() for r in side]
+
+
+def pooled_with_one_trial(ev):
+    """Every record becomes a pooled one with a single trial per cell (the middle trial, which has the median exactly: what the cells compare is not changed)."""
+    for rec in every_record(ev):
+        rec["meta"].update(sample_stat="pooled", trials=1)
+        for cell in rec["cells"]:
+            cell["samples"] = cell["samples"][2:3]
+
+
+def keys_over_lockstep_cells(ev):
+    """The keys still name the cold, staggered and probe cells; every cell measured the lock-step workload at no position."""
+    for rec in every_record(ev):
+        for cell in rec["cells"]:
+            if cell["args"]["regime"] != "lockstep":
+                cell["args"].update(regime="lockstep", pos=None)
+
+
+def no_eviction_buffer(ev):
+    for rec in every_record(ev):
+        rec["meta"].update(eviction_bytes=0)
+
+
+def a_cell_that_is_no_cell_of_the_campaign(ev):
+    cell = ev["devices"]["b300"]["forced"]["first"]["B"][1]["cells"][0]
+    cell.update(key=key_of(3, 7))
+    cell["args"].update(N=3, H=7)
+
+
+@pytest.mark.parametrize("name,edit,expected", [
+    ("pooled records with one trial each: not Method M", pooled_with_one_trial, "has sample_stat 'pooled', not 'process_median'"),
+    ("pooled records with one trial each: one trial", pooled_with_one_trial, "declares 1 trials per cell: Method M needs at least 5 trials"),
+    ("cold, staggered and probe keys over lock-step cells", keys_over_lockstep_cells, "does not measure the workload its key names (regime"),
+    ("no eviction buffer under the cold keys", no_eviction_buffer, "holds cold cells and an eviction buffer of 0 bytes, less than twice the L2 cache"),
+    ("a cell that is no cell of the campaign", a_cell_that_is_no_cell_of_the_campaign, "is not a cell of the decode benchmark"),
+])
+def test_records_that_are_not_method_m_records_of_the_campaigns_cells_are_no_evidence_whatever_the_comparator_makes_of_them(full, name, edit, expected):
+    """The comparator takes pooled records and records of any workload. The evidence goes through the contract of the final campaigns first: the whole path (the check of the table against its
+    evidence) returns these problems and no table, and the table of the campaign that the unchanged records give is not an adopted one for them."""
+    mut = mutated(full["ev"], edit)
+    assert has(slr.evidence_problems(mut), expected), name
+    assert has(slr.check_problems(full["table"], mut, results=full["results"]), expected), name
+    assert slr.evidence_problems(full["ev"]) == [] and slr.check_problems(full["table"], full["ev"], results=full["results"]) == []
+
+
 def test_the_graph_replays_are_held_to_the_same_route_when_they_were_profiled(full):
     def profiled(ev):
         for dev, arms in ev["devices"].items():

@@ -1073,6 +1073,8 @@ def final_rec(campaign, dev, commit, ts, host, slows=None, scale=1, cells=None, 
     keys = cells if cells is not None else (DECODE_KEYS if campaign == "decode" else CHAIN_KEYS)
     meta = {"commit": commit, "dirty": False, "gpu": gpu, "sm_count": sm, "host": host, "timestamp": ts, "sample_stat": br.PROCESS_MEDIAN, "trials": 5, "kind": KIND[campaign], "impl": 0,
             "env_impl": None}
+    if campaign == "decode":                                                  # what the decode benchmark writes for its cold regime: the L2 cache and a buffer of twice its size and a megabyte
+        meta.update(l2_cache_bytes=1 << 26, eviction_bytes=(1 << 27) + (1 << 20))
     return {"schema": br.SCHEMA, "meta": meta, "cells": [final_cell(campaign, k, MEDIANS[campaign][k], (slows or {}).get(k, 1.0), scale, (spreads or {}).get(k, 0.0), idx) for k in keys]}
 
 
