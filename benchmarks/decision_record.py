@@ -395,12 +395,12 @@ def launch_problems(launch, ncu):
     return out
 
 
-def occupancy_problems(rec, dev, container, launch=None, commit=None):
-    """The occupancy-API record of a device, bound to what it claims: the device, the commit (the label; ``commit``: the commit that the evidence is of), the instantiations (the names are
-    read from the record, the keys of the dump from them, and every row-engine kernel of the dump needs an instance), the registers and the static shared memory against the
-    production-toolchain dump, the threads and the dynamic shared memory against the launch in the sources at the record's commit (``launch``: ``launch_constants``), at least two CTAs per
-    SM and at most 128 registers for every instantiation of the row engine, and the arithmetic of ``ctas_per_sm`` reproducing the API for every instance (the CTA count alone does not say
-    which configuration it is the count of)."""
+def occupancy_admission_problems(rec, dev, container, launch=None, commit=None):
+    """The ADMISSION of the occupancy-API record of a device as evidence: the record bound to what it claims. The device, the commit (the label; ``commit``: the commit that the evidence is of),
+    the instantiations (the names are read from the record, the keys of the dump from them, and every row-engine kernel of the dump needs an instance), the registers and the static shared
+    memory against the production-toolchain dump, the threads and the dynamic shared memory against the launch in the sources at the record's commit (``launch``: ``launch_constants``), and the
+    arithmetic of ``ctas_per_sm`` reproducing the API for every instance (the CTA count alone does not say which configuration it is the count of). A record that fails here proves nothing,
+    neither a pass nor a failure of the resource gate; what a record that passes says about that gate is ``occupancy_gate_failures``."""
     where = "occupancy record %s" % (rec.get("_path", dev) if isinstance(rec, dict) else dev)
     if not isinstance(rec, dict):
         return ["%s: not a record" % where]
@@ -443,9 +443,29 @@ def occupancy_problems(rec, dev, container, launch=None, commit=None):
         arithmetic = ctas_per_sm(inst["registers"], inst["threads"], inst["static_smem"], inst["dynamic_smem"], dv)
         if inst["ctas_per_sm"] != arithmetic:
             out.append("%s: %s: the API says %d CTAs per SM, the arithmetic of the registers, the shared memory and the threads %d" % (where, name, inst["ctas_per_sm"], arithmetic))
-        if name != REFERENCE_KERNEL and (inst["ctas_per_sm"] < GATE_CTAS or inst["registers"] > GATE_REGISTERS):
+    return out
+
+
+def occupancy_gate_failures(rec, dev):
+    """What the occupancy-API record says about the resource gate: one message for every instantiation of the row engine (the frozen reference is none) that has fewer than two CTAs per SM or
+    more than 128 registers. This is a VERDICT, not a defect of the record: a record that was admitted (``occupancy_admission_problems``) and shows a failure is the evidence that the gate
+    failed, and a ledger row that says so is honest. Instances whose figures cannot be read are left to the admission."""
+    if not isinstance(rec, dict):
+        return []
+    where = "occupancy record %s" % rec.get("_path", dev)
+    out = []
+    for name in row_names(rec) or [ROWS_KERNEL]:
+        inst = instance(rec, name)
+        if inst is None or not (all(rc.count(inst.get(f)) for f in INSTANCE_FIGURES) and inst["registers"] > 0 and inst["threads"] > 0):
+            continue
+        if inst["ctas_per_sm"] < GATE_CTAS or inst["registers"] > GATE_REGISTERS:
             out.append("%s: the row engine %s has %d CTAs per SM with %d registers: at least %d CTAs and at most %d registers are required" % (where, name, inst["ctas_per_sm"], inst["registers"], GATE_CTAS, GATE_REGISTERS))
     return out
+
+
+def occupancy_problems(rec, dev, container, launch=None, commit=None):
+    """The admission of the occupancy-API record of a device and its resource verdict together (the decision record's evidence must show a record that passes the gate)."""
+    return occupancy_admission_problems(rec, dev, container, launch, commit) + occupancy_gate_failures(rec, dev)
 
 
 def retained_launch_problems(rec, dev, launch):

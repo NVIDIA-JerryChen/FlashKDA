@@ -47,13 +47,18 @@ ledger   ``cfbi-step-ledger-v1``: one row for each step (``single_launch``, ``tr
          nothing to differ), the comparison of every other step is the ``change`` mode. The comparison of a production-toolchain device (``container_b200``, ``container_b300``) also names the
          occupancy-API record of the device (``occupancy``, the JSON of ``occupancy_dump.py``) that is bound to the device, to the commit of the candidate dump, to every row-engine
          instantiation of that dump (the names come from the record and the dump), to the registers and the static shared memory of the dump, to the threads and the dynamic shared memory of
-         the launch in the sources at the record's commit (with ``--repo``), to the arithmetic of the CTAs per SM, and to at least two CTAs per SM and at most 128 registers for every
-         instantiation (``decision_record.occupancy_problems``). An adopted row passes every comparison and all of timing (beats the
+         the launch in the sources at the record's commit (with ``--repo``), and to the arithmetic of the CTAs per SM (``decision_record.occupancy_admission_problems``: a record that
+         fails this proves nothing). What an admitted record says about the resource gate, at least two CTAs per SM and at most 128 registers for every instantiation
+         (``decision_record.occupancy_gate_failures``), is a verdict, not a defect: it joins the dump comparison in the verdict of the comparison, so an honest row that failed the
+         code-generation gate on a device is admissible (``not_adopted``, ``failed_at`` ``codegen``) and an adopted row may not have it. An adopted row passes every comparison and all of timing (beats the
          previous accepted state, does not regress against the base, keeps the layer chain where the step changes the shared-memory requirement of the row kernel: ``e_tile``,
          ``a_fragments``, ``kd_tile``, the type of the step decides); the E tile and the A fragments are one adoption unit decided on three arms (T the previous accepted state, E, F)
          by a table (E passes against T and F beats E: both adopted; E passes and F does not beat E: E only; E fails against T and F beats T: both; neither: none): the table only changes
          against which state the gain is judged, so every adopted row passes everything itself, except the E tile that F rescued, which the selected state E + F stands in for. A ledger
-         that contradicts the table is rejected. ``--decision`` cross-checks the skipped steps with the decision record.
+         that contradicts the table is rejected. ``--decision`` cross-checks the skipped steps with the decision record and, with ``--repo``, proves the order of the steps by the Git history: the
+         ledger of a row-engine step names the commit that holds the decision record (``meta.decision_commit``, the path ``meta.decision_path`` defaults to the record's place in the
+         repository), the content of the file at that commit must be the record under check, and that commit must be a strict ancestor of every row-engine step commit (the ``recorded_on``
+         date of the record is only the commit it was generated on, which must not come after the commit that holds it).
 decision a decision record has the keys ``row_engine_order`` (the steps of the row engine in their default order, a step may only be left out, never moved), ``value_split_inputs`` and ``budget_table``.
          With ``--evidence`` (the manifest of the raw evidence) the record is derived again from the evidence and must equal the given one, and the section of the performance document
          (``--document``) must be the generated one (see ``decision_record.py``).
@@ -885,25 +890,30 @@ def identity_allow_problems(allow, w):
 
 
 def occupancy_entry_problems(entry, key, cand, w, repo):
-    """The occupancy-API record of the device of a production-toolchain comparison against the candidate dump of the comparison (``decision_record.occupancy_problems``: device, the commit of the
-    dump, every row-engine instantiation of the dump, registers and static shared memory against the dump, the launch of the sources at the record's commit when ``repo`` is given, the arithmetic,
-    at least two CTAs per SM and at most 128 registers for every instantiation of the row engine)."""
+    """The occupancy-API record of the device of a production-toolchain comparison against the candidate dump of the comparison. Returns ``(problems, failures)``.
+
+    ``problems`` is the ADMISSION of the record as evidence (``decision_record.occupancy_admission_problems``: device, the commit of the dump, every row-engine instantiation of the dump,
+    registers and static shared memory against the dump, the launch of the sources at the record's commit when ``repo`` is given, the arithmetic): a record that fails it proves nothing.
+    ``failures`` is what an admitted record says about the resource gate (``decision_record.occupancy_gate_failures``: at least two CTAs per SM and at most 128 registers for every
+    instantiation of the row engine). It is not a problem of the row: ``comparison_problems`` counts it as a failed comparison, which an adopted row may not have and an honest row that
+    failed the code-generation gate is built on."""
     import decision_record as dr                                   # not at the top: that module imports this one
     dev = key.split("_", 1)[1]
     path = entry.get("occupancy")
     if not text(path):
-        return ["%s needs occupancy (the path of the occupancy-API record of %s at the commit of the candidate dump)" % (w, dev)]
+        return ["%s needs occupancy (the path of the occupancy-API record of %s at the commit of the candidate dump)" % (w, dev)], []
     try:
         rec = load_json(path)
     except (OSError, ValueError) as e:
-        return ["%s: the occupancy record %s cannot be used: %s" % (w, path, _first_line(e))]
+        return ["%s: the occupancy record %s cannot be used: %s" % (w, path, _first_line(e))], []
     launch, problems, label = None, [], dr.label_commit(rec, dev)
     if repo is not None and label is not None:
         try:
             launch = dr.launch_constants(repo, label)
         except ValueError as e:
             problems.append("%s: the launch cannot be read from the sources at commit %s of the occupancy record: %s" % (w, label, e))
-    return problems + ["%s: %s" % (w, p) for p in dr.occupancy_problems(rec, dev, cand, launch, commit=cand["meta"]["tree"].get("commit"))]
+    admission = problems + ["%s: %s" % (w, p) for p in dr.occupancy_admission_problems(rec, dev, cand, launch, commit=cand["meta"]["tree"].get("commit"))]
+    return admission, ["%s: %s" % (w, p) for p in dr.occupancy_gate_failures(rec, dev)]
 
 
 def comparison_problems(row, key, entry, resources, meta, where, repo=None):
@@ -955,10 +965,14 @@ def comparison_problems(row, key, entry, resources, meta, where, repo=None):
         report = cg.compare_dumps(base, cand, allow, entry["mode"], prev)
     except cg.Unusable as e:
         return problems + ["%s: the dumps cannot be compared: %s" % (w, _first_line(e))], None
-    passed = report["exit"] == 0
+    container = key.startswith("container_")
+    occupancy_problems, occupancy_failures = occupancy_entry_problems(entry, key, cand, w, repo) if container else ([], [])
+    passed = report["exit"] == 0 and not occupancy_failures          # on a device the verdict of the comparison is the dump comparison and the occupancy verdict together
+    report["passed"], report["occupancy_failures"] = passed, occupancy_failures
     if entry.get("verdict") != ("PASS" if passed else "FAIL"):
-        problems.append("%s: the ledger says %r, the comparison of the dumps says %s (%d difference(s), %d resource failure(s))" % (
-            w, entry.get("verdict"), "PASS" if passed else "FAIL", len(report["differences"]), len(report["gate_r"]["failures"])))
+        problems.append("%s: the ledger says %r, the comparison of the dumps says %s (%d difference(s), %d resource failure(s)%s)" % (
+            w, entry.get("verdict"), "PASS" if passed else "FAIL", len(report["differences"]), len(report["gate_r"]["failures"]),
+            ", %d occupancy failure(s)" % len(occupancy_failures) if container else ""))
     for field, got in (("compared", report["compared"]), ("differences", len(report["differences"]))):
         if entry.get(field) != got or type(entry.get(field)) is bool:
             problems.append("%s: the ledger says %s = %r, the comparison of the dumps says %r" % (w, field, entry.get(field), got))
@@ -976,8 +990,7 @@ def comparison_problems(row, key, entry, resources, meta, where, repo=None):
                 say = figures[arch].get(inst) if isinstance(figures[arch], dict) else None
                 if not isinstance(say, dict) or any(say.get(f) != got[f] or type(say.get(f)) is bool for f in RESOURCE_FIGURES):
                     problems.append("%s: resource_gate (%s, %s, %s) says %r, the dump has %r" % (where, key, arch, inst, say, got))
-    if key.startswith("container_"):
-        problems.extend(occupancy_entry_problems(entry, key, cand, w, repo))
+    problems.extend(occupancy_problems)
     return problems, report
 
 
@@ -995,7 +1008,7 @@ def _codegen_problems(step, where, reached_codegen, both_required, meta, repo=No
     needed = list(COMPARISONS) if both_required else [k for k in COMPARISONS if k in entries][:1]
     if not needed:
         return ["%s: codegen_gate has no comparison for any toolchain" % where], []
-    problems, results = [], []
+    problems, results, occupancy = [], [], []
     for key in needed:
         if key not in entries:
             problems.append("%s: codegen_gate has no comparison for %s" % (where, key))
@@ -1003,9 +1016,11 @@ def _codegen_problems(step, where, reached_codegen, both_required, meta, repo=No
         probs, report = comparison_problems(step, key, entries[key], resources, meta, where, repo)
         problems.extend(probs)
         if report is not None:
-            results.append(report["exit"] == 0)
+            results.append(report["passed"])
+            occupancy.extend(report["occupancy_failures"])
     if both_required and step.get("outcome") == "adopted" and results and not all(results):
-        problems.append("%s: the comparison of the dumps fails (code generation or resources): an adopted step passes it on every toolchain" % where)
+        problems.append("%s: the comparison of the dumps fails (code generation or resources): an adopted step passes it on every toolchain%s" % (
+            where, " (occupancy: %s)" % "; ".join(occupancy) if occupancy else ""))
     return problems, results
 
 
@@ -1203,10 +1218,7 @@ def ledger_problems(ledger, repo=None, decision=None, require_all_steps=False, h
                     problems.append("%s: %s is skipped in the ledger, the decision record keeps it" % (where, sid))
     if repo is not None:
         head_full = resolve(repo, head)
-        recorded = decision["meta"].get("recorded_on") if isinstance(decision, dict) and isinstance(decision.get("meta"), dict) else None
-        recorded_full = resolve(repo, recorded) if hexcommit(recorded) else None
-        if hexcommit(recorded) and recorded_full is None:
-            problems.append("%s: the decision record was written on commit %s, which the repository does not have" % (where, recorded))
+        row_engine_commits = []                                       # (step, full hash) of every row-engine step that names a commit
         for s in steps:
             if not isinstance(s, dict) or s.get("outcome") == "skipped":
                 continue
@@ -1218,9 +1230,64 @@ def ledger_problems(ledger, repo=None, decision=None, require_all_steps=False, h
                     continue
                 if s.get("outcome") == "adopted" and head_full and not (full == head_full or is_ancestor(repo, full, head_full)):
                     problems.append("%s: adopted step %s: commit %s is not an ancestor of %s" % (where, s.get("id"), c, head))
-                if recorded_full and s.get("id") in ROW_ENGINE_STEPS and (full == recorded_full or not is_ancestor(repo, recorded_full, full)):
-                    problems.append("%s: step %s: commit %s does not come after the decision record (written on %s): the order of the row-engine steps is recorded before the first of them"
-                                    % (where, s.get("id"), c, recorded))
+                if s.get("id") in ROW_ENGINE_STEPS:
+                    row_engine_commits.append((s.get("id"), c, full))
+        if decision is not None:
+            problems.extend(decision_version_problems(where, meta, decision, row_engine_commits, repo))
+    return problems
+
+
+DECISION_PATH = "docs/cfbi-decode-decision-record.json"              # where the repository keeps the decision record (the ledger may name another path: meta.decision_path)
+
+
+def decision_version_problems(where, meta, decision, row_engine_commits, repo):
+    """The order of the steps is recorded before the first row-engine step, and that is proved by the Git history, not by a date that the record says about itself.
+
+    ``meta.decision_commit`` of the ledger names the commit that holds the decision record (at ``meta.decision_path``, by default ``DECISION_PATH``); the content of the file at that commit
+    must be the record under check (``git show``), and the commit must be a strict ancestor of every row-engine step commit (``row_engine_commits``: ``(step, commit, full hash)``). The
+    ledger of a row-engine step names it, or it is a problem. ``recorded_on`` of the record stays what it was, the commit that the record was generated on: it must exist and may not come
+    after the commit that holds the record. (A record committed after the first step carries a ``recorded_on`` that names an earlier commit all the same; the date alone proves nothing.)"""
+    problems = []
+    recorded = decision["meta"].get("recorded_on") if isinstance(decision, dict) and isinstance(decision.get("meta"), dict) else None
+    recorded_full = resolve(repo, recorded) if hexcommit(recorded) else None
+    if hexcommit(recorded) and recorded_full is None:
+        problems.append("%s: the decision record was written on commit %s, which the repository does not have" % (where, recorded))
+    named = meta.get("decision_commit") if isinstance(meta, dict) else None
+    if named is None:
+        if row_engine_commits:
+            problems.append("%s: the ledger names no committed version of the decision record (meta.decision_commit): the order of the row-engine steps is proved by a commit of the history that "
+                            "holds the record and comes before the first step, not by the date that the record says about itself" % where)
+        return problems
+    path = meta.get("decision_path", DECISION_PATH)
+    if not hexcommit(named):
+        return problems + ["%s: meta.decision_commit %r must be a hexadecimal commit hash of at least 7 characters" % (where, named)]
+    if not text(path):
+        return problems + ["%s: meta.decision_path must be the path of the decision record in the repository, got %r" % (where, path)]
+    full = resolve(repo, named)
+    if full is None:
+        return problems + ["%s: the decision record is said to be committed in %s, which the repository does not have" % (where, named)]
+    code, out, err = git(repo, "show", "%s:%s" % (full, path))
+    if code != 0:
+        return problems + ["%s: commit %s does not hold %s (%s)" % (where, named, path, err.strip()[:100])]
+    try:
+        committed = json.loads(out)
+    except ValueError as e:
+        return problems + ["%s: %s at commit %s is not JSON: %s" % (where, path, named, _first_line(e))]
+
+    def public(rec):
+        return dict((k, v) for k, v in rec.items() if not str(k).startswith("_")) if isinstance(rec, dict) else rec
+
+    if public(committed) != public(decision):
+        keys = sorted(set(public(committed)) | set(public(decision)), key=str) if isinstance(committed, dict) and isinstance(decision, dict) else []
+        problems.append("%s: the decision record that %s holds at commit %s is not the record under check (they differ in %s)" % (
+            where, path, named, ", ".join(str(k) for k in keys if public(committed).get(k) != public(decision).get(k)) or "their form"))
+    for sid, c, step_full in row_engine_commits:
+        if step_full == full or not is_ancestor(repo, full, step_full):
+            problems.append("%s: step %s: commit %s does not come after the commit that holds the decision record (%s): the order of the row-engine steps is recorded in a commit before the first of them"
+                            % (where, sid, c, named))
+    if recorded_full and not (recorded_full == full or is_ancestor(repo, recorded_full, full)):
+        problems.append("%s: the decision record says it was written on commit %s, which is not an ancestor of the commit that holds it (%s): a record is not generated on a commit that comes after it"
+                        % (where, recorded, named))
     return problems
 
 

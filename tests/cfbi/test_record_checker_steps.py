@@ -738,22 +738,9 @@ def test_ledger_commits_are_checked_against_the_repository(steps_repo_rw):
     assert has(rc.ledger_problems(mutated(ok, lambda l: l["steps"][0].update(commit=off)), repo=repo), "is not an ancestor")
 
 
-def test_the_decision_record_is_written_before_the_first_row_engine_commit(steps_repo_rw):
-    """The order of the steps is recorded before any of them is committed: a step commit must come after the commit that the decision record was written on."""
-    repo, h = steps_repo_rw["repo"], steps_repo_rw
-    later = commit_file(repo, "csrc/after.cu", "a row-engine step\n", "a step after the record")
-    ok = {"schema": rc.LEDGER_SCHEMA, "meta": dict(META), "steps": [adopted("trims", later)], "_path": "mem"}
-    dec = dict(decision(), meta={"recorded_on": h["base"]})
-    assert rc.ledger_problems(ok, repo=repo, decision=dec) == []
-    early = mutated(ok, lambda l: l["steps"][0].update(commit=h["base"]))                                  # the step is the commit that the record was written on
-    assert has(rc.ledger_problems(early, repo=repo, decision=dec), "does not come after the decision record")
-    after = dict(decision(), meta={"recorded_on": later})                                                    # the record was written after the step
-    assert has(rc.ledger_problems(ok, repo=repo, decision=after), "does not come after the decision record")
-    assert rc.ledger_problems(ok, repo=repo, decision=decision()) == []                                      # a decision record without the commit asks nothing of the history
-    unknown = dict(decision(), meta={"recorded_on": "0" * 40})                                                # a commit that the repository does not have is not skipped silently
-    assert has(rc.ledger_problems(ok, repo=repo, decision=unknown), "which the repository does not have")
-    other = {"schema": rc.LEDGER_SCHEMA, "meta": dict(META), "steps": [adopted("single_launch", h["base"])], "_path": "mem"}
-    assert rc.ledger_problems(other, repo=repo, decision=dec) == []                                          # the single-launch step comes before the record, by the plan's order
+# The order of the steps against the decision record used to be checked against the `recorded_on` date that the record says about itself (a step had to come after that commit, and a record
+# without the date asked nothing of the history). A record that is committed after the first step and carries an old date passed that rule: the committed version replaced it, the one
+# that the ledger names (`meta.decision_commit`), tested in the chronology tests at the end of this file.
 
 
 def test_the_ledger_and_decision_command_lines(steps_repo, tmp_path, capsys):
@@ -2156,3 +2143,183 @@ def test_the_baseline_command_line_rejects_a_missing_cell(baseline, capsys):
     assert rc.main(["baseline", "--record", str(path), "--allow-missing-raw"]) == 0                             # and a baseline that declares the benchmark's coverage passes without its raw records
     with pytest.raises(SystemExit):                                                                              # the coverage that a campaign is expected to have is a parameter of the caller, not an option
         rc.main(["baseline", "--record", str(path), "--expected", "x"])
+
+
+# ---- an honest resource failure on the production toolchain is evidence, not a defective record: the admission of the occupancy record is separate from its verdict ------------------
+HEAVY = lambda r: r["occupancy"]["instances"][0].update(dynamic_smem=130000, ctas_per_sm=1)          # 128 registers and 130 000 B of dynamic shared memory: one CTA per SM by the arithmetic
+OTHER_GPU = lambda r: r.update(gpu="NVIDIA H100")
+OTHER_COMMIT = lambda r: r.update(label="b200-" + "d" * 9)
+NO_COMMIT = lambda r: r.update(label="b200")
+FIGURE_OF_THE_DUMP = lambda r: r["occupancy"]["instances"][0].update(registers=96, ctas_per_sm=2)
+ARITHMETIC = lambda r: r["occupancy"]["instances"][0].update(ctas_per_sm=3)
+OTHER_THREADS = lambda r: r["occupancy"]["instances"][0].update(threads=128, ctas_per_sm=4)
+NO_INSTANCE = lambda r: r["occupancy"]["instances"].pop(0)
+
+
+def container_failure_row(dev="b200", rows=None, occ_edit=None, sid="trims", declared="FAIL", commit=C2):
+    """A step that failed the code-generation gate where the production toolchain says so: its only comparison is the one of ``dev`` (a candidate dump of ``commit`` with ``rows`` edited), bound
+    to the occupancy record that the dump gives (``occ_edit`` edits that record), and it declares ``declared`` as the verdict of the comparison."""
+    key = "container_" + dev
+    entry, figures = comparison(key, commit, sid=sid, rows=rows or {})
+    if occ_edit is not None:
+        entry["occupancy"] = occupancy_file(dev, commit, entry["cand_dump"], occ_edit)
+    entry["verdict"] = declared
+    step = not_adopted(sid, "codegen")
+    step["codegen_gate"], step["resource_gate"] = {key: entry}, {key: figures}
+    return step
+
+
+def test_an_honest_resource_failure_of_the_production_toolchain_is_a_valid_not_adopted_row():
+    row = container_failure_row(rows={"reg": 129})                      # 129 registers: gate R fails, and the occupancy API of the same dump says one CTA per SM
+    assert row["codegen_gate"]["container_b200"]["verdict"] == "FAIL" and row["failed_at"] == "codegen" and row["outcome"] == "not_adopted"
+    assert step_check(row) == [], step_check(row)
+    assert step_check(container_failure_row("b300", rows={"reg": 129})) == []
+
+
+def test_a_failure_of_the_occupancy_alone_is_a_code_generation_failure_of_the_row():
+    row = container_failure_row(occ_edit=HEAVY)                          # the dump passes gate R, the launch configuration does not fit two CTAs per SM
+    assert step_check(row) == [], step_check(row)
+    passing = container_failure_row(occ_edit=HEAVY, declared="PASS")     # the verdict of a production comparison is the dump comparison and the occupancy verdict together
+    assert has(step_check(passing), "the ledger says 'PASS'"), step_check(passing)
+
+
+def test_the_same_failures_in_an_adopted_row_are_rejected():
+    for kw in ({"rows": {"reg": 129}}, {"occ_edit": HEAVY}):
+        bad = container_failure_row(commit=C1, **kw)
+        row = mutated(adopted("trims"), lambda s: (s["codegen_gate"].update(container_b200=bad["codegen_gate"]["container_b200"]), s["resource_gate"].update(container_b200=bad["resource_gate"]["container_b200"])))
+        assert has(step_check(row), "the comparison of the dumps fails"), (kw, step_check(row)[:3])
+
+
+def test_a_failed_gate_row_needs_a_failing_comparison():
+    row = container_failure_row(declared="PASS")                         # 128 registers and two CTAs per SM: nothing failed
+    assert has(step_check(row), "failed at the code generation, but every comparison of the dumps passes"), step_check(row)
+
+
+UNUSABLE_FAILED_GATE = [
+    ("the record of another GPU", OTHER_GPU, "is not b200"),
+    ("a record of another commit", OTHER_COMMIT, "the record is of commit"),
+    ("a label that does not name the commit", NO_COMMIT, "does not name the device and the commit"),
+    ("figures that are not the dump's", FIGURE_OF_THE_DUMP, "the production dump"),
+    ("a CTA count that the arithmetic does not reproduce", ARITHMETIC, "the arithmetic"),
+    ("a CTA of other threads", OTHER_THREADS, "256 are required"),
+    ("an instance of the dump that the record lacks", NO_INSTANCE, "either the plain cfbi::rows_kernel or both of its instantiations"),
+]
+
+
+@pytest.mark.parametrize("name,edit,expected", UNUSABLE_FAILED_GATE, ids=[m[0] for m in UNUSABLE_FAILED_GATE])
+def test_unusable_occupancy_evidence_is_no_proof_of_a_failure_even_where_the_gate_failed(name, edit, expected):
+    row = container_failure_row(rows={"reg": 129}, occ_edit=edit)
+    assert has(step_check(row), expected), (name, step_check(row)[:4])
+
+
+def test_the_occupancy_validation_separates_the_admission_of_the_record_from_its_verdict_and_the_gates_do_not_move():
+    entry = container_failure_row(rows={"reg": 129})["codegen_gate"]["container_b200"]
+    rec, cand = json.load(open(entry["occupancy"])), cg.load_dump(entry["cand_dump"])
+    assert dr.GATE_CTAS == 2 and dr.GATE_REGISTERS == 128
+    admission, verdict = dr.occupancy_admission_problems(rec, "b200", cand, commit=C2), dr.occupancy_gate_failures(rec, "b200")
+    assert admission == [] and len(verdict) == 1 and "has 1 CTAs per SM with 129 registers" in verdict[0] and "at least 2 CTAs and at most 128 registers" in verdict[0], (admission, verdict)
+    assert dr.occupancy_problems(rec, "b200", cand, commit=C2) == admission + verdict                      # the combined validation is what it was
+    good = json.load(open(comparison("container_b200", C2)[0]["occupancy"]))
+    assert dr.occupancy_gate_failures(good, "b200") == []
+
+
+# ---- the order of the steps is proved by the committed version of the decision record, never by a date that the record says about itself ----------------------------------------
+DECISION_PATH = "docs/cfbi-decode-decision-record.json"
+
+
+def build_chronology_repo(repo, decision_first=True):
+    """A history with the launch of the row engine, a base commit, the decision record committed at ``decision`` and a row-engine step committed at ``step`` (the record first, or the step first:
+    the review's late record whose ``recorded_on`` names the base)."""
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    h = {"repo": repo}
+    commit_file(repo, "csrc/cfbi/cfbi_primitives.cuh", PRIMITIVES, "the sizes of the kernels")
+    commit_file(repo, "csrc/cfbi/cfbi_launch.cu", LAUNCH, "the launch of the row engine")
+    h["base"] = commit_file(repo, "csrc/k.cu", "base\n", "base")
+    h["record"] = dict(decision(), meta={"recorded_on": h["base"]})
+    body = json.dumps(dict((k, v) for k, v in h["record"].items() if not k.startswith("_")), indent=1)
+    if decision_first:
+        h["decision"] = commit_file(repo, DECISION_PATH, body, "the decision record")
+        h["step"] = commit_file(repo, "csrc/step.cu", "the step\n", "the first row-engine step")
+    else:
+        h["step"] = commit_file(repo, "csrc/step.cu", "the step\n", "the first row-engine step")
+        h["decision"] = commit_file(repo, DECISION_PATH, body, "a decision record written after the step, with the date of the base")
+    return h
+
+
+def chronology_ledger(h, **meta):
+    return {"schema": rc.LEDGER_SCHEMA, "meta": dict(META, decision_commit=h["decision"], **meta), "steps": [adopted("trims", h["step"])], "_path": "mem"}
+
+
+@pytest.fixture()
+def chronology_repo(tmp_path):
+    return build_chronology_repo(tmp_path / "repo")
+
+
+def test_the_decision_record_is_proved_by_a_committed_version_that_precedes_the_first_row_engine_commit(chronology_repo):
+    h = chronology_repo
+    ok = chronology_ledger(h)
+    assert rc.ledger_problems(ok, repo=h["repo"], decision=h["record"]) == [], rc.ledger_problems(ok, repo=h["repo"], decision=h["record"])
+    other = {"schema": rc.LEDGER_SCHEMA, "meta": dict(META), "steps": [adopted("single_launch", h["base"])], "_path": "mem"}
+    assert rc.ledger_problems(other, repo=h["repo"], decision=h["record"]) == []                      # a ledger without a row-engine step asks nothing of the history of the record
+    assert rc.DECISION_PATH == DECISION_PATH
+
+
+def test_a_record_committed_after_the_step_does_not_prove_the_order_whatever_its_recorded_on_says(tmp_path):
+    h = build_chronology_repo(tmp_path / "repo", decision_first=False)
+    late = chronology_ledger(h)
+    problems = rc.ledger_problems(late, repo=h["repo"], decision=h["record"])
+    assert has(problems, "does not come after the commit that holds the decision record"), problems
+    assert h["record"]["meta"]["recorded_on"] == h["base"]                                              # the old rule saw nothing wrong: recorded_on names a commit before the step
+
+
+def test_the_ledger_must_name_the_committed_version_of_the_record(chronology_repo):
+    h = chronology_repo
+    none = mutated(chronology_ledger(h), lambda l: l["meta"].pop("decision_commit"))
+    assert has(rc.ledger_problems(none, repo=h["repo"], decision=h["record"]), "names no committed version of the decision record"), rc.ledger_problems(none, repo=h["repo"], decision=h["record"])
+    unknown = mutated(chronology_ledger(h), lambda l: l["meta"].update(decision_commit="0" * 40))
+    assert has(rc.ledger_problems(unknown, repo=h["repo"], decision=h["record"]), "which the repository does not have")
+    notahash = mutated(chronology_ledger(h), lambda l: l["meta"].update(decision_commit="the commit"))
+    assert has(rc.ledger_problems(notahash, repo=h["repo"], decision=h["record"]), "hexadecimal commit hash")
+    early = mutated(chronology_ledger(h), lambda l: l["meta"].update(decision_commit=h["base"]))       # a commit that does not hold the record at all
+    assert has(rc.ledger_problems(early, repo=h["repo"], decision=h["record"]), "does not hold")
+    elsewhere = mutated(chronology_ledger(h), lambda l: l["meta"].update(decision_path="docs/other.json"))
+    assert has(rc.ledger_problems(elsewhere, repo=h["repo"], decision=h["record"]), "does not hold")
+
+
+def test_the_committed_version_must_be_the_record_under_check(chronology_repo):
+    h = chronology_repo
+    other = dict(h["record"], value_split_inputs={"prefix_share": 0.99, "n_h_range": [12, 1536]})       # the record under check says something else than the committed one (the order of the steps is the same)
+    problems = rc.ledger_problems(chronology_ledger(h), repo=h["repo"], decision=other)
+    assert has(problems, "is not the record under check"), problems
+    loaded = dict(h["record"], _path="docs/cfbi-decode-decision-record.json")                         # what the command line gives: the loader adds the path
+    assert rc.ledger_problems(chronology_ledger(h), repo=h["repo"], decision=loaded) == []
+
+
+def test_the_step_may_not_be_the_commit_that_holds_the_record_and_the_anchor_may_not_come_after_it(chronology_repo):
+    h = chronology_repo
+    same = mutated(chronology_ledger(h), lambda l: l["steps"][0].update(commit=h["decision"]))
+    assert has(rc.ledger_problems(same, repo=h["repo"], decision=h["record"]), "does not come after the commit that holds the decision record")
+    git(h["repo"], "checkout", "-q", "-b", "elsewhere", h["base"])
+    foreign = commit_file(h["repo"], "csrc/foreign.cu", "a commit on another line\n", "a commit that the record's history does not contain")
+    git(h["repo"], "checkout", "-q", "main")
+    after = dict(h["record"], meta={"recorded_on": foreign})                                           # generated on a commit that is not in the history that holds the record
+    body = json.dumps(dict((k, v) for k, v in after.items() if not k.startswith("_")), indent=1)
+    h2 = dict(h, decision=commit_file(h["repo"], DECISION_PATH, body, "a record that names a commit of another line"))
+    h2["step"] = commit_file(h["repo"], "csrc/step2.cu", "a later step\n", "a later step")
+    problems = rc.ledger_problems(chronology_ledger(h2), repo=h["repo"], decision=after)
+    assert has(problems, "is not an ancestor of the commit that holds it"), problems
+    unknown = dict(h["record"], meta={"recorded_on": "0" * 40})
+    assert has(rc.ledger_problems(chronology_ledger(h), repo=h["repo"], decision=unknown), "which the repository does not have")
+
+
+def test_the_chronology_command_line_takes_the_ledger_s_version(chronology_repo, tmp_path, capsys):
+    h = chronology_repo
+    led, dec = tmp_path / "ledger.json", tmp_path / "decision.json"
+    led.write_text(json.dumps(dict((k, v) for k, v in chronology_ledger(h).items() if not k.startswith("_"))))
+    dec.write_text(json.dumps(dict((k, v) for k, v in h["record"].items() if not k.startswith("_"))))
+    assert rc.main(["ledger", "--ledger", str(led), "--repo", str(h["repo"]), "--decision", str(dec)]) == 0
+    dec.write_text(json.dumps(dict((k, v) for k, v in h["record"].items() if not k.startswith("_")), indent=1).replace("0.41", "0.99"))      # edited after it was committed
+    capsys.readouterr()
+    assert rc.main(["ledger", "--ledger", str(led), "--repo", str(h["repo"]), "--decision", str(dec)]) == 1
+    assert "is not the record under check" in capsys.readouterr().out
