@@ -35,6 +35,7 @@ import argparse
 import json
 import math
 import os
+import statistics
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -46,19 +47,19 @@ import suite_record as sr  # noqa: E402
 SCHEMA = "cfbi-step-evidence-v1"
 GATING = rc.DEVICES                                          # the devices that decide
 GATE_METRIC = "total_us"                                     # the kernel sum: the gating metric of the row-engine steps
-KINDS = ("previous", "base")                                 # the two campaigns of a device: against the previous accepted state and against the base
+KINDS = ("previous", "base")                                 # the two campaigns of a device, each named after the manifest field of its side A: the previous accepted state, the base
 AGAINST = {"previous": "the previous accepted state", "base": "the base"}
 TOL_PCT = rc.TOLERANCE_PCT
 AB_ORDER = "abba"                                           # the start order of the record files of a step campaign: blocks of four that are ABBA or BAAB
 REQUIRE_NODES = True                                         # every trial of every cell carries the launch mapping that the benchmark asserted
 
 
-def figure(x):
-    return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) else float("nan")
-
-
 def is_number(x):
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def figure(x):
+    return float(x) if is_number(x) else float("nan")
 
 
 def load_json(path):
@@ -145,18 +146,19 @@ def exactness_problems(m, repo=None):
     for dev in GATING:
         for name in ("gate", "S"):
             spec = m["suites"][dev][name]
+            where = "%s, suite %s" % (dev, name)
             try:
                 base, cand = load_json(spec["baseline"]), load_json(spec["candidate"])
             except (OSError, ValueError) as e:
-                out.append("%s, suite %s: a record cannot be read: %s" % (dev, name, e))
+                out.append("%s: a record cannot be read: %s" % (where, e))
                 continue
-            where = "%s, suite %s" % (dev, name)
-            if (cand.get("meta") or {}).get("suite") != name:
-                out.append("%s: the candidate record is of the suite %r" % (where, (cand.get("meta") or {}).get("suite")))
-            if not rc.commit_matches(str((cand.get("meta") or {}).get("commit")), ran_on):
-                out.append("%s: the candidate record is of commit %s, the suites ran on %s" % (where, (cand.get("meta") or {}).get("commit"), ran_on[:10]))
-            if rc.DEVICE_GPU[dev] not in str((cand.get("meta") or {}).get("gpu")):
-                out.append("%s: the candidate record is of the GPU %r" % (where, (cand.get("meta") or {}).get("gpu")))
+            meta = cand.get("meta") or {}
+            if meta.get("suite") != name:
+                out.append("%s: the candidate record is of the suite %r" % (where, meta.get("suite")))
+            if not rc.commit_matches(str(meta.get("commit")), ran_on):
+                out.append("%s: the candidate record is of commit %s, the suites ran on %s" % (where, meta.get("commit"), ran_on[:10]))
+            if rc.DEVICE_GPU[dev] not in str(meta.get("gpu")):
+                out.append("%s: the candidate record is of the GPU %r" % (where, meta.get("gpu")))
             out.extend("%s: %s" % (where, p) for p in sr.check(base, cand))
     return out
 
@@ -171,7 +173,7 @@ def campaign_infos(m):
         baseline = load_json(m["devices"][dev]["baseline"])
         for kind in KINDS:
             entry = load_json(m["devices"][dev][kind])
-            a_commit = m["previous"] if kind == "previous" else m["base"]
+            a_commit = m[kind]
             where = "%s, %s, against %s" % (dev, m["step"], AGAINST[kind])
             problems, info = rc.campaign_evidence_problems(entry, where, "decode", dev, baseline, a_commit, a_commit, m["commit"], order=AB_ORDER, require_nodes=REQUIRE_NODES)
             for field, want in (("a_commit", a_commit), ("b_commit", m["commit"])):
@@ -181,6 +183,11 @@ def campaign_infos(m):
                 problems.extend("%s: %s" % (where, p) for p in rc.default_route_problems(info["first"], where))
             out[dev][kind] = (problems, info)
     return out
+
+
+def metric_rows(info, metric):
+    """The recomputed rows of ``metric`` in a campaign, by cell key."""
+    return dict((key, row) for (mm, key), row in info["rows"].items() if mm == metric)
 
 
 def first_deltas(info, metric, commit):
@@ -209,11 +216,11 @@ def decide(m, infos, tol_pct=TOL_PCT):
             if problems:
                 invalid.extend(problems[:3] + (["... %d more problem(s) of %s %s" % (len(problems) - 3, dev, kind)] if len(problems) > 3 else []))
                 continue
-            rows = dict((key, row) for (metric, key), row in info["rows"].items() if metric == GATE_METRIC)
+            rows = metric_rows(info, GATE_METRIC)
             if not rows:
                 invalid.append("%s, against %s: no cell of the kernel sum was judged" % (dev, AGAINST[kind]))
                 continue
-            firsts = first_deltas(info, GATE_METRIC, m["previous"] if kind == "previous" else m["base"])
+            firsts = first_deltas(info, GATE_METRIC, m[kind])
             info_dev[kind]["cells"] = len(rows)
             for key in sorted(rows):
                 row = rows[key]
@@ -225,7 +232,7 @@ def decide(m, infos, tol_pct=TOL_PCT):
                     info_dev["previous"]["faster"] += 1
             wall = {}
             for metric in br.WALL_METRICS:                                          # reported, never gating: the confirmed slower and faster cells of the wall metrics
-                wrows = [row for (mm, key), row in info["rows"].items() if mm == metric]
+                wrows = metric_rows(info, metric).values()
                 wall[metric] = {"slower": sum(1 for r in wrows if r["status"] == "FAIL"), "cells": len(wrows)}
             info_dev["reported"][kind] = wall
         if infos[dev]["previous"][0] == [] and info_dev["previous"]["cells"] and not info_dev["previous"]["faster"]:
@@ -259,6 +266,11 @@ def ab_figures(infos):
     return out
 
 
+def owned_instantiations(dump, arch):
+    """The instantiations of the row engine (the family that a row-engine step may change) in the dump of ``arch``, sorted."""
+    return sorted(k for k in dump["kernels"][arch] if cg.family(k) in cg.DEFAULT_OWNED)
+
+
 def codegen_entries(m):
     """``(codegen_gate, resource_gate)`` of the row from the dumps of the manifest: one comparison in change mode per toolchain (the previous accepted dump, the allow-list, the occupancy record of a
     device), the verdict as ``codegen_gate.compare_dumps`` gives it (and, on a device, the occupancy verdict with it), and the resource figures of the row engine."""
@@ -268,7 +280,7 @@ def codegen_entries(m):
         spec = cgm[key]
         base, cand = cg.load_dump(spec["base"]), cg.load_dump(spec["cand"])
         report = cg.compare_dumps(base, cand, cg.load_allow(cgm["allow"]), "change", cg.load_dump(spec["prev"]))
-        owned = dict((arch, sorted(k for k in cand["kernels"][arch] if cg.family(k) in cg.DEFAULT_OWNED)) for arch in rc.COMPARISON_ARCHS[key])
+        owned = dict((arch, owned_instantiations(cand, arch)) for arch in rc.COMPARISON_ARCHS[key])
         entry = {"base_dump": spec["base"], "cand_dump": spec["cand"], "prev_dump": spec["prev"], "allow": cgm["allow"], "mode": "change", "compared": report["compared"],
                  "differences": len(report["differences"]), "instantiations": next(iter(owned.values()))}
         passed = report["exit"] == 0
@@ -308,12 +320,6 @@ STEP_TITLES = {"trims": "Row engine step 1: the schedule trims", "e_tile": "Row 
 SHOWN_METRICS = (GATE_METRIC,) + tuple(br.WALL_METRICS)       # the kernel sum decides, the wall metrics are reported
 
 
-def median_of(values):
-    v = sorted(values)
-    n = len(v)
-    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0
-
-
 def timing_rows(m, infos):
     """``[(device, kind, metric, cells, slower, faster, median change, lowest, highest, noise-limited, judged on the re-run)]``: the recomputed comparison of every device and side, the change being B
     against A in percent of A's median (negative is faster); ``slower`` and ``faster`` are the confirmed cells."""
@@ -321,16 +327,15 @@ def timing_rows(m, infos):
     for dev in GATING:
         for kind in KINDS:
             info = infos[dev][kind][1]
-            commit = m["previous"] if kind == "previous" else m["base"]
             for metric in SHOWN_METRICS:
-                rows = dict((key, row) for (mm, key), row in info["rows"].items() if mm == metric)
+                rows = metric_rows(info, metric)
                 if not rows:
                     continue
-                firsts = first_deltas(info, metric, commit)
+                firsts = first_deltas(info, metric, m[kind])
                 deltas = [figure(r["median_delta_pct"]) for r in rows.values() if is_number(r.get("median_delta_pct"))]
+                med, low, high = (statistics.median(deltas), min(deltas), max(deltas)) if deltas else (float("nan"),) * 3
                 out.append((dev, kind, metric, len(rows), sum(1 for r in rows.values() if r["status"] == "FAIL"), sum(1 for k, r in rows.items() if confirmed_gain(r, firsts.get(k), TOL_PCT)),
-                            median_of(deltas) if deltas else float("nan"), min(deltas) if deltas else float("nan"), max(deltas) if deltas else float("nan"),
-                            sum(1 for r in rows.values() if r.get("noise_limited")), sum(1 for r in rows.values() if r.get("judged_on") == "rerun")))
+                            med, low, high, sum(1 for r in rows.values() if r.get("noise_limited")), sum(1 for r in rows.values() if r.get("judged_on") == "rerun")))
     return out
 
 
@@ -346,7 +351,7 @@ def resource_rows(m):
         spec = m["codegen"][key]
         base, cand, prev = (cg.load_dump(spec[name]) for name in ("base", "cand", "prev"))
         for arch in rc.COMPARISON_ARCHS[key]:
-            for inst in sorted(k for k in cand["kernels"][arch] if cg.family(k) in cg.DEFAULT_OWNED):
+            for inst in owned_instantiations(cand, arch):
                 out.append((key, arch, inst, _figures(cg.gate_r_reference(base["kernels"][arch], inst)), _figures(prev["kernels"][arch].get(inst)), _figures(cand["kernels"][arch][inst])))
     return out
 
@@ -415,18 +420,18 @@ def main(argv=None):
         infos = campaign_infos(m)
         decision = decide(m, infos)
         _print_decision(decision)
-        if a.cmd == "decide":
-            return 0 if decision["outcome"] != "undecided" else 2
         if decision["outcome"] == "undecided":
             return 2
+        if a.cmd == "decide":
+            return 0
         exact = exactness_problems(m, a.repo)
         row = build_row(m, decision, infos, exact)
         if a.cmd == "row":
-            with open(a.out or "-", "w") if a.out else sys.stdout as f:
+            with open(a.out, "w") if a.out else sys.stdout as f:
                 json.dump(row, f, indent=1, sort_keys=True)
                 f.write("\n")
         if a.cmd == "render":
-            with open(a.out or "-", "w") if a.out else sys.stdout as f:
+            with open(a.out, "w") if a.out else sys.stdout as f:
                 f.write(render_section(m, decision, row, infos, a.number))
         return _report(["exactness: %s" % p for p in exact] + row_problems(m, row, a.repo))
     except (OSError, ValueError, KeyError, cg.Unusable) as e:

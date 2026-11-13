@@ -82,6 +82,7 @@ def campaign(d, name, dev, a_commit, b_commit, factors=None, rerun=None, rerun_f
 
 def manifest(d, per_device, wall=None):
     """The evidence manifest of a step for the campaigns of ``per_device``: ``{dev: {"previous": kwargs, "base": kwargs}}`` (the keyword arguments of ``campaign``)."""
+    Path(d).mkdir(exist_ok=True)
     devices = {}
     for dev in rc.DEVICES:
         gpu, sm = trs.GPU[dev]
@@ -97,6 +98,8 @@ GAIN = {"factors": {GAIN_A: 0.9, GAIN_B: 0.95}, "rerun": [GAIN_A, GAIN_B]}      
 FLAT = {"factors": None}
 SLOWER = {"factors": {GAIN_B: 1.08}, "rerun": [GAIN_B]}                                          # one cell about 6 % slower in the kernel sum, re-run and confirmed
 EVERYWHERE = {"previous": GAIN, "base": FLAT}
+ADOPTABLE = dict((dev, EVERYWHERE) for dev in rc.DEVICES)                                       # a step that both devices adopt
+GAIN_AND_SLOWER = {"factors": dict(GAIN["factors"], **SLOWER["factors"]), "rerun": GAIN["rerun"]}   # GAIN_A faster, GAIN_B about 6 % slower, both re-run
 
 
 def decision_of(tmp_path, per_device, wall=None):
@@ -106,7 +109,7 @@ def decision_of(tmp_path, per_device, wall=None):
 
 
 def test_a_confirmed_gain_without_a_regression_adopts_the_step(tmp_path):
-    m, infos, d = decision_of(tmp_path, {"b200": EVERYWHERE, "b300": EVERYWHERE})
+    m, infos, d = decision_of(tmp_path, ADOPTABLE)
     assert all(infos[dev][k][0] == [] for dev in rc.DEVICES for k in sp.KINDS), [infos[dev][k][0][:2] for dev in rc.DEVICES for k in sp.KINDS]
     assert d["outcome"] == "adopted", d
     assert d["timing"] == {"vs_previous": "pass", "vs_base": "pass", "chain": "not_applicable"}
@@ -114,9 +117,9 @@ def test_a_confirmed_gain_without_a_regression_adopts_the_step(tmp_path):
 
 
 def test_a_confirmed_slower_cell_of_the_kernel_sum_against_the_previous_state_or_the_base_does_not_adopt(tmp_path):
-    for kind in sp.KINDS:
-        per = {"b200": EVERYWHERE, "b300": dict(EVERYWHERE, **{kind: SLOWER, "previous": {"factors": dict(GAIN["factors"], **SLOWER["factors"]), "rerun": GAIN["rerun"]}})}
-        m, infos, d = decision_of(tmp_path / kind if (tmp_path / kind).mkdir() is None else tmp_path, per)
+    for kind, base in (("previous", FLAT), ("base", SLOWER)):                        # b300's campaign against the previous state is GAIN_AND_SLOWER in both
+        per = {"b200": EVERYWHERE, "b300": {"previous": GAIN_AND_SLOWER, "base": base}}
+        m, infos, d = decision_of(tmp_path / kind, per)
         assert d["outcome"] == "not_adopted", (kind, d["outcome"], d["reasons"][:2])
         assert any("slower than A in the kernel sum" in r and "b300" in r and GAIN_B in r for r in d["reasons"]), d["reasons"]
         assert d["timing"]["vs_previous" if kind == "previous" else "vs_base"] == "fail"
@@ -133,25 +136,25 @@ def test_a_gain_that_the_confirmation_did_not_reproduce_is_noise(tmp_path):
     m, infos, d = decision_of(tmp_path, {"b200": {"previous": first_only, "base": FLAT}, "b300": EVERYWHERE})
     assert d["outcome"] == "not_adopted" and d["per_device"]["b200"]["previous"]["faster"] == 0, d
     late = {"factors": None, "rerun": GAIN["rerun"], "rerun_factors": GAIN["factors"]}                                    # neutral in the first campaign, fast on the re-run: the sign was not reproduced
-    m, infos, d = decision_of(tmp_path / "late" if (tmp_path / "late").mkdir() is None else tmp_path, {"b200": {"previous": late, "base": FLAT}, "b300": EVERYWHERE})
+    m, infos, d = decision_of(tmp_path / "late", {"b200": {"previous": late, "base": FLAT}, "b300": EVERYWHERE})
     assert d["per_device"]["b200"]["previous"]["faster"] == 0
 
 
 def test_the_wall_metrics_are_reported_and_never_decide(tmp_path):
     wall = {GAIN_A: 1.10}                                                                                                    # the graph replay of one cell gets 10 % slower, the kernel sum does not
-    m, infos, d = decision_of(tmp_path, {"b200": EVERYWHERE, "b300": EVERYWHERE}, wall=wall)
+    m, infos, d = decision_of(tmp_path, ADOPTABLE, wall=wall)
     assert d["outcome"] == "adopted"
     assert d["per_device"]["b200"]["reported"]["previous"]["gpu_graph_us"]["slower"] >= 1
 
 
 def test_a_comparison_that_is_not_a_measurement_leaves_the_outcome_undecided(tmp_path):
-    m = manifest(tmp_path, {"b200": EVERYWHERE, "b300": EVERYWHERE})
+    m = manifest(tmp_path, ADOPTABLE)
     entry = json.loads(Path(m["devices"]["b300"]["previous"]).read_text())
     entry["records_first"]["B"] = entry["records_first"]["B"][:1]                                                           # one record per side: not three interleaved repeats
     Path(m["devices"]["b300"]["previous"]).write_text(json.dumps(entry))
     d = sp.decide(m, sp.campaign_infos(m))
     assert d["outcome"] == "undecided" and any("b300" in r for r in d["reasons"]), d
-    m = manifest(tmp_path / "wrong" if (tmp_path / "wrong").mkdir() is None else tmp_path, {"b200": EVERYWHERE, "b300": EVERYWHERE})
+    m = manifest(tmp_path / "wrong", ADOPTABLE)
     entry = json.loads(Path(m["devices"]["b200"]["base"]).read_text())
     entry["b_commit"] = PREV                                                                                                   # the entry names another candidate than the step
     Path(m["devices"]["b200"]["base"]).write_text(json.dumps(entry))
@@ -175,7 +178,7 @@ def test_the_manifest_names_what_the_decision_needs():
 
 def adopted_case(tmp_path, monkeypatch, per_device=None):
     """The manifest, the recomputed campaigns, the decision and the row of a step (adopted unless ``per_device`` says otherwise) whose dumps are those of the record checker's own tests."""
-    m = manifest(tmp_path, per_device or {"b200": EVERYWHERE, "b300": EVERYWHERE})
+    m = manifest(tmp_path, per_device or ADOPTABLE)
     codegen = {}
     for key in rc.COMPARISONS:
         entry, _ = trs.comparison(key, STEP, sid="trims")
@@ -249,67 +252,47 @@ def test_a_suite_on_a_later_commit_proves_the_step_only_with_the_same_kernel_sou
     assert sp.source_problems(tmp_path / "nowhere", step, step)                                             # no repository: the step cannot be placed
 
 
-def suite_pair(tmp_path, commit, cand_extra=None, cand_commit=None, gpu_cand="NVIDIA B200"):
-    """The baseline and the candidate record of one suite (``cfbi-suite-v1``) written as files; the candidate is of ``cand_commit`` and may have one more failed test."""
+def suite_pair(directory, suite, gpu, failed=()):
+    """The baseline (of the previous accepted state) and the candidate record (of the step, with the failed tests ``failed``) of one suite on ``gpu``, written as files (``cfbi-suite-v1``)."""
     def junit(names, bad=()):
         cases = "".join('<testcase classname="tests.cfbi.test_x" name="%s" time="0.1">%s</testcase>' % (n, '<failure message="boom">t</failure>' if n in bad else "") for n in names)
         return ('<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="%d" skipped="0" tests="%d">%s</testsuite></testsuites>'
                 % (len(bad), len(names), cases))
     names = ["test_a", "test_b", "test_c"]
-    meta = {"dirty": False, "sm_count": 148, "env": {}, "python": "3.12.3", "torch": "2.14.0", "cuda": "13.4"}
-    base = tbt.suite_record_of(junit(names), commit=PREV, suite="S", gpu="NVIDIA B200", **meta)
-    cand = tbt.suite_record_of(junit(names, bad=(cand_extra or ())), commit=cand_commit or commit, suite="S", gpu=gpu_cand, **meta)
+    meta = {"suite": suite, "gpu": gpu, "dirty": False, "sm_count": 148, "env": {}, "python": "3.12.3", "torch": "2.14.0", "cuda": "13.4"}
     paths = []
-    for name, rec in (("base", base), ("cand", cand)):
-        path = Path(tmp_path) / ("suite-%s.json" % name)
-        path.write_text(json.dumps(rec))
+    for name, commit, bad in (("base", PREV, ()), ("cand", STEP, failed)):
+        path = Path(directory) / ("suite-%s.json" % name)
+        path.write_text(json.dumps(tbt.suite_record_of(junit(names, bad), commit=commit, **meta)))
         paths.append(str(path))
     return paths
 
 
-def exactness_manifest(tmp_path, repo=None, **fields):
+def exactness_manifest(directory, failed=()):
     suites = {}
     for dev in rc.DEVICES:
-        sub = Path(tmp_path) / dev
-        sub.mkdir(exist_ok=True)
-        entry = {}
+        suites[dev] = {}
         for name in ("gate", "S"):
-            (sub / name).mkdir(exist_ok=True)
-            entry[name] = dict(zip(("baseline", "candidate"), suite_pair(sub / name, STEP, gpu_cand=trs.GPU[dev][0], **fields)))
-        suites[dev] = entry
+            sub = Path(directory) / dev / name
+            sub.mkdir(parents=True, exist_ok=True)
+            suites[dev][name] = dict(zip(("baseline", "candidate"), suite_pair(sub, name, trs.GPU[dev][0], failed)))
     return {"schema": sp.SCHEMA, "step": "trims", "commit": STEP, "previous": PREV, "base": BASE, "markers": ["x"], "suites": suites}
 
 
 def test_the_exactness_gate_reads_the_suite_records_of_both_devices(tmp_path):
     m = exactness_manifest(tmp_path)
-    for dev in rc.DEVICES:                                    # the fixture's record of the baseline is of the GPU of the device, the gate and S are one record per name here
-        for name in ("gate", "S"):
-            for field in ("baseline", "candidate"):
-                rec = json.loads(Path(m["suites"][dev][name][field]).read_text())
-                rec["meta"]["suite"] = name
-                rec["meta"]["gpu"] = trs.GPU[dev][0]
-                Path(m["suites"][dev][name][field]).write_text(json.dumps(rec))
     assert sp.exactness_problems(m) == [], sp.exactness_problems(m)
-    failing = exactness_manifest(tmp_path / "failing" if (tmp_path / "failing").mkdir() is None else tmp_path, cand_extra=("test_b",))
-    for dev in rc.DEVICES:
-        for name in ("gate", "S"):
-            for field in ("baseline", "candidate"):
-                rec = json.loads(Path(failing["suites"][dev][name][field]).read_text())
-                rec["meta"]["suite"] = name
-                rec["meta"]["gpu"] = trs.GPU[dev][0]
-                Path(failing["suites"][dev][name][field]).write_text(json.dumps(rec))
-    found = sp.exactness_problems(failing)
+    found = sp.exactness_problems(exactness_manifest(tmp_path / "failing", failed=("test_b",)))
     assert any("failed or errored test tests/cfbi/test_x.py::test_b" in p and p.startswith("b200, suite gate") for p in found), found[:3]
     assert any(p.startswith("b300, suite S") for p in found)
-    other = json.loads(json.dumps(m))
-    other["suite_commit"] = PREV                              # the suites ran on a commit that is not the one of the records
+    other = dict(m, suite_commit=PREV)                        # the suites ran on a commit that is not the one of the records
     assert any("the candidate record is of commit" in p for p in sp.exactness_problems(other, tmp_path / "nowhere"))
 
 
 def test_a_campaign_is_recomputed_under_the_contract_it_was_run_under(tmp_path):
     """The checker recomputes a campaign from its raw records under the start order and the launch-mapping requirement that the CALLER names; a step runs in ABBA blocks, and the same records are
     not a measurement under the strict alternation of the final A/B (nor under a requirement of mappings that the records do not carry)."""
-    m = manifest(tmp_path, {"b200": EVERYWHERE, "b300": EVERYWHERE})
+    m = manifest(tmp_path, ADOPTABLE)
     entry = json.loads(Path(m["devices"]["b200"]["previous"]).read_text())
     baseline = json.loads(Path(m["devices"]["b200"]["baseline"]).read_text())
     args = (entry, "x", "decode", "b200", baseline, PREV, PREV, STEP)
@@ -318,7 +301,7 @@ def test_a_campaign_is_recomputed_under_the_contract_it_was_run_under(tmp_path):
     problems, _ = rc.campaign_evidence_problems(*args)                                          # the defaults of the final A/B: strict alternation, no mappings required
     assert problems and all("not interleaved in time" in p for p in problems), problems[:2]
     assert rc.compare_kwargs("total_us", 1.0, PREV, None)["order"] == "alternate" and rc.compare_kwargs("total_us", 1.0, PREV, None)["require_nodes"] is False
-    plain = manifest(tmp_path / "plain" if (tmp_path / "plain").mkdir() is None else tmp_path, {"b200": EVERYWHERE, "b300": EVERYWHERE})
+    plain = manifest(tmp_path / "plain", ADOPTABLE)
     for path in json.loads(Path(plain["devices"]["b200"]["previous"]).read_text())["records_first"]["A"][:1]:
         rec = json.loads(Path(path).read_text())
         for cell in rec["cells"]:
@@ -332,7 +315,7 @@ def test_a_campaign_is_recomputed_under_the_contract_it_was_run_under(tmp_path):
 def test_a_step_that_a_confirmed_slower_cell_stops_gets_a_not_adopted_row_that_the_record_checker_accepts(tmp_path, monkeypatch):
     """The row of a step that failed at the timing phase: not adopted, failed_at timing, the revert commit, the reason naming the cell, every earlier gate passed, the A/B medians kept; it is
     refused without the revert commit and with a failed_at that contradicts the gates."""
-    per = {"b200": EVERYWHERE, "b300": dict(EVERYWHERE, previous={"factors": dict(GAIN["factors"], **SLOWER["factors"]), "rerun": GAIN["rerun"]})}
+    per = {"b200": EVERYWHERE, "b300": dict(EVERYWHERE, previous=GAIN_AND_SLOWER)}
     m, infos, decision, row = adopted_case(tmp_path, monkeypatch, per)
     assert decision["outcome"] == "not_adopted" and row["outcome"] == "not_adopted" and row["failed_at"] == "timing", decision["reasons"][:2]
     assert GAIN_B in row["reason"] and "b300" in row["reason"] and row["gates"] == {"exactness": True, "codegen": True}
