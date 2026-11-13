@@ -36,8 +36,8 @@ def a_record(ev, arm="default"):
 CAMPAIGN = rc.spec_workloads(bd.campaign_cell_specs(PER_SM, SMS))
 
 
-def problems(rec, **kw):
-    return rc.campaign_contract_problems([rec], "decode", "b200 default first A", workloads=kw.get("workloads", CAMPAIGN))
+def problems(rec):
+    return rc.campaign_contract_problems([rec], "decode", "b200 default first A", workloads=CAMPAIGN)
 
 
 # ---- the cells are those of the caller -------------------------------------------------------------------------------------------------------------------

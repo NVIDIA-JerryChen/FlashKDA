@@ -210,7 +210,7 @@ def test_a_gain_needs_the_first_campaign_and_the_confirmation_to_agree_beyond_th
     t = tdb.synthetic_table(at(K_SMALL, metrics=slr.GAIN_METRICS, delta=rerun, first_delta=first, judged_on="rerun"))
     d = slr.decide_table(t)
     found = {(g["device"], g["metric"]) for g in d["gains"] if g["key"] == K_SMALL}
-    assert (found == {(dev, m) for dev in slr.GATING for m in slr.GAIN_METRICS}) is confirmed and (confirmed or found == set()), what
+    assert found == ({(dev, m) for dev in slr.GATING for m in slr.GAIN_METRICS} if confirmed else set()), what
     assert d == t["decision"] and d["outcome"] == "adopted"                                          # the other cells still give both devices their gains
     entry = row_of(t, "b200", "default", K_SMALL)["metrics"]["gpu_graph_us"]
     assert (entry["first_delta_pct"], entry["delta_pct"]) == (first, rerun)
@@ -309,7 +309,7 @@ def test_a_gain_on_one_device_only_is_not_adoption():
     only_b200 = lambda dev, arm, metric, key, f: dict(CLEAN(dev, arm, metric, key, f), **({"delta": 0.0} if dev == "b300" and metric in slr.GAIN_METRICS else {}))     # noqa: E731
     d, t = decided(only_b200)
     assert d["outcome"] == "not_adopted" and d["per_device"]["b200"]["gains"] > 0 and d["per_device"]["b300"]["gains"] == 0
-    assert d["reasons"] == ["b300: no confirmed gain: no stable GPU-elapsed cell within the limit of 1184 CTAs, judged on the re-run, is faster than A by 1.00 % or more"]
+    assert d["reasons"] == ["b300: no confirmed gain: no stable GPU-elapsed cell within the limit of 1184 CTAs, judged on the re-run, is faster than A by 1.00 % or more on the re-run and in its first campaign"]
     assert slr.timing_of(d) == ("pass", "fail")                                                                                             # nothing regresses, nothing is gained on b300
 
 
@@ -587,7 +587,7 @@ def test_the_section_says_what_the_table_says():
     table["meta"]["not_run"] = {}
     text = slr.render_section(table, table["decision"], 9)
     assert "Single-launch decode is **adopted**." in text and "Limit of the tree: 8 CTAs per SM on 148 SMs, N * H at most 1184." in text and "Candidate commit 0123456789ab." in text
-    assert "- no gating metric regresses on b200, b300" in text and "- b200: 52 confirmed gain cell(s) (GPU-elapsed graph or eager, stable, judged on the re-run, within the limit of 1184 CTAs)" in text
+    assert "- no gating metric regresses on b200, b300" in text and "- b200: 52 confirmed gain cell(s) (GPU-elapsed graph or eager, stable, faster by the tolerance or more in the first campaign and on the re-run, within the limit of 1184 CTAs)" in text
     assert "| b200 | default | gpu_graph_us | PASS | 92 | 0 | 26 | 0 |" in text and "| b200 | forced | gpu_graph_us | FAIL | 33 | 0 | 30 | 0 |" in text and "| b200 | default | cpu_eager_us | PASS | 48 | 0 | 0 | 0 |" in text
     assert "The largest tested N * H below the smallest unsafe one (the largest of all when none is unsafe) is 1188; divided by the 148 SMs and rounded down that is 8 CTAs per SM. The limit of the tree is 8 CTAs per SM, the calibrated value." in text
     assert "| b200 | gpu_graph_us | 1 | 12 | 12 | lockstep | 100.000 | 97.000 | 3.000 | -3.00 |" in text

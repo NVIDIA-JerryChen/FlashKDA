@@ -661,7 +661,7 @@ def decide(results, limit_by_device, tol_pct=TOL_PCT):
                 info["regressions"] += 1
                 regress.append("%s %s: the comparison FAILs" % (dev, metric))
         if not info["gains"] and not info["invalid"]:
-            nogain.append("%s: no confirmed gain: no stable GPU-elapsed cell within the limit of %d CTAs, judged on the re-run, is faster than A by %.2f %% or more" % (dev, limit, tol_pct))
+            nogain.append("%s: no confirmed gain: no stable GPU-elapsed cell within the limit of %d CTAs, judged on the re-run, is faster than A by %.2f %% or more on the re-run and in its first campaign" % (dev, limit, tol_pct))
     gains.sort(key=lambda g: (device_order(g["device"]), GATE_METRICS.index(g["metric"]), cell_order(g["key"])))
     if invalid:
         outcome, reasons = "undecided", invalid
@@ -669,7 +669,7 @@ def decide(results, limit_by_device, tol_pct=TOL_PCT):
         outcome, reasons = "not_adopted", regress + nogain
     else:
         outcome = "adopted"
-        reasons = ["no gating metric regresses on %s" % ", ".join(GATING)] + ["%s: %d confirmed gain cell(s) (GPU-elapsed graph or eager, stable, judged on the re-run, within the limit of %d CTAs)" % (
+        reasons = ["no gating metric regresses on %s" % ", ".join(GATING)] + ["%s: %d confirmed gain cell(s) (GPU-elapsed graph or eager, stable, faster by the tolerance or more in the first campaign and on the re-run, within the limit of %d CTAs)" % (
             dev, per_device[dev]["gains"], per_device[dev]["limit"]) for dev in GATING]
     return {"outcome": outcome, "reasons": reasons, "gains": gains, "per_device": per_device}
 
@@ -1015,10 +1015,7 @@ def evidence_problems(ev):
                 out.append("%s has no first campaign of the %s arm" % (dev, arm))
     if out:
         return out
-    out = identity_problems(ev)
-    if out:
-        return out
-    return contract_problems(ev) or launch_problems(ev)
+    return identity_problems(ev) or contract_problems(ev) or launch_problems(ev)
 
 
 def candidate_commit(ev):
@@ -1048,8 +1045,12 @@ def recompute(ev, compare=None):
             results[dev][arm] = {}
             for metric in GATE_METRICS:
                 try:
-                    res = compare(phases["first"]["A"], phases["first"]["B"], **comparison_kwargs(metric, commit, phases["rerun"]))
-                    first = compare(phases["first"]["A"], phases["first"]["B"], **comparison_kwargs(metric, commit, {"A": [], "B": []})) if (phases["rerun"]["A"] or phases["rerun"]["B"]) else res
+                    base, cand = phases["first"]["A"], phases["first"]["B"]
+                    res = compare(base, cand, **comparison_kwargs(metric, commit, phases["rerun"]))
+                    if phases["rerun"]["A"] or phases["rerun"]["B"]:
+                        first = compare(base, cand, **comparison_kwargs(metric, commit, {"A": [], "B": []}))
+                    else:
+                        first = res                                                 # no re-run: the comparison is of the first campaign alone
                     first_delta = dict((r["key"], r["median_delta_pct"]) for r in first.get("rows") or [])
                     for r in res.get("rows") or []:
                         r["first_delta_pct"] = first_delta.get(r["key"])

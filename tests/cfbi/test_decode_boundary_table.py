@@ -351,7 +351,7 @@ def test_the_calibrated_limit_lands_when_the_table_has_the_cells_of_that_limit()
     own and the table passes every rule with the constants that the real tree states."""
     t = synthetic_table(CLEAN_AT_20, per_sm=20)
     assert slr.calibrate(t) == 20 and t["meta"]["per_sm"] == 20 and any(r["nh"] > slr.CALIBRATION_HORIZON_NH for r in t["rows"])
-    assert slr.table_problems(t, 20, constants={"header": 20, "specification": 20}) == []
+    assert problems_of(t, per_sm=20) == []
     assert slr.calibration_problems(t, 20) == [] and slr.straddle_problems(t, 20) == []
     assert slr.decide_table(t)["outcome"] == "adopted" and slr.final_problems(t, {"header": 20, "specification": 20}) == []
 
@@ -361,7 +361,7 @@ def test_the_boundary_is_a_condition_of_its_own_and_a_calibrated_limit_does_not_
     k = key_of(247, 12)                                                                      # 2964 CTAs: the next grid above the limit at 12 heads
     assert slr.nh(k) == 2964
     broken = mutated(t, lambda x: x["rows"].remove(row_of(x, "b300", "default", k)))
-    problems = slr.table_problems(broken, 20, constants={"header": 20, "specification": 20})
+    problems = problems_of(broken, per_sm=20)
     assert slr.calibration_problems(broken, 20) == [] and has(problems, "which straddles 2960 CTAs (the limit times 1/1), has no row in the default arm")
 
 
@@ -372,7 +372,7 @@ def test_rows_above_the_horizon_are_shown_and_never_calibrate():
     cal = slr.calibration_of(t)
     assert cal["unsafe"] == [] and [(u["device"], u["nh"]) for u in cal["unsafe_above_horizon"]] == [("b200", 5928), ("b300", 5928)] and cal["per_sm"] == 20 == slr.calibrate(t)
     assert slr.calibration_problems(t, 20) == [] and slr.unsafe_problems(t, 20) == []
-    assert has(slr.table_problems(synthetic_table(CLEAN_AT_20, per_sm=20), 40, constants={"header": 40, "specification": 40}), "the table calibrates to 20 CTAs per SM")     # a clean higher cell does not raise it
+    assert has(problems_of(synthetic_table(CLEAN_AT_20, per_sm=20), per_sm=40), "the table calibrates to 20 CTAs per SM")     # a clean higher cell does not raise it
 
 
 def test_the_horizon_is_the_largest_grid_of_the_fixed_matrix_and_cuts_the_tested_values_that_calibrate():
