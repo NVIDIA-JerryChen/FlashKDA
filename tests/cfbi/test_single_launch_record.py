@@ -99,7 +99,8 @@ def raw_records(dev, arm, values, per_sm=PER_SM, commit=COMMIT, cells=None):
                 route = TWO if side == "A" else dp.expected_route(0, f["N"], f["H"], SMS, slr.cc_number(CC[dev]), per_sm, arm == "forced")
                 medians = {}
                 for m, v in figures[key].items():
-                    median = v["base"] if side == "A" else v["base"] * (1.0 + v["delta"] / 100.0)
+                    delta = v.get("first_delta", v["delta"]) if phase == "first" else v["delta"]                  # the first campaign may have measured another change than its re-run
+                    median = v["base"] if side == "A" else v["base"] * (1.0 + delta / 100.0)
                     medians[m] = median * (1.0 + v["spread"] / 200.0 * OFFSETS[index - 1])
                 recs.append(raw_cell(key, route, medians, scale, side == "B" and arm == "forced", side))
             out[phase][side].append({"schema": br.SCHEMA, "meta": raw_meta(dev, arm, side, phase, slot, scale, per_sm, commit), "cells": recs})
@@ -193,6 +194,74 @@ def test_the_default_scenario_is_adopted_with_the_gains_of_both_devices():
     assert per_sm["b200"]["gains"] == per_sm["b300"]["gains"] == 13 * 2 * 2 and len(d["gains"]) == 4 * 13 * 2
     assert {g["metric"] for g in d["gains"]} == {"gpu_graph_us", "gpu_eager_us"} and {g["delta_pct"] for g in d["gains"]} == {-3.0} and {g["base_median"] for g in d["gains"]} == {100.0}
     assert d["reasons"][0] == "no gating metric regresses on b200, b300" and "b300: 52 confirmed gain cell(s)" in d["reasons"][2]
+
+
+@pytest.mark.parametrize("first,rerun,confirmed,what", [
+    (-3.0, -3.0, True, "both campaigns beyond the tolerance"),
+    (-1.0, -3.0, True, "the first campaign exactly at the tolerance"),
+    (-2.5, -3.0, True, "a first campaign beyond the tolerance whose re-run is faster still (a noisy first campaign with the same sign is a legal one)"),
+    (-0.2, -3.0, False, "a neutral first campaign and a fast re-run"),
+    (-0.99, -3.0, False, "a first campaign just inside the tolerance"),
+    (1.5, -3.0, False, "a slower first campaign: the sign flips"),
+    (-3.0, -0.5, False, "a re-run inside the tolerance"),
+    (-3.0, 0.5, False, "a re-run that is slower")])
+def test_a_gain_needs_the_first_campaign_and_the_confirmation_to_agree_beyond_the_tolerance(first, rerun, confirmed, what):
+    """The re-run is a confirmation: a cell is a confirmed gain only when the re-run reproduces what the first campaign found, the same sign beyond the tolerance in both."""
+    t = tdb.synthetic_table(at(K_SMALL, metrics=slr.GAIN_METRICS, delta=rerun, first_delta=first, judged_on="rerun"))
+    d = slr.decide_table(t)
+    found = {(g["device"], g["metric"]) for g in d["gains"] if g["key"] == K_SMALL}
+    assert (found == {(dev, m) for dev in slr.GATING for m in slr.GAIN_METRICS}) is confirmed and (confirmed or found == set()), what
+    assert d == t["decision"] and d["outcome"] == "adopted"                                          # the other cells still give both devices their gains
+    entry = row_of(t, "b200", "default", K_SMALL)["metrics"]["gpu_graph_us"]
+    assert (entry["first_delta_pct"], entry["delta_pct"]) == (first, rerun)
+    assert all(g["first_delta_pct"] <= -slr.TOL_PCT and g["delta_pct"] <= -slr.TOL_PCT for g in d["gains"])
+
+
+def test_a_row_without_the_change_of_its_first_campaign_is_no_gain_and_is_no_valid_row():
+    t = tdb.synthetic_table(at(K_SMALL, metrics=slr.GAIN_METRICS, delta=-3.0, judged_on="rerun"))
+    results = slr.results_of_table(t)
+    for dev in slr.GATING:
+        for row in results[dev]["default"]["gpu_graph_us"]["rows"]:
+            if row["key"] == K_SMALL:
+                row["first_delta_pct"] = None
+    assert K_SMALL not in {g["key"] for g in slr.decide(results, limits())["gains"] if g["metric"] == "gpu_graph_us"}
+    gone = mutated(t, lambda x: row_of(x, "b200", "default", K_SMALL)["metrics"]["gpu_graph_us"].update(first_delta_pct=None))
+    assert has(slr.table_problems(gone, PER_SM, constants=CONSTANTS), "the entry is malformed")
+
+
+def test_a_cell_judged_on_its_first_campaign_has_one_change_in_both_places():
+    t = tdb.synthetic_table()
+    row = row_of(t, "b200", "default", K_SMALL)["metrics"]["total_us"]
+    assert row["judged_on"] == "first" and row["first_delta_pct"] == row["delta_pct"] == -15.0
+    edited = mutated(t, lambda x: row_of(x, "b200", "default", K_SMALL)["metrics"]["total_us"].update(first_delta_pct=-2.0))
+    assert has(slr.table_problems(edited, PER_SM, constants=CONSTANTS), "a cell that was judged on the first campaign has the change -2.000000 % in its first campaign and -15.000000 % as its figure")
+
+
+def table_with(**figures):
+    """The table that the real comparator gives for a small campaign in which the cell K_SMALL has the figures ``figures`` in its graph metric (judged on the re-run)."""
+    ev = make_ev(at(K_SMALL, metrics=("gpu_graph_us",), judged_on="rerun", base=default_values, **figures), cells=MINI)
+    return slr.build_table(ev, slr.recompute(ev))
+
+
+def graph_gains(t):
+    return {(g["device"], g["metric"]) for g in t["decision"]["gains"] if g["key"] == K_SMALL and g["metric"] == "gpu_graph_us"}
+
+
+def test_the_first_campaign_of_a_rerun_cell_comes_from_the_raw_records_and_gates_the_gain():
+    """The tool derives the change of the first campaign from the raw first records (the comparison again without the re-run records); a hand edit of that figure is a difference."""
+    t = table_with(delta=-3.0, first_delta=-0.2)
+    entry = row_of(t, "b200", "default", K_SMALL)["metrics"]["gpu_graph_us"]
+    assert (entry["judged_on"], entry["delta_pct"], entry["first_delta_pct"]) == ("rerun", -3.0, -0.2)
+    assert graph_gains(t) == set()                                                                  # the first campaign found nothing: the re-run alone confirms nothing
+    assert graph_gains(table_with(delta=-3.0, first_delta=-3.0)) == {("b200", "gpu_graph_us"), ("b300", "gpu_graph_us")}
+    flipped = table_with(delta=-3.0, first_delta=1.5)
+    assert row_of(flipped, "b200", "default", K_SMALL)["metrics"]["gpu_graph_us"]["first_delta_pct"] == 1.5 and graph_gains(flipped) == set()
+
+
+def test_a_first_campaign_figure_that_was_edited_by_hand_is_a_difference_from_the_derived_table(full):
+    edited = mutated(full["table"], lambda x: row_of(x, "b200", "default", K_SMALL)["metrics"]["gpu_graph_us"].update(first_delta_pct=-0.2))
+    assert row_of(full["table"], "b200", "default", K_SMALL)["metrics"]["gpu_graph_us"]["first_delta_pct"] == -3.0
+    assert has(slr.check_problems(edited, full["ev"], results=full["results"]), "first_delta_pct")
 
 
 def test_a_candidate_that_is_3_percent_slower_fails_the_gate_and_one_that_is_3_percent_faster_passes_it_on_the_real_comparator():
@@ -520,7 +589,7 @@ def test_the_section_says_what_the_table_says():
     assert "Single-launch decode is **adopted**." in text and "Limit of the tree: 8 CTAs per SM on 148 SMs, N * H at most 1184." in text and "Candidate commit 0123456789ab." in text
     assert "- no gating metric regresses on b200, b300" in text and "- b200: 52 confirmed gain cell(s) (GPU-elapsed graph or eager, stable, judged on the re-run, within the limit of 1184 CTAs)" in text
     assert "| b200 | default | gpu_graph_us | PASS | 92 | 0 | 26 | 0 |" in text and "| b200 | forced | gpu_graph_us | FAIL | 33 | 0 | 30 | 0 |" in text and "| b200 | default | cpu_eager_us | PASS | 48 | 0 | 0 | 0 |" in text
-    assert "The largest tested N * H below the smallest unsafe one is 1188; divided by the 148 SMs and rounded down that is 8 CTAs per SM. The tree's limit is 8 CTAs per SM." in text
+    assert "The largest tested N * H below the smallest unsafe one (the largest of all when none is unsafe) is 1188; divided by the 148 SMs and rounded down that is 8 CTAs per SM. The limit of the tree is 8 CTAs per SM, the calibrated value." in text
     assert "| b200 | gpu_graph_us | 1 | 12 | 12 | lockstep | 100.000 | 97.000 | 3.000 | -3.00 |" in text
     assert "| 1 | 12 | 12 | lockstep | - | single-launch | 100.000 | 97.000 | 100.000 | 97.000 | -3.00 r | -3.00 r | -15.00 | +0.00 | +0.00 |" in text
     assert "| 128 | 12 | 1536 | lockstep | - | single-launch | 100.000 | 102.500 | 100.000 | 102.500 | +2.50 F r | +2.50 F r | +0.00 | +0.00 | +0.00 |" in text
@@ -793,7 +862,8 @@ def test_the_comparator_is_called_with_the_parameters_of_the_campaign_driver():
         return br.compare(base, cand, **kw)
     ev = make_ev(default_values, cells=MINI)
     slr.recompute(ev, compare=spy)
-    assert len(calls) == 2 * 2 * 5
+    assert len(calls) == 2 * 2 * 5 * 2                                                         # every metric of every arm: with the re-run records, and again without them (the first campaign of every cell)
+    assert sum(kw["base_rerun"] is None for kw in calls) == sum(kw["base_rerun"] is not None for kw in calls) == 2 * 2 * 5
     for kw in calls:
         assert (kw["tol_pct"], kw["mode"], kw["min_repeats"], kw["baseline_unstable"], kw["require_clean_cand"], kw["order"], kw["require_nodes"], kw["expect_base_commit"]) == (
             1.0, "regress", 3, "widen", True, "abba", True, COMMIT)

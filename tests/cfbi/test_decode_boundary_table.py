@@ -56,9 +56,10 @@ K_PROBE = key_of(64, 12, "probe", 31)
 
 
 # ---- stub comparator results ------------------------------------------------------------------------------------------------------------------------
-def stub_row(key, base=100.0, delta=0.0, spread=0.1, judged_on="first", tol=slr.TOL_PCT, status=None):
+def stub_row(key, base=100.0, delta=0.0, spread=0.1, judged_on="first", tol=slr.TOL_PCT, status=None, first_delta=None):
     """A row of a comparator result as ``bench_records.compare`` makes it (the same fields, the same rules): A has the median ``base``, B ``base * (1 + delta / 100)``, both have the spread ``spread``
-    percent. A spread above 0.3 % judged on the first campaign needs its re-run; judged on the re-run it makes the cell noise-limited and widens the tolerance by the spread."""
+    percent. A spread above 0.3 % judged on the first campaign needs its re-run; judged on the re-run it makes the cell noise-limited and widens the tolerance by the spread. ``first_delta``: the
+    change of the median in the first campaign (``first_delta_pct``, which the table tool adds to the rows of the comparator): by default the change of the row itself."""
     cand = base * (1.0 + delta / 100.0)
     noisy = spread > 100 * br.UNSTABLE_SPREAD
     needs, noise_limited = noisy and judged_on == "first", noisy and judged_on == "rerun"
@@ -67,8 +68,8 @@ def stub_row(key, base=100.0, delta=0.0, spread=0.1, judged_on="first", tol=slr.
     if status is None:
         status = "NEEDS_RERUN" if needs else ("FAIL" if change > tol_eff else "PASS")
     return {"key": key, "kind": "decode", "metric": "stub", "base_median": base, "base_reference": base, "base_spread_pct": spread, "cand_median": cand, "cand_spread_pct": spread, "cand_judged": cand,
-            "delta_pct": change, "median_delta_pct": change, "status": status, "note": "", "n_base": 4, "n_cand": 4, "noise_limited": noise_limited, "needs_rerun": needs,
-            "tol_pct_effective": tol_eff, "judged_on": judged_on}
+            "delta_pct": change, "median_delta_pct": change, "first_delta_pct": change if first_delta is None else first_delta, "status": status, "note": "", "n_base": 4, "n_cand": 4,
+            "noise_limited": noise_limited, "needs_rerun": needs, "tol_pct_effective": tol_eff, "judged_on": judged_on}
 
 
 def stub_result(rows, metric="gpu_graph_us", verdict=None, problems=None, **over):
@@ -318,17 +319,75 @@ def test_the_doubled_limit_is_rejected_by_the_data_alone_when_the_cells_and_the_
     assert slr.final_problems(t16, {"header": 16, "specification": 16}) != []                                  # and it is no final table either
 
 
-def test_a_table_whose_data_allow_a_larger_limit_than_its_cells_straddle_is_the_table_of_the_limit_that_they_straddle(monkeypatch):
-    """Nothing loses before 3072 CTAs, so the data would allow 16 CTAs per SM, but the boundary cells of the campaign straddle 8 only: 8 is the limit that the table verifies, and 16 is not
-    (its cells are not there). The section says that the data allow more and that a higher limit is a campaign of its own."""
+def test_a_table_whose_data_allow_a_larger_limit_than_the_one_under_test_is_not_the_table_of_that_limit():
+    """Only the largest grid loses (3072 CTAs), so the calibration set gives 16 CTAs per SM. The table has the complete boundary of 8 (nothing missing), and it is rejected for 8: the data set the
+    limit, a boundary that was measured for another value does not stand in for them. The table of 16 needs the cells of 16, which this one does not have."""
     t = synthetic_table(functools.partial(default_values, unsafe_from=3072))
-    assert slr.calibrate(t) == 16 and slr.verified_limits(t) == [8]
-    assert problems_of(t, per_sm=8) == []
-    assert has(problems_of(t, per_sm=16), "does not verify the 16 CTAs per SM under test") and has(problems_of(t, per_sm=16), "cells of the campaign for 16 CTAs per SM")
-    assert "The data allow more than that" in slr.render_section(t, t["decision"])
-    assert "The data allow more than that" not in slr.render_section(synthetic_table(), synthetic_table()["decision"])                  # the data of the right limit do not
-    monkeypatch.setattr(slr, "verified_limits", lambda table: [8, 16])                                                                  # a table that did straddle both limits
-    assert has(slr.calibration_problems(t, 8), "the table verifies 16 CTAs per SM, more than the 8 under test") and slr.calibration_problems(t, 16) == []
+    assert slr.calibrate(t) == 16
+    at8 = problems_of(t, per_sm=8)
+    assert has(at8, "the table calibrates to 16 CTAs per SM (the smallest unsafe N * H is 3072, the largest tested N * H below it 2376, 148 SMs), not to the 8 under test")
+    assert not has(at8, "straddles") and not has(at8, "cells of the campaign") and not has(at8, "is within the limit")             # nothing else is wrong with it: the calibration alone rejects it
+    at16 = problems_of(t, per_sm=16)
+    assert has(at16, "cells of the campaign for 16 CTAs per SM") and has(at16, "the table was measured at 8 CTAs per SM")
+    assert slr.final_problems(t, CONSTANTS) != []                                                                                   # and it is no final table of the limit that it was measured at
+
+
+def test_the_literal_case_of_the_review_a_table_with_no_unsafe_cell_and_a_complete_boundary_of_8_is_rejected_for_8():
+    """No cell at or below the horizon is unsafe: the set gives 3072 // 148 = 20 CTAs per SM. The shipped 8 with its complete 8-boundary is rejected (it passed when the limit that a table verifies
+    was accepted in place of the calibrated one)."""
+    t = synthetic_table(CLEAN)
+    assert slr.calibrate(t) == 20 and slr.calibration_of(t)["unsafe"] == [] and slr.calibration_of(t)["first_unsafe_nh"] is None
+    problems = problems_of(t, per_sm=8)
+    assert has(problems, "the table calibrates to 20 CTAs per SM (no cell at or below the horizon of 3072 CTAs is unsafe: the largest tested N * H is 3072, 148 SMs), not to the 8 under test")
+    assert not has(problems, "straddles") and not has(problems, "cells of the campaign") and not has(problems, "is within the limit") and not has(problems, "policy header")
+    assert slr.final_problems(t, CONSTANTS) != [] and slr.decide_table(t)["outcome"] == "adopted"                                  # an adopted outcome at a limit that the data do not give
+
+
+CLEAN_AT_20 = functools.partial(default_values, unsafe_from=10 ** 9, limit=20 * SMS)
+
+
+def test_the_calibrated_limit_lands_when_the_table_has_the_cells_of_that_limit():
+    """The table of 20 CTAs per SM with the cells of 20 (the boundary at 1480, 2960 and 5920 CTAs) and nothing unsafe: the set gives 20, the limit under test is 20, both conditions hold on their
+    own and the table passes every rule with the constants that the real tree states."""
+    t = synthetic_table(CLEAN_AT_20, per_sm=20)
+    assert slr.calibrate(t) == 20 and t["meta"]["per_sm"] == 20 and any(r["nh"] > slr.CALIBRATION_HORIZON_NH for r in t["rows"])
+    assert slr.table_problems(t, 20, constants={"header": 20, "specification": 20}) == []
+    assert slr.calibration_problems(t, 20) == [] and slr.straddle_problems(t, 20) == []
+    assert slr.decide_table(t)["outcome"] == "adopted" and slr.final_problems(t, {"header": 20, "specification": 20}) == []
+
+
+def test_the_boundary_is_a_condition_of_its_own_and_a_calibrated_limit_does_not_excuse_a_missing_cell():
+    t = synthetic_table(CLEAN_AT_20, per_sm=20)
+    k = key_of(247, 12)                                                                      # 2964 CTAs: the next grid above the limit at 12 heads
+    assert slr.nh(k) == 2964
+    broken = mutated(t, lambda x: x["rows"].remove(row_of(x, "b300", "default", k)))
+    problems = slr.table_problems(broken, 20, constants={"header": 20, "specification": 20})
+    assert slr.calibration_problems(broken, 20) == [] and has(problems, "which straddles 2960 CTAs (the limit times 1/1), has no row in the default arm")
+
+
+def test_rows_above_the_horizon_are_shown_and_never_calibrate():
+    """The twice-limit cells of a campaign for 20 CTAs per SM lie above the horizon: an unsafe one is listed apart and does not lower the limit, and a clean one cannot raise it."""
+    k = key_of(494, 12)                                                                      # 5928 CTAs: the next grid above twice the limit at 12 heads, a cell of the forced arm
+    t = synthetic_table(at(k, arms=("forced",), delta=2.5, judged_on="rerun", base=CLEAN_AT_20), per_sm=20)
+    cal = slr.calibration_of(t)
+    assert cal["unsafe"] == [] and [(u["device"], u["nh"]) for u in cal["unsafe_above_horizon"]] == [("b200", 5928), ("b300", 5928)] and cal["per_sm"] == 20 == slr.calibrate(t)
+    assert slr.calibration_problems(t, 20) == [] and slr.unsafe_problems(t, 20) == []
+    assert has(slr.table_problems(synthetic_table(CLEAN_AT_20, per_sm=20), 40, constants={"header": 40, "specification": 40}), "the table calibrates to 20 CTAs per SM")     # a clean higher cell does not raise it
+
+
+def test_the_horizon_is_the_largest_grid_of_the_fixed_matrix_and_cuts_the_tested_values_that_calibrate():
+    assert slr.CALIBRATION_HORIZON_NH == max(N * H for N, H in bd.MATRIX_D) == 3072
+    t = synthetic_table(CLEAN)
+    assert slr.calibration_of(t)["horizon_nh"] == 3072 and slr.calibration_of(t)["tested"][-1] == 3072
+    assert slr.calibrate(t, tested=[12, 768, 1176, 5000, 9000]) == 7 and slr.calibration_of(t, tested=[12, 5000])["tested"] == [12]        # 1176 // 148; the grids above the horizon are not in the set
+
+
+def test_the_section_says_whether_the_limit_of_the_tree_is_the_calibrated_value():
+    assert ", the calibrated value." in slr.render_section(synthetic_table(), synthetic_table()["decision"])
+    clean = synthetic_table(CLEAN)
+    text = slr.render_section(clean, clean["decision"])
+    assert "that is 20 CTAs per SM. The limit of the tree is 8 CTAs per SM, NOT the calibrated value." in text and "The data allow more than that" not in text
+    assert "at or below the horizon of 3072 CTAs" in text
 
 
 def test_a_fail_within_the_limit_rejects_the_limit():
@@ -473,7 +532,7 @@ def test_a_malformed_table_is_a_problem_and_not_a_crash(good):
     for edit in (lambda t: t.pop("rows"), lambda t: t.update(rows="x"), lambda t: t.update(schema="other"), lambda t: t["meta"].pop("devices"), lambda t: t["meta"].update(candidate="x"),
                  lambda t: t["meta"].update(sm_count=0), lambda t: t["rows"][0].update(key="decode;N=1;"), lambda t: t["rows"][0].update(device="b100"), lambda t: t.pop("comparisons")):
         assert slr.table_problems(mutated(good, edit), 8, constants=CONSTANTS) != []
-    assert slr.table_problems("not a table", 8) == ["not a cfbi-single-launch-table-v1 table"]
+    assert slr.table_problems("not a table", 8) == ["not a %s table" % slr.SCHEMA] and slr.SCHEMA.endswith("-v2")
     assert slr.check_problems({"schema": slr.SCHEMA, "meta": good["meta"]}) != []
 
 
@@ -504,7 +563,7 @@ def test_the_tracked_table_satisfies_every_rule_for_the_limit_of_the_tree():
     assert slr.final_problems(table) == []
     if slr.decide_table(table)["outcome"] == "adopted":
         assert table["meta"]["per_sm"] == dp.MAX_CTAS_PER_SM == dp.header_per_sm(_ROOT)
-        assert max(slr.verified_limits(table)) == dp.MAX_CTAS_PER_SM                                      # the largest limit that the table verifies is the limit of the tree
+        assert slr.calibrate(table) == dp.MAX_CTAS_PER_SM                                                  # the calibration set of the table gives the limit of the tree
         assert slr.table_problems(table, dp.MAX_CTAS_PER_SM) == []
         doubled = 2 * dp.MAX_CTAS_PER_SM
         assert slr.table_problems(table, doubled, constants={"header": doubled, "specification": doubled}) != []

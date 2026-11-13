@@ -12,11 +12,14 @@ The rules (the functions below are these rules and nothing else):
 
   * a cell is unsafe when a gating metric (GPU-elapsed graph replay, GPU-elapsed eager loop, kernel sum, host time of the graph loop, host time of the eager loop) is a comparator FAIL on either
     gating device, noise-limited or not, in either arm; a comparison that is INVALID is no verdict (``calibrate``)
-  * the limit is the largest tested N * H below the smallest N * H of an unsafe cell, divided by the SM count and rounded down: an integer number of CTAs per SM (``calibrate``)
-  * a table is accepted for a limit when its rows are exactly the cells of the campaign, the limit equals the constant of the policy header and of the specification, no unsafe cell is within the limit
-    and the limit is the largest one that the table verifies: its boundary cells straddle it (a limit that no boundary cell straddles is not verified, even where the data allow more) (``table_problems``)
+  * the calibration set is every row of the gating devices (both arms, every regime) at or below the horizon, ``CALIBRATION_HORIZON_NH``; rows above it are measured and shown and never calibrate
+  * the limit is the largest tested N * H of the set below the smallest N * H of an unsafe cell of the set, divided by the SM count and rounded down: an integer number of CTAs per SM (``calibrate``)
+  * a table is accepted for a limit when its rows are exactly the cells of the campaign, the limit equals the constant of the policy header and of the specification, the limit EQUALS the one that the
+    calibration set gives (a limit above it has an unsafe cell within it, a limit below it is rejected as well: the data set the limit) and, as a condition of its own, the boundary cells of the
+    limit straddle it. Neither condition returns for the other (``table_problems``)
   * the outcome is "adopted" when no gating metric regresses (every comparison of the default arm is PASS on both gating devices) and a confirmed gain exists on both: a GPU-elapsed graph or eager
-    cell within the limit that is stable (not noise-limited), judged on the re-run and faster by the tolerance or more. The kernel sum and the host times gate but are never the evidence of a gain.
+    cell within the limit that is stable (not noise-limited), judged on the re-run, faster by the tolerance or more on the re-run AND in its first campaign (the confirmation has to reproduce the
+    sign of the first campaign beyond the tolerance, otherwise the cell is noise). The kernel sum and the host times gate but are never the evidence of a gain.
     The outcome is "not_adopted" when a comparison FAILs or a device has no confirmed gain. Any INVALID comparison leaves it "undecided": a repair, never "not adopted" (``decide``)
 
 The evidence manifest (a JSON file next to the evidence, paths relative to it) is ``{"schema": "cfbi-single-launch-evidence-v1", "devices": {"b200": {"default": ARM, "forced": ARM}, "b300": {...},
@@ -48,7 +51,7 @@ import bench_decode as bd  # noqa: E402
 import bench_records as br  # noqa: E402
 import decode_policy as dp  # noqa: E402
 
-SCHEMA = "cfbi-single-launch-table-v1"
+SCHEMA = "cfbi-single-launch-table-v2"
 EVIDENCE_SCHEMA = "cfbi-single-launch-evidence-v1"
 SECTION_TITLE = "Single-launch decode: calibration and decision"
 SECTION_NUMBER = 9                                          # the number of the section in the performance document (the next free one)
@@ -69,11 +72,12 @@ SIDES = ("A", "B")
 STRADDLE_HEADS = (6, 12, 33)                                # the heads of the boundary cells, written here again so that the generator of the benchmark is not its own witness
 STRADDLE_FRACTIONS = ((1, 2), (1, 1), (2, 1))               # the limit divided by two, the limit and twice the limit
 STRADDLE_REGIMES = ("lockstep", "staggered", "cold")
+CALIBRATION_HORIZON_NH = 3072                               # the calibration reads the rows at or below this N * H: the largest grid of the fixed matrix (N = 256, H = 12), written here again (a test holds it equal to the benchmark's matrix)
 TWO_LAUNCH = dp.TWO_LAUNCH
 STATUSES = ("PASS", "FAIL", "NEEDS_RERUN", "UNSTABLE_BASELINE")
 JUDGED = ("first", "rerun")
 ROUND = 6                                                   # decimals of every figure of the table: the rules read the rounded figures, so that the table alone gives the decision
-ROW_FIGURES = ("base_median", "cand_median", "delta_pct", "base_spread_pct", "cand_spread_pct", "tol_pct_effective")
+ROW_FIGURES = ("base_median", "cand_median", "delta_pct", "first_delta_pct", "base_spread_pct", "cand_spread_pct", "tol_pct_effective")
 SLACK = 1e-3                                                # what a rounded figure may differ from the figure derived from other rounded figures (percent)
 LEDGER_STEP = "single_launch"
 CODE_PATHS = ("csrc", "flash_kda", "setup.py")              # what the measured extension is built from and called through: a commit that holds the same bytes there is the same code
@@ -238,9 +242,11 @@ def expected_cells(per_sm, sms, cc_by_device):
 
 # ---- the rows of the table ---------------------------------------------------------------------------------------------------------------------
 def entry_of(row):
-    """The figures of one cell and metric that the table keeps, from a row of a comparator result."""
+    """The figures of one cell and metric that the table keeps, from a row of a comparator result that ``recompute`` has given its ``first_delta_pct``: the change of the median in the FIRST
+    campaign of the cell (the same figure as ``delta_pct`` for a cell that was judged on the first campaign, the change before the re-run for a cell that was judged on it)."""
+    first = row.get("first_delta_pct")
     return {"base_median": figure(row["base_median"]), "cand_median": figure(row["cand_median"]), "delta_pct": figure(row["median_delta_pct"]),
-            "status": row["status"], "noise_limited": bool(row["noise_limited"]), "needs_rerun": bool(row["needs_rerun"]), "judged_on": row["judged_on"],
+            "first_delta_pct": None if first is None else figure(first), "status": row["status"], "noise_limited": bool(row["noise_limited"]), "needs_rerun": bool(row["needs_rerun"]), "judged_on": row["judged_on"],
             "base_spread_pct": figure(row["base_spread_pct"]), "cand_spread_pct": figure(row["cand_spread_pct"]), "tol_pct_effective": figure(row["tol_pct_effective"])}
 
 
@@ -298,7 +304,7 @@ def results_of_table(table):
         for metric, e in row["metrics"].items():
             out[row["device"]][row["arm"]][metric]["rows"].append({
                 "key": row["key"], "status": e["status"], "noise_limited": e["noise_limited"], "needs_rerun": e["needs_rerun"], "judged_on": e["judged_on"], "median_delta_pct": e["delta_pct"],
-                "delta_pct": e["delta_pct"], "base_median": e["base_median"], "cand_median": e["cand_median"], "tol_pct_effective": e["tol_pct_effective"]})
+                "delta_pct": e["delta_pct"], "first_delta_pct": e["first_delta_pct"], "base_median": e["base_median"], "cand_median": e["cand_median"], "tol_pct_effective": e["tol_pct_effective"]})
     return out
 
 
@@ -314,25 +320,33 @@ def unsafe_rows(table):
     return [r for r in table["rows"] if r["device"] in GATING and any(fails(e) for m, e in r["metrics"].items() if m in GATE_METRICS)]
 
 
+def unsafe_cells_of(rows):
+    """The unsafe rows as the calibration lists them: device, arm, key, N * H and the gating metrics that FAIL."""
+    return [{"device": r["device"], "arm": r["arm"], "key": r["key"], "nh": nh(r["key"]), "metrics": sorted(m for m, e in r["metrics"].items() if fails(e))}
+            for r in sorted(rows, key=lambda r: (device_order(r["device"]), r["arm"], cell_order(r["key"])))]
+
+
 def calibration_of(table, tested=None):
-    """What the calibration is made of: the tested N * H (``tested``: given, or those of the rows of the gating devices), the unsafe cells, the smallest N * H among them, the largest tested N * H
-    below it (all of them when none is unsafe, 0 when even the smallest is unsafe) and that divided by the SM count, rounded down: the integer limit in CTAs per SM."""
-    sms = table["meta"]["sm_count"]
+    """What the calibration is made of. The calibration set is every row of the gating devices (both arms, every regime) at or below the horizon, ``CALIBRATION_HORIZON_NH``: the rows above it
+    are measured and shown and never calibrate, so that a campaign that adds boundary cells for a higher limit cannot raise the limit by itself. Of the set: the tested N * H (``tested``:
+    given, or those of its rows), the unsafe cells, the smallest N * H among them, the largest tested N * H below it (all of them when none is unsafe, 0 when even the smallest is unsafe)
+    and that divided by the SM count, rounded down: the integer limit in CTAs per SM. The unsafe cells above the horizon are listed apart."""
+    sms, horizon = table["meta"]["sm_count"], CALIBRATION_HORIZON_NH
     if tested is None:
         tested = [nh(r["key"]) for r in table["rows"] if r["device"] in GATING]
-    tested = sorted(set(tested))
+    tested = sorted(set(t for t in tested if t <= horizon))
     unsafe = unsafe_rows(table)
-    first = min((nh(r["key"]) for r in unsafe), default=None)
+    inside = [r for r in unsafe if nh(r["key"]) <= horizon]
+    first = min((nh(r["key"]) for r in inside), default=None)
     below = [t for t in tested if first is None or t < first]
     limit = max(below, default=0)
-    unsafe_cells = [{"device": r["device"], "arm": r["arm"], "key": r["key"], "nh": nh(r["key"]), "metrics": sorted(m for m, e in r["metrics"].items() if fails(e))}
-                    for r in sorted(unsafe, key=lambda r: (device_order(r["device"]), r["arm"], cell_order(r["key"])))]
-    return {"tested": tested, "unsafe": unsafe_cells, "first_unsafe_nh": first, "limit_nh": limit, "per_sm": limit // sms}
+    return {"horizon_nh": horizon, "tested": tested, "unsafe": unsafe_cells_of(inside), "unsafe_above_horizon": unsafe_cells_of([r for r in unsafe if nh(r["key"]) > horizon]),
+            "first_unsafe_nh": first, "limit_nh": limit, "per_sm": limit // sms}
 
 
 def calibrate(table, tested=None):
-    """The limit in CTAs per SM that the table calibrates: L is the largest tested N * H below the smallest N * H of any unsafe row (any gating device, any arm, H and regime, any gating metric) and
-    the limit is L // sm_count, an integer. A table in which even the smallest tested cell is unsafe calibrates to 0."""
+    """The limit in CTAs per SM that the calibration set of the table gives: L is the largest tested N * H of the set below the smallest N * H of any unsafe row of the set (any gating device, any arm,
+    H and regime, any gating metric, at or below the horizon) and the limit is L // sm_count, an integer. A table in which even the smallest tested cell is unsafe calibrates to 0."""
     return calibration_of(table, tested)["per_sm"]
 
 
@@ -414,6 +428,8 @@ def entry_problems(e, tol, where):
     unstable_pct = 100 * br.UNSTABLE_SPREAD                                 # the spread above which a cell needs its re-run, in percent
     if abs(e["delta_pct"] - 100.0 * (e["cand_median"] / e["base_median"] - 1.0)) > SLACK:
         out.append("%s: the change of %.6f %% is not the change of the medians %.6f and %.6f" % (where, e["delta_pct"], e["base_median"], e["cand_median"]))
+    if e["judged_on"] == "first" and abs(e["first_delta_pct"] - e["delta_pct"]) > SLACK:
+        out.append("%s: a cell that was judged on the first campaign has the change %.6f %% in its first campaign and %.6f %% as its figure" % (where, e["first_delta_pct"], e["delta_pct"]))
     if e["needs_rerun"] != (e["status"] == "NEEDS_RERUN"):
         out.append("%s: needs_rerun and the status %s disagree" % (where, e["status"]))
     if e["needs_rerun"] and e["judged_on"] != "first":
@@ -532,30 +548,17 @@ def unsafe_problems(table, per_sm):
     """No unsafe row (a gating metric FAILs, in either arm, noise-limited or not) lies within the limit: a cell that the limit routes to the single launch must not lose."""
     limit = per_sm * table["meta"]["sm_count"]
     return ["%s %s %s: FAIL in %s, N * H = %d is within the limit of %d CTAs (%d per SM on %d SMs)" % (
-        u["device"], u["arm"], u["key"], ", ".join(u["metrics"]), u["nh"], limit, per_sm, table["meta"]["sm_count"]) for u in calibration_of(table)["unsafe"] if u["nh"] <= limit]
-
-
-def verified_limits(table):
-    """The limits, in CTAs per SM, that the table can vouch for: those whose boundary cells it holds (``straddle_problems``) and within which no unsafe row lies. The campaign measures what its
-    cells straddle: a limit that no boundary cell straddles is not verified, even where the data would allow it (a higher limit is a campaign of its own)."""
-    sms = table["meta"]["sm_count"]
-    top = max((r["nh"] for r in table["rows"] if r["device"] in GATING), default=0) // sms
-    first = calibration_of(table)["first_unsafe_nh"]
-    return [p for p in range(1, top + 1) if not straddle_problems(table, p) and (first is None or first > p * sms)]
+        u["device"], u["arm"], u["key"], ", ".join(u["metrics"]), u["nh"], limit, per_sm, table["meta"]["sm_count"]) for u in unsafe_cells_of(unsafe_rows(table)) if u["nh"] <= limit]
 
 
 def calibration_problems(table, per_sm):
-    """The limit under test is the largest limit that the table verifies (``verified_limits``). Otherwise the message says what the data give: the limit that they support (``calibrate``), or, when
-    that is the limit under test, that no boundary cell straddles it."""
-    verified = verified_limits(table)
-    if verified and per_sm == max(verified):
-        return []
-    if per_sm in verified:
-        return ["the table verifies %d CTAs per SM, more than the %d under test (its boundary cells straddle that limit and no unsafe cell lies within it)" % (max(verified), per_sm)]
+    """The limit under test is the limit that the calibration set gives (``calibration_of``), no more and no less. A limit above it has an unsafe cell within it; a limit below it is rejected
+    as well: the data set the limit, and a boundary that was measured for another value does not stand in for them (a table whose data allow 20 CTAs per SM is not the table of 8, whatever
+    its boundary cells say). The boundary cells of the limit under test are a condition of their own (``straddle_problems``); neither condition returns for the other."""
     cal = calibration_of(table)
     if cal["per_sm"] == per_sm:
-        return ["the table does not verify the %d CTAs per SM under test: its boundary cells do not straddle that limit" % per_sm]
-    why = ("no cell is unsafe: the largest tested N * H is %d" % cal["limit_nh"]) if cal["first_unsafe_nh"] is None else (
+        return []
+    why = ("no cell at or below the horizon of %d CTAs is unsafe: the largest tested N * H is %d" % (cal["horizon_nh"], cal["limit_nh"])) if cal["first_unsafe_nh"] is None else (
         "the smallest unsafe N * H is %d, the largest tested N * H below it %d" % (cal["first_unsafe_nh"], cal["limit_nh"]))
     return ["the table calibrates to %d CTAs per SM (%s, %d SMs), not to the %d under test" % (cal["per_sm"], why, table["meta"]["sm_count"], per_sm)]
 
@@ -566,8 +569,8 @@ def table_problems(table, per_sm, constants=None, limit_rules=True):
       (a) the rows are exactly the cells of the campaign for ``per_sm`` (the matrix, the boundary cells, the probe) on both gating devices,
       (b) ``per_sm`` equals the constant of the policy header and of the specification (``constants``) and the limit that the table was measured at,
       (c) no unsafe row (a gating metric FAILs) is within the limit,
-      (d) ``per_sm`` is the largest limit that the table verifies (its boundary cells straddle it and no unsafe row lies within it),
-      (e) the boundary cells straddle the limit for every head count at the limit divided by two, the limit and twice the limit.
+      (d) ``per_sm`` is the limit that the calibration set of the table gives (``calibration_problems``: no unsafe row within it, and not below the calibrated value either),
+      (e) the boundary cells straddle the limit for every head count at the limit divided by two, the limit and twice the limit: a condition of its own, never replaced by (d).
     ``limit_rules`` False leaves out (b) to (d), the rules that tie the table to a limit that a tree ships (a table of a step that was not adopted ships none)."""
     problems = structure_problems(table)
     if problems:
@@ -605,9 +608,11 @@ def verdict_problem(res, tol_pct):
 
 def confirmed_gain(metric, row, limit, tol_pct):
     """Whether a row of a comparison of the gate is a confirmed gain: a GPU-elapsed metric (``GAIN_METRICS``), judged on the re-run, stable (not noise-limited, not in need of a re-run),
-    PASS, N * H within ``limit`` and faster by ``tol_pct`` or more."""
+    PASS, N * H within ``limit``, faster by ``tol_pct`` or more on the re-run and, because the re-run is a CONFIRMATION, faster by ``tol_pct`` or more in the first campaign as well: a re-run
+    that finds a gain where the first campaign found none or the other sign has not reproduced anything, and the cell is noise. A row without the change of its first campaign is no gain."""
+    first = row.get("first_delta_pct")
     return (metric in GAIN_METRICS and row["judged_on"] == "rerun" and not row["noise_limited"] and not row["needs_rerun"] and row["status"] == "PASS" and nh(row["key"]) <= limit
-            and figure(row["median_delta_pct"]) <= -tol_pct)
+            and figure(row["median_delta_pct"]) <= -tol_pct and is_number(first) and figure(first) <= -tol_pct)
 
 
 def decide(results, limit_by_device, tol_pct=TOL_PCT):
@@ -617,7 +622,8 @@ def decide(results, limit_by_device, tol_pct=TOL_PCT):
     (``limit_by_device``: N * H, the CTAs that the limit allows). Any comparison that is missing, INVALID, or not made under the parameters of the gate (regress at ``tol_pct``, widening, the ABBA
     order, the launch mappings required) leaves the outcome undecided: that is a repair and never "not adopted". Otherwise a confirmed regression (a comparison of any gating metric that FAILs)
     on either device means not adopted, and so does a device without a confirmed gain. A confirmed gain is a row of a GPU-elapsed metric (``GAIN_METRICS``) at N * H within the limit that is stable
-    (not noise-limited, not in need of a re-run), judged on the re-run and faster by ``tol_pct`` or more; the kernel sum and the host times never are one. Both devices need one."""
+    (not noise-limited, not in need of a re-run), judged on the re-run and faster by ``tol_pct`` or more on the re-run and in its first campaign; the kernel sum and the host times never are one.
+    Both devices need one."""
     invalid, regress, nogain, gains, per_device = [], [], [], [], {}
     for dev in GATING:
         limit = (limit_by_device or {}).get(dev)
@@ -650,7 +656,7 @@ def decide(results, limit_by_device, tol_pct=TOL_PCT):
                 elif confirmed_gain(metric, r, limit, tol_pct):
                     info["gains"] += 1
                     gains.append({"device": dev, "metric": metric, "key": r["key"], "nh": nh(r["key"]), "base_median": figure(r["base_median"]), "cand_median": figure(r["cand_median"]),
-                                  "delta_pct": figure(r["median_delta_pct"])})
+                                  "delta_pct": figure(r["median_delta_pct"]), "first_delta_pct": figure(r["first_delta_pct"])})
             if verdict == "FAIL" and not any(r["status"] == "FAIL" for r in res["rows"]):
                 info["regressions"] += 1
                 regress.append("%s %s: the comparison FAILs" % (dev, metric))
@@ -1027,7 +1033,9 @@ def comparison_kwargs(metric, commit, rerun):
 
 
 def recompute(ev, compare=None):
-    """The comparator results of every device, arm and gating metric, computed again from the raw records (``compare``: the comparison function, ``bench_records.compare``)."""
+    """The comparator results of every device, arm and gating metric, computed again from the raw records (``compare``: the comparison function, ``bench_records.compare``). Every row gets
+    ``first_delta_pct``, the change of the median in the FIRST campaign of its cell: the comparison once more without the re-run records (a cell that was judged on the re-run is judged
+    on that, and it is a confirmed gain only when its first campaign agrees)."""
     compare = compare or br.compare
     commit = candidate_commit(ev)
     results = {}
@@ -1040,7 +1048,12 @@ def recompute(ev, compare=None):
             results[dev][arm] = {}
             for metric in GATE_METRICS:
                 try:
-                    results[dev][arm][metric] = compare(phases["first"]["A"], phases["first"]["B"], **comparison_kwargs(metric, commit, phases["rerun"]))
+                    res = compare(phases["first"]["A"], phases["first"]["B"], **comparison_kwargs(metric, commit, phases["rerun"]))
+                    first = compare(phases["first"]["A"], phases["first"]["B"], **comparison_kwargs(metric, commit, {"A": [], "B": []})) if (phases["rerun"]["A"] or phases["rerun"]["B"]) else res
+                    first_delta = dict((r["key"], r["median_delta_pct"]) for r in first.get("rows") or [])
+                    for r in res.get("rows") or []:
+                        r["first_delta_pct"] = first_delta.get(r["key"])
+                    results[dev][arm][metric] = res
                 except (KeyError, TypeError, ValueError, IndexError) as e:        # an unforeseen record shape is unusable input, never a verdict
                     raise ValueError("cannot compare the %s %s records of %s: %s: %s" % (arm, metric, dev, type(e).__name__, e))
     return results
@@ -1232,14 +1245,19 @@ def _comparison_lines(comparisons):
 
 
 def _calibration_lines(cal, sms, per_sm):
-    """The subsection "Calibration of the limit": the tested grids, the unsafe cells and the limit that they calibrate, next to the limit of the tree (``per_sm`` CTAs on each of ``sms`` SMs)."""
+    """The subsection "Calibration of the limit": the calibration set (the rows at or below the horizon), its unsafe cells and the limit that it gives, next to the limit of the tree (``per_sm``
+    CTAs on each of ``sms`` SMs)."""
     out = ["### Calibration of the limit", "",
-           "Tested N * H: %s." % _fmt(cal["tested"]),
-           "Unsafe cells: %s." % ("none" if not cal["unsafe"] else "%d on the two devices together (the smallest N * H is %d)" % (len(cal["unsafe"]), cal["first_unsafe_nh"])),
-           "The largest tested N * H below the smallest unsafe one is %d; divided by the %d SMs and rounded down that is %d CTAs per SM. The tree's limit is %d CTAs per SM." % (
-               cal["limit_nh"], sms, cal["per_sm"], per_sm) + (
-               "" if cal["per_sm"] <= per_sm else " The data allow more than that, but the boundary cells of the campaign straddle the limit of the tree only: no larger limit is verified here, and a "
-               "higher one needs a campaign whose cells straddle it."), ""]
+           "The calibration set is every row of both gating devices and both arms at or below the horizon of %d CTAs, the largest grid of the fixed matrix. Rows above the horizon are measured and shown "
+           "and never calibrate, so a campaign that adds boundary cells for a higher limit cannot raise the limit by itself." % cal["horizon_nh"],
+           "Tested N * H within the horizon: %s." % _fmt(cal["tested"]),
+           "Unsafe cells within the horizon: %s." % ("none" if not cal["unsafe"] else "%d on the two devices together (the smallest N * H is %d)" % (len(cal["unsafe"]), cal["first_unsafe_nh"])),
+           "The largest tested N * H below the smallest unsafe one (the largest of all when none is unsafe) is %d; divided by the %d SMs and rounded down that is %d CTAs per SM. The limit of the tree "
+           "is %d CTAs per SM%s." % (cal["limit_nh"], sms, cal["per_sm"], per_sm, ", the calibrated value" if cal["per_sm"] == per_sm else ", NOT the calibrated value"),
+           "The boundary cells of the limit of the tree (6, 12 and 33 heads at half the limit, the limit and twice the limit: the largest number of sequences inside and the next larger one, in "
+           "every regime) are timed in the default arm on both devices; they are a condition of their own and do not stand in for the calibration.", ""]
+    if cal["unsafe_above_horizon"]:
+        out += ["Unsafe cells above the horizon (they do not calibrate): %d." % len(cal["unsafe_above_horizon"]), ""]
     if cal["unsafe"]:
         unsafe = []
         for u in cal["unsafe"]:
@@ -1254,11 +1272,12 @@ def _gain_lines(gains):
     rows = []
     for g in gains:
         device, metric, f = g["device"], g["metric"], cell_fields(g["key"])
-        rows.append([device, metric, f["N"], f["H"], g["nh"], f["regime"], g["base_median"], g["cand_median"], figure(g["base_median"] - g["cand_median"]), "%+.2f" % g["delta_pct"]])
+        rows.append([device, metric, f["N"], f["H"], g["nh"], f["regime"], g["base_median"], g["cand_median"], figure(g["base_median"] - g["cand_median"]), "%+.2f" % g["delta_pct"],
+                     "%+.2f" % g["first_delta_pct"]])
     return (["### Confirmed gains", "",
-             "GPU-elapsed graph or eager cells of the default arm within the limit that are stable, judged on the re-run and faster by the tolerance or more (A minus B in microseconds per call). The draft "
-             "estimated %s: a direction, not a gate." % DRAFT_ESTIMATE, ""]
-            + _table(["device", "metric", "N", "H", "N * H", "regime", "A us", "B us", "A - B us", "change %"], rows) + [""])
+             "GPU-elapsed graph or eager cells of the default arm within the limit that are stable, judged on the re-run and faster by the tolerance or more on the re-run and in the first campaign "
+             "(A minus B in microseconds per call). The draft estimated %s: a direction, not a gate." % DRAFT_ESTIMATE, ""]
+            + _table(["device", "metric", "N", "H", "N * H", "regime", "A us", "B us", "A - B us", "change %", "first campaign %"], rows) + [""])
 
 
 def _device_lines(meta, rows):
