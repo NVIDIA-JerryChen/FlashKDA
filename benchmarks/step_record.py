@@ -35,6 +35,7 @@ import argparse
 import json
 import math
 import os
+import re
 import statistics
 import sys
 
@@ -97,8 +98,8 @@ def manifest_problems(m):
     for dev in GATING:
         for name in ("gate", "S"):
             e = ((suites or {}).get(dev) or {}).get(name) if isinstance(suites, dict) else None
-            if not (isinstance(e, dict) and isinstance(e.get("baseline"), str) and isinstance(e.get("candidate"), str)):
-                out.append("suites.%s.%s must name the baseline and the candidate record of the suite" % (dev, name))
+            if not (isinstance(e, dict) and all(isinstance(e.get(f), str) for f in ("baseline", "candidate", "collection"))):
+                out.append("suites.%s.%s must name the baseline record, the candidate record and the expected collection of the suite" % (dev, name))
     cg_ = m.get("codegen")
     if not isinstance(cg_, dict) or not isinstance(cg_.get("allow"), str) or any(k not in cg_ for k in rc.COMPARISONS):
         out.append("codegen must name the allow-list and one comparison per toolchain (%s)" % ", ".join(rc.COMPARISONS))
@@ -135,14 +136,51 @@ def source_problems(repo, step, later):
     return ["the suites ran on %s, whose kernel sources differ from the step's %s: %s" % (later[:10], step[:10], ", ".join(changed[:4]) + (" ..." if len(changed) > 4 else ""))] if changed else []
 
 
-def exactness_problems(m, repo=None):
-    """Why the exactness gate (Gate G and Suite S on both devices) is not shown by the suite records of the manifest: a record that cannot be read, that is of another commit than the one the
-    suites ran on (the step's commit or, after a repair of the tests, a later commit with the same kernel sources: ``suite_commit``), of another device, or that fails the comparison with
-    the record of the baseline (``suite_record.check``)."""
+GATE_FILES = ("tests/cfbi/test_vs_ref.py",)                  # Gate G is one file; Suite S is every test file of tests/cfbi (the K2 sanitizer file included)
+SUITE_BIG = {"gate": "0", "S": "1"}                          # CFBI_BIG of the collection of each suite
+
+
+def suite_files(repo, commit, name):
+    """``(files, problem)``: the test files that a complete record of the suite ``name`` holds at ``commit`` (Gate G: its one file, Suite S: every ``tests/cfbi/test_*.py`` of the commit)."""
+    status, out, err = rc.git(repo, "ls-tree", "-r", "--name-only", commit, "--", "tests/cfbi")
+    if status != 0:
+        return None, "cannot list tests/cfbi of the commit %s in %s: %s" % (commit[:10], repo, err.strip() or "git failed")
+    files = sorted(p for p in out.split("\n") if re.match(r"^tests/cfbi/test_[^/]*\.py$", p))
+    return (files if name == "S" else [f for f in GATE_FILES if f in files]), None
+
+
+def collection_problems(repo, commit, name, path):
+    """``(files, ids, problems)``: the files of the commit and the test ids that a complete record of the suite holds. The ids are read from the collection file that the run made at the snapshot of
+    the commit (``scripts/r13_collect.sh``): its first line names the commit and the environment, and every id belongs to a test file of that commit."""
+    files, why = suite_files(repo, commit, name)
+    if why:
+        return None, None, [why]
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = [ln.rstrip("\n") for ln in f]
+    except OSError as e:
+        return files, None, ["the expected collection %s cannot be read: %s" % (os.path.basename(path), e)]
+    header = lines[0] if lines and lines[0].startswith("#") else ""
+    ids = [ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")]
     out = []
+    if not any(rc.commit_matches(tok, commit) for tok in re.findall(r"\b[0-9a-f]{7,40}\b", header)):
+        out.append("the expected collection %s does not name the commit of the suites (%s) in its first line" % (os.path.basename(path), commit[:10]))
+    if "CFBI_BIG=%s" % SUITE_BIG[name] not in header:
+        out.append("the expected collection %s was not made with CFBI_BIG=%s, the environment of the suite" % (os.path.basename(path), SUITE_BIG[name]))
+    out.extend("the expected collection %s holds %s, which is not a test file of the commit" % (os.path.basename(path), tid) for tid in ids if tid.split("::", 1)[0] not in files)
+    return files, ids, out
+
+
+def exactness_problems(m, repo=None):
+    """Why the exactness gate (Gate G and Suite S on both devices) is not shown by the suite records of the manifest. A record that cannot be read, that is of another commit than the one the
+    suites ran on (the step's commit or, after a repair of the tests, a later commit with the same kernel sources: ``suite_commit``) or of another device; a candidate that is not the WHOLE suite
+    at that commit (not complete: a subset record, a record that ignores files, a file or a test id of the commit's collection that it lacks or an id that it has beyond it; a verified merge of
+    several runs is complete) or a baseline that is not a complete record of the base; and a candidate that fails the comparison with the baseline (``suite_record.check``)."""
+    out = []
+    repo = repo or default_repo()
     ran_on = m.get("suite_commit") or m["commit"]
     if not rc.commit_matches(ran_on, m["commit"]):
-        out.extend(source_problems(repo or default_repo(), m["commit"], ran_on))
+        out.extend(source_problems(repo, m["commit"], ran_on))
     for dev in GATING:
         for name in ("gate", "S"):
             spec = m["suites"][dev][name]
@@ -159,6 +197,13 @@ def exactness_problems(m, repo=None):
                 out.append("%s: the candidate record is of commit %s, the suites ran on %s" % (where, meta.get("commit"), ran_on[:10]))
             if rc.DEVICE_GPU[dev] not in str(meta.get("gpu")):
                 out.append("%s: the candidate record is of the GPU %r" % (where, meta.get("gpu")))
+            files, ids, bad = collection_problems(repo, ran_on, name, spec["collection"])
+            out.extend("%s: %s" % (where, p) for p in bad)
+            out.extend("%s: the candidate record is not complete: %s" % (where, p) for p in sr.completeness_problems(cand, files, ids))
+            if not rc.commit_matches(str((base.get("meta") or {}).get("commit")), m["base"]):
+                out.append("%s: the baseline record is of commit %s, the base is %s" % (where, (base.get("meta") or {}).get("commit"), m["base"][:10]))
+            base_files, why = suite_files(repo, m["base"], name)
+            out.extend("%s: the baseline record is not complete: %s" % (where, p) for p in sr.completeness_problems(base, base_files if not why else None))
             out.extend("%s: %s" % (where, p) for p in sr.check(base, cand))
     return out
 
@@ -366,8 +411,9 @@ def render_section(m, decision, row, infos, number=10):
              "Generated from the evidence of the step by `benchmarks/step_record.py render`; every number below is recomputed from the raw record files (the campaigns by the admission of the record "
              "checker, the dumps by the code-generation gate).", "", "### Outcome", "", "The step is **%s**." % ("adopted" if adopted else "not adopted"), ""]
     lines += ["- %s" % r for r in decision["reasons"]] + ["", "### What was measured", ""]
-    lines.append("- Step commit %s, previous accepted state %s, base %s; Gate G and Suite S (without the sanitizer file) ran on %s, which has the sources of the step's kernels." % (
-        m["commit"][:12], m["previous"][:12], m["base"][:12], (m.get("suite_commit") or m["commit"])[:12]))
+    lines.append("- Step commit %s, previous accepted state %s, base %s; Gate G and Suite S ran on %s, which has the sources of the step's kernels. Suite S is every test file of `tests/cfbi`, the four cases of "
+                 "the K2 sanitizer file included (the run without that file merged with the four cases), complete against the collection of that commit and not below the baseline in any file." % (
+                     m["commit"][:12], m["previous"][:12], m["base"][:12], (m.get("suite_commit") or m["commit"])[:12]))
     lines.append("- Campaigns: per device two interleaved A/B campaigns, A the previous accepted state or the base and B the step, both sides at the default routing with CUDA_MODULE_LOADING=EAGER, "
                  "%s record files per side in the abba start order, a cell with a spread above %.1f %% re-run once with %d times the calls; hosts %s." % (
                      counts, 100 * br.UNSTABLE_SPREAD, br.RERUN_SCALE, ", ".join("%s on %s" % (dev, hosts[dev]) for dev in GATING)))

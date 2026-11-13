@@ -5,6 +5,7 @@ The rule under test: a step is adopted only with no confirmed slower cell of the
 previous accepted state on each device (stable, judged on the re-run, faster by the tolerance or more on the re-run and in the first campaign); a comparison that is not a measurement leaves
 the outcome undecided; the wall metrics are reported and never decide.
 """
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -165,11 +166,11 @@ def test_the_manifest_names_what_the_decision_needs():
     assert sp.manifest_problems({}) and sp.manifest_problems({"schema": sp.SCHEMA})
     good = {"schema": sp.SCHEMA, "step": "trims", "commit": STEP, "previous": PREV, "base": BASE, "markers": ["x"],
             "devices": dict((d, {"baseline": "b", "previous": "p", "base": "q"}) for d in rc.DEVICES),
-            "suites": dict((d, {"gate": {"baseline": "a", "candidate": "b"}, "S": {"baseline": "a", "candidate": "b"}}) for d in rc.DEVICES),
+            "suites": dict((d, {"gate": {"baseline": "a", "candidate": "b", "collection": "c"}, "S": {"baseline": "a", "candidate": "b", "collection": "c"}}) for d in rc.DEVICES),
             "codegen": {"allow": "a", "conda": {"base": "b", "cand": "c", "prev": "p"}, "container_b200": {"base": "b", "cand": "c", "prev": "p", "occupancy": "o"},
                         "container_b300": {"base": "b", "cand": "c", "prev": "p", "occupancy": "o"}}}
     assert sp.manifest_problems(good) == []
-    for edit, needle in ((lambda m: m.pop("markers"), "markers"), (lambda m: m["devices"].pop("b300"), "devices"), (lambda m: m["suites"]["b200"].pop("S"), "suites.b200.S"),
+    for edit, needle in ((lambda m: m.pop("markers"), "markers"), (lambda m: m["devices"].pop("b300"), "devices"), (lambda m: m["suites"]["b200"].pop("S"), "suites.b200.S"), (lambda m: m["suites"]["b300"]["gate"].pop("collection"), "suites.b300.gate"),
                          (lambda m: m["codegen"]["container_b300"].pop("occupancy"), "occupancy"), (lambda m: m.update(step="e_tile_x"), "step"), (lambda m: m.update(commit="x"), "commit")):
         bad = json.loads(json.dumps(good))
         edit(bad)
@@ -208,6 +209,7 @@ def test_the_section_of_the_document_holds_the_numbers_of_the_recomputed_evidenc
     assert any(line.startswith("| conda | sm_100a | cfbi::rows_kernel |") for line in lines)                                       # the resource table names the row engine of every toolchain
     assert sum(1 for line in lines if line.startswith("| container_b200 |")) == 1 and sum(1 for line in lines if line.startswith("| conda |")) == 3
     assert any(line.startswith("Gate X in change mode") and "conda PASS" in line and "container_b300 PASS" in line for line in lines)
+    assert any(line.startswith("- Step commit") and "Suite S is every test file of `tests/cfbi`, the four cases of the K2 sanitizer file included" in line for line in lines)        # what the admission proved
     assert any(line.startswith("- Campaigns:") and " 4 record files per side in the abba start order" in line for line in lines)      # the number of record files of the campaigns, not their minimum
     assert text.endswith("\n") and not text.endswith("\n\n")
     refused = json.loads(json.dumps(decision))
@@ -252,41 +254,174 @@ def test_a_suite_on_a_later_commit_proves_the_step_only_with_the_same_kernel_sou
     assert sp.source_problems(tmp_path / "nowhere", step, step)                                             # no repository: the step cannot be placed
 
 
-def suite_pair(directory, suite, gpu, failed=()):
-    """The baseline (of the previous accepted state) and the candidate record (of the step, with the failed tests ``failed``) of one suite on ``gpu``, written as files (``cfbi-suite-v1``)."""
-    def junit(names, bad=()):
-        cases = "".join('<testcase classname="tests.cfbi.test_x" name="%s" time="0.1">%s</testcase>' % (n, '<failure message="boom">t</failure>' if n in bad else "") for n in names)
-        return ('<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="%d" skipped="0" tests="%d">%s</testsuite></testsuites>'
-                % (len(bad), len(names), cases))
-    names = ["test_a", "test_b", "test_c"]
-    meta = {"suite": suite, "gpu": gpu, "dirty": False, "sm_count": 148, "env": {}, "python": "3.12.3", "torch": "2.14.0", "cuda": "13.4"}
-    paths = []
-    for name, commit, bad in (("base", PREV, ()), ("cand", STEP, failed)):
-        path = Path(directory) / ("suite-%s.json" % name)
-        path.write_text(json.dumps(tbt.suite_record_of(junit(names, bad), commit=commit, **meta)))
-        paths.append(str(path))
-    return paths
+SANITIZER = "tests/cfbi/test_k2_dyn_sanitizer.py"
+GATE_FILE = "tests/cfbi/test_vs_ref.py"
+# the tests of the world of the exactness tests: classname -> test names. The base has three files, the commit of the suites adds the step's own tests.
+BASE_TESTS = {"tests.cfbi.test_vs_ref": ["test_g1", "test_g2"], "tests.cfbi.test_x": ["test_a", "test_b"], "tests.cfbi.test_k2_dyn_sanitizer": ["test_case[memcheck]", "test_case[racecheck]"]}
+STEP_TESTS = {"tests.cfbi.test_new_mechanism": ["test_pin", "test_control"]}
 
 
-def exactness_manifest(directory, failed=()):
+def ids_of(files):
+    return ["%s.py::%s" % (cls.replace(".", "/"), name) for cls, names in files.items() for name in names]
+
+
+def junit_of(files, failed=()):
+    cases = "".join('<testcase classname="%s" name="%s" time="0.1">%s</testcase>' % (cls, n, '<failure message="boom">t</failure>' if n in failed else "") for cls, names in files.items() for n in names)
+    return ('<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="%d" skipped="0" tests="%d">%s</testsuite></testsuites>'
+            % (len(failed), sum(len(v) for v in files.values()), cases))
+
+
+def suite_record(commit, suite, gpu, files, failed=(), ignored=(), subset=False, host="node-a"):
+    """A ``cfbi-suite-v1`` record of ``files`` ({classname: names}) as the node pipelines build them from a JUnit file."""
+    meta = {"dirty": False, "sm_count": 148, "tree": "at-" + commit[:7], "env": {"CFBI_BIG": "1" if suite == "S" else "0"}, "python": "3.12.3", "torch": "2.14.0", "cuda": "13.4", "host": host,
+            "ignored": list(ignored), "subset": subset, "label": "part", "junit": "part.xml"}
+    return tbt.suite_record_of(junit_of(files, failed), commit=commit, suite=suite, gpu=gpu, **meta)
+
+
+def merged_suite(commit, gpu, files, expected_files, expected_ids, failed=()):
+    """Suite S as a merge of the run without the sanitizer file and the sanitizer cases (the way ``suite_record.py --merge`` makes it), verified against the expected collection."""
+    rest = dict((c, n) for c, n in files.items() if "k2_dyn" not in c)
+    parts = [suite_record(commit, "S", gpu, rest, failed, ignored=(SANITIZER,), subset=True), suite_record(commit, "S", gpu, {"tests.cfbi.test_k2_dyn_sanitizer": files["tests.cfbi.test_k2_dyn_sanitizer"]}, failed, subset=True, host="node-b")]
+    infos = [{"file": "part-%d.json" % i, "sha256": hashlib.sha256(json.dumps(part, sort_keys=True).encode()).hexdigest()} for i, part in enumerate(parts)]
+    return sr.merge_records(parts, infos, "merge of two runs", expected_files, expected_ids, "collection")
+
+
+def collection_file(path, commit, ids, big):
+    Path(path).write_text("# pytest --collect-only -q tests/cfbi, CFBI_BIG=%s, snapshot of commit %s, conda env tlang, 2026-11-13T00:00:00Z\n%s\n" % (big, commit, "\n".join(ids)))
+    return str(path)
+
+
+def exactness_world(tmp_path, failed=()):
+    """A repository (the base with three test files, the step's kernel change, a later commit that adds the step's own test file: the commit of the suites), the expected collections of that commit
+    and a complete record of Gate G and of Suite S (a merge) on each device, with the records of the base as baselines; returns ``(manifest, repo, facts)``."""
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    git(repo, "init", "-q", "-b", "main")
+    for rel in (GATE_FILE, "tests/cfbi/test_x.py", SANITIZER):
+        commit_file(repo, rel, "# test file\n", "a test file")
+    base = git(repo, "rev-parse", "HEAD")
+    step = commit_file(repo, "csrc/k.cu", "the step\n", "the step")
+    suite = commit_file(repo, "tests/cfbi/test_new_mechanism.py", "# the step's own tests\n", "the tests of the step")
+    world = dict(BASE_TESTS, **STEP_TESTS)
+    files = sorted("tests/cfbi/%s.py" % c.rsplit(".", 1)[1] for c in world)
+    collections = {"S": collection_file(tmp_path / "collected-S.txt", suite, ids_of(world), 1), "gate": collection_file(tmp_path / "collected-gate.txt", suite, ids_of({"tests.cfbi.test_vs_ref": world["tests.cfbi.test_vs_ref"]}), 0)}
     suites = {}
     for dev in rc.DEVICES:
+        gpu, sub = trs.GPU[dev][0], tmp_path / dev
+        sub.mkdir()
+        recs = {"gate": (suite_record(base, "gate", gpu, {"tests.cfbi.test_vs_ref": BASE_TESTS["tests.cfbi.test_vs_ref"]}), suite_record(suite, "gate", gpu, {"tests.cfbi.test_vs_ref": world["tests.cfbi.test_vs_ref"]}, failed)),
+                "S": (suite_record(base, "S", gpu, BASE_TESTS), merged_suite(suite, gpu, world, files, ids_of(world), failed))}
         suites[dev] = {}
-        for name in ("gate", "S"):
-            sub = Path(directory) / dev / name
-            sub.mkdir(parents=True, exist_ok=True)
-            suites[dev][name] = dict(zip(("baseline", "candidate"), suite_pair(sub, name, trs.GPU[dev][0], failed)))
-    return {"schema": sp.SCHEMA, "step": "trims", "commit": STEP, "previous": PREV, "base": BASE, "markers": ["x"], "suites": suites}
+        for name, (baseline, candidate) in recs.items():
+            paths = {}
+            for role, rec in (("baseline", baseline), ("candidate", candidate)):
+                paths[role] = str(sub / ("%s-%s.json" % (name, role)))
+                Path(paths[role]).write_text(json.dumps(rec))
+            suites[dev][name] = dict(paths, collection=collections[name])
+    m = {"schema": sp.SCHEMA, "step": "trims", "commit": step, "suite_commit": suite, "previous": base, "base": base, "markers": ["x"], "suites": suites}
+    return m, repo, {"base": base, "step": step, "suite": suite, "world": world, "files": files, "collections": collections}
 
 
-def test_the_exactness_gate_reads_the_suite_records_of_both_devices(tmp_path):
-    m = exactness_manifest(tmp_path)
-    assert sp.exactness_problems(m) == [], sp.exactness_problems(m)
-    found = sp.exactness_problems(exactness_manifest(tmp_path / "failing", failed=("test_b",)))
-    assert any("failed or errored test tests/cfbi/test_x.py::test_b" in p and p.startswith("b200, suite gate") for p in found), found[:3]
-    assert any(p.startswith("b300, suite S") for p in found)
-    other = dict(m, suite_commit=PREV)                        # the suites ran on a commit that is not the one of the records
-    assert any("the candidate record is of commit" in p for p in sp.exactness_problems(other, tmp_path / "nowhere"))
+def edit_record(m, dev, name, role, edit):
+    path = Path(m["suites"][dev][name][role])
+    rec = json.loads(path.read_text())
+    edit(rec)
+    path.write_text(json.dumps(rec))
+
+
+def test_complete_records_bound_to_the_collection_of_the_suite_commit_are_the_exactness_evidence(tmp_path):
+    m, repo, facts = exactness_world(tmp_path)
+    assert sp.exactness_problems(m, repo) == [], sp.exactness_problems(m, repo)
+    cand = json.loads(Path(m["suites"]["b200"]["S"]["candidate"]).read_text())
+    assert cand["meta"]["kind"] == "merge" and cand["meta"]["subset"] is False and sorted(cand["files"]) == facts["files"]            # the legitimate merge of the two runs
+    mf, repof, _ = exactness_world(tmp_path / "failing", failed=("test_pin",))                                                          # complete, but a test of the step failed
+    found = sp.exactness_problems(mf, repof)
+    assert any("failed or errored test tests/cfbi/test_new_mechanism.py::test_pin" in p and p.startswith("b200, suite S") for p in found), found[:3]
+
+
+def test_a_record_that_is_not_the_whole_suite_at_the_commit_of_the_suites_is_no_exactness_evidence(tmp_path):
+    def subset(rec):                                                          # the run without the sanitizer file, as a subset record: what round 12 had
+        rec["meta"].update(subset=True, ignored=[SANITIZER], kind="single")
+        rec["meta"].pop("parts", None), rec["meta"].pop("expected", None)
+        for tid in [t for t in rec["tests"] if "k2_dyn" in t]:
+            rec["tests"].pop(tid)
+        rec["files"].pop("tests/cfbi/test_k2_dyn_sanitizer.py")
+        rec["totals"] = dict((k, sum(c[k] for c in rec["files"].values())) for k in rec["totals"])
+        rec["skipped"] = []
+
+    def without_file(file):
+        def edit(rec):
+            for tid in [t for t in rec["tests"] if t.startswith(file + "::")]:
+                rec["tests"].pop(tid)
+            rec["files"].pop(file)
+            rec["totals"] = dict((k, sum(c[k] for c in rec["files"].values())) for k in rec["totals"])
+            rec["meta"].pop("parts", None), rec["meta"].pop("expected", None)
+            rec["meta"]["kind"] = "single"
+        return edit
+
+    def without_id(tid):
+        def edit(rec):
+            file = tid.split("::")[0]
+            rec["tests"].pop(tid)
+            rec["files"][file]["passed"] -= 1
+            rec["files"][file]["total"] -= 1
+            rec["totals"] = dict((k, sum(c[k] for c in rec["files"].values())) for k in rec["totals"])
+            rec["meta"].pop("parts", None), rec["meta"].pop("expected", None)
+            rec["meta"]["kind"] = "single"
+        return edit
+    cases = [("a subset record that ignores the sanitizer file", subset, ["subset record", "ignores " + SANITIZER]),
+             ("a record without the whole file of the step's own tests", without_file("tests/cfbi/test_new_mechanism.py"), ["expected file(s) are missing: tests/cfbi/test_new_mechanism.py", "expected test(s) are missing"]),
+             ("a record without one control of the step", without_id("tests/cfbi/test_new_mechanism.py::test_control"), ["1 expected test(s) are missing: tests/cfbi/test_new_mechanism.py::test_control"]),
+             ("a record without the K2 sanitizer module", without_file(SANITIZER), ["expected file(s) are missing: " + SANITIZER])]
+    for i, (label, edit, needles) in enumerate(cases):
+        m, repo, _ = exactness_world(tmp_path / ("case%d" % i))
+        edit_record(m, "b300", "S", "candidate", edit)
+        found = sp.exactness_problems(m, repo)
+        assert found and all(p.startswith("b300, suite S") for p in found), (label, found[:3])
+        for needle in needles:
+            assert any(needle in p for p in found), (label, needle, found[:4])
+    m, repo, _ = exactness_world(tmp_path / "baseline")                      # a baseline that leaves files out certifies nothing about them
+    edit_record(m, "b200", "S", "baseline", subset)
+    assert any("baseline record is not complete" in p and "subset record" in p for p in sp.exactness_problems(m, repo)), sp.exactness_problems(m, repo)[:3]
+    m, repo, _ = exactness_world(tmp_path / "other-base")                    # a baseline of another commit than the base
+    edit_record(m, "b200", "gate", "baseline", lambda rec: rec["meta"].update(commit="f" * 40))
+    assert any("the baseline record is of commit" in p for p in sp.exactness_problems(m, repo)), sp.exactness_problems(m, repo)[:3]
+
+
+def test_the_expected_collection_is_the_one_of_the_suite_commit_and_of_the_environment_of_the_suite(tmp_path):
+    m, repo, facts = exactness_world(tmp_path)
+    for label, edit, needle in (("another commit", lambda path, text: text.replace(facts["suite"], "e" * 40), "does not name the commit of the suites"),
+                                ("another environment", lambda path, text: text.replace("CFBI_BIG=1", "CFBI_BIG=0"), "CFBI_BIG=1"),
+                                ("a file that the commit does not have", lambda path, text: text + "tests/cfbi/test_gone.py::test_z\n", "not a test file of the commit")):
+        path = Path(facts["collections"]["S"])
+        original = path.read_text()
+        path.write_text(edit(path, original))
+        found = sp.exactness_problems(m, repo)
+        assert any(needle in p and "suite S" in p for p in found), (label, found[:3])
+        path.write_text(original)
+    Path(facts["collections"]["gate"]).unlink()
+    assert any("collection" in p and "cannot be read" in p and "suite gate" in p for p in sp.exactness_problems(m, repo))
+
+
+def test_gate_g_is_held_to_its_own_file_and_ids_and_the_manifest_names_a_collection_for_each_suite(tmp_path):
+    m, repo, _ = exactness_world(tmp_path)
+    edit_record(m, "b200", "gate", "candidate", lambda rec: (rec["tests"].update({"tests/cfbi/test_vs_ref.py::test_extra": "passed"}), rec["files"]["tests/cfbi/test_vs_ref.py"].update(passed=3, total=3),
+                                                             rec["totals"].update(passed=3, total=3)))
+    assert any("suite gate" in p and "1 test(s) are not expected" in p for p in sp.exactness_problems(m, repo)), sp.exactness_problems(m, repo)[:3]
+    good = exactness_world(tmp_path / "again")[0]
+    del good["suites"]["b300"]["S"]["collection"]
+    assert any("suites.b300.S must name" in p and "collection" in p for p in sp.manifest_problems(dict(good, devices=dict((d, {"baseline": "b", "previous": "p", "base": "q"}) for d in rc.DEVICES),
+                                                                                                           codegen={"allow": "a", "conda": {"base": "b", "cand": "c", "prev": "p"}, "container_b200": {"base": "b", "cand": "c", "prev": "p", "occupancy": "o"},
+                                                                                                                    "container_b300": {"base": "b", "cand": "c", "prev": "p", "occupancy": "o"}})))
+
+
+def test_the_commit_of_the_suites_stays_bound_to_the_step_by_its_kernel_sources(tmp_path):
+    m, repo, facts = exactness_world(tmp_path)
+    changed = commit_file(repo, "flash_kda/cfbi/_ext.py", "a flag of the build\n", "a compiled input changes after the step")
+    bad = dict(m, suite_commit=changed)
+    found = sp.exactness_problems(bad, repo)
+    assert any("kernel sources differ from the step's" in p for p in found), found[:3]
+    assert any("the candidate record is of commit" in p for p in found)
 
 
 def test_a_campaign_is_recomputed_under_the_contract_it_was_run_under(tmp_path):
