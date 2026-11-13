@@ -1270,6 +1270,36 @@ def _toolchain_or_skip():
         pytest.skip("no toolchain for the compile-only gate on this machine: %s" % e)
 
 
+def row_engine_above_the_base(dump):
+    """The figures of the row engine in ``dump`` that are above the recorded figures of the base row engine (``LITERALS``, which are also the caps of the resource gate): registers over the limit, stack
+    or spill over the base's. Equal figures are the base's own; lower ones are those of an accepted step (the schedule trims removed the stack of the epilogue arrays), which a tree after such a
+    step has by design, so that its row engine is held to the caps and not to the figures of the base."""
+    out = []
+    for arch, caps in sorted(cg.LITERALS.items()):
+        for key, rec in sorted(dump["kernels"].get(arch, {}).items()):
+            if cg.family(key) == cg.GATE_R_REF:
+                out.extend("%s %s of %s is %s, above the recorded base figure %s" % (arch, f, key, rec[f], cap) for f, cap in sorted(caps.items()) if rec.get(f) is not None and rec[f] > cap)
+    return out
+
+
+def test_the_row_engine_of_a_dump_is_held_to_the_recorded_figures_of_the_base_not_to_their_equality():
+    base = cg_base()
+    assert row_engine_above_the_base(base) == [] and cg.literal_check(base) == []                    # the base is at its figures
+    inst = cg_inst_base()
+    assert row_engine_above_the_base(inst) == []                                                    # both instantiations are bounded alike
+    lower = cg_edit(inst, "sm_100a", "cfbi::rows_kernel<Lb0E>", stack=8, sass_hash=cg_hash("rows0-trimmed"))
+    assert row_engine_above_the_base(lower) == [] and cg.literal_check(lower) != []                  # a step that lowers a figure: within the caps, no longer the base's own figure
+    for arch, key, field, value in (("sm_100a", "cfbi::rows_kernel<Lb0E>", "spill_stores", 8), ("sm_100a", "cfbi::rows_kernel<Lb1E>", "stack", 113), ("sm_90a", "cfbi::rows_kernel<Lb1E>", "spill_loads", 173),
+                                    ("sm_100a", "cfbi::rows_kernel<Lb1E>", "reg", 129)):
+        worse = cg_edit(inst, arch, key, **{field: value})
+        found = row_engine_above_the_base(worse)
+        assert len(found) == 1 and ("%s %s of %s is %d" % (arch, field, key, value)) in found[0], (key, field, found)
+    other = cg_edit(inst, "sm_100a", "cfbi::ref::rows_kernel", stack=9999)                           # the reference kernels of the tests are not the row engine
+    assert row_engine_above_the_base(other) == []
+    base_arch = cg_edit(base, "sm_100a", "cfbi::rows_kernel", reg=129)
+    assert any("sm_100a reg of cfbi::rows_kernel is 129" in p for p in row_engine_above_the_base(base_arch))
+
+
 def test_codegen_controls_with_nvcc():
     """The gate on the real sources (login node, conda nvcc): base against base passes, the existing row-engine negative control fails and names the
     row engine, and register-pressure variants of the row engine fail the resource gate."""
@@ -1277,7 +1307,9 @@ def test_codegen_controls_with_nvcc():
     base = cg.dump_tree(tree, cg.GATE_ARCHS, (), tc, cache_dir=cache)
     assert set(base["kernels"]) == set(cg.GATE_ARCHS) and all(len(v) >= 10 for v in base["kernels"].values())
     assert cg.dump_tree(tree, cg.GATE_ARCHS, (), tc, cache_dir=cache)["meta"]["cache"] == "hit"
-    assert cg.literal_check(base) == [], cg.literal_check(base)           # the recorded figures of the base row engine hold with this toolchain
+    # the row engine of THIS tree is held to the recorded figures of the base as caps: after an accepted step of the row engine its figures are lower than the base's, never above them (the figures
+    # of the base itself are cross-checked by every comparison against a base dump: CROSS-CHECK and WARNING of the report)
+    assert row_engine_above_the_base(base) == [], row_engine_above_the_base(base)
     variants = {"same": (), "neg": ("CFBI_NEG_CONTROL=1",), "regs": ("CFBI_ROWS_MINB=1",), "spill": ("CFBI_ROWS_MINB=3",)}
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(variants)) as pool:
         futs = {k: pool.submit(cg.dump_tree, tree, cg.GATE_ARCHS, v, tc) for k, v in variants.items()}
