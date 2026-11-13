@@ -564,6 +564,9 @@ def build_parser():
                     help="measure the cells whose DEFAULT route (impl 0, control off) is the two-launch path before those whose default route is the single launch, keeping the order of the cells "
                          "within each class: the same order on both sides of an A/B, so that a process has no single-launch shape in its history when it measures the cells that both sides run "
                          "with the same kernels; recorded as route_order")
+    ap.add_argument("--order-per-sm", type=int, default=None, metavar="N",
+                    help="the limit of the single launch, in CTAs per SM, that fixes the order of --route-order when the measured tree has none of its own (a tree from before the single launch, "
+                         "which launches two kernels in every cell): the order is one for both sides of an A/B, so that side takes the limit of the other side's tree")
     ap.add_argument("--json", default=None)
     ap.add_argument("--label", default="")
     ap.add_argument("--list-cells", action="store_true")
@@ -577,6 +580,10 @@ def check_args(ap, a):
             ap.error("--%s must be at least 1" % name.replace("_", "-"))
     if a.expect_route and (a.expect_compute or a.expect_kernels):
         ap.error("--expect-route spec derives the expected launches of every cell itself: it cannot be combined with --expect-compute or --expect-kernels (two spellings of one assertion)")
+    if a.order_per_sm is not None and not a.route_order:
+        ap.error("--order-per-sm gives the limit that fixes the order of --route-order: it needs --route-order")
+    if a.order_per_sm is not None and a.order_per_sm < 1:
+        ap.error("--order-per-sm must be at least 1")
     if a.boundary is not None:
         clashes = [flag for flag, given in (("--shapes", a.shapes), ("--probe-shapes", a.probe_shapes), ("--regimes", list(a.regimes) != list(REGIMES)),
                                             ("--positions", list(a.positions) != list(PROBE_POSITIONS))) if given]
@@ -615,8 +622,14 @@ def run_notes(a, per_sm, device):
     if a.graph_nodes:
         notes.append("graph-nodes")
     if a.route_order:
-        notes.append("route-order")
+        notes.append("route-order" if a.order_per_sm is None else "route-order, %d CTAs per SM" % a.order_per_sm)
     return notes
+
+
+def order_limit(order_per_sm, per_sm):
+    """The limit, in CTAs per SM, that fixes the order of ``--route-order``: the option's when it is given (a tree from before the single launch has none of its own), else the limit of the
+    measured tree; None when there is neither."""
+    return order_per_sm if order_per_sm is not None else per_sm
 
 
 def main(argv=None):
@@ -628,9 +641,13 @@ def main(argv=None):
     except ValueError as e:
         ap.error(str(e))
     per_sm = tree_per_sm(ROOT)
-    if per_sm is None and (a.boundary is not None or a.expect_route or a.route_order):
-        ap.error("--boundary, --expect-route and --route-order need the single-launch limit of the measured tree, which cannot be read: %s must define DECODE_SINGLE_MAX_CTAS_PER_SM as an integer literal "
+    if per_sm is None and (a.boundary is not None or a.expect_route):
+        ap.error("--boundary and --expect-route need the single-launch limit of the measured tree, which cannot be read: %s must define DECODE_SINGLE_MAX_CTAS_PER_SM as an integer literal "
                  "(and the tests/cfbi/decode_policy.py of this tool must exist)" % (ROOT / "csrc" / "cfbi" / "cfbi_policy.h"))
+    ordering = order_limit(a.order_per_sm, per_sm)
+    if a.route_order and ordering is None:
+        ap.error("--route-order needs the single-launch limit of the measured tree, which cannot be read (%s must define DECODE_SINGLE_MAX_CTAS_PER_SM as an integer literal), or --order-per-sm "
+                 "for a tree from before the single launch" % (ROOT / "csrc" / "cfbi" / "cfbi_policy.h"))
     torch = device = None
     if a.boundary == FROM_DEVICE:                                   # the cells depend on the device: its SM count is read before they are chosen
         torch, device = start_cuda()
@@ -647,7 +664,7 @@ def main(argv=None):
     if device is None:
         torch, device = start_cuda()
     if a.route_order:
-        specs = route_ordered(specs, device, per_sm)
+        specs = route_ordered(specs, device, ordering)
     started = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     notes = run_notes(a, per_sm, device)
     print("device %s  impl=%s  %d cell(s)  trials=%d  calls/trial: lockstep %d, cold %d, probe %d%s" % (

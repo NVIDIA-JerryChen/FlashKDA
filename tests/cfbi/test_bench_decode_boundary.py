@@ -54,7 +54,7 @@ NOT_ROUTED_148 = [(36, 33), (71, 33), (72, 33), (99, 12), (128, 12), (197, 12), 
 
 DEFAULT_OPTIONS = dict(impl=0, shapes=None, regimes=["lockstep", "staggered", "cold", "probe"], probe_shapes=None, positions=[0, 1, 15, 16, 31, 32, 47, 48, 62, 63], trials=5, calls=1536,
                        cold_calls=256, probe_calls=256, profile_calls=64, calls_scale=1, cells=None, expect_compute=None, expect_kernels=None, json=None, label="", list_cells=False)
-NEW_OPTIONS = dict(boundary=None, single_force=False, expect_route=None, graph_nodes=False, route_order=False)
+NEW_OPTIONS = dict(boundary=None, single_force=False, expect_route=None, graph_nodes=False, route_order=False, order_per_sm=None)
 
 
 # ---- the cells ---------------------------------------------------------------------------------------------------------------------------------------------
@@ -880,3 +880,39 @@ def test_the_route_order_needs_the_limit_of_the_tree_and_is_listed_in_the_header
         bd.main(["--route-order", "--boundary", "148", "--json", str(tmp_path / "x.json")] + FAST)
     assert e.value.code == 2
     assert "route-order" in "; ".join(bd.run_notes(parse("--boundary", "148", "--route-order"), 8, DEVICE_B200))
+
+
+# ---- the limit of the order for a tree from before the single launch (the base tree on side A of an A/B against it) -----------------------------------------------
+def test_the_limit_of_the_order_is_the_options_else_the_trees_and_none_without_both():
+    assert bd.order_limit(None, 8) == 8 and bd.order_limit(20, None) == 20 and bd.order_limit(20, 8) == 20 and bd.order_limit(None, None) is None
+
+
+def test_the_order_option_parses_and_needs_the_route_order(capsys):
+    assert parse().order_per_sm is None and parse("--route-order", "--order-per-sm", "20").order_per_sm == 20
+    for argv in (("--order-per-sm", "20"), ("--order-per-sm", "0", "--route-order")):
+        code, err = exit_code_and_message(capsys, *argv, "--list-cells")
+        assert code == 2 and "--order-per-sm" in err, argv
+    with pytest.raises(SystemExit):
+        parse("--order-per-sm", "many", "--route-order")
+
+
+def test_a_tree_without_a_header_follows_the_order_of_the_limit_that_it_is_given(world, tmp_path, monkeypatch):
+    filters = ["N=1;H=12;regime=lockstep;", "N=16;H=12;regime=lockstep;", "N=128;H=12;regime=lockstep;", "N=256;H=12;regime=lockstep;"]
+    cells = ["decode;" + f for f in filters]                                                                         # the keys of the record
+    monkeypatch.setattr(bd, "ROOT", tree_with_header(tmp_path, None, "old"))                                            # the base: no policy header, so no limit of its own
+    code, plain = run_main(tmp_path, "--cells", *filters)
+    assert code == 0 and [c["key"] for c in plain["cells"]] == cells
+    code, ordered = run_main(tmp_path, "--route-order", "--order-per-sm", "8", "--cells", *filters)
+    assert code == 0 and ordered["meta"]["route_order"] is True
+    assert [c["key"] for c in ordered["cells"]] == [cells[2], cells[3], cells[0], cells[1]]                          # above 8 * 148 = 1184 CTAs (two-launch by the rule) first
+    code, other = run_main(tmp_path, "--route-order", "--order-per-sm", "20", "--cells", *filters)
+    assert [c["key"] for c in other["cells"]] == [cells[3], cells[0], cells[1], cells[2]]                             # above 20 * 148 = 2960 CTAs: only N = 256, H = 12
+    assert "route-order, 20 CTAs per SM" in "; ".join(bd.run_notes(parse("--route-order", "--order-per-sm", "20"), None, DEVICE_B200))
+
+
+def test_the_other_options_that_need_the_limit_still_refuse_a_tree_without_a_header(world, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(bd, "ROOT", tree_with_header(tmp_path, None, "old"))
+    for argv in (("--expect-route", "spec"), ("--boundary", "148")):
+        with pytest.raises(SystemExit) as e:
+            bd.main(list(argv) + ["--route-order", "--order-per-sm", "20", "--json", str(tmp_path / "x.json")] + FAST)
+        assert e.value.code == 2 and "single-launch limit of the measured tree" in capsys.readouterr().err, argv
