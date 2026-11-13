@@ -10,7 +10,10 @@ run only claims:
       records_rerun, and the commits of its sides);
     codegen: allow (the allow-list of the comparison) and, per toolchain (conda, container_b200, container_b300), the base, candidate and previous-state dumps (and the occupancy record of
       a container toolchain);
-    suites[<device>][gate|S]: baseline (the ``cfbi-suite-v1`` record of the previous accepted state) and candidate (the step's), made by ``suite_record.py`` from the JUnit files of the runs.
+    suites[<device>][gate|S]: baseline (the ``cfbi-suite-v1`` record of the base) and candidate (the step's), made by ``suite_record.py`` from the JUnit files of the runs, the expected
+      collection of the commit of the suites (``collection``) and that of the base (``baseline_collection``): the files named by ``scripts/r13_collect.sh`` at a snapshot of the commit,
+      whose first line names the commit and the CFBI_BIG that the ids were collected with; and, for the S of a device on which racecheck cannot analyse the kernels, the
+      ``substitute_controls`` (test ids) that gate in its place.
 
   decision: two campaigns per device, both recomputed from their raw records through the checker's own admission (``record_checker.campaign_evidence_problems``: the Method M records of the
     benchmark's own matrix, the commits of the sides, the GPU, one host, the comparison again and the report row by row) and judged on the KERNEL SUM (``total_us``, the gating metric of the
@@ -20,8 +23,10 @@ run only claims:
     steps before this one) with no confirmed slower cell. A comparison that is missing, not a measurement (INVALID) or made under other parameters leaves the outcome undecided: that is a
     repair, never "not adopted".
 
-  exactness: Gate G and Suite S of the step have, for every file of the previous accepted state's record, at least as many passed tests and no failed or errored test
-    (``suite_record.check``), on both devices, and are complete records of their device.
+  exactness: Gate G and Suite S of the step have, for every file of the base's record, at least as many passed tests and no failed or errored test (``suite_record.check``), on both devices,
+    and are complete records of their device: the candidate is the whole suite of the commit of the suites and the baseline the whole suite of the base (every file and exactly the ids of
+    the collection of that commit), both ran with the CFBI_BIG of the suite (S: 1, Gate G: 0), and no test was skipped but the one that is skipped by design on B200 and B300 (and, with
+    its substitute controls passed, the racecheck test of a device that the tool cannot analyse).
 
   row: the ledger row (``record_checker.step_problems``) built from the dumps and the decision: the comparison entries in change mode with the previous accepted dump and the allow-list,
     the resource figures of the row engine, the A/B medians and the noise-limited cells of the comparison against the previous accepted state, and the timing results.
@@ -98,8 +103,11 @@ def manifest_problems(m):
     for dev in GATING:
         for name in ("gate", "S"):
             e = ((suites or {}).get(dev) or {}).get(name) if isinstance(suites, dict) else None
-            if not (isinstance(e, dict) and all(isinstance(e.get(f), str) for f in ("baseline", "candidate", "collection"))):
-                out.append("suites.%s.%s must name the baseline record, the candidate record and the expected collection of the suite" % (dev, name))
+            if not (isinstance(e, dict) and all(isinstance(e.get(f), str) for f in SUITE_FIELDS)):
+                out.append("suites.%s.%s must name the baseline record, the candidate record, the expected collection of the suite and the expected collection of its base (%s)"
+                           % (dev, name, ", ".join(SUITE_FIELDS)))
+            elif "substitute_controls" in e and not (name == "S" and isinstance(e["substitute_controls"], list) and all(isinstance(c, str) for c in e["substitute_controls"])):
+                out.append("suites.%s.%s.substitute_controls must be a list of test ids (Suite S only)" % (dev, name))
     cg_ = m.get("codegen")
     if not isinstance(cg_, dict) or not isinstance(cg_.get("allow"), str) or any(k not in cg_ for k in rc.COMPARISONS):
         out.append("codegen must name the allow-list and one comparison per toolchain (%s)" % ", ".join(rc.COMPARISONS))
@@ -137,7 +145,13 @@ def source_problems(repo, step, later):
 
 
 GATE_FILES = ("tests/cfbi/test_vs_ref.py",)                  # Gate G is one file; Suite S is every test file of tests/cfbi (the K2 sanitizer file included)
-SUITE_BIG = {"gate": "0", "S": "1"}                          # CFBI_BIG of the collection of each suite
+SUITE_BIG = {"gate": "0", "S": "1"}                          # CFBI_BIG of the collection of each suite and of the records of its runs
+BIG_FIELD = re.compile(r"(?<![A-Za-z0-9_])CFBI_BIG=([^\s,;]*)")        # a field of a collection header, up to the next separator (CFBI_BIG=10 is not CFBI_BIG=1)
+BY_DESIGN_SKIPS = {                                          # the tests that are skipped by design on B200 and B300 (id -> the beginning of the reason that the test gives): nothing else may be skipped there
+    "tests/cfbi/test_guard_zones.py::test_prefill_varlen_warm_and_decode_stay_inside_their_buffers[1005-16]": "the 1000 + x hook belongs to the old kernels"}
+UNSUPPORTED_RACECHECK_SKIPS = {                              # the exception of the sanitizer policy: racecheck says that it cannot analyse the kernels, and the step's negative controls gate in its place
+    "tests/cfbi/test_k2_dyn_sanitizer.py::test_racecheck_where_the_tool_supports_the_kernels": "racecheck does not support these kernels"}
+SUITE_FIELDS = ("baseline", "candidate", "collection", "baseline_collection")
 
 
 def suite_files(repo, commit, name):
@@ -149,9 +163,10 @@ def suite_files(repo, commit, name):
     return (files if name == "S" else [f for f in GATE_FILES if f in files]), None
 
 
-def collection_problems(repo, commit, name, path):
+def collection_problems(repo, commit, name, path, what="the commit of the suites"):
     """``(files, ids, problems)``: the files of the commit and the test ids that a complete record of the suite holds. The ids are read from the collection file that the run made at the snapshot of
-    the commit (``scripts/r13_collect.sh``): its first line names the commit and the environment, and every id belongs to a test file of that commit."""
+    the commit (``scripts/r13_collect.sh``): its first line names the commit (``what``: the commit of the suites or the base) and the environment (the CFBI_BIG field, read as a whole), and
+    every id belongs to a test file of that commit."""
     files, why = suite_files(repo, commit, name)
     if why:
         return None, None, [why]
@@ -164,11 +179,50 @@ def collection_problems(repo, commit, name, path):
     ids = [ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")]
     out = []
     if not any(rc.commit_matches(tok, commit) for tok in re.findall(r"\b[0-9a-f]{7,40}\b", header)):
-        out.append("the expected collection %s does not name the commit of the suites (%s) in its first line" % (os.path.basename(path), commit[:10]))
-    if "CFBI_BIG=%s" % SUITE_BIG[name] not in header:
-        out.append("the expected collection %s was not made with CFBI_BIG=%s, the environment of the suite" % (os.path.basename(path), SUITE_BIG[name]))
+        out.append("the expected collection %s does not name %s (%s) in its first line" % (os.path.basename(path), what, commit[:10]))
+    fields = BIG_FIELD.findall(header)
+    if fields != [SUITE_BIG[name]]:
+        out.append("the expected collection %s was not made with CFBI_BIG=%s, the environment of the suite (its first line has %s)"
+                   % (os.path.basename(path), SUITE_BIG[name], ", ".join("CFBI_BIG=%s" % v for v in fields) or "no CFBI_BIG field"))
     out.extend("the expected collection %s holds %s, which is not a test file of the commit" % (os.path.basename(path), tid) for tid in ids if tid.split("::", 1)[0] not in files)
     return files, ids, out
+
+
+def env_problems(rec, name, role):
+    """Why a record does not say that it ran with the CFBI_BIG of the suite ``name`` (a record of the other value, of a value that only begins like it, or without the field)."""
+    env = (rec.get("meta") or {}).get("env")
+    want = SUITE_BIG[name]
+    if not isinstance(env, dict) or "CFBI_BIG" not in env:
+        return ["the %s record does not say which CFBI_BIG it ran with (the suite needs CFBI_BIG=%s)" % (role, want)]
+    if env["CFBI_BIG"] != want:
+        return ["the %s record ran with CFBI_BIG=%r, the suite needs CFBI_BIG=%s" % (role, env["CFBI_BIG"], want)]
+    return []
+
+
+def skip_problems(rec, role, substitutes=None):
+    """Why the skipped tests of a record are not all legitimate. A skipped test proves nothing about itself, so only the tests of ``BY_DESIGN_SKIPS`` (with the beginning of the reason that they
+    give) may be skipped; the racecheck test of ``UNSUPPORTED_RACECHECK_SKIPS`` may be skipped too (the tool cannot analyse the kernels of the device), and a candidate that skips it needs the
+    substitute controls (test ids that the manifest names) to have passed in the same record."""
+    if sr.structure_problems(rec):
+        return []                                                  # the structure problems of the record are reported by its completeness check
+    out, racecheck = [], False
+    for s in rec["skipped"]:
+        tid, reason = s["id"], s["reason"]
+        if tid in BY_DESIGN_SKIPS:
+            if not reason.startswith(BY_DESIGN_SKIPS[tid]):
+                out.append("the %s record skips %s for the reason %r, the skip by design is %r" % (role, tid, reason[:80], BY_DESIGN_SKIPS[tid]))
+        elif tid in UNSUPPORTED_RACECHECK_SKIPS and reason.startswith(UNSUPPORTED_RACECHECK_SKIPS[tid]):
+            racecheck = True
+        else:
+            out.append("the %s record skips %s (%s): only the tests that are skipped by design may be skipped" % (role, tid, reason[:80]))
+    if racecheck and role == "candidate":
+        if not substitutes:
+            out.append("the candidate record skips racecheck (it cannot analyse the kernels): the documented exception needs the substitute controls (suites.<device>.S.substitute_controls) that passed")
+        for control in substitutes or []:
+            outcome = rec["tests"].get(control, "absent") if rec.get("tests") else "absent"
+            if outcome != "passed":
+                out.append("the substitute control %s of the skipped racecheck did not pass in the candidate record (%s)" % (control, outcome))
+    return out
 
 
 def exactness_problems(m, repo=None):
@@ -202,10 +256,17 @@ def exactness_problems(m, repo=None):
             out.extend("%s: the candidate record is not complete: %s" % (where, p) for p in sr.completeness_problems(cand, files, ids))
             if not rc.commit_matches(str((base.get("meta") or {}).get("commit")), m["base"]):
                 out.append("%s: the baseline record is of commit %s, the base is %s" % (where, (base.get("meta") or {}).get("commit"), m["base"][:10]))
-            base_files, why = suite_files(repo, m["base"], name)
-            if why:
-                out.append("%s: %s" % (where, why))
-            out.extend("%s: the baseline record is not complete: %s" % (where, p) for p in sr.completeness_problems(base, base_files))
+            if isinstance(spec.get("baseline_collection"), str):
+                base_files, base_ids, bad = collection_problems(repo, m["base"], name, spec["baseline_collection"], what="the base")
+            else:
+                base_files, why = suite_files(repo, m["base"], name)
+                base_ids, bad = None, [why] if why else []
+                out.append("%s: the manifest names no baseline_collection: the baseline is held to the exact ids of the collection of the base" % where)
+            out.extend("%s: %s" % (where, p) for p in bad)
+            out.extend("%s: the baseline record is not complete: %s" % (where, p) for p in sr.completeness_problems(base, base_files, base_ids))
+            for role, rec in (("baseline", base), ("candidate", cand)):
+                out.extend("%s: %s" % (where, p) for p in env_problems(rec, name, role))
+                out.extend("%s: %s" % (where, p) for p in skip_problems(rec, role, spec.get("substitute_controls") if name == "S" else None))
             out.extend("%s: %s" % (where, p) for p in sr.check(base, cand))
     return out
 

@@ -9,6 +9,7 @@ import hashlib
 import json
 import sys
 from pathlib import Path
+from xml.sax.saxutils import quoteattr
 
 import pytest
 
@@ -166,11 +167,13 @@ def test_the_manifest_names_what_the_decision_needs():
     assert sp.manifest_problems({}) and sp.manifest_problems({"schema": sp.SCHEMA})
     good = {"schema": sp.SCHEMA, "step": "trims", "commit": STEP, "previous": PREV, "base": BASE, "markers": ["x"],
             "devices": dict((d, {"baseline": "b", "previous": "p", "base": "q"}) for d in rc.DEVICES),
-            "suites": dict((d, {"gate": {"baseline": "a", "candidate": "b", "collection": "c"}, "S": {"baseline": "a", "candidate": "b", "collection": "c"}}) for d in rc.DEVICES),
+            "suites": dict((d, {"gate": {"baseline": "a", "candidate": "b", "collection": "c", "baseline_collection": "d"}, "S": {"baseline": "a", "candidate": "b", "collection": "c", "baseline_collection": "d"}})
+                           for d in rc.DEVICES),
             "codegen": {"allow": "a", "conda": {"base": "b", "cand": "c", "prev": "p"}, "container_b200": {"base": "b", "cand": "c", "prev": "p", "occupancy": "o"},
                         "container_b300": {"base": "b", "cand": "c", "prev": "p", "occupancy": "o"}}}
     assert sp.manifest_problems(good) == []
     for edit, needle in ((lambda m: m.pop("markers"), "markers"), (lambda m: m["devices"].pop("b300"), "devices"), (lambda m: m["suites"]["b200"].pop("S"), "suites.b200.S"), (lambda m: m["suites"]["b300"]["gate"].pop("collection"), "suites.b300.gate"),
+                         (lambda m: m["suites"]["b300"]["S"].pop("baseline_collection"), "suites.b300.S"), (lambda m: m["suites"]["b200"]["gate"].update(baseline_collection=3), "suites.b200.gate"),
                          (lambda m: m["codegen"]["container_b300"].pop("occupancy"), "occupancy"), (lambda m: m.update(step="e_tile_x"), "step"), (lambda m: m.update(commit="x"), "commit")):
         bad = json.loads(json.dumps(good))
         edit(bad)
@@ -256,8 +259,15 @@ def test_a_suite_on_a_later_commit_proves_the_step_only_with_the_same_kernel_sou
 
 SANITIZER = "tests/cfbi/test_k2_dyn_sanitizer.py"
 GATE_FILE = "tests/cfbi/test_vs_ref.py"
-# the tests of the world of the exactness tests: classname -> test names. The base has three files, the commit of the suites adds the step's own tests.
-BASE_TESTS = {"tests.cfbi.test_vs_ref": ["test_g1", "test_g2"], "tests.cfbi.test_x": ["test_a", "test_b"], "tests.cfbi.test_k2_dyn_sanitizer": ["test_case[memcheck]", "test_case[racecheck]"]}
+GUARD = "tests/cfbi/test_guard_zones.py"
+GUARD_TEST = "test_prefill_varlen_warm_and_decode_stay_inside_their_buffers[1005-16]"       # the one test that is skipped by design on B200 and B300, in the base and in every later commit
+GUARD_REASON = "the 1000 + x hook belongs to the old kernels; the device-scheduled K2 rejects it"
+RACECHECK = "test_racecheck_where_the_tool_supports_the_kernels"                              # the test whose skip is the documented exception of the sanitizer policy
+RACECHECK_REASON = "racecheck does not support these kernels: Unsupported architecture"
+BY_DESIGN = {GUARD_TEST: GUARD_REASON}
+# the tests of the world of the exactness tests: classname -> test names. The base has four files, the commit of the suites adds the step's own tests.
+BASE_TESTS = {"tests.cfbi.test_vs_ref": ["test_g1", "test_g2"], "tests.cfbi.test_x": ["test_a", "test_b"], "tests.cfbi.test_guard_zones": ["test_plain", GUARD_TEST],
+              "tests.cfbi.test_k2_dyn_sanitizer": ["test_case[memcheck]", "test_case[racecheck]", RACECHECK]}
 STEP_TESTS = {"tests.cfbi.test_new_mechanism": ["test_pin", "test_control"]}
 
 
@@ -265,23 +275,31 @@ def ids_of(files):
     return ["%s.py::%s" % (cls.replace(".", "/"), name) for cls, names in files.items() for name in names]
 
 
-def junit_of(files, failed=()):
-    cases = "".join('<testcase classname="%s" name="%s" time="0.1">%s</testcase>' % (cls, n, '<failure message="boom">t</failure>' if n in failed else "") for cls, names in files.items() for n in names)
-    return ('<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="%d" skipped="0" tests="%d">%s</testsuite></testsuites>'
-            % (len(failed), sum(len(v) for v in files.values()), cases))
+def junit_of(files, failed=(), skipped=None):
+    """The JUnit XML of a run of ``files`` ({classname: names}): the tests of ``failed`` fail, those of ``skipped`` ({name: reason}) are skipped with that reason."""
+    skipped = skipped or {}
+
+    def body(n):
+        if n in failed:
+            return '<failure message="boom">t</failure>'
+        return '<skipped type="pytest.skip" message=%s>skipped</skipped>' % quoteattr(skipped[n]) if n in skipped else ""
+    cases = "".join('<testcase classname="%s" name="%s" time="0.1">%s</testcase>' % (cls, n, body(n)) for cls, names in files.items() for n in names)
+    return ('<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="%d" skipped="%d" tests="%d">%s</testsuite></testsuites>'
+            % (len(failed), sum(1 for v in files.values() for n in v if n in skipped), sum(len(v) for v in files.values()), cases))
 
 
-def suite_record(commit, suite, gpu, files, failed=(), ignored=(), subset=False, host="node-a"):
-    """A ``cfbi-suite-v1`` record of ``files`` ({classname: names}) as the node pipelines build them from a JUnit file."""
-    meta = {"dirty": False, "sm_count": 148, "tree": "at-" + commit[:7], "env": {"CFBI_BIG": "1" if suite == "S" else "0"}, "python": "3.12.3", "torch": "2.14.0", "cuda": "13.4", "host": host,
-            "ignored": list(ignored), "subset": subset, "label": "part", "junit": "part.xml"}
-    return tbt.suite_record_of(junit_of(files, failed), commit=commit, suite=suite, gpu=gpu, **meta)
+def suite_record(commit, suite, gpu, files, failed=(), ignored=(), subset=False, host="node-a", skipped=None, big=None):
+    """A ``cfbi-suite-v1`` record of ``files`` ({classname: names}) as the node pipelines build them from a JUnit file (``big``: the CFBI_BIG that the record says it ran with)."""
+    meta = {"dirty": False, "sm_count": 148, "tree": "at-" + commit[:7], "env": {"CFBI_BIG": big if big is not None else ("1" if suite == "S" else "0")}, "python": "3.12.3", "torch": "2.14.0", "cuda": "13.4",
+            "host": host, "ignored": list(ignored), "subset": subset, "label": "part", "junit": "part.xml"}
+    return tbt.suite_record_of(junit_of(files, failed, skipped), commit=commit, suite=suite, gpu=gpu, **meta)
 
 
-def merged_suite(commit, gpu, files, expected_files, expected_ids, failed=()):
+def merged_suite(commit, gpu, files, expected_files, expected_ids, failed=(), skipped=None):
     """Suite S as a merge of the run without the sanitizer file and the sanitizer cases (the way ``suite_record.py --merge`` makes it), verified against the expected collection."""
     rest = dict((c, n) for c, n in files.items() if "k2_dyn" not in c)
-    parts = [suite_record(commit, "S", gpu, rest, failed, ignored=(SANITIZER,), subset=True), suite_record(commit, "S", gpu, {"tests.cfbi.test_k2_dyn_sanitizer": files["tests.cfbi.test_k2_dyn_sanitizer"]}, failed, subset=True, host="node-b")]
+    parts = [suite_record(commit, "S", gpu, rest, failed, ignored=(SANITIZER,), subset=True, skipped=skipped),
+             suite_record(commit, "S", gpu, {"tests.cfbi.test_k2_dyn_sanitizer": files["tests.cfbi.test_k2_dyn_sanitizer"]}, failed, subset=True, host="node-b", skipped=skipped)]
     infos = [{"file": "part-%d.json" % i, "sha256": hashlib.sha256(json.dumps(part, sort_keys=True).encode()).hexdigest()} for i, part in enumerate(parts)]
     return sr.merge_records(parts, infos, "merge of two runs", expected_files, expected_ids, "collection")
 
@@ -292,34 +310,37 @@ def collection_file(path, commit, ids, big):
 
 
 def exactness_world(tmp_path, failed=()):
-    """A repository (the base with three test files, the step's kernel change, a later commit that adds the step's own test file: the commit of the suites), the expected collections of that commit
-    and a complete record of Gate G and of Suite S (a merge) on each device, with the records of the base as baselines; returns ``(manifest, repo, facts)``."""
+    """A repository (the base with four test files, the step's kernel change, a later commit that adds the step's own test file: the commit of the suites), the expected collections of the base and
+    of that commit and a complete record of Gate G and of Suite S (a merge) on each device, with the records of the base as baselines; returns ``(manifest, repo, facts)``. The base and the
+    commit of the suites skip the one test that is skipped by design."""
     repo = tmp_path / "repo"
     repo.mkdir(parents=True)
     git(repo, "init", "-q", "-b", "main")
-    for rel in (GATE_FILE, "tests/cfbi/test_x.py", SANITIZER):
+    for rel in (GATE_FILE, "tests/cfbi/test_x.py", GUARD, SANITIZER):
         commit_file(repo, rel, "# test file\n", "a test file")
     base = git(repo, "rev-parse", "HEAD")
     step = commit_file(repo, "csrc/k.cu", "the step\n", "the step")
     suite = commit_file(repo, "tests/cfbi/test_new_mechanism.py", "# the step's own tests\n", "the tests of the step")
     world = dict(BASE_TESTS, **STEP_TESTS)
     files = sorted("tests/cfbi/%s.py" % c.rsplit(".", 1)[1] for c in world)
-    collections = {"S": collection_file(tmp_path / "collected-S.txt", suite, ids_of(world), 1), "gate": collection_file(tmp_path / "collected-gate.txt", suite, ids_of({"tests.cfbi.test_vs_ref": world["tests.cfbi.test_vs_ref"]}), 0)}
+    gate_of = lambda tests: {"tests.cfbi.test_vs_ref": tests["tests.cfbi.test_vs_ref"]}                                                  # noqa: E731
+    collections = {"S": collection_file(tmp_path / "collected-S.txt", suite, ids_of(world), 1), "gate": collection_file(tmp_path / "collected-gate.txt", suite, ids_of(gate_of(world)), 0)}
+    base_collections = {"S": collection_file(tmp_path / "collected-base-S.txt", base, ids_of(BASE_TESTS), 1), "gate": collection_file(tmp_path / "collected-base-gate.txt", base, ids_of(gate_of(BASE_TESTS)), 0)}
     suites = {}
     for dev in rc.DEVICES:
         gpu, sub = trs.GPU[dev][0], tmp_path / dev
         sub.mkdir()
-        recs = {"gate": (suite_record(base, "gate", gpu, {"tests.cfbi.test_vs_ref": BASE_TESTS["tests.cfbi.test_vs_ref"]}), suite_record(suite, "gate", gpu, {"tests.cfbi.test_vs_ref": world["tests.cfbi.test_vs_ref"]}, failed)),
-                "S": (suite_record(base, "S", gpu, BASE_TESTS), merged_suite(suite, gpu, world, files, ids_of(world), failed))}
+        recs = {"gate": (suite_record(base, "gate", gpu, gate_of(BASE_TESTS)), suite_record(suite, "gate", gpu, gate_of(world), failed)),
+                "S": (suite_record(base, "S", gpu, BASE_TESTS, skipped=BY_DESIGN), merged_suite(suite, gpu, world, files, ids_of(world), failed, skipped=BY_DESIGN))}
         suites[dev] = {}
         for name, (baseline, candidate) in recs.items():
             paths = {}
             for role, rec in (("baseline", baseline), ("candidate", candidate)):
                 paths[role] = str(sub / ("%s-%s.json" % (name, role)))
                 Path(paths[role]).write_text(json.dumps(rec))
-            suites[dev][name] = dict(paths, collection=collections[name])
+            suites[dev][name] = dict(paths, collection=collections[name], baseline_collection=base_collections[name])
     m = {"schema": sp.SCHEMA, "step": "trims", "commit": step, "suite_commit": suite, "previous": base, "base": base, "markers": ["x"], "suites": suites}
-    return m, repo, {"base": base, "step": step, "suite": suite, "world": world, "files": files, "collections": collections}
+    return m, repo, {"base": base, "step": step, "suite": suite, "world": world, "files": files, "collections": collections, "base_collections": base_collections}
 
 
 def edit_record(m, dev, name, role, edit):
@@ -327,6 +348,59 @@ def edit_record(m, dev, name, role, edit):
     rec = json.loads(path.read_text())
     edit(rec)
     path.write_text(json.dumps(rec))
+
+
+def recount(rec):
+    rec["totals"] = dict((k, sum(c[k] for c in rec["files"].values())) for k in rec["totals"])
+
+
+def skip_test(tid, reason):
+    """The edit that turns the outcome of the test ``tid`` into a skip with ``reason``: the counts, the totals and the list of skipped tests stay consistent (a record that a run could have written)."""
+    def edit(rec):
+        file, was = tid.split("::")[0], rec["tests"][tid]
+        rec["tests"][tid] = "skipped"
+        rec["files"][file][was] -= 1
+        rec["files"][file]["skipped"] += 1
+        recount(rec)
+        rec["failed"] = [t for t in rec["failed"] if t != tid]
+        rec["skipped"] = sorted(rec["skipped"] + [{"id": tid, "reason": reason}], key=lambda s: s["id"])
+    return edit
+
+
+def reason_of(tid, reason):
+    """The edit that gives the skip of ``tid`` another reason."""
+    def edit(rec):
+        for s in rec["skipped"]:
+            if s["id"] == tid:
+                s["reason"] = reason
+    return edit
+
+
+def set_env(env):
+    """The edit that replaces the environment that a record says it ran in (None: the record has none)."""
+    def edit(rec):
+        if env is None:
+            rec["meta"].pop("env", None)
+        else:
+            rec["meta"]["env"] = env
+    return edit
+
+
+def one_id_per_file(rec):
+    """A record cut to the first test of every file (all files are kept, the counts say what is left): structurally valid, and 1 of n ids per file."""
+    keep = {}
+    for tid in sorted(rec["tests"]):
+        keep.setdefault(tid.split("::")[0], tid)
+    rec["tests"] = dict((t, rec["tests"][t]) for t in keep.values())
+    for f in rec["files"]:
+        rec["files"][f] = dict.fromkeys(rec["files"][f], 0)
+        rec["files"][f][rec["tests"][keep[f]]] = 1
+        rec["files"][f]["total"] = 1
+    recount(rec)
+    rec["failed"] = [t for t in rec["failed"] if t in rec["tests"]]
+    rec["skipped"] = [s for s in rec["skipped"] if s["id"] in rec["tests"]]
+    rec["meta"].pop("parts", None), rec["meta"].pop("expected", None)
+    rec["meta"]["kind"] = "single"
 
 
 def test_complete_records_bound_to_the_collection_of_the_suite_commit_are_the_exactness_evidence(tmp_path):
@@ -347,7 +421,7 @@ def test_a_record_that_is_not_the_whole_suite_at_the_commit_of_the_suites_is_no_
             rec["tests"].pop(tid)
         rec["files"].pop("tests/cfbi/test_k2_dyn_sanitizer.py")
         rec["totals"] = dict((k, sum(c[k] for c in rec["files"].values())) for k in rec["totals"])
-        rec["skipped"] = []
+        rec["skipped"] = [s for s in rec["skipped"] if "k2_dyn" not in s["id"]]
 
     def without_file(file):
         def edit(rec):
@@ -421,6 +495,136 @@ def test_gate_g_is_held_to_its_own_file_and_ids_and_the_manifest_names_a_collect
     assert any("suites.b300.S must name" in p and "collection" in p for p in sp.manifest_problems(dict(good, devices=dict((d, {"baseline": "b", "previous": "p", "base": "q"}) for d in rc.DEVICES),
                                                                                                            codegen={"allow": "a", "conda": {"base": "b", "cand": "c", "prev": "p"}, "container_b200": {"base": "b", "cand": "c", "prev": "p", "occupancy": "o"},
                                                                                                                     "container_b300": {"base": "b", "cand": "c", "prev": "p", "occupancy": "o"}})))
+
+
+NEW = "tests/cfbi/test_new_mechanism.py::"
+
+
+def test_a_skipped_test_is_no_exactness_evidence_unless_it_is_skipped_by_design(tmp_path):
+    """A complete record in which the tests of a step were SKIPPED holds every expected id and fails nothing, and it proves nothing about those tests: only the test that is skipped by design on
+    B200 and B300 (named in the tool with the beginning of its reason) may be skipped, in the baseline as in the candidate."""
+    m, repo, _ = exactness_world(tmp_path)
+    assert sp.exactness_problems(m, repo) == []                                                   # the legal skip: the test that is skipped by design is skipped in both records of Suite S
+    both = [skip_test(NEW + "test_pin", "no CUDA device"), skip_test(NEW + "test_control", "no CUDA device")]
+    cases = [("every test of the step's own file skipped", "candidate", both, [NEW + "test_pin", NEW + "test_control"]),
+             ("one control of the step skipped", "candidate", both[1:], [NEW + "test_control"]),
+             ("a test of the base skipped in the candidate", "candidate", [skip_test("tests/cfbi/test_x.py::test_a", "no CUDA device")], ["tests/cfbi/test_x.py::test_a"]),
+             ("the test that is skipped by design, for another reason", "candidate", [reason_of(GUARD + "::" + GUARD_TEST, "no CUDA device")], [GUARD + "::" + GUARD_TEST]),
+             ("a test of the base skipped in the baseline", "baseline", [skip_test("tests/cfbi/test_x.py::test_b", "no CUDA device")], ["tests/cfbi/test_x.py::test_b"])]
+    for i, (label, role, edits, ids) in enumerate(cases):
+        mm, rr, _ = exactness_world(tmp_path / ("case%d" % i))
+        for edit in edits:
+            edit_record(mm, "b200", "S", role, edit)
+        found = sp.exactness_problems(mm, rr)
+        assert found and all(p.startswith("b200, suite S") for p in found), (label, found[:3])
+        for tid in ids:
+            assert any("the %s record skips %s" % (role, tid) in p for p in found), (label, tid, found[:3])
+    mm, rr, _ = exactness_world(tmp_path / "gate")                                                # Gate G has no by-design skip at all
+    edit_record(mm, "b300", "gate", "candidate", skip_test("tests/cfbi/test_vs_ref.py::test_g2", "no CUDA device"))
+    assert any(p.startswith("b300, suite gate") and "the candidate record skips tests/cfbi/test_vs_ref.py::test_g2" in p for p in sp.exactness_problems(mm, rr))
+
+
+def test_a_skipped_racecheck_is_the_documented_exception_only_with_substitute_controls_that_passed(tmp_path):
+    """The sanitizer policy: when racecheck says that it cannot analyse the kernels, the hazard class is covered by the step's negative controls, which gate in its place. The skip of the one test
+    that does that is allowed when the controls named by the manifest passed in the same record, and never without them."""
+    rid, control = SANITIZER + "::" + RACECHECK, NEW + "test_control"
+    m, repo, _ = exactness_world(tmp_path)
+    for dev in rc.DEVICES:                                                                         # the tool cannot analyse the kernels of the device: the base skipped the test too
+        for role in ("baseline", "candidate"):
+            edit_record(m, dev, "S", role, skip_test(rid, RACECHECK_REASON))
+    found = sp.exactness_problems(m, repo)
+    assert found and any("the candidate record skips racecheck" in p and "substitute controls" in p for p in found), found[:3]       # no control named: a skipped racecheck is a skipped test
+    for dev in rc.DEVICES:
+        m["suites"][dev]["S"]["substitute_controls"] = [control]
+    assert sp.exactness_problems(m, repo) == [], sp.exactness_problems(m, repo)[:3]                 # the control passed in the record: the documented exception
+    edit_record(m, "b300", "S", "candidate", skip_test(control, "no CUDA device"))
+    found = sp.exactness_problems(m, repo)
+    assert any(p.startswith("b300, suite S") and "the substitute control %s" % control in p and "did not pass" in p for p in found), found[:3]       # the control itself was skipped
+    m["suites"]["b300"]["S"]["substitute_controls"] = [NEW + "test_absent"]
+    assert any("the substitute control %s" % (NEW + "test_absent") in p and "absent" in p for p in sp.exactness_problems(m, repo))
+    m2, repo2, _ = exactness_world(tmp_path / "other-reason")                                      # a skip with another reason is not the exception, whatever the controls say
+    for dev in rc.DEVICES:
+        m2["suites"][dev]["S"]["substitute_controls"] = [control]
+    edit_record(m2, "b200", "S", "candidate", skip_test(rid, "no CUDA device"))
+    assert any("the candidate record skips %s" % rid in p for p in sp.exactness_problems(m2, repo2))
+
+
+def test_the_tests_that_the_tool_allows_to_skip_are_in_the_sources_with_that_reason():
+    """The tables of the skips that the tool allows name real tests and reasons: a renamed test or a reworded reason is found here, not on a device."""
+    assert sp.BY_DESIGN_SKIPS and sp.UNSUPPORTED_RACECHECK_SKIPS
+    for tid, reason in list(sp.BY_DESIGN_SKIPS.items()) + list(sp.UNSUPPORTED_RACECHECK_SKIPS.items()):
+        path, name = tid.split("::", 1)
+        text = (_ROOT / path).read_text()
+        assert "def %s(" % name.split("[", 1)[0] in text and reason in text, tid
+
+
+def test_the_environment_of_both_records_is_the_one_of_the_suite_and_the_header_of_a_collection_is_read_as_a_field(tmp_path):
+    """The collection says which CFBI_BIG the ids were collected with; the records say which they ran with. Both are bound to the suite (S: 1, Gate G: 0) for the baseline and the candidate alike:
+    records that both ran with the other value, a record that says nothing and a header with another value that has the right one as its beginning are all refused."""
+    m, repo, facts = exactness_world(tmp_path)
+    assert sp.exactness_problems(m, repo) == []
+    cases = [("both records of Suite S ran with CFBI_BIG=0", "S", {"baseline": set_env({"CFBI_BIG": "0"}), "candidate": set_env({"CFBI_BIG": "0"})}, ["the baseline record ran with CFBI_BIG='0'", "the candidate record ran with CFBI_BIG='0'"]),
+             ("both records of Suite S ran with CFBI_BIG=10", "S", {"baseline": set_env({"CFBI_BIG": "10"}), "candidate": set_env({"CFBI_BIG": "10"})}, ["the candidate record ran with CFBI_BIG='10'"]),
+             ("the candidate says nothing about its environment", "S", {"baseline": set_env({"CFBI_BIG": "1"}), "candidate": set_env({})}, ["the candidate record does not say which CFBI_BIG"]),
+             ("neither record has an environment", "S", {"baseline": set_env(None), "candidate": set_env(None)}, ["the baseline record does not say which CFBI_BIG", "the candidate record does not say which CFBI_BIG"]),
+             ("the value is a number", "S", {"baseline": set_env({"CFBI_BIG": 1}), "candidate": set_env({"CFBI_BIG": 1})}, ["the baseline record ran with CFBI_BIG=1"]),
+             ("both records of Gate G ran with CFBI_BIG=1", "gate", {"baseline": set_env({"CFBI_BIG": "1"}), "candidate": set_env({"CFBI_BIG": "1"})}, ["the baseline record ran with CFBI_BIG='1'", "the candidate record ran with CFBI_BIG='1'"])]
+    for i, (label, name, edits, needles) in enumerate(cases):
+        mm, rr, _ = exactness_world(tmp_path / ("env%d" % i))
+        for role, edit in edits.items():
+            edit_record(mm, "b200", name, role, edit)
+        found = sp.exactness_problems(mm, rr)
+        assert found and all(p.startswith("b200, suite %s" % name) for p in found), (label, found[:3])
+        for needle in needles:
+            assert any(needle in p and "needs CFBI_BIG=%s" % sp.SUITE_BIG[name] in p for p in found), (label, needle, found[:3])
+    for which in ("collection", "baseline_collection"):                                          # the header of the expected collections, the suite's and the base's
+        for label, edit in (("a header with CFBI_BIG=10", lambda t: t.replace("CFBI_BIG=1,", "CFBI_BIG=10,")), ("a header with two fields", lambda t: t.replace("CFBI_BIG=1,", "CFBI_BIG=1, CFBI_BIG=0,")),
+                            ("a header without the field", lambda t: t.replace("CFBI_BIG=1,", "")), ("a field that continues", lambda t: t.replace("CFBI_BIG=1,", "CFBI_BIG=1x,"))):
+            path = Path(m["suites"]["b200"]["S"][which])
+            original = path.read_text()
+            path.write_text(edit(original))
+            found = sp.exactness_problems(m, repo)
+            assert any("was not made with CFBI_BIG=1" in p and p.startswith("b200, suite S") and path.name in p for p in found), (which, label, found[:3])
+            path.write_text(original)
+    assert sp.exactness_problems(m, repo) == []
+
+
+def test_the_baseline_is_complete_against_the_collection_of_the_base_and_the_manifest_binds_that_collection(tmp_path):
+    """The baseline is held to the exact ids of the collection of the base, like the candidate to those of the commit of the suites: a record that keeps every file of the base and one test of
+    each is no baseline. The manifest names the collection, and its header names the base and the environment of the suite."""
+    m, repo, facts = exactness_world(tmp_path)
+    assert sp.exactness_problems(m, repo) == []
+    cut = tmp_path / "cut"
+    cut.mkdir()
+    mm, rr, _ = exactness_world(cut)
+    edit_record(mm, "b300", "S", "baseline", one_id_per_file)
+    found = sp.exactness_problems(mm, rr)
+    assert any(p.startswith("b300, suite S") and "the baseline record is not complete" in p and "expected test(s) are missing" in p for p in found), found[:3]
+    old = tmp_path / "old"
+    old.mkdir()
+    mm, rr, _ = exactness_world(old)                                                                # a baseline record of the older format: counts per file, no outcome per test
+    edit_record(mm, "b200", "gate", "baseline", lambda rec: rec.pop("tests"))
+    assert any(p.startswith("b200, suite gate") and "the baseline record is not complete" in p and "no per-test outcomes" in p for p in sp.exactness_problems(mm, rr))
+    more = tmp_path / "more"
+    more.mkdir()
+    mm, rr, _ = exactness_world(more)                                                               # an id that the base never had
+    edit_record(mm, "b200", "S", "baseline", lambda rec: (rec["tests"].update({"tests/cfbi/test_x.py::test_extra": "passed"}), rec["files"]["tests/cfbi/test_x.py"].update(passed=3, total=3), recount(rec)))
+    assert any("the baseline record is not complete" in p and "1 test(s) are not expected" in p for p in sp.exactness_problems(mm, rr))
+    spec = m["suites"]["b200"]["S"]
+    path = Path(facts["base_collections"]["S"])
+    original = path.read_text()
+    for label, text, needle in (("a collection of the suites' commit", original.replace(facts["base"], facts["suite"]), "does not name the base"),
+                                ("a collection made with CFBI_BIG=0", original.replace("CFBI_BIG=1,", "CFBI_BIG=0,"), "was not made with CFBI_BIG=1"),
+                                ("a file that the base does not have", original + "tests/cfbi/test_new_mechanism.py::test_pin\n", "not a test file of the commit")):
+        path.write_text(text)
+        found = sp.exactness_problems(m, repo)
+        assert any(needle in p and p.startswith("b200, suite S") and path.name in p for p in found), (label, found[:3])
+        path.write_text(original)
+    path.unlink()
+    assert any(p.startswith("b200, suite S") and "collected-base-S.txt cannot be read" in p for p in sp.exactness_problems(m, repo))
+    path.write_text(original)
+    del spec["baseline_collection"]                                                                 # a manifest that names no collection of the base: a named problem, not an exception
+    assert any(p.startswith("b200, suite S") and "baseline_collection" in p for p in sp.exactness_problems(m, repo))
 
 
 def test_the_commit_of_the_suites_stays_bound_to_the_step_by_its_kernel_sources(tmp_path):
