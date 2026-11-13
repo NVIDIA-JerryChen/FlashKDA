@@ -42,7 +42,7 @@ NOT_ROUTED_148 = [(36, 33), (71, 33), (72, 33), (99, 12), (128, 12), (197, 12), 
 
 DEFAULT_OPTIONS = dict(impl=0, shapes=None, regimes=["lockstep", "staggered", "cold", "probe"], probe_shapes=None, positions=[0, 1, 15, 16, 31, 32, 47, 48, 62, 63], trials=5, calls=1536,
                        cold_calls=256, probe_calls=256, profile_calls=64, calls_scale=1, cells=None, expect_compute=None, expect_kernels=None, json=None, label="", list_cells=False)
-NEW_OPTIONS = dict(boundary=None, single_force=False, expect_route=None, graph_nodes=False)
+NEW_OPTIONS = dict(boundary=None, single_force=False, expect_route=None, graph_nodes=False, route_order=False)
 
 
 # ---- the cells ---------------------------------------------------------------------------------------------------------------------------------------------
@@ -794,3 +794,49 @@ def test_graph_problem_accepts_the_eager_mapping_and_names_every_other():
     assert "expected" in bd.graph_problem({"plan_kernel": 1.0, "rows_kernel": 2.0}, {}, dict(eager), TWO)                               # a duplicated launch
     assert "whole number" in bd.graph_problem({"plan_kernel": 1.0, "rows_kernel": 0.984}, {}, dict(eager), None)                       # a fractional one
     assert "expected" in bd.graph_problem(dict(eager), {}, dict(eager), ONE)                                                              # not the asserted mapping
+
+
+# ---- the route order: the cells that both sides run with the same kernels first ------------------------------------------------------------------------------
+def shape_runs(specs):
+    runs = []
+    for s in specs:
+        if not runs or runs[-1] != (s["N"], s["H"]):
+            runs.append((s["N"], s["H"]))
+    return runs
+
+
+def test_the_route_order_puts_the_cells_of_the_two_launch_default_route_first_and_keeps_every_other_order():
+    specs = bd.campaign_cell_specs(8, 148)
+    plain = shape_runs(specs)
+    ordered = bd.route_ordered(specs, DEVICE_B200, 8)
+    assert sorted(s["key"] for s in ordered) == sorted(s["key"] for s in specs) and len(ordered) == 92                      # the same cells
+    spec = bd.policy_spec()
+    route = lambda s: spec.expected_route(0, s["N"], s["H"], 148, 100, 8, False)
+    classes = [route(s) == spec.SINGLE_LAUNCH for s in ordered]
+    assert classes == sorted(classes) and 0 < sum(classes) < len(classes)                                            # the two-launch cells, then the single-launch cells
+    two, single = [s for s in specs if not route(s) == spec.SINGLE_LAUNCH], [s for s in specs if route(s) == spec.SINGLE_LAUNCH]
+    assert [s["key"] for s in ordered] == [s["key"] for s in two + single]                                           # a stable sort: the order inside a class is the plain one
+    assert plain.index((35, 33)) + 1 == plain.index((36, 33)) and shape_runs(ordered).index((36, 33)) < shape_runs(ordered).index((35, 33))      # N = 36 no longer follows N = 35
+    assert [k for k in shape_runs(ordered) if k[0] * k[1] > 8 * 148] == [k for k in plain if k[0] * k[1] > 8 * 148] != []                       # the cells above the limit keep their order
+    assert [s["key"] for s in bd.route_ordered(specs, DEVICE_H100, 8)] == [s["key"] for s in specs]                      # on a device that the default rule does not route nothing moves
+
+
+def test_a_run_with_the_route_order_measures_in_that_order_and_records_it(world, tmp_path):
+    cells = ["N=35;H=33;regime=lockstep;", "N=36;H=33;regime=lockstep;", "N=1;H=12;regime=lockstep;", "N=99;H=12;regime=lockstep;"]
+    code, plain = run_main(tmp_path, "--boundary", "148", "--cells", *cells)
+    assert code == 0 and plain["meta"]["route_order"] is False
+    code, ordered = run_main(tmp_path, "--boundary", "148", "--route-order", "--cells", *cells)
+    assert code == 0 and ordered["meta"]["route_order"] is True
+    keys = [c["key"] for c in ordered["cells"]]
+    assert sorted(keys) == sorted(c["key"] for c in plain["cells"])
+    assert [k for k in keys if "N=36;" in k or "N=99;" in k] == keys[:2] and all("N=1;" in k or "N=35;" in k for k in keys[2:])      # the two-launch routes first, the single-launch ones after them
+    side_a = [c["key"] for c in run_main(tmp_path, "--boundary", "148", "--route-order", "--impl", "64", "--cells", *cells)[1]["cells"]]
+    assert side_a == keys                                                                                           # the same order on side A (bit 64) as on side B
+
+
+def test_the_route_order_needs_the_limit_of_the_tree_and_is_listed_in_the_header(world, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(bd, "ROOT", tree_with_header(tmp_path, None, "old"))
+    with pytest.raises(SystemExit) as e:
+        bd.main(["--route-order", "--boundary", "148", "--json", str(tmp_path / "x.json")] + FAST)
+    assert e.value.code == 2
+    assert "route-order" in "; ".join(bd.run_notes(parse("--boundary", "148", "--route-order"), 8, DEVICE_B200))

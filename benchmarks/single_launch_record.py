@@ -860,7 +860,7 @@ def all_records(ev):
 
 def meta_problems(rec, where, dev, arm, side):
     """What a record must say about the tree and the arm that it measured: one clean commit, side A at the explicit two-launch path (bit 64) and side B at the default path, the control off
-    except for the forced arm of side B, no environment override of the path, eager module loading on a gating device, a limit constant, the device, and that every cell is a decode cell
+    except for the forced arm of side B, no environment override of the path, eager module loading on a gating device, the route order in the default arm of a gating device, a limit constant, the device, and that every cell is a decode cell
     that carries the same path and control."""
     meta, out = rec.get("meta"), []
     if not isinstance(meta, dict):
@@ -876,6 +876,9 @@ def meta_problems(rec, where, dev, arm, side):
         out.append("%s: side %s measured impl %r, the explicit two-launch path (64) is side A and the default path (0) side B" % (where, side, meta.get("impl")))
     if meta.get("env_impl") is not None:
         out.append("%s: the environment override of the path was set (%r)" % (where, meta.get("env_impl")))
+    if dev in GATING and arm == "default" and meta.get("route_order") is not True:
+        out.append("%s: the cells were not measured in the route order (meta route_order is %r): the default arm of a gating device measures the cells whose default route is the two-launch path first, "
+                   "so that a process has no single-launch shape in its history when it measures the cells that both sides run with the same kernels" % (where, meta.get("route_order")))
     if dev in GATING and meta.get("cuda_module_loading") != "EAGER":
         out.append("%s: the process ran with CUDA_MODULE_LOADING %r, a campaign on a gating device needs EAGER (with the default lazy loading the machine code of a kernel is placed when it is first "
                    "launched, so a side that launches other kernels earlier gets another placement of the kernels that both run)" % (where, meta.get("cuda_module_loading")))
@@ -1179,6 +1182,10 @@ def _measured_lines(meta, sms, per_sm):
            "- Module loading: every process of a gating device ran with CUDA_MODULE_LOADING=EAGER, which every record states and the table tool requires. With the default lazy loading the machine "
            "code of a kernel is placed when it is first launched, and the two sides launch different kernels earlier in a long process (the default routing runs the single-launch kernel for the small "
            "grids first): a first campaign under lazy loading (records t12a) measured identical kernels apart by up to about one percent per shape, and a process that measured one shape did not.",
+           "- Route order: the cells whose default route is the two-launch path (every cell above the limit, where the default routing and the explicit two-launch path launch the same kernels) are measured "
+           "BEFORE the cells whose default route is the single launch, in the same order on both sides (the default arm of a gating device states it in every record and the table tool requires it). "
+           "Eager loading did not remove the per-shape differences of identical kernels on B300 (N = 36 with 33 heads, graph replay +1.18 % in the second campaign, t12b): they follow the earlier "
+           "single-launch shapes of the process of the default side, and a process that has run none measures the same kernels alike.",
            "- Device query: the candidate keeps the SM count and the compute capability of a device from its first query (once per process and device). The first campaign found that asking the runtime on "
            "every decode call is a cost of the call itself wherever the host work is on the critical path (a call after an idle GPU: the cold regime, about 1.5 microseconds on B200 and on B300), "
            "which the two-launch path with bit 64 does not pay because it never asks.",

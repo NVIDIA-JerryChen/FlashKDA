@@ -534,9 +534,9 @@ def test_route_problems_accept_the_specified_launches_and_reject_a_flipped_route
 # ---- the control state and the route expectation: what a side shares, what a re-run shares with its first campaign, what A and B may differ in ----
 
 def test_the_single_launch_fields_are_side_meta_a_rerun_shares_and_build_arguments_that_a_and_b_may_differ_in():
-    assert br.SIDE_META[-4:] == ("single_force", "single_per_sm", "graph_nodes", "cuda_module_loading") and set(br.SIDE_META) <= set(br.RERUN_SAME_CONFIG)
+    assert br.SIDE_META[-5:] == ("single_force", "single_per_sm", "graph_nodes", "route_order", "cuda_module_loading") and set(br.SIDE_META) <= set(br.RERUN_SAME_CONFIG)
     assert {"single_force", "single_per_sm"} <= set(br.RERUN_SAME_CONFIG) and not {"single_force", "single_per_sm"} & set(br.AB_META)
-    assert "graph_nodes" in br.RERUN_SAME_CONFIG and br.AB_FLAGS == ("graph_nodes",) and "graph_nodes" not in br.AB_META
+    assert "graph_nodes" in br.RERUN_SAME_CONFIG and br.AB_FLAGS == ("graph_nodes", "route_order") and not {"graph_nodes", "route_order"} & set(br.AB_META)
     assert {"single_force", "expect_route", "expect_compute"} <= set(br.BUILD_ARGS) and not {"single_force", "expect_route"} & set(br.SCALED_ARGS)
 
 
@@ -671,6 +671,35 @@ def test_both_builds_profile_the_graph_replay_or_neither_and_a_rerun_does_as_its
         edit_fields(side, {"graph_nodes": False})
     res = compare(*first, baseline_unstable="widen", base_rerun=rerun[0], cand_rerun=rerun[1])
     assert res["verdict"] == "INVALID" and has(res["problems"], "re-run does not come from the same snapshot / configuration as its first campaign", "meta graph_nodes")
+
+
+def test_both_builds_measure_the_cells_in_the_route_order_or_neither_and_a_rerun_as_its_first_campaign_did():
+    """The order of the cells decides which kernels a process has launched before it measures a cell (meta ``route_order``, a boolean option of the benchmark): a build that measured in the route
+    order must not be compared with one that did not, the files of a side share it, a re-run shares it with its first campaign, and a record of before the option counts as one that did not."""
+    def pair(a, b, labels="ABABAB"):
+        base, cand = ordered_sets(labels)
+        edit_fields(base, {"route_order": a})
+        edit_fields(cand, {"route_order": b})
+        return compare(base, cand)
+    for a, b in ((False, False), (True, True), (GONE, False), (False, GONE), (GONE, GONE)):
+        assert pair(a, b)["verdict"] == "PASS", (a, b)
+    for a, b in ((False, True), (True, False), (GONE, True), (True, GONE)):
+        res = pair(a, b)
+        assert res["verdict"] == "INVALID" and has(res["problems"], "differ in meta route_order"), (a, b, res["problems"])
+    base, cand = ordered_sets("ABABAB")
+    edit_fields(base, {"route_order": True})
+    edit_fields(cand, {"route_order": True})
+    cand[1]["meta"]["route_order"] = False
+    res = compare(base, cand)
+    assert res["verdict"] == "INVALID" and has(res["problems"], "candidate records disagree on meta route_order")
+    first = ordered_sets("ABABAB", meds_a=UNSTABLE_A, meds_b=UNSTABLE_B)
+    rerun = ordered_sets("ABABAB", hour="11", scale=3, meds_a=RERUN_A, meds_b=RERUN_B)
+    for side in first:
+        edit_fields(side, {"route_order": True})
+    for side in rerun:
+        edit_fields(side, {"route_order": False})
+    res = compare(*first, baseline_unstable="widen", base_rerun=rerun[0], cand_rerun=rerun[1])
+    assert res["verdict"] == "INVALID" and has(res["problems"], "re-run does not come from the same snapshot / configuration as its first campaign", "meta route_order")
 
 
 def test_both_builds_share_the_module_loading_mode_the_files_of_a_side_too_and_a_rerun_as_its_first_campaign_did():

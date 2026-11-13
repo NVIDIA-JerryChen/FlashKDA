@@ -59,10 +59,10 @@ UNSTABLE_POLICIES = ("invalid", "worst", "widen")
 RERUN_SCALE = 3  # calls per trial (and profiled calls) of a re-run relative to the first campaign
 # meta fields that are one value for all record files of a side (the last three: whether the single-launch control was on, the limit constant of the measured tree, and whether one graph
 # replay per trial was profiled)
-SIDE_META = ("commit", "tree", "src", "impl", "env_impl", "torch", "cuda", "cc", "trials", "sample_stat", "kind", "single_force", "single_per_sm", "graph_nodes", "cuda_module_loading")
+SIDE_META = ("commit", "tree", "src", "impl", "env_impl", "torch", "cuda", "cc", "trials", "sample_stat", "kind", "single_force", "single_per_sm", "graph_nodes", "route_order", "cuda_module_loading")
 RERUN_SAME_CONFIG = SIDE_META + ("gpu", "sm_count", "host")  # meta fields a re-run shares with its first campaign
 AB_META = ("trials", "torch", "cuda", "cc", "kind", "dm", "heads", "l2_cache_bytes", "eviction_bytes", "cuda_module_loading")  # the baseline and the candidate are measured under one contract and one toolchain; the last: the module loading mode of the process (CUDA_MODULE_LOADING; a record of before the field says null)
-AB_FLAGS = ("graph_nodes",)  # boolean options of the benchmark that both builds must share (a record of before the option counts as False): profiling a replay is no neutral act for the next trial
+AB_FLAGS = ("graph_nodes", "route_order")  # boolean options of the benchmark that both builds must share (a record of before the option counts as False): profiling a replay is no neutral act for the next trial, and the order of the cells decides which kernels a process has launched before it measures a cell
 # cell arguments that describe a build, which A and B may differ in (the last two: the single-launch control, and whether the expected launches came from a per-cell specification)
 BUILD_ARGS = ("impl", "kernels", "compute_nodes", "aux_nodes", "compute_kernels", "expect_compute", "expect_aux", "single_force", "expect_route")
 SCALED_ARGS = ("calls_per_trial", "profile_calls", "profile_cycles", "calls_scale")  # cell arguments that a re-run multiplies

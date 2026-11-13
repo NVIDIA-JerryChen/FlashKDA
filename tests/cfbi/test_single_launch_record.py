@@ -48,7 +48,7 @@ def raw_meta(dev, arm, side, phase, slot, scale, per_sm, commit):
             "timestamp": stamp(dev, arm, phase, slot), "kind": "decode-wall", "sample_stat": br.PROCESS_MEDIAN, "impl": 64 if side == "A" else 0, "env_impl": None, "regimes": list(bd.REGIMES),
             "trials": 5, "calls_per_trial": {r: 1536 * scale for r in bd.REGIMES}, "profile_calls": {r: 64 * scale for r in bd.REGIMES}, "profile_calls_option": 64, "calls_scale": scale,
             "l2_cache_bytes": 1 << 26, "eviction_bytes": (1 << 27) + (1 << 20), "single_force": side == "B" and arm == "forced", "single_per_sm": per_sm, "boundary_sms": SMS,
-            "graph_nodes": False, "cuda_module_loading": "EAGER", "cells_filter": None, "label": "%s-%s-%s" % (side, arm, phase), "tag": None, "build_dir": None, "src": "tree", "argv": []}
+            "graph_nodes": False, "route_order": arm == "default", "cuda_module_loading": "EAGER", "cells_filter": None, "label": "%s-%s-%s" % (side, arm, phase), "tag": None, "build_dir": None, "src": "tree", "argv": []}
 
 
 def metrics_of(f):
@@ -655,6 +655,8 @@ def test_a_trial_on_the_other_route_and_a_record_without_launch_mappings_are_rej
     ("side A measured with the default path", lambda ev: ev["devices"]["b200"]["default"]["first"]["A"][0]["meta"].update(impl=0), "side A measured impl 0"),
     ("side B measured with the explicit two-launch path", lambda ev: ev["devices"]["b300"]["default"]["first"]["B"][1]["meta"].update(impl=64), "side B measured impl 64"),
     ("an environment override of the path", lambda ev: ev["devices"]["b200"]["default"]["first"]["B"][0]["meta"].update(env_impl="64"), "the environment override of the path was set"),
+    ("the default arm not in the route order", lambda ev: ev["devices"]["b200"]["default"]["first"]["B"][0]["meta"].update(route_order=False), "the cells were not measured in the route order (meta route_order is False)"),
+    ("a default-arm record of before the option", lambda ev: ev["devices"]["b300"]["default"]["first"]["A"][0]["meta"].pop("route_order"), "the cells were not measured in the route order (meta route_order is None)"),
     ("lazy module loading on a gating device", lambda ev: ev["devices"]["b200"]["default"]["first"]["B"][0]["meta"].update(cuda_module_loading=None), "the process ran with CUDA_MODULE_LOADING None, a campaign on a gating device needs EAGER"),
     ("another module loading mode", lambda ev: ev["devices"]["b300"]["forced"]["first"]["A"][0]["meta"].update(cuda_module_loading="LAZY"), "the process ran with CUDA_MODULE_LOADING 'LAZY'"),
     ("a record without the field", lambda ev: ev["devices"]["b300"]["default"]["first"]["A"][0]["meta"].pop("cuda_module_loading"), "the process ran with CUDA_MODULE_LOADING None"),

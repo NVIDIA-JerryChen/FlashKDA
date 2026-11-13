@@ -50,7 +50,12 @@ as ``expect_compute``, the mapping that each of them was asserted against.
 
 Graph replay: the profiled pass of a trial is an eager one, and the wall metric that gates most comparisons is the graph replay. ``--graph-nodes`` profiles ONE replay of the cell's graph in every trial, after
 the eager pass (nothing of it enters a metric, and the default run does not take it), and requires its compute kernels to equal the eager pass's of the same trial and ``--expect-compute`` / the specification
-of the cell when there is one; the replay's mapping is recorded in the sample as ``graph_nodes`` (``compute`` and ``aux`` as in ``nodes``, which stays the eager pass's) and the meta as ``graph_nodes``.
+of the cell when there is one; the replay's mapping is recorded in the sample as ``graph_nodes`` (``compute`` and ``aux`` as in ``nodes``, which stays the eager pass's) and the meta as ``graph_nodes``
+
+Order of the cells: ``--route-order`` measures the cells whose default route is the two-launch path first and those whose default route is the single launch after them (``route_ordered``), the same
+order on both sides of an A/B. The cells that both sides run with the same kernels (the default routing above the limit and the explicit two-launch path) are then measured in a process that has no
+single-launch shape in its history: a process in which the default side had run the single launch for the small grids first measured the same two kernels differently from the side that had not, and
+identical kernels differed per shape by up to 1.3 % (a process that measured one shape, or only the cells above the limit, did not show it). Recorded as the meta ``route_order``..
 """
 import argparse
 import contextlib
@@ -202,6 +207,15 @@ def route_expectations(specs, impl, device, per_sm, force):
     return {s["key"]: expected_route(impl, s["N"], s["H"], sms, cc, per_sm, force) for s in specs}
 
 
+def route_ordered(specs, device, per_sm):
+    """``specs`` in the order of ``--route-order``: the cells whose default route (``expected_route`` for impl 0 with the control off, on ``device`` and the limit ``per_sm`` of the measured
+    tree) is the two-launch path first, then those whose default route is the single launch; a stable sort, so that the order of the cells within a class and of the regimes within a shape stays.
+    The route is the one of the DEFAULT path on both sides of an A/B (side A pins bit 64 and launches two kernels everywhere): one order for both."""
+    spec = policy_spec()
+    sms, cc = device["sm_count"], device_cc(device)
+    return sorted(specs, key=lambda s: spec.expected_route(0, s["N"], s["H"], sms, cc, per_sm, False) == spec.SINGLE_LAUNCH)
+
+
 def route_binding_problems(ext, specs, impl, routes):
     """Why the extension of the measured tree does not agree with the route specification (an empty list: it does, for every shape of ``specs``). The extension is asked what the benchmark's
     decode call asks it (``decode_single_launch`` with the resolved bits of ``impl``, on the current device, under the current state of the control) and ``routes`` is ``route_expectations``."""
@@ -250,7 +264,7 @@ def cell_line(spec, cell):
 def run_meta(a, started, opts, device, torch_mod):
     """The metadata of a record. ``single_force`` (the calibration control was on for the whole process) and ``single_per_sm`` (the limit constant of the measured tree: None for a tree that has
     none) are what the comparison of two sides binds; ``boundary_sms`` is the SM count that the cells of ``--boundary`` were made for (None without it), ``graph_nodes`` whether one graph replay
-    per trial was profiled, ``cuda_module_loading`` the module loading mode of the process (the environment variable CUDA_MODULE_LOADING, None when unset): with the default lazy loading the
+    per trial was profiled, ``route_order`` whether the cells were measured in the order of ``--route-order``, ``cuda_module_loading`` the module loading mode of the process (the environment variable CUDA_MODULE_LOADING, None when unset): with the default lazy loading the
     machine code of a kernel is placed when it is first launched, so two builds that launch different kernels earlier in a long process get another placement of the kernels that both run
     (graph replays of identical kernels differed by 1 % per shape); two sides of an A/B must share the mode."""
     commit, dirty, tree = records.tree_identity(ROOT)
@@ -261,7 +275,8 @@ def run_meta(a, started, opts, device, torch_mod):
             "calls_per_trial": {r: calls_per_trial(r, opts) for r in REGIMES}, "profile_calls": {r: profile_calls_of(r, opts) for r in REGIMES},
             "profile_calls_option": opts["profile_calls"], "calls_scale": opts["calls_scale"], "l2_cache_bytes": device["l2_bytes"], "eviction_bytes": device["eviction_bytes"],
             "single_force": bool(getattr(a, "single_force", False)), "single_per_sm": tree_per_sm(ROOT), "boundary_sms": None if boundary is None else (boundary or device["sm_count"]),
-            "graph_nodes": bool(getattr(a, "graph_nodes", False)), "cuda_module_loading": os.environ.get("CUDA_MODULE_LOADING"),
+            "graph_nodes": bool(getattr(a, "graph_nodes", False)), "route_order": bool(getattr(a, "route_order", False)),
+            "cuda_module_loading": os.environ.get("CUDA_MODULE_LOADING"),
             "cells_filter": a.cells, "label": a.label, "tag": os.environ.get("CFBI_BENCH_TAG"), "build_dir": os.environ.get("FLASH_KDA_CFBI_BUILD_DIR"),
             "src": str(ROOT), "argv": sys.argv[1:]}
 
@@ -545,6 +560,10 @@ def build_parser():
                          "tree and the state of the control; the extension's own answer is checked against it first. Not combined with --expect-compute or --expect-kernels")
     ap.add_argument("--graph-nodes", action="store_true",
                     help="profile one replay of the graph in every trial (after the eager pass, not timed) and assert its compute kernels like the eager pass's; recorded as graph_nodes in the samples")
+    ap.add_argument("--route-order", action="store_true",
+                    help="measure the cells whose DEFAULT route (impl 0, control off) is the two-launch path before those whose default route is the single launch, keeping the order of the cells "
+                         "within each class: the same order on both sides of an A/B, so that a process has no single-launch shape in its history when it measures the cells that both sides run "
+                         "with the same kernels; recorded as route_order")
     ap.add_argument("--json", default=None)
     ap.add_argument("--label", default="")
     ap.add_argument("--list-cells", action="store_true")
@@ -595,6 +614,8 @@ def run_notes(a, per_sm, device):
         notes.append("expect-route spec, %d CTAs per SM" % per_sm)
     if a.graph_nodes:
         notes.append("graph-nodes")
+    if a.route_order:
+        notes.append("route-order")
     return notes
 
 
@@ -607,8 +628,8 @@ def main(argv=None):
     except ValueError as e:
         ap.error(str(e))
     per_sm = tree_per_sm(ROOT)
-    if per_sm is None and (a.boundary is not None or a.expect_route):
-        ap.error("--boundary and --expect-route need the single-launch limit of the measured tree, which cannot be read: %s must define DECODE_SINGLE_MAX_CTAS_PER_SM as an integer literal "
+    if per_sm is None and (a.boundary is not None or a.expect_route or a.route_order):
+        ap.error("--boundary, --expect-route and --route-order need the single-launch limit of the measured tree, which cannot be read: %s must define DECODE_SINGLE_MAX_CTAS_PER_SM as an integer literal "
                  "(and the tests/cfbi/decode_policy.py of this tool must exist)" % (ROOT / "csrc" / "cfbi" / "cfbi_policy.h"))
     torch = device = None
     if a.boundary == FROM_DEVICE:                                   # the cells depend on the device: its SM count is read before they are chosen
@@ -625,6 +646,8 @@ def main(argv=None):
 
     if device is None:
         torch, device = start_cuda()
+    if a.route_order:
+        specs = route_ordered(specs, device, per_sm)
     started = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     notes = run_notes(a, per_sm, device)
     print("device %s  impl=%s  %d cell(s)  trials=%d  calls/trial: lockstep %d, cold %d, probe %d%s" % (
