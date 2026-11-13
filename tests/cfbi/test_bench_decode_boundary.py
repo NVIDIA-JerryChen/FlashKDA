@@ -642,6 +642,8 @@ def test_a_bare_boundary_takes_the_sm_count_of_the_device_and_an_explicit_one_fi
 
 
 def test_the_meta_carries_the_control_and_the_limit_of_the_measured_tree(tmp_path, monkeypatch):
+    monkeypatch.delenv("CUDA_MODULE_LOADING", raising=False)                                                    # the environment of the test, not that of the machine that runs it (a GPU node sets it)
+
     class FakeTorchVersion:
         __version__ = "2.14.0"
         version = types.SimpleNamespace(cuda="13.4")
@@ -654,7 +656,6 @@ def test_the_meta_carries_the_control_and_the_limit_of_the_measured_tree(tmp_pat
     meta = bd.run_meta(a, started, opts, DEVICE_B200, FakeTorchVersion)
     assert (meta["single_force"], meta["single_per_sm"], meta["boundary_sms"], meta["graph_nodes"]) == (True, 8, 148, True)
     assert bd.run_meta(parse("--boundary"), started, opts, DEVICE_H100, FakeTorchVersion)["boundary_sms"] == 132
-    monkeypatch.delenv("CUDA_MODULE_LOADING", raising=False)
     assert meta["cuda_module_loading"] is None                                                                  # the module loading mode of the process, as the environment says it
     monkeypatch.setenv("CUDA_MODULE_LOADING", "EAGER")
     assert bd.run_meta(a, started, opts, DEVICE_B200, FakeTorchVersion)["cuda_module_loading"] == "EAGER"
