@@ -2223,6 +2223,65 @@ def test_the_occupancy_validation_separates_the_admission_of_the_record_from_its
     assert dr.occupancy_gate_failures(good, "b200") == []
 
 
+# ---- a row that failed the code generation may supply the comparisons of several toolchains: every comparison that it supplies is evidence and is admitted, none is skipped ---------------
+def mixed_failure_row(verdicts, sid="trims", commit=C2, edits=None):
+    """A step that failed the code-generation gate with one comparison per toolchain in ``verdicts`` (``{key: "PASS" | "FAIL"}``): a PASS has the honest dump, a FAIL a candidate of 129 registers (the
+    occupancy of a production comparison follows the dump); ``edits`` maps a key to a function that damages that entry or its figures after it was made."""
+    codegen, resources = {}, {}
+    for key, verdict in verdicts.items():
+        entry, figures = comparison(key, commit, sid=sid, rows={"reg": 129} if verdict == "FAIL" else {})
+        assert entry["verdict"] == verdict, (key, entry["verdict"])
+        codegen[key], resources[key] = entry, figures
+    for key, edit in (edits or {}).items():
+        edit(codegen[key], resources[key])
+    step = not_adopted(sid, "codegen")
+    step["codegen_gate"], step["resource_gate"] = codegen, resources
+    return step
+
+
+def test_a_failure_on_the_production_toolchain_after_a_pass_on_the_conda_toolchain_is_a_valid_row_whatever_the_toolchain_order():
+    for verdicts in ({"conda": "PASS", "container_b200": "FAIL"}, {"conda": "PASS", "container_b300": "FAIL"}, {"conda": "FAIL", "container_b200": "PASS"},
+                     {"conda": "PASS", "container_b200": "PASS", "container_b300": "FAIL"}, {"conda": "FAIL", "container_b200": "FAIL", "container_b300": "FAIL"},
+                     {"container_b300": "PASS", "container_b200": "FAIL"}):                       # the toolchains in any order of the dictionary, in the order of the gate for the check
+        row = mixed_failure_row(verdicts)
+        assert step_check(row) == [], (verdicts, step_check(row))
+    reverse = mixed_failure_row({"container_b200": "FAIL", "conda": "PASS"})                      # the failing comparison supplied first
+    assert list(reverse["codegen_gate"]) == ["container_b200", "conda"] and step_check(reverse) == []
+
+
+def test_every_comparison_that_a_failed_gate_row_supplies_is_admitted():
+    damaged = {
+        "a verdict that the dump does not give (the conda comparison, behind a failure)": ({"container_b200": "FAIL", "conda": "PASS"}, {"conda": lambda e, f: e.update(verdict="FAIL")}, "the ledger says"),
+        "figures that are not the dump's (the container comparison, behind a pass)": ({"conda": "PASS", "container_b200": "FAIL"}, {"container_b200": lambda e, f: f["sm_100a"].popitem()}, "resource_gate (container_b200"),
+        "an occupancy record of another GPU (the later of two failures)": ({"container_b200": "FAIL", "container_b300": "FAIL"},
+                                                                         {"container_b300": lambda e, f: e.update(occupancy=occupancy_file("b300", C2, e["cand_dump"], OTHER_GPU))}, "is not b300"),
+        "a missing dump (the second comparison)": ({"conda": "FAIL", "container_b200": "PASS"}, {"container_b200": lambda e, f: e.update(cand_dump="/nonexistent/dump.json")}, "container_b200"),
+    }
+    for name, (verdicts, edits, expected) in damaged.items():
+        row = mixed_failure_row(verdicts, edits=edits)
+        assert has(step_check(row), expected), (name, step_check(row)[:4])
+    unbound = mixed_failure_row({"conda": "FAIL"})                                                # figures for a toolchain that has no comparison are not evidence
+    unbound["resource_gate"]["container_b300"] = comparison("container_b300", C2)[1]
+    assert has(step_check(unbound), "has no comparison"), step_check(unbound)[:3]
+
+
+def test_a_failed_gate_row_whose_supplied_comparisons_all_pass_is_refused_and_one_comparison_at_least_is_required():
+    assert has(step_check(mixed_failure_row({"conda": "PASS", "container_b200": "PASS"})), "failed at the code generation, but every comparison of the dumps passes")
+    row = mixed_failure_row({"conda": "FAIL"})
+    row["codegen_gate"], row["resource_gate"] = {}, {}
+    assert has(step_check(row), "no comparison for any toolchain"), step_check(row)[:3]
+
+
+def test_the_hard_gates_of_a_multi_toolchain_failed_row_are_the_same_as_for_a_single_one():
+    row = mixed_failure_row({"conda": "PASS", "container_b200": "FAIL"})
+    assert has(step_check(mutated(row, lambda r: r["codegen_gate"]["container_b200"].update(verdict="PASS"))), "the ledger says 'PASS'")          # the production verdict follows the dump and the occupancy
+    heavy = mixed_failure_row({"conda": "PASS", "container_b300": "PASS"}, edits={"container_b300": lambda e, f: e.update(occupancy=occupancy_file("b300", C2, e["cand_dump"], HEAVY), verdict="FAIL")})
+    assert step_check(heavy) == [], step_check(heavy)                                              # one CTA per SM by the arithmetic: the occupancy verdict fails the comparison
+    adopted_row = mutated(adopted("trims"), lambda s: (s["codegen_gate"].update(container_b200=mixed_failure_row({"container_b200": "FAIL"}, commit=C1)["codegen_gate"]["container_b200"]),
+                                                      s["resource_gate"].update(container_b200=mixed_failure_row({"container_b200": "FAIL"}, commit=C1)["resource_gate"]["container_b200"])))
+    assert has(step_check(adopted_row), "the comparison of the dumps fails")                       # an adopted step still passes every toolchain
+
+
 # ---- the order of the steps is proved by the committed version of the decision record, never by a date that the record says about itself ----------------------------------------
 DECISION_PATH = "docs/cfbi-decode-decision-record.json"
 

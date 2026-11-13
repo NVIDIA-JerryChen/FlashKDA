@@ -998,7 +998,9 @@ def comparison_problems(row, key, entry, resources, meta, where, repo=None):
 
 def _codegen_problems(step, where, reached_codegen, both_required, meta, repo=None):
     """The code-generation and resource evidence of a row: none before the phase was reached, a bound comparison for every toolchain of the gate when the step passed it (or went on to
-    the timing), at least one when it failed there; and the recomputed result decides: an adopted row passes every comparison, a row that failed at the code generation fails at least one.
+    the timing), at least one when it failed there, and EVERY comparison that the row supplies is admitted and recomputed (a failure of the production toolchain after a pass of the conda
+    toolchain is the normal course of a failed gate, and a defect behind the first comparison is a defect); the figures of the resource gate belong to the comparisons that are supplied; and
+    the recomputed result decides: an adopted row passes every comparison, a row that failed at the code generation fails at least one.
     Returns ``(problems, results)`` with the recomputed pass / fail of the comparisons that could be made."""
     entries, resources = step.get("codegen_gate"), step.get("resource_gate")
     if not reached_codegen:
@@ -1007,10 +1009,10 @@ def _codegen_problems(step, where, reached_codegen, both_required, meta, repo=No
         return ["%s: codegen_gate must give one comparison of dumps per toolchain (%s)" % (where, ", ".join(COMPARISONS))], []
     if not isinstance(resources, dict) or any(k not in COMPARISONS for k in resources):
         return ["%s: resource_gate must give the resource figures per toolchain (%s)" % (where, ", ".join(COMPARISONS))], []
-    needed = list(COMPARISONS) if both_required else [k for k in COMPARISONS if k in entries][:1]
+    needed = list(COMPARISONS) if both_required else [k for k in COMPARISONS if k in entries]
     if not needed:
         return ["%s: codegen_gate has no comparison for any toolchain" % where], []
-    problems, results, occupancy = [], [], []
+    problems, results, occupancy = ["%s: resource_gate gives figures for %s, which has no comparison in codegen_gate" % (where, key) for key in COMPARISONS if key in resources and key not in entries], [], []
     for key in needed:
         if key not in entries:
             problems.append("%s: codegen_gate has no comparison for %s" % (where, key))
