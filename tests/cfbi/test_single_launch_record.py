@@ -37,6 +37,14 @@ OFFSETS = (-1.0, 0.0, 0.0, 1.0)                            # the process medians
 TWO, SINGLE = dp.TWO_LAUNCH, dp.SINGLE_LAUNCH
 
 
+@pytest.fixture(autouse=True)
+def the_tree_of_the_synthetic_campaigns(monkeypatch):
+    """The synthetic campaigns of this module are measured at PER_SM CTAs per SM, so the tree that they were measured at says that (the limit of the real tree is another number, and
+    test_decode_boundary_table.py checks it against the header and the survey)."""
+    monkeypatch.setattr(slr.dp, "header_per_sm", lambda root: PER_SM)
+    monkeypatch.setattr(slr.dp, "MAX_CTAS_PER_SM", PER_SM)
+
+
 # ---- synthetic raw records, the way the benchmark writes them --------------------------------------------------------------------------------------------
 def stamp(dev, arm, phase, slot):
     hour = 6 + 4 * list(tdb.DEVICES).index(dev) + 2 * list(slr.ARMS).index(arm) + list(slr.PHASES).index(phase)
@@ -815,9 +823,7 @@ def files(full, tmp_path_factory):
     return {"dir": directory, "manifest": write_ev(full["ev"], directory)}
 
 
-def test_the_command_lines_build_render_check_and_write_the_row(files, tmp_path, capsys, monkeypatch):
-    monkeypatch.setattr(slr.dp, "header_per_sm", lambda root: PER_SM)                                           # the table is of the limit 8, whatever the tree says
-    monkeypatch.setattr(slr.dp, "MAX_CTAS_PER_SM", PER_SM)
+def test_the_command_lines_build_render_check_and_write_the_row(files, tmp_path, capsys):
     manifest, out, doc = str(files["manifest"]), tmp_path / "table.json", tmp_path / "perf.md"
     doc.write_text("# Performance\n\n## 7. Something\ntext\n")
     assert slr.main(["build", "--evidence", manifest, "--out", str(out)]) == 0

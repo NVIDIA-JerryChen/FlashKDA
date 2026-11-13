@@ -11,6 +11,7 @@ sets, the option rules, the records that the options write and the order in whic
 * the order of a run: the control is on before the first graph is captured and restored when the run ends, by a failing trial too; the extension is asked the specification's question
   before anything is measured; a cell on the other route fails its own assertion; one graph replay per trial is profiled and asserted when that is asked for, and the default run does not.
 """
+import functools
 import itertools
 import json
 import os
@@ -29,6 +30,17 @@ for _p in (ROOT / "benchmarks", ROOT / "tests" / "cfbi"):                      #
 import bench_decode as bd  # noqa: E402
 import bench_records as br  # noqa: E402
 import decode_policy as dp  # noqa: E402
+
+START = 8                                                            # the limit (CTAs per SM) that the worked-out cells, routes and counts of this module are for
+REAL_TREE_PER_SM, REAL_ROOT = bd.tree_per_sm, bd.ROOT               # the reader of a tree's limit and the measured tree, before the fixture below stands in for the header of the real tree
+
+
+@pytest.fixture(autouse=True)
+def the_tree_of_the_starting_limit(monkeypatch):
+    """The driver reads the limit of the tree that it measures. The figures below are worked out for a tree whose header says START CTAs per SM, so the real tree stands in as that tree (a
+    fake tree with another header is read as it is); the limit of the real tree is another number, and one test reads it from the header."""
+    monkeypatch.setattr(bd, "tree_per_sm", lambda root: START if Path(root) == REAL_ROOT else REAL_TREE_PER_SM(root))
+
 
 B200, B300, H100, SM120 = 100, 103, 90, 120                          # compute capabilities as the policy takes them (major * 10 + minor)
 DEVICE_B200 = {"name": "NVIDIA B200", "sm_count": 148, "cc": "10.0", "l2_bytes": 126 * 2 ** 20, "eviction_bytes": 2 * 126 * 2 ** 20 + 2 ** 20}
@@ -134,7 +146,7 @@ def test_another_sm_count_or_limit_gives_other_cells():
 
 # ---- the route specification -------------------------------------------------------------------------------------------------------------------------------
 def test_expected_route_on_literal_cases():
-    route, one, two = dp.expected_route, "single-launch", "two-launch"
+    route, one, two = functools.partial(dp.expected_route, per_sm=START), "single-launch", "two-launch"
     assert (dp.SINGLE_LAUNCH, dp.TWO_LAUNCH) == (one, two) and {one, two} < set(bd.CANONICAL_COMPUTE)
     assert bd.CANONICAL_COMPUTE[one] == {"rows_kernel": 1} and bd.CANONICAL_COMPUTE[two] == {"plan_kernel": 1, "rows_kernel": 1}
     # the limit boundary at 12 heads on 148 SMs (1184 CTAs): 98 sequences are 1176 CTAs, 99 are 1188
@@ -199,7 +211,7 @@ def fresh_spec():
 
 
 def test_the_limit_of_the_measured_tree_comes_from_its_own_header(tmp_path):
-    assert bd.tree_per_sm(ROOT) == dp.MAX_CTAS_PER_SM == 8
+    assert REAL_TREE_PER_SM(ROOT) == dp.MAX_CTAS_PER_SM
     assert bd.tree_per_sm(tree_with_header(tmp_path, "constexpr int64_t DECODE_SINGLE_MAX_CTAS_PER_SM = 12;\n", "a")) == 12
     assert bd.tree_per_sm(tree_with_header(tmp_path, None, "b")) is None                          # a tree from before the single launch: no such header
     assert bd.tree_per_sm(tree_with_header(tmp_path, "constexpr int64_t OTHER = 4;\n", "c")) is None

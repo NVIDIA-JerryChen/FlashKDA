@@ -78,9 +78,11 @@ def test_a_cuda_construct_in_the_header_is_caught(planted):
 def test_the_specification_on_hand_checked_points():
     b200 = dp.cc_number((10, 0))
     assert dp.policy(1, 0, 1, 12, 148, b200)
-    assert dp.policy(1, 0, 98, 12, 148, b200) and not dp.policy(1, 0, 99, 12, 148, b200)          # 1176 CTAs fit the limit of 1184, 1188 do not
-    assert dp.policy(1, 0, 148, 8, 148, b200) and not dp.policy(1, 0, 149, 8, 148, b200)           # the grid reaches the limit exactly
-    assert dp.policy(1, 0, 1184, 1, 148, b200) and not dp.policy(1, 0, 1185, 1, 148, b200)
+    assert dp.policy(1, 0, 246, 12, 148, b200) and not dp.policy(1, 0, 247, 12, 148, b200)        # 2952 CTAs fit the limit of 2960 (20 CTAs per SM), 2964 do not
+    assert dp.policy(1, 0, 370, 8, 148, b200) and not dp.policy(1, 0, 371, 8, 148, b200)           # the grid reaches the limit exactly
+    assert dp.policy(1, 0, 2960, 1, 148, b200) and not dp.policy(1, 0, 2961, 1, 148, b200)
+    assert dp.policy(1, 0, 98, 12, 148, b200, per_sm=8) and not dp.policy(1, 0, 99, 12, 148, b200, per_sm=8)      # the same rule for another limit: 1176 CTAs fit 1184, 1188 do not
+    assert dp.policy(1, 0, 148, 8, 148, b200, per_sm=8) and not dp.policy(1, 0, 149, 8, 148, b200, per_sm=8)
     assert dp.policy(1, 0, 4, 12, 148, dp.cc_number((10, 3))) and not dp.policy(1, 0, 4, 12, 132, dp.cc_number((9, 0))) and not dp.policy(1, 0, 4, 12, 148, dp.cc_number((12, 0)))
     assert not dp.policy(0, 0, 4, 12, 148, b200) and not dp.policy(1, 1, 4, 12, 148, b200) and not dp.policy(1, 64, 4, 12, 148, b200)
     assert dp.policy(1, 4, 4, 12, 148, b200) and dp.policy(1, 2 | 8, 4, 12, 148, b200) and dp.policy(1, 32, 4, 12, 148, b200)      # the other bits do not matter
@@ -168,13 +170,14 @@ def test_a_specification_with_another_rule_differs_from_the_cpp_function_on_the_
 
 
 def test_the_probe_judges_the_header_it_is_given(tmp_path):
-    """The probe is not a fixed answer: a header whose limit is 9 CTAs per SM gives other results than the real one."""
+    """The probe is not a fixed answer: a header whose limit is one CTA per SM higher gives other results than the real one."""
     csrc = tmp_path / "csrc"
     shutil.copytree(CSRC, csrc / "cfbi")
     target = csrc / "cfbi" / "cfbi_policy.h"
     text = target.read_text()
-    assert text.count("DECODE_SINGLE_MAX_CTAS_PER_SM = 8;") == 1
-    target.write_text(text.replace("DECODE_SINGLE_MAX_CTAS_PER_SM = 8;", "DECODE_SINGLE_MAX_CTAS_PER_SM = 9;"))
+    real, other = "DECODE_SINGLE_MAX_CTAS_PER_SM = %d;" % dp.MAX_CTAS_PER_SM, "DECODE_SINGLE_MAX_CTAS_PER_SM = %d;" % (dp.MAX_CTAS_PER_SM + 1)
+    assert text.count(real) == 1
+    target.write_text(text.replace(real, other))
     rows = dp.shape_matrix()
     assert run_probe(csrc, rows, tmp_path) != [int(dp.policy(*r)) for r in rows]
 
@@ -249,7 +252,7 @@ def policy_tree(tmp_path, replace=None, name="tree"):
     return root
 
 
-LIMIT_LINE = "constexpr int64_t DECODE_SINGLE_MAX_CTAS_PER_SM = 8;"
+LIMIT_LINE = "constexpr int64_t DECODE_SINGLE_MAX_CTAS_PER_SM = %d;" % dp.MAX_CTAS_PER_SM
 
 
 def test_the_limit_of_a_tree_is_what_its_header_defines():
@@ -257,15 +260,16 @@ def test_the_limit_of_a_tree_is_what_its_header_defines():
 
 
 def test_the_limit_of_another_tree_is_its_own_and_so_is_its_route(tmp_path):
-    """A tree with 9 CTAs per SM: the reader gives 9, the specification that takes it agrees with the C++ function of that tree on the decode rows, and the limit of this tree does not."""
-    root = policy_tree(tmp_path, (LIMIT_LINE, LIMIT_LINE.replace("= 8;", "= 9;")))
+    """A tree with one CTA per SM more than this one: the reader gives that limit, the specification that takes it agrees with the C++ function of that tree on the decode rows, and the limit
+    of this tree does not."""
+    root = policy_tree(tmp_path, (LIMIT_LINE, LIMIT_LINE.replace("= %d;" % dp.MAX_CTAS_PER_SM, "= %d;" % (dp.MAX_CTAS_PER_SM + 1))))
     per_sm = dp.header_per_sm(root)
-    assert per_sm == 9
+    assert per_sm == dp.MAX_CTAS_PER_SM + 1
     rows = dp.shape_matrix()
     got = run_probe(root / "csrc", rows, tmp_path)
     decode = decode_rows(rows, got)
     assert [(r, g) for r, g in decode if route_of(r, per_sm=per_sm) != route_name(g)] == []
-    assert [r for r, g in decode if route_of(r) != route_name(g)]                                    # the limit of 8 is another route, on some row
+    assert [r for r, g in decode if route_of(r) != route_name(g)]                                    # the limit of this tree is another route, on some row
 
 
 UNREADABLE_LIMITS = [
@@ -286,7 +290,7 @@ def test_a_tree_without_a_readable_limit_is_an_error_not_a_default(tmp_path, wha
 
 def test_a_commented_out_definition_does_not_change_the_limit(tmp_path):
     root = policy_tree(tmp_path, (LIMIT_LINE, "/* constexpr int64_t DECODE_SINGLE_MAX_CTAS_PER_SM = 5; */\n// constexpr int64_t DECODE_SINGLE_MAX_CTAS_PER_SM = 6;\n" + LIMIT_LINE))
-    assert dp.header_per_sm(root) == 8
+    assert dp.header_per_sm(root) == dp.MAX_CTAS_PER_SM
 
 
 # ---- the shared-memory need of the header ----------------------------------------------------------------------------------------------------------------------

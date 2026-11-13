@@ -21,7 +21,7 @@ from pathlib import Path
 IMPL_REF_ROWS = 1
 IMPL_DECODE_PLAN = 64
 IMPL_MAX = 127                                                # the largest accepted impl value: every bit up to IMPL_DECODE_PLAN
-MAX_CTAS_PER_SM = 8
+MAX_CTAS_PER_SM = 20
 ROUTING_CC_MAJOR = 10
 
 SM_COUNTS = (114, 132, 148)                                   # H100 PCIe, H100 SXM, B200 / B300

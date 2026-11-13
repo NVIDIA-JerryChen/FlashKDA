@@ -51,7 +51,7 @@ def _impl_arg(_impl: Optional[int]) -> int:
     device-scheduled one (it excludes bit 4). Bit 6 (value 64) keeps the plan kernel in front of the row engine for decode:
     decode (mode 1) on the optimised row engine is ONE kernel launch (the row engine derives its sequence entry itself and
     advances ``pos`` by an arrival count) where ``decode_single_launch_policy`` of csrc/cfbi/cfbi_policy.h says so (by default
-    on devices of compute capability 10 and for grids of at most 8 CTAs per SM; every other decode call keeps the plan
+    on devices of compute capability 10 and for grids of at most 20 CTAs per SM; every other decode call keeps the plan
     kernel), bit 6 asks for the two launches (A/B, differential tests) and changes nothing for any other call; same bits either
     way. The accepted values are 0 .. 127 (bit 7, value 128, is reserved and rejected). 0 = the optimised kernels where the device can run them (the launcher falls
     back to the reference kernels below sm_90 and to the row engine where K1 does not fit in shared memory, see

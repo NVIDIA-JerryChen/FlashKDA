@@ -510,6 +510,20 @@ def test_the_tracked_table_satisfies_every_rule_for_the_limit_of_the_tree():
         assert slr.table_problems(table, doubled, constants={"header": doubled, "specification": doubled}) != []
 
 
+SURVEY_TABLE = _ROOT / "docs" / "cfbi-single-launch-survey-table.json"
+
+
+@pytest.mark.skipif(not SURVEY_TABLE.exists(), reason="the survey table is the table of the first campaign, tracked with the limit that it calibrated")
+def test_the_survey_table_calibrates_to_the_limit_of_the_tree():
+    """The first campaign was measured at a starting limit and timed the single launch above it with the calibration control, up to the largest grid of the matrix. It is the calibration set of
+    the limit that the tree ships: no cell of it is unsafe, and the limit that it calibrates to is the constant of the header and of the specification."""
+    table = json.loads(SURVEY_TABLE.read_text())
+    assert slr.table_problems(table, table["meta"]["per_sm"], limit_rules=False) == []              # its own cells, figures and comparisons are the table of a campaign
+    cal = slr.calibration_of(table)
+    assert cal["unsafe"] == [] and cal["limit_nh"] == 3072 and cal["tested"][-1] == 3072
+    assert slr.calibrate(table) == dp.MAX_CTAS_PER_SM == dp.header_per_sm(_ROOT)
+
+
 # ---- text of the tracked files ----------------------------------------------------------------------------------------------------------------------------
 def test_the_tool_and_its_tests_carry_no_plan_vocabulary_or_marker_of_the_removable_code():
     """The text that the tool and its tests add is checked by the same expressions as the marker scan of the loop (plan identifiers, paths of the loop) and by the identifiers that the absence

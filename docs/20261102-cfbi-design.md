@@ -75,7 +75,7 @@ IEEE intrinsics, the extension is built without `--use_fast_math` and with `-fma
 
 - **Decode is one launch** (mode 1 on the optimised row engine, `decode_single_launch_policy` in `cfbi_policy.h`, which the wrapper `decode_single_launch` in `cfbi_launch.h` calls with
   the device's SM count and compute capability; `_impl` bit 6 = 64 keeps the plan kernel, the frozen reference row engine and mode 0 always do, and so do grids of more than
-  8 CTAs per SM, `N * H > 8 * SMs`, and every device outside the routing set, compute capability 10, where a hidden calibration control forces the single launch for
+  20 CTAs per SM, `N * H > 20 * SMs`, and every device outside the routing set, compute capability 10, where a hidden calibration control forces the single launch for
   tests; the limit and the routing set are calibrated by the A/B of the performance document, section 9): `rows_kernel<true>` derives its plan entry itself with the plan kernel's own `seq_window` (token window and slot from
   `cu_seqlens` / `fixed_len` and `slot_ids`) and replaces the plan kernel's `pos` snapshot by an arrival count in the high bits of the `pos` word: each head CTA of a
   participating sequence starts with `old = atomicAdd(&pos[slot], 1 << 8)`, whose result carries the fill (`& 63`) and the number of CTAs that arrived before; the CTA
