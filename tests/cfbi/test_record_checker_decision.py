@@ -47,6 +47,8 @@ ROWS_FLOATS = 6 * 128 + 2 * 128 + 3 * 128 + 3 * 128 + 2 * 64 + 1                
 E_LINES = "constexpr int ROWS_E_STRIDE = HEAD_K + 4;\nconstexpr int ROWS_DYN_SMEM_BYTES = HEAD_V * ROWS_E_STRIDE * static_cast<int>(sizeof(float));   // staged copy of E\n"
 KD_LINES = "constexpr int ROWS_KD_FRAGS = 8 * 8 * 32;\n"
 LAUNCH = "constexpr size_t ROWS_DYNAMIC_SMEM = 0;   // the dynamic shared memory of the row-engine launch: the launch sites and the occupancy hook read it\n"
+LAUNCH_SPLIT = ("constexpr size_t ROWS_DYNAMIC_SMEM = 67584;   // the dynamic tile of the optimised row engine: its launch sites and its occupancy hook read it\n"
+                "constexpr size_t ROWS_REF_DYNAMIC_SMEM = 0;    // the frozen reference row engine has no tile: its own launch site and occupancy hook read this one\n")
 E_BYTES, KD_BYTES = 128 * 132 * 4, 8 * 8 * 32 * 16                                    # 67584 and 32768, by hand
 RESERVE = 1024
 # the base row engine per architecture: (registers, stack, spill stores, spill loads, static shared memory)
@@ -136,6 +138,7 @@ def make_evidence(root, processes):
     commits["occ_b200"] = commit_file(repo, "csrc/cfbi/cfbi_launch.cu", LAUNCH, "the occupancy binding")
     commits["occ_b300"] = commit_file(repo, "csrc/cfbi/cfbi_launch.cu", LAUNCH + "// second device\n", "the occupancy binding, second device")
     commits["cfg"] = commit_file(repo, "csrc/cfbi/cfbi_launch.cu", LAUNCH.replace("= 0;", "= 4096;"), "a launch with dynamic shared memory")
+    commits["split"] = commit_file(repo, "csrc/cfbi/cfbi_launch.cu", LAUNCH_SPLIT, "a launch whose optimised and reference row engines have their own dynamic shared memory")
     commits["head"] = commit_file(repo, "docs/last.md", "last\n", "the commit that the record is written on")
     profile_commit = commits["profile"]
     ev = root / "evidence"
@@ -720,6 +723,68 @@ def test_the_launch_constants_follow_the_launcher_into_the_header(tmp_path):
         dr.launch_constants(repo, aliased)
     assert dr.launch_constants(repo, zero) == {"threads": 256, "dynamic_smem": 0}
     assert dr.launch_constants(repo, four) == {"threads": 256, "dynamic_smem": 4096}                                    # nothing is hard-coded to 0
+
+
+REF_FROM_HEADER = "constexpr size_t ROWS_REF_DYNAMIC_SMEM = ROWS_REF_DYNAMIC_SMEM_BYTES;   // read from the CUDA-free header\n"
+HEADER_REF = "constexpr int ROWS_REF_DYNAMIC_SMEM_BYTES = %d;\n"
+E_DYNAMIC = 67584
+
+
+def test_the_launch_constants_name_the_dynamic_shared_memory_of_the_reference_engine_only_when_the_launcher_has_its_own_constant(tmp_path):
+    """A launcher with one constant launches every row engine with it (the earlier commits, read as before, with no key for the reference); a launcher with a constant of its own for the frozen
+    reference engine (the optimised engine has a dynamic tile, the reference has none) names both, and a constant that the commit does not define is never read as zero."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    commit_file(repo, "csrc/cfbi/cfbi_primitives.cuh", PRIMITIVES, "the sizes of a head")
+    one = commit_file(repo, "csrc/cfbi/cfbi_launch.cu", LAUNCH, "a launcher with one constant")
+    literal = commit_file(repo, "csrc/cfbi/cfbi_launch.cu", LAUNCH_SPLIT, "a launcher with two numbers")
+    commit_file(repo, "csrc/cfbi/cfbi_launch.cu", LAUNCH_FROM_HEADER + REF_FROM_HEADER, "a launcher that names two constants of the header")
+    undefined = commit_file(repo, "csrc/cfbi/cfbi_policy.h", HEADER_NEED % E_DYNAMIC, "the header, without the constant of the reference engine")
+    zero = commit_file(repo, "csrc/cfbi/cfbi_policy.h", HEADER_NEED % E_DYNAMIC + HEADER_REF % 0, "the header with the constant of the reference engine")
+    four = commit_file(repo, "csrc/cfbi/cfbi_policy.h", HEADER_NEED % E_DYNAMIC + HEADER_REF % 4096, "the header with a dynamic shared memory of the reference engine")
+    assert dr.launch_constants(repo, one) == {"threads": 256, "dynamic_smem": 0}                                           # no key: the one constant is the launch of the reference too
+    assert dr.launch_constants(repo, literal) == {"threads": 256, "dynamic_smem": E_DYNAMIC, "reference_dynamic_smem": 0}
+    with pytest.raises(ValueError, match="ROWS_REF_DYNAMIC_SMEM_BYTES is not defined"):
+        dr.launch_constants(repo, undefined)
+    assert dr.launch_constants(repo, zero) == {"threads": 256, "dynamic_smem": E_DYNAMIC, "reference_dynamic_smem": 0}
+    assert dr.launch_constants(repo, four) == {"threads": 256, "dynamic_smem": E_DYNAMIC, "reference_dynamic_smem": 4096}   # nothing is hard-coded to 0
+
+
+def split_launch_record(world, reference=0, optimised=E_DYNAMIC):
+    """The occupancy record of b200 and its production dump for a commit whose optimised row engine (both instantiations) has a dynamic tile of ``optimised`` bytes and whose frozen reference
+    engine has ``reference``; the CTAs per SM are the arithmetic of each instance's own figures."""
+    ev = reloaded(world, instantiated())
+    rec = copy.deepcopy(ev["occupancy"]["b200"])
+    dv = dr.occupancy_device(rec)
+    for inst in rec["occupancy"]["instances"]:
+        inst["dynamic_smem"] = reference if inst["name"] == dr.REFERENCE_KERNEL else optimised
+        inst["ctas_per_sm"] = dr.ctas_per_sm(inst["registers"], inst["threads"], inst["static_smem"], inst["dynamic_smem"], dv)
+    rec["label"] = "b200-" + world["commits"]["split"][:9]
+    return rec, ev["container"]["b200"]
+
+
+def test_each_occupancy_instance_is_bound_to_the_dynamic_shared_memory_of_its_own_launch(world):
+    """With a dynamic tile for the optimised engine and none for the reference, the two kinds of instance have different launches: the optimised ones the tile, the reference none. One constant for
+    every instance (the rule of the commits before the split) cannot admit that record, and the record of a reference that launches with the tile is not admitted either."""
+    launch = dr.launch_constants(world["repo"], world["commits"]["split"])
+    assert launch == {"threads": 256, "dynamic_smem": E_DYNAMIC, "reference_dynamic_smem": 0}
+    rec, container = split_launch_record(world)
+    assert [(i["name"], i["dynamic_smem"]) for i in rec["occupancy"]["instances"]] == [("cfbi::rows_kernel<false>", E_DYNAMIC), ("cfbi::rows_kernel<true>", E_DYNAMIC), (dr.REFERENCE_KERNEL, 0)]
+
+    def admission(rec, launch=launch):
+        return dr.occupancy_admission_problems(rec, "b200", container, launch)
+    assert admission(rec) == [], admission(rec)[:3]
+    refd, container = split_launch_record(world, reference=E_DYNAMIC)                                                       # the reference engine launched with the tile of the other
+    assert has(admission(refd), "%s: the API says 256 threads and %d B dynamic shared memory, the launch in the sources at the record's commit uses 256 threads and 0 B" % (dr.REFERENCE_KERNEL, E_DYNAMIC)), admission(refd)[:3]
+    bare, container = split_launch_record(world, optimised=0)                                                               # the optimised engines without the tile of their launch
+    found = admission(bare)
+    assert has(found, "cfbi::rows_kernel<false>: the API says 256 threads and 0 B") and has(found, "cfbi::rows_kernel<true>: the API says 256 threads and 0 B") and has(found, "uses 256 threads and %d B" % E_DYNAMIC), found[:3]
+    assert not has(found, "%s: the API" % dr.REFERENCE_KERNEL), found[:3]                                                   # the reference engine is as its own launch says
+    old = {"threads": 256, "dynamic_smem": E_DYNAMIC}                                                                       # a launch with one constant: it is the launch of every instance
+    assert has(admission(rec, old), "%s: the API says 256 threads and 0 B dynamic shared memory, the launch in the sources at the record's commit uses 256 threads and %d B" % (dr.REFERENCE_KERNEL, E_DYNAMIC))
+    other, container = split_launch_record(world, reference=4096)
+    assert has(admission(other), "%s: the API says 256 threads and 4096 B" % dr.REFERENCE_KERNEL) and not admission(other, dict(launch, reference_dynamic_smem=4096))
 
 
 # ---- the command lines -----------------------------------------------------------------------------------------------------------------------------

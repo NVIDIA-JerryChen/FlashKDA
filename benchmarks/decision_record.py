@@ -337,14 +337,19 @@ POLICY_SOURCE = "csrc/cfbi/cfbi_policy.h"     # the CUDA-free header: where the 
 
 def launch_constants(repo, commit):
     """The threads and the dynamic shared memory of the row-engine launch at a commit, as the sources define them: the thread count of the kernels and the launcher's constant that its
-    launch sites and its occupancy hook both read (a number, or the constant of the CUDA-free header that the launcher takes it from; the header is absent at the earlier commits)."""
+    launch sites and its occupancy hook both read (a number, or the constant of the CUDA-free header that the launcher takes it from; the header is absent at the earlier commits). A launcher
+    that has a constant of its own for the frozen reference engine (``ROWS_REF_DYNAMIC_SMEM``: the optimised engine has a dynamic tile, the reference has none) adds it as
+    ``reference_dynamic_smem``; without that key the one constant is the launch of every row engine, the reference included."""
     texts = [source_text(repo, commit, PRIMITIVES_SOURCE), source_text(repo, commit, LAUNCH_SOURCE)]
     try:
         texts.append(source_text(repo, commit, POLICY_SOURCE))
     except ValueError:
         pass                                                                    # no header at this commit: a constant of the launcher that names one is then not defined (an error below)
     resolve = constants_of(*texts)
-    return {"threads": resolve("NTHREADS"), "dynamic_smem": resolve("ROWS_DYNAMIC_SMEM")}
+    out = {"threads": resolve("NTHREADS"), "dynamic_smem": resolve("ROWS_DYNAMIC_SMEM")}
+    if any(re.search(r"\bROWS_REF_DYNAMIC_SMEM\b", t) for t in texts):
+        out["reference_dynamic_smem"] = resolve("ROWS_REF_DYNAMIC_SMEM")
+    return out
 
 
 def launch_problems(launch, ncu):
@@ -398,8 +403,9 @@ def launch_problems(launch, ncu):
 def occupancy_admission_problems(rec, dev, container, launch=None, commit=None):
     """The ADMISSION of the occupancy-API record of a device as evidence: the record bound to what it claims. The device, the commit (the label; ``commit``: the commit that the evidence is of),
     the instantiations (the names are read from the record, the keys of the dump from them, and every row-engine kernel of the dump needs an instance), the registers and the static shared
-    memory against the production-toolchain dump, the threads and the dynamic shared memory against the launch in the sources at the record's commit (``launch``: ``launch_constants``), and the
-    arithmetic of ``ctas_per_sm`` reproducing the API for every instance (the CTA count alone does not say which configuration it is the count of). A record that fails here proves nothing,
+    memory against the production-toolchain dump, the threads and the dynamic shared memory against the launch in the sources at the record's commit (``launch``: ``launch_constants``; every
+    instance against the launch of its own engine: the frozen reference against its own constant when the launcher has one), and the arithmetic of ``ctas_per_sm`` reproducing the API for every
+    instance (the CTA count alone does not say which configuration it is the count of). A record that fails here proves nothing,
     neither a pass nor a failure of the resource gate; what a record that passes says about that gate is ``occupancy_gate_failures``."""
     where = "occupancy record %s" % (rec.get("_path", dev) if isinstance(rec, dict) else dev)
     if not isinstance(rec, dict):
@@ -437,9 +443,11 @@ def occupancy_admission_problems(rec, dev, container, launch=None, commit=None):
                        % (where, name, inst["registers"], inst["static_smem"], want["reg"], want["shared"]))
         if inst["threads"] != THREADS:
             out.append("%s: %s: %d threads per CTA, %d are required" % (where, name, inst["threads"], THREADS))
-        if launch is not None and (inst["threads"], inst["dynamic_smem"]) != (launch["threads"], launch["dynamic_smem"]):
-            out.append("%s: %s: the API says %d threads and %d B dynamic shared memory, the launch in the sources at the record's commit uses %d threads and %d B"
-                       % (where, name, inst["threads"], inst["dynamic_smem"], launch["threads"], launch["dynamic_smem"]))
+        if launch is not None:
+            dynamic = launch.get("reference_dynamic_smem", launch["dynamic_smem"]) if name == REFERENCE_KERNEL else launch["dynamic_smem"]       # each instance has the launch of its own engine
+            if (inst["threads"], inst["dynamic_smem"]) != (launch["threads"], dynamic):
+                out.append("%s: %s: the API says %d threads and %d B dynamic shared memory, the launch in the sources at the record's commit uses %d threads and %d B"
+                           % (where, name, inst["threads"], inst["dynamic_smem"], launch["threads"], dynamic))
         arithmetic = ctas_per_sm(inst["registers"], inst["threads"], inst["static_smem"], inst["dynamic_smem"], dv)
         if inst["ctas_per_sm"] != arithmetic:
             out.append("%s: %s: the API says %d CTAs per SM, the arithmetic of the registers, the shared memory and the threads %d" % (where, name, inst["ctas_per_sm"], arithmetic))
