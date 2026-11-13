@@ -46,6 +46,33 @@ constexpr int ROWS_STATIC_SMEM_BYTES = 8192;
 constexpr int ROWS_DYNAMIC_SMEM_BYTES = 0;
 constexpr int ROWS_SMEM_NEED_BYTES = ROWS_STATIC_SMEM_BYTES + ROWS_DYNAMIC_SMEM_BYTES;
 
+// ---- which implementation runs on a device ----------------------------------------------------------------------------------------------------------------------------
+// What the launches of a forward call ask of a device, per CTA, in bytes of shared memory (static plus dynamic, without the driver's per-CTA reserve: the opt-in limit of the device,
+// cudaDevAttrMaxSharedMemoryPerBlockOptin, bounds exactly this figure): K1 of the optimised and of the reference chunk kernels (dynamic) and the optimised row engine (ROWS_SMEM_NEED_BYTES).
+struct ImplNeeds {
+    int64_t k1;
+    int64_t k1_ref;
+    int64_t rows;
+};
+
+// The pure part of resolve_impl (cfbi_launch.h documents the bits): the implementation bits that run for `requested` on a device of compute capability `cc` (major * 10 + minor) whose
+// opt-in limit of shared memory per block is `smem_optin`. Every input is an argument, so the tests call it with any device and any need. Idempotent.
+//   * the tcgen05 K2 exists in the sm_100a / sm_103a code only (dropped on every other major version); below sm_90 the optimised kernels are compiled as traps: the reference kernels run;
+//   * a device whose opt-in limit is below the need of K1 of the selected family runs every row through the row engine, the reference row engine (the one validated on such devices);
+//   * the optimised row engine needs `needs.rows`: a device whose limit is below it runs the reference row engine, WHATEVER was requested, an explicit rows-only request (IMPL_ROWS_ONLY,
+//     which skips the K1 check above) included, and keeps the optimised one from exactly that need on;
+//   * the dynamic-schedule K2 runs on the optimised K1: the reference chunk kernels, the row-engine-only schedule and a request for the UMMA K2 (which wins, also where it is dropped) clear it.
+constexpr int resolve_impl_for(int requested, int cc, int64_t smem_optin, const ImplNeeds& needs) {
+    int impl = requested & (IMPL_REF_ROWS | IMPL_REF_CHUNK | IMPL_ROWS_ONLY | IMPL_K2_UMMA | IMPL_K2_DYN | IMPL_DECODE_PLAN);
+    const int major = cc / 10;
+    if (major != 10) impl &= ~IMPL_K2_UMMA;
+    if (major < 9) impl |= IMPL_REF_ROWS | IMPL_REF_CHUNK;
+    if (!(impl & IMPL_ROWS_ONLY) && smem_optin < ((impl & IMPL_REF_CHUNK) ? needs.k1_ref : needs.k1)) impl |= IMPL_ROWS_ONLY | IMPL_REF_ROWS;
+    if (!(impl & IMPL_REF_ROWS) && smem_optin < needs.rows) impl |= IMPL_REF_ROWS;
+    if ((impl & (IMPL_REF_CHUNK | IMPL_ROWS_ONLY)) || (requested & IMPL_K2_UMMA)) impl &= ~IMPL_K2_DYN;
+    return impl;
+}
+
 // ---- single-launch decode -----------------------------------------------------------------------------------------------------------------------------------------------
 // Whether a call that runs mode 1 (`mode` and `impl` as resolve_mode / resolve_impl return them: the caller maps mode 0 + IMPL_ROWS_ONLY to 1 and resolves the device's bits) of N
 // sequences and H heads is ONE kernel launch of the optimised row engine (rows_kernel<true>, cfbi_rows.cuh) instead of the plan kernel followed by the row engine. The plan kernel
