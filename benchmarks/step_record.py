@@ -418,6 +418,24 @@ def build_row(m, decision, infos, exactness=None):
     return row
 
 
+def repair_termination(first_dump, attempts):
+    """``termination`` of a row for a step that ended by the budget of its repairs: ``first_dump`` is the path of the dump of the first failed resource gate, ``attempts`` the repair candidates and
+    ablations (``[{"id", "role", "dump", "tree"?, "note"?}]``); the count is the record checker's own (``record_checker.repair_candidates``), so the row says what the checker recomputes."""
+    counted = len(rc.repair_candidates(cg.load_dump(first_dump), attempts))
+    return {"rule": "repair_budget", "allowed": rc.REPAIR_BUDGET, "first_failed_gate": {"dump": first_dump}, "attempts": attempts, "counted": counted}
+
+
+def build_termination_row(m, termination, reason, exactness=None):
+    """The ledger row of a step that ended by the budget of its repairs (``failed_at`` ``repair_budget``): what the gates of its FINAL commit measured (the comparisons of the dumps of the manifest,
+    which may pass; the exactness of its suites), no timing (never reached: ``not_run``), the revert commit that removed it (``m["revert_commit"]``) and ``termination``, the proof of the budget
+    that the record checker recomputes (``record_checker.termination_problems``). ``exactness``: the problems of ``exactness_problems`` when the caller has them already."""
+    codegen, resources = codegen_entries(m)
+    exact = exactness_problems(m) if exactness is None else exactness
+    return {"id": m["step"], "outcome": "not_adopted", "commit": m["commit"], "revert_commit": m.get("revert_commit"), "markers": list(m["markers"]), "failed_at": "repair_budget",
+            "reason": reason, "gates": {"exactness": not exact, "codegen": all(e["verdict"] == "PASS" for e in codegen.values())},
+            "timing": {"vs_previous": "not_run", "vs_base": "not_run", "chain": "not_run"}, "codegen_gate": codegen, "resource_gate": resources, "ab": None, "termination": termination}
+
+
 def row_problems(m, row, repo=None):
     """The problems that the record checker finds in the row: its own checks (the dumps, the occupancy records, the timing results of an adopted row), and the marker check against the tree."""
     meta = {"base": m["base"]}
@@ -494,6 +512,62 @@ def render_section(m, decision, row, infos, number=10):
     lines += ["", "Registers / spill loads / spill stores / stack bytes of the row engine; the base column is the kernel that the resource gate holds the instantiation to.", "",
               "| toolchain | architecture | instantiation | base | previous accepted state | step |", "|---|---|---|---|---|---|"]
     lines += ["| %s | %s | %s | %s | %s | %s |" % r for r in resource_rows(m)]
+    return "\n".join(lines) + "\n"
+
+
+def attempt_rows(termination):
+    """``[(id, role, moment, content hash of the tree, architectures)]`` of the attempts of a termination, from the dumps that were made of them, in the order they were made."""
+    out = []
+    for a in termination["attempts"]:
+        dump = cg.load_dump(a["dump"])
+        out.append((a["id"], a["role"], dump["meta"].get("created", "-"), dump["meta"]["tree"]["content_hash"][:12], ", ".join(dump["meta"]["toolchain"].get("archs") or [])))
+    return sorted(out, key=lambda r: (r[2], r[0]))
+
+
+def suite_rows(m):
+    """``[(device, Gate G passed, Suite S files, passed, skipped, failed + errors, commit of the suites)]`` of the complete candidate records of the manifest."""
+    out = []
+    for dev in GATING:
+        gate, whole = (load_json(m["suites"][dev][name]["candidate"]) for name in ("gate", "S"))
+        t = whole["totals"]
+        out.append((dev, gate["totals"].get("passed"), len(whole["files"]), t.get("passed"), t.get("skipped"), (t.get("failed") or 0) + (t.get("errors") or 0), (m.get("suite_commit") or m["commit"])[:12]))
+    return out
+
+
+def render_termination_section(m, row, number=11):
+    """The section of the performance document for a step that ended by the budget of its repairs: only numbers of the evidence (the suite records, the dumps, the occupancy records, the attempts)."""
+    t = row["termination"]
+    conda = row["codegen_gate"]["conda"]
+    first = cg.load_dump(t["first_failed_gate"]["dump"])
+    failures = cg.compare_dumps(cg.load_dump(conda["base_dump"]), first, cg.load_allow(conda["allow"]) if conda.get("allow") else None, "change")["gate_r"]["failures"]
+    ablations = sum(1 for a in t["attempts"] if a["role"] == "ablation")
+    lines = ["## %d. %s" % (number, STEP_TITLES.get(m["step"], m["step"])), "",
+             "Generated from the evidence of the step by `benchmarks/step_record.py`; every number below is read from the record files: the suites from their records, the dumps by the "
+             "code-generation gate, the occupancy from the API records, the repairs by the record checker's own count.", "", "### Outcome", "",
+             "The step is **not adopted**: it ended by the budget of its repairs, not by a measurement.", "", "- %s" % row["reason"],
+             "- Step commit %s, removed by the revert commit %s; previous accepted state %s, base %s." % (m["commit"][:12], (row["revert_commit"] or "none")[:12], m["previous"][:12], m["base"][:12]),
+             "- What the final form measured (below) are research results: they are no evidence for adoption, and no timing was measured (not run).", "", "### The repairs", "",
+             "The first failed gate is the resource gate on the conda toolchain (the dump made at %s, compared with the base in change mode): %s." % (first["meta"].get("created"), "; ".join(failures[:3]) or "none"),
+             "The budget is %d repair attempts after a failed gate. %d distinct repair candidates were dumped after it (%d ablation(s), which only take something away to see what it costs, are not counted)." % (
+                 t["allowed"], t["counted"], ablations), "",
+             "| attempt | role | made | tree content hash | architectures |", "|---|---|---|---|---|"]
+    lines += ["| %s | %s | %s | %s | %s |" % r for r in attempt_rows(t)]
+    lines += ["", "### What the final form measured", "",
+              "Gate G and Suite S (every test file of `tests/cfbi`, the four cases of the K2 sanitizer file included; complete against the collection of the commit of the suites, whose kernel sources are the step's):", "",
+              "| device | Gate G passed | Suite S files | Suite S passed | skipped | failed | commit of the suites |", "|---|---|---|---|---|---|---|"]
+    lines += ["| %s | %s | %s | %s | %s | %s | %s |" % r for r in suite_rows(m)]
+    lines += ["", "Gate X in change mode (every kernel but the row engine identical to the base): " + "; ".join(
+        "%s %s (%d kernels compared, %d differences)" % (key, e["verdict"], e["compared"], e["differences"]) for key, e in sorted(row["codegen_gate"].items())) + ".",
+              "", "Registers / spill loads / spill stores / stack bytes of the row engine; the base column is the kernel that the resource gate holds the instantiation to.", "",
+              "| toolchain | architecture | instantiation | base | previous accepted state | step |", "|---|---|---|---|---|---|"]
+    lines += ["| %s | %s | %s | %s | %s | %s |" % r for r in resource_rows(m)]
+    lines += ["", "Occupancy-API records of the production toolchain (threads of a CTA: 256):", "", "| device | instantiation | registers | static shared memory | dynamic shared memory | CTAs per SM |", "|---|---|---|---|---|---|"]
+    for key in rc.COMPARISONS:
+        if key.startswith("container_"):
+            for i in load_json(row["codegen_gate"][key]["occupancy"])["occupancy"]["instances"]:
+                lines.append("| %s | %s | %d | %d B | %d B | %d |" % (key.split("_", 1)[1], i["name"], i["registers"], i["static_smem"], i["dynamic_smem"], i["ctas_per_sm"]))
+    lines += ["", "### Timing", "", "Not run: the step ended before the timing phase (vs previous accepted state, vs base and layer chain: %s)." % ", ".join(
+        "%s %s" % (k, row["timing"][k]) for k in ("vs_previous", "vs_base", "chain"))]
     return "\n".join(lines) + "\n"
 
 

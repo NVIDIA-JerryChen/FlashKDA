@@ -7,6 +7,7 @@ the outcome undecided; the wall metrics are reported and never decide.
 """
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
@@ -684,3 +685,62 @@ def test_a_step_that_a_confirmed_slower_cell_stops_gets_a_not_adopted_row_that_t
     wrong = json.loads(json.dumps(row))
     wrong["failed_at"] = "codegen"                                                                   # the gates say that the code generation passed
     assert any("failed at codegen" in p for p in rc.step_problems(wrong, None, meta)), rc.step_problems(wrong, None, meta)[:2]
+
+
+# ---- a step that ended by the budget of its repairs: the row is built from the evidence, the checker recomputes the proof, the section of the document holds only numbers of the records -------------
+def budget_case(tmp_path):
+    """The manifest of a step (the dumps of the record checker's own tests, the suites of ``exactness_world``), the termination of its repairs and the row that the builder makes of them."""
+    m, _, _ = exactness_world(tmp_path / "world")
+    m = dict(m, step="e_tile", commit=trs.C2, previous=trs.C1, markers=["tile_marker"], revert_commit=trs.C3)
+    codegen = {}
+    for key in rc.COMPARISONS:
+        entry, _ = trs.comparison(key, m["commit"], sid="e_tile")
+        codegen[key] = {"base": entry["base_dump"], "cand": entry["cand_dump"], "prev": trs.dump_file(key, trs.C1, "cand")}
+        if key.startswith("container_"):
+            codegen[key]["occupancy"] = entry["occupancy"]
+    m["codegen"] = dict(codegen, allow=trs.allow_file({}))
+    (tmp_path / "budget").mkdir()
+    termination = trs.budget_row(tmp_path / "budget")["termination"]
+    return m, termination, sp.build_termination_row(m, termination, "the repairs of the failed resource gate exceeded the budget of the gate protocol", exactness=[])
+
+
+def test_the_row_of_a_step_that_ended_by_the_budget_of_its_repairs_is_built_from_the_evidence_and_passes_the_record_checker(tmp_path):
+    m, termination, row = budget_case(tmp_path)
+    assert row["failed_at"] == "repair_budget" and row["outcome"] == "not_adopted" and row["gates"] == {"exactness": True, "codegen": True}
+    assert row["timing"] == {"vs_previous": "not_run", "vs_base": "not_run", "chain": "not_run"} and row["ab"] is None and row["revert_commit"] == trs.C3
+    assert all(e["verdict"] == "PASS" for e in row["codegen_gate"].values())                      # the final form passes: the row does not call it failed
+    assert rc.step_problems(row, None, trs.META) == [], rc.step_problems(row, None, trs.META)
+    assert row["termination"]["counted"] == 4 and row["termination"]["allowed"] == rc.REPAIR_BUDGET
+    failed = sp.build_termination_row(m, termination, "x", exactness=["a suite did not pass"])      # exactness is what the evidence gave
+    assert failed["gates"]["exactness"] is False and rc.step_problems(failed, None, trs.META) == []
+    no_revert = sp.build_termination_row(dict(m, revert_commit=None), termination, "x", exactness=[])
+    assert any("is not reverted" in p for p in rc.step_problems(no_revert, None, trs.META))
+
+
+def test_the_termination_of_a_row_is_counted_by_the_checker_alone(tmp_path):
+    m, termination, row = budget_case(tmp_path)
+    rebuilt = sp.repair_termination(termination["first_failed_gate"]["dump"], termination["attempts"])
+    assert rebuilt == termination and rebuilt["counted"] == 4                                  # four repairs, one ablation: the ablation is not counted
+    fewer = sp.repair_termination(termination["first_failed_gate"]["dump"], termination["attempts"][:3] + termination["attempts"][4:])
+    assert fewer["counted"] == 3 and any("not exhausted" in p for p in rc.step_problems(dict(row, termination=fewer), None, trs.META))
+
+
+def test_the_section_of_a_step_that_ended_by_the_budget_holds_the_numbers_of_the_records_and_no_plan_vocabulary(tmp_path):
+    m, termination, row = budget_case(tmp_path)
+    text = sp.render_termination_section(m, row, number=11)
+    lines = text.split("\n")
+    assert lines[0] == "## 11. Row engine step 2: the staged E tile" and "The step is **not adopted**: it ended by the budget of its repairs, not by a measurement." in lines
+    assert any("4 distinct repair candidates were dumped after it (1 ablation(s)" in line for line in lines)
+    attempts = [line for line in lines if line.startswith("| V")]
+    assert len(attempts) == 5 and sum(1 for line in attempts if "| repair |" in line) == 4 and sum(1 for line in attempts if "| ablation |" in line) == 1
+    for dev in rc.DEVICES:                                                           # the suites: the numbers of the complete candidate records, one row per device
+        gate, whole = (json.loads(Path(m["suites"][dev][name]["candidate"]).read_text()) for name in ("gate", "S"))
+        expected = "| %s | %d | %d | %d | %d | %d | %s |" % (dev, gate["totals"]["passed"], len(whole["files"]), whole["totals"]["passed"], whole["totals"]["skipped"],
+                                                           whole["totals"]["failed"] + whole["totals"].get("errors", 0), m["suite_commit"][:12])
+        assert lines.count(expected) == 1, (expected, [l for l in lines if l.startswith("| %s |" % dev)][:2])
+    assert sum(1 for line in lines if line.startswith("| conda |")) == 3 and sum(1 for line in lines if line.startswith("| container_b200 |")) == 1
+    assert "| b200 | cfbi::rows_kernel | 128 | 8192 B | 0 B | 2 |" in lines and "| b300 | cfbi::rows_kernel | 128 | 8192 B | 0 B | 2 |" in lines            # the occupancy of every instance
+    assert any(line.startswith("Gate X in change mode") and "conda PASS" in line for line in lines) and "Not run: the step ended before the timing phase" in text
+    assert text.endswith("\n") and not text.endswith("\n\n")
+    assert not rc.PLAN_VOCABULARY.search(text), rc.PLAN_VOCABULARY.search(text).group(0)
+    assert not re.search(r"\b(Q|B|M|R)[0-9]{1,2}\b", text)                           # nor the loop's numbers

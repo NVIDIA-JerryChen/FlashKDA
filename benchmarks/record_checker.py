@@ -56,7 +56,12 @@ ledger   ``cfbi-step-ledger-v1``: one row for each step (``single_launch``, ``tr
          ``a_fragments``, ``kd_tile``, the type of the step decides); the E tile and the A fragments are one adoption unit decided on three arms (T the previous accepted state, E, F)
          by a table (E passes against T and F beats E: both adopted; E passes and F does not beat E: E only; E fails against T and F beats T: both; neither: none): the table only changes
          against which state the gain is judged, so every adopted row passes everything itself, except the E tile that F rescued, which the selected state E + F stands in for. A ledger
-         that contradicts the table is rejected. ``--decision`` cross-checks the skipped steps with the decision record and, with ``--repo``, proves the order of the steps by the Git history: the
+         that contradicts the table is rejected. A step can also end not adopted by the budget of its repairs (``failed_at`` ``repair_budget``): no gate failed at the end, the repairs of a failed
+         gate went on past ``REPAIR_BUDGET`` (three). The row then says what the gates of its FINAL commit measured (its comparisons are recomputed and may pass: nothing is relabelled; the
+         phases after the code generation are ``not_run``), names the revert that removed the step, and carries a ``termination`` that the checker proves from the files it names: the first
+         failed resource gate (a dump of the conda toolchain compared with the base dump of the row again), every attempt (its dump, the content hash of its tree, which the tree gives again
+         when the row names it, and the moment it was made) and the distinct repair candidates dumped after the failed gate (an ablation, which only takes something away to see what it costs,
+         and the failed form itself are not counted): more than the budget, or the row is refused. ``--decision`` cross-checks the skipped steps with the decision record and, with ``--repo``, proves the order of the steps by the Git history: the
          ledger of a row-engine step names the commit that holds the decision record (``meta.decision_commit``, the path ``meta.decision_path`` defaults to the record's place in the
          repository), the content of the file at that commit must be the record under check, and that commit must be a strict ancestor of every row-engine step commit (the ``recorded_on``
          date of the record is only the commit it was generated on, which must not come after the commit that holds it).
@@ -77,6 +82,7 @@ final    ``cfbi-final-v1``: the final A/B of the final candidate against the bas
          changes do not cause it), and the performance document (``--document``) must name the cell in its known-limit section.
 """
 import argparse
+import datetime
 import json
 import math
 import os
@@ -810,6 +816,10 @@ ROW_ENGINE_STEPS = ROW_ENGINE_ORDER + ("kd_tile",)             # the steps whose
 UNIT = ("e_tile", "a_fragments")                              # adopted or reverted together by the three-arm rule
 OUTCOMES = ("adopted", "not_adopted", "skipped")
 GATE_PHASES = ("compile", "exactness", "codegen", "timing")   # the order of the step gate protocol; a step that failed ends at one of them
+REPAIR_BUDGET = 3                                             # repair attempts after a failed gate: a step that needs more ends not adopted, whatever its last form measures
+TERMINATIONS = ("repair_budget",)                             # the other way for a step to end not adopted: no gate failed at the end, the budget of its repairs was spent (it has its own proof)
+ATTEMPT_ROLES = ("repair", "ablation")                         # an ablation only takes something away to see what it costs: it is no attempt to pass the gate and is not counted
+TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"                            # ``meta.created`` of a dump
 # the code-generation evidence of a row is one comparison of a base dump and a candidate dump for each of these: the conda toolchain of the login node (the three architectures) and the
 # production container toolchain on each device (one architecture each)
 COMPARISONS = ("conda", "container_b200", "container_b300")
@@ -1108,7 +1118,7 @@ def step_problems(step, waiver=None, meta=None, repo=None):
             problems.append("%s: a skipped step has no commit" % where)
         if not text(step.get("reason")):
             problems.append("%s: a skipped step carries the reason of the decision record" % where)
-        for field in ("codegen_gate", "resource_gate", "ab", "timing", "gates"):
+        for field in ("codegen_gate", "resource_gate", "ab", "timing", "gates", "termination"):
             if step.get(field) not in (None, {}):
                 problems.append("%s: a skipped step has no %s" % (where, field))
         return problems
@@ -1119,6 +1129,8 @@ def step_problems(step, waiver=None, meta=None, repo=None):
             problems.append("%s: an adopted step has no revert commit" % where)
         if step.get("failed_at") is not None:
             problems.append("%s: an adopted step failed at nothing (failed_at %r)" % (where, step.get("failed_at")))
+        if step.get("termination") is not None:
+            problems.append("%s: only a step that ended by the budget of its repairs carries a termination, an adopted step ended by nothing" % where)
         if gates.get("exactness") is not True or gates.get("codegen") is not True:
             problems.append("%s: an adopted step passes the exactness and the code-generation gate (gates %r)" % (where, gates))
         probs, _ = _codegen_problems(step, where, True, True, meta, repo)
@@ -1126,8 +1138,12 @@ def step_problems(step, waiver=None, meta=None, repo=None):
         return problems
     # not adopted: the evidence stops at the phase where it failed
     failed_at = step.get("failed_at")
+    if failed_at in TERMINATIONS:
+        return problems + _terminated_problems(step, where, gates, meta, repo)
     if failed_at not in GATE_PHASES:
-        return problems + ["%s: a step that was not adopted says where it failed (failed_at is one of %s), got %r" % (where, ", ".join(GATE_PHASES), failed_at)]
+        return problems + ["%s: a step that was not adopted says where it failed (failed_at is one of %s), got %r" % (where, ", ".join(GATE_PHASES + TERMINATIONS), failed_at)]
+    if step.get("termination") is not None:
+        problems.append("%s: only a step that ended by the budget of its repairs carries a termination (this one failed at %s)" % (where, failed_at))
     if not text(step.get("reason")):
         problems.append("%s: a step that was not adopted carries a reason" % where)
     if step.get("commit") is not None and step.get("revert_commit") is None:
@@ -1142,11 +1158,162 @@ def step_problems(step, waiver=None, meta=None, repo=None):
     if failed_at == "codegen" and results and all(results):
         problems.append("%s: failed at the code generation, but every comparison of the dumps passes" % where)
     if reached < 3:
-        timing = step.get("timing")
-        if timing not in ({}, None) and any(v not in ("not_run", None) for v in (timing.values() if isinstance(timing, dict) else [timing])):
-            problems.append("%s: failed at %s, so no timing was measured (timing %r)" % (where, failed_at, timing))
+        problems.extend(_no_timing_problems(step, where, failed_at))
     else:
         problems.extend(_timing_problems(step, where, False, waiver))
+    return problems
+
+
+def _no_timing_problems(step, where, failed_at):
+    """A step that ended before the timing phase has no timing: nothing, or only ``not_run``."""
+    timing = step.get("timing")
+    if timing not in ({}, None) and any(v not in ("not_run", None) for v in (timing.values() if isinstance(timing, dict) else [timing])):
+        return ["%s: failed at %s, so no timing was measured (timing %r)" % (where, failed_at, timing)]
+    return []
+
+
+def _terminated_problems(step, where, gates, meta, repo=None):
+    """A step that ended by the budget of its repairs (``failed_at`` ``repair_budget``). No gate is what ended it, so the row says what the gates of its FINAL form measured and proves the budget
+    (``termination_problems``): the code-generation evidence is that of any row that reached the gate (every comparison bound to its dumps and recomputed, and ``gates.codegen`` is what the
+    comparisons say: a gate that the dumps pass is not called failed, one that they fail is not called passed), exactness is the boolean that the step's evidence gave (null when it was never
+    measured), the phases after it were never reached (no timing, no A/B medians), and the step is removed by a revert commit like every step that was not adopted."""
+    problems = []
+    if not text(step.get("reason")):
+        problems.append("%s: a step that was not adopted carries a reason" % where)
+    if step.get("commit") is not None and step.get("revert_commit") is None:
+        problems.append("%s: not adopted but its commit %s is not reverted (no revert_commit)" % (where, step["commit"]))
+    if not (gates.get("exactness") is None or type(gates.get("exactness")) is bool):
+        problems.append("%s: gates.exactness is what the step's evidence gave (true or false), or null when it was never measured, got %r" % (where, gates.get("exactness")))
+    probs, results = _codegen_problems(step, where, True, False, meta, repo)          # at least one comparison, every supplied one admitted and recomputed (the step may have ended before every toolchain ran)
+    problems.extend(probs)
+    if results and gates.get("codegen") is not all(results):
+        problems.append("%s: the comparisons of the dumps say %s, the row says gates.codegen %r: a gate that the dumps pass is not called failed and one that they fail is not called passed" % (
+            where, "PASS" if all(results) else "FAIL", gates.get("codegen")))
+    problems.extend(_no_timing_problems(step, where, "repair_budget") + _ab_problems(step, where, False))
+    return problems + termination_problems(step, where, meta, repo)
+
+
+def _stamp(dump, who, problems):
+    """``(content hash of the tree, moment)`` that a dump says it was made from and at: ``meta.tree.content_hash`` and ``meta.created`` (``TIME_FORMAT``); what is missing or unusable is a problem."""
+    meta = dump.get("meta") if isinstance(dump, dict) and isinstance(dump.get("meta"), dict) else {}
+    tree = meta.get("tree") if isinstance(meta.get("tree"), dict) else {}
+    content, created, when = tree.get("content_hash"), meta.get("created"), None
+    if not text(content):
+        problems.append("%s: the dump names no content hash of the tree it was made from (meta.tree.content_hash)" % who)
+        content = None
+    if created is None:
+        problems.append("%s: the dump has no creation time (meta.created)" % who)
+    else:
+        try:
+            when = datetime.datetime.strptime(created, TIME_FORMAT)
+        except (TypeError, ValueError):
+            problems.append("%s: the creation time %r of the dump is not %s" % (who, created, TIME_FORMAT))
+    return content, when
+
+
+def repair_candidates(first_dump, attempts):
+    """The content hashes of the distinct trees that count as repair candidates after ``first_dump`` (the dump of the first failed gate, loaded): the attempts in the role repair whose own dump
+    names a content hash and a moment later than the first failed gate's and is not the failed form's own tree. An attempt that cannot be used does not count (``termination_problems`` says
+    why); the proof and the builder of the row count with this function alone."""
+    sink = []
+    gate_hash, gate_when = _stamp(first_dump, "the first failed gate", sink)
+    found = set()
+    if gate_when is None:
+        return found
+    for a in attempts if isinstance(attempts, list) else []:
+        if isinstance(a, dict) and a.get("role") == "repair" and text(a.get("dump")):
+            dump, error = _load_dump(a["dump"], "the dump of the attempt")
+            content, when = (None, None) if error else _stamp(dump, "attempt %s" % a.get("id"), sink)
+            if content is not None and when is not None and when > gate_when and content != gate_hash:
+                found.add(content)
+    return found
+
+
+def termination_problems(step, where, meta=None, repo=None):
+    """The proof that a step ended by the budget of its repairs, recomputed from the files that it names and never from what the row says about them (``repo`` is not needed: the evidence is the
+    dumps and the trees). ``termination`` is ``{"rule": "repair_budget", "allowed": 3, "first_failed_gate": {"dump": path}, "attempts": [{"id", "role", "dump", "tree"?, "note"?}], "counted": n}``:
+    * the budget is the plan's (``REPAIR_BUDGET``), not the row's;
+    * the first failed gate is a dump of the conda toolchain that fails the resource gate (Gate R) when it is compared with the base dump of the row's conda comparison again, with the same
+      allow-list in change mode (``codegen_gate.compare_dumps``): without a failed gate there was nothing to repair;
+    * every attempt names the dump that was made of it; the dump says the content hash of the tree it was made from (and the tree, when the row names it, must have that hash again: the
+      hash of everything under ``csrc`` and the extension's ``_ext.py``) and the moment it was made;
+    * the repair candidates that count are the distinct trees of the attempts in the role repair that were dumped AFTER the first failed gate and are not the failed form itself; the
+      ablations (an ablation says what it takes away) are not counted, the most favourable reading of the rule for the step;
+    * the row's count is the recomputed one, and the budget is exhausted: more distinct repair candidates than ``REPAIR_BUDGET``."""
+    t = step.get("termination")
+    if not isinstance(t, dict):
+        return ["%s: a step that ended by the budget of its repairs carries the proof (termination)" % where]
+    w = "%s: termination" % where
+    problems = []
+    if t.get("rule") != "repair_budget":
+        problems.append("%s: the rule is repair_budget, got %r" % (w, t.get("rule")))
+    if type(t.get("allowed")) is not int or t.get("allowed") != REPAIR_BUDGET:
+        problems.append("%s: the budget is %d repair attempts after a failed gate, the row says %r" % (w, REPAIR_BUDGET, t.get("allowed")))
+    first = t.get("first_failed_gate")
+    codegen = step.get("codegen_gate") if isinstance(step.get("codegen_gate"), dict) else {}
+    conda = codegen.get("conda")
+    gate_dump = None
+    if not (isinstance(first, dict) and text(first.get("dump"))):
+        problems.append("%s: first_failed_gate names the dump of the first failed gate (first_failed_gate.dump)" % w)
+    elif not (isinstance(conda, dict) and text(conda.get("base_dump"))):
+        problems.append("%s: the first failed gate is compared with the base on the conda toolchain, so the row carries its conda comparison (codegen_gate.conda)" % w)
+    else:
+        dump, e1 = _load_dump(first["dump"], "the dump of the first failed gate")
+        base, e2 = _load_dump(conda["base_dump"], "the base dump")
+        allow, e3 = None, None
+        if conda.get("allow"):
+            try:
+                allow = cg.load_allow(conda["allow"])
+            except (cg.Unusable, OSError, ValueError) as e:
+                e3 = "the allow-list %s cannot be used: %s" % (conda["allow"], _first_line(e))
+        if e1 or e2 or e3:
+            problems.extend("%s: %s" % (w, e) for e in (e1, e2, e3) if e)
+        else:
+            gate_dump = dump
+            _stamp(dump, "%s: the first failed gate" % w, problems)
+            try:
+                report = cg.compare_dumps(base, dump, allow, "change")
+            except cg.Unusable as e:
+                problems.append("%s: the first failed gate cannot be compared with the base again: %s" % (w, _first_line(e)))
+            else:
+                if not report["gate_r"]["failures"]:
+                    problems.append("%s: the first failed gate does not fail the resource gate when it is compared with the base again (%d Gate R check(s), no failure): there was nothing to repair" % (
+                        w, len(report["gate_r"]["checked"])))
+    attempts = t.get("attempts")
+    if not isinstance(attempts, list):
+        problems.append("%s: the attempts are a list of the repair candidates and the ablations, each with the dump that was made of it" % w)
+        attempts = []
+    ids = [a.get("id") if isinstance(a, dict) else None for a in attempts]
+    problems.extend("%s: more than one attempt is named %s" % (w, i) for i in sorted(set(ids), key=str) if ids.count(i) > 1)
+    for a in attempts:
+        if not isinstance(a, dict):
+            problems.append("%s: an attempt is an object (id, role, dump)" % w)
+            continue
+        who = "%s: attempt %s" % (w, a.get("id"))
+        if a.get("role") not in ATTEMPT_ROLES:
+            problems.append("%s: the role is repair or ablation, got %r" % (who, a.get("role")))
+        if a.get("role") == "ablation" and not text(a.get("note")):
+            problems.append("%s: an ablation says what it takes away (note)" % who)
+        if not text(a.get("dump")):
+            problems.append("%s: names no dump" % who)
+            continue
+        dump, error = _load_dump(a["dump"], "the dump of the attempt")
+        if error:
+            problems.append("%s: %s" % (who, error))
+            continue
+        content, when = _stamp(dump, who, problems)
+        if a.get("tree") is not None:
+            if not (text(a["tree"]) and os.path.isdir(a["tree"])):
+                problems.append("%s: the tree %r is not a directory" % (who, a["tree"]))
+            elif content is not None and cg.tree_content_hash(a["tree"]) != content:
+                problems.append("%s: the tree %s is not the tree that the dump was made from (content hash %s, the dump says %s)" % (who, a["tree"], cg.tree_content_hash(a["tree"])[:12], content[:12]))
+    counted = repair_candidates(gate_dump, attempts) if gate_dump is not None else set()
+    declared = t.get("counted")
+    if type(declared) is not int or declared != len(counted):
+        problems.append("%s: the row says %r counted repair attempts, the dumps give %d" % (w, declared, len(counted)))
+    if len(counted) <= REPAIR_BUDGET:
+        problems.append("%s: the budget is %d repair attempts after a failed gate and it is not exhausted: %d distinct repair candidate(s) were dumped after the first failed gate" % (
+            w, REPAIR_BUDGET, len(counted)))
     return problems
 
 

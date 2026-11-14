@@ -2416,3 +2416,171 @@ def test_the_chronology_command_line_takes_the_ledger_s_version(chronology_repo,
     capsys.readouterr()
     assert rc.main(["ledger", "--ledger", str(led), "--repo", str(h["repo"]), "--decision", str(dec)]) == 1
     assert "is not the record under check" in capsys.readouterr().out
+
+
+# ---- a step that ended by the budget of its repairs: the proof is recomputed from the retained dumps and trees, and the final form keeps the figures that it measured ------------------------
+GATE_WHEN = "2026-11-14T08:42:03Z"                                      # when the first failed resource gate was dumped; every counted repair candidate was dumped after it
+ATTEMPT_WHEN = "2026-11-14T08:47:%02dZ"
+
+
+def stamp(path, directory, name, content, created=None):
+    """A copy of the dump at ``path`` that says it was made from the tree with the content hash ``content`` at ``created`` (the dumps of the synthetic loop carry neither)."""
+    rec = json.load(open(path))
+    rec["meta"]["tree"]["content_hash"] = content
+    if created is not None:
+        rec["meta"]["created"] = created
+    out = os.path.join(str(directory), name)
+    with open(out, "w") as f:
+        json.dump(rec, f)
+    return out
+
+
+def tree_of(directory, name, body):
+    """A tiny source tree (``csrc/x.cu``) and its content hash as the code-generation gate computes it."""
+    root = os.path.join(str(directory), name)
+    os.makedirs(os.path.join(root, "csrc"))
+    with open(os.path.join(root, "csrc", "x.cu"), "w") as f:
+        f.write(body)
+    return root, cg.tree_content_hash(root)
+
+
+def budget_row(tmp_path, repairs=4, ablations=1, edit=None):
+    """A row-engine step that ended by the budget of its repairs: the honest comparisons of its final form on every toolchain (they pass), the first failed resource gate (129 registers), ``repairs``
+    dumps of distinct trees after it (role repair) and ``ablations`` more that only take something away to see what it costs; the revert commit removed the step. ``edit`` damages the row."""
+    d = Path(str(tmp_path))
+    codegen, resources = gate_evidence(C2, sid="e_tile")
+    failing = stamp(dump_file("conda", C4, "cand", rows={"reg": 129}), d, "first-failed-gate.json", "f" * 64, GATE_WHEN)
+    attempts = []
+    for i in range(repairs + ablations):
+        root, content = tree_of(d, "tree-%d" % i, "// variant %d\n" % i)
+        entry = {"id": "V%d" % i, "role": "repair" if i < repairs else "ablation", "dump": stamp(dump_file("conda", C3, "cand"), d, "attempt-%d.json" % i, content, ATTEMPT_WHEN % i), "tree": root}
+        if entry["role"] == "ablation":
+            entry["note"] = "takes the staging away to see what it costs"
+        attempts.append(entry)
+    step = {"id": "e_tile", "outcome": "not_adopted", "commit": C2, "revert_commit": C3, "markers": ["tile_marker"], "failed_at": "repair_budget",
+            "reason": "the repairs of the failed resource gate exceeded the budget of the gate protocol; the final form's figures are research results and are not adoption evidence",
+            "gates": {"exactness": True, "codegen": True}, "timing": {"vs_previous": "not_run", "vs_base": "not_run", "chain": "not_run"},
+            "codegen_gate": codegen, "resource_gate": resources, "ab": None,
+            "termination": {"rule": "repair_budget", "allowed": 3, "first_failed_gate": {"dump": failing}, "attempts": attempts, "counted": repairs}}
+    if edit is not None:
+        edit(step)
+    return step
+
+
+def test_a_step_that_ended_by_the_budget_of_its_repairs_is_a_valid_not_adopted_row(tmp_path):
+    row = budget_row(tmp_path)
+    assert row["failed_at"] == "repair_budget" and all(e["verdict"] == "PASS" for e in row["codegen_gate"].values())     # the final form passes: nothing is relabelled
+    assert step_check(row) == [], step_check(row)
+    ledger = {"schema": rc.LEDGER_SCHEMA, "meta": META, "steps": [adopted("single_launch"), row]}
+    assert rc.ledger_problems(ledger) == [], rc.ledger_problems(ledger)
+
+
+@pytest.mark.parametrize("repairs,ablations,expected", [(3, 0, "not exhausted"), (3, 6, "not exhausted"), (0, 5, "not exhausted"), (4, 0, None), (4, 3, None)])
+def test_the_budget_is_exhausted_by_more_than_three_distinct_repair_candidates_and_ablations_are_not_counted(tmp_path, repairs, ablations, expected):
+    problems = step_check(budget_row(tmp_path, repairs, ablations))
+    if expected is None:
+        assert problems == [], problems
+    else:
+        assert has(problems, expected) and has(problems, "the budget is %d repair attempts" % rc.REPAIR_BUDGET), problems
+
+
+def sub(tmp_path, name):
+    """A directory of its own for the files of one case."""
+    d = Path(str(tmp_path)) / name
+    d.mkdir()
+    return d
+
+
+def test_a_candidate_counts_once_and_only_after_the_failed_gate_and_not_when_it_is_the_failed_form_itself(tmp_path):
+    def twice(row):                                                       # two of four entries made from the same tree: three distinct candidates
+        a = row["termination"]["attempts"]
+        a[1]["dump"], a[1]["tree"] = a[0]["dump"], a[0]["tree"]
+        row["termination"]["counted"] = 3
+    def early(row):                                                       # two of four were dumped before the gate failed: they were not repairs of it
+        for a in row["termination"]["attempts"][:2]:
+            rec = json.load(open(a["dump"]))
+            rec["meta"]["created"] = "2026-11-14T08:30:00Z"
+            with open(a["dump"], "w") as f:
+                json.dump(rec, f)
+        row["termination"]["counted"] = 2
+    def itself(row):                                                      # one of four is the failed form: it is not a repair of itself
+        a = row["termination"]["attempts"][0]
+        a["dump"] = stamp(a["dump"], tmp_path, "the-failed-form.json", "f" * 64, ATTEMPT_WHEN % 0)
+        a.pop("tree")
+        row["termination"]["counted"] = 3
+    for name, edit in (("twice", twice), ("early", early), ("itself", itself)):
+        problems = step_check(budget_row(sub(tmp_path, name), 4, 0, edit=edit))
+        assert has(problems, "not exhausted"), (name, problems[:3])
+        assert not has(problems, "counted repair attempts, the dumps give"), (name, problems[:3])             # the declared count was the recomputed one
+
+
+def test_the_proof_of_the_budget_is_recomputed_and_not_declared(tmp_path):
+    def attempt(row, i=0):
+        return row["termination"]["attempts"][i]
+    cases = {
+        "a declared count that is not the recomputed one": (lambda r: r["termination"].update(counted=9), "says 9 counted repair attempts, the dumps give 4"),
+        "a budget of another size": (lambda r: r["termination"].update(allowed=5), "the budget is %d repair attempts" % rc.REPAIR_BUDGET),
+        "a boolean for the budget": (lambda r: r["termination"].update(allowed=True), "the budget is %d repair attempts" % rc.REPAIR_BUDGET),
+        "another rule": (lambda r: r["termination"].update(rule="something"), "the rule is repair_budget"),
+        "a duplicate attempt id": (lambda r: attempt(r, 1).update(id="V0"), "more than one attempt is named V0"),
+        "a role that is neither": (lambda r: attempt(r).update(role="idea"), "role is repair or ablation"),
+        "an ablation that does not say what it takes away": (lambda r: attempt(r, 4).pop("note"), "an ablation says what it takes away"),
+        "a dump that cannot be read": (lambda r: attempt(r).update(dump="/nonexistent/dump.json"), "cannot be used"),
+        "an attempt without a tree hash": (lambda r: attempt(r).update(dump=stamp(attempt(r)["dump"], tmp_path, "nohash.json", "", ATTEMPT_WHEN % 0)), "names no content hash"),
+        "an attempt without a time": (lambda r: attempt(r).update(dump=dump_file("conda", C3, "cand")), "has no creation time"),
+        "an attempt with an unreadable time": (lambda r: attempt(r).update(dump=stamp(attempt(r)["dump"], tmp_path, "badtime.json", "a" * 64, "yesterday")), "creation time"),
+        "a tree that is not the one the dump was made from": (lambda r: attempt(r).update(tree=attempt(r, 1)["tree"]), "is not the tree that the dump was made from"),
+        "a tree that is not there": (lambda r: attempt(r).update(tree="/nonexistent/tree"), "is not a directory"),
+        "no attempts at all": (lambda r: r["termination"].update(attempts=[], counted=0), "not exhausted"),
+        "attempts that are not a list": (lambda r: r["termination"].update(attempts="many"), "attempts are a list"),
+    }
+    for i, (name, (edit, expected)) in enumerate(cases.items()):
+        problems = step_check(budget_row(sub(tmp_path, "c%d" % i), edit=edit))
+        assert has(problems, expected), (name, expected, problems[:4])
+
+
+def test_the_first_failed_gate_must_fail_the_resource_gate_when_it_is_compared_with_the_base_again(tmp_path):
+    def passing(row):                                                     # the 'failed' gate passes: there was nothing to repair
+        row["termination"]["first_failed_gate"]["dump"] = stamp(dump_file("conda", C4, "cand"), tmp_path, "passing.json", "f" * 64, GATE_WHEN)
+    def other_toolchain(row):
+        row["termination"]["first_failed_gate"]["dump"] = stamp(dump_file("container_b200", C4, "cand", rows={"reg": 129}), tmp_path, "container.json", "f" * 64, GATE_WHEN)
+    def none_at_all(row):
+        row["termination"].pop("first_failed_gate")
+    for i, (edit, expected) in enumerate(((passing, "does not fail the resource gate"), (other_toolchain, "cannot be compared"), (none_at_all, "names the dump of the first failed gate"))):
+        problems = step_check(budget_row(sub(tmp_path, "g%d" % i), edit=edit))
+        assert has(problems, expected), (expected, problems[:3])
+
+
+def test_the_final_form_of_a_budget_row_keeps_the_figures_that_it_measured(tmp_path):
+    def relabelled(row):                                                  # the comparisons pass: the gate may not be called failed
+        row["gates"]["codegen"] = False
+    def failing_final(row):                                               # a final form that fails the resource gate is as valid a row as one that passes it
+        codegen, resources = gate_evidence(C2, sid="e_tile", rows={"reg": 129})
+        row["codegen_gate"], row["resource_gate"], row["gates"]["codegen"] = codegen, resources, False
+    def no_comparisons(row):
+        row["codegen_gate"], row["resource_gate"] = {}, {}
+    assert has(step_check(budget_row(sub(tmp_path, "a"), edit=relabelled)), "the comparisons of the dumps say"), "relabelled"
+    assert step_check(budget_row(sub(tmp_path, "b"), edit=failing_final)) == [], step_check(budget_row(sub(tmp_path, "b2"), edit=failing_final))
+    missing = step_check(budget_row(sub(tmp_path, "c"), edit=no_comparisons))
+    assert has(missing, "no comparison for any toolchain") or has(missing, "codegen_gate must give"), missing[:3]
+
+
+def test_a_budget_row_has_no_timing_and_names_the_revert_that_removed_the_step(tmp_path):
+    damage = {
+        "a measured timing": (lambda r: r.update(timing={"vs_previous": "pass", "vs_base": "pass", "chain": "pass"}), "no timing was measured"),
+        "A/B medians": (lambda r: r.update(ab=ab_figures()), "ab has medians for a phase the step never reached"),
+        "a kept commit": (lambda r: r.update(revert_commit=None), "is not reverted"),
+        "no reason": (lambda r: r.update(reason=" "), "carries a reason"),
+        "no termination": (lambda r: r.pop("termination"), "carries the proof"),
+    }
+    for i, (name, (edit, expected)) in enumerate(damage.items()):
+        problems = step_check(budget_row(sub(tmp_path, "t%d" % i), edit=edit))
+        assert has(problems, expected), (name, problems[:3])
+
+
+def test_a_termination_belongs_to_a_budget_row_only(tmp_path):
+    proof = budget_row(tmp_path)["termination"]
+    for what, row in (("an adopted step", adopted("e_tile")), ("a step that failed at the timing", not_adopted("e_tile", "timing", commit=C1, revert=C2)),
+                      ("a step that failed at the code generation", not_adopted("e_tile", "codegen", commit=C1, revert=C2))):
+        assert has(step_check(mutated(row, lambda r: r.update(termination=proof))), "only a step that ended by the budget"), what
+    assert has(step_check(mutated(skipped("e_tile"), lambda r: r.update(termination=proof))), "a skipped step has no termination")
