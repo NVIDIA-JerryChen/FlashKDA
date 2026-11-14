@@ -42,9 +42,25 @@ static_assert(IMPL_MAX == 2 * IMPL_DECODE_PLAN - 1, "the highest assigned bit is
 // generation gate (ptxas reports 8,192 B on sm_100a / sm_103a and 7,808 B on sm_90a); it is larger than the structure of the source (cfbi_rows.cuh static_asserts that the
 // structure fits and that the difference stays below one allocation unit of 1 KiB), so the need is the compiler's figure, not the structure's. DYNAMIC is the dynamic shared
 // memory of the launch (the launch sites and the occupancy hook read this constant). The per-CTA reserve of the driver (1 KiB) comes on top of both and is a device figure.
+// The dynamic part of the optimised engine is the staged copy of the state E (cfbi_rows.cuh): 128 value rows of ROWS_E_STRIDE floats, a row being the 128 key columns of E and a pad of 4
+// floats (a row stride of 4 banks (mod 32): the fragment reads and the chunk-end updates of the kernel are then free of bank conflicts, and every row starts on a 16-byte boundary for the
+// async copies). The kernel static_asserts that these numbers are its layout; the literals are kept as numbers because the tests and the record checker read them from this file.
 constexpr int ROWS_STATIC_SMEM_BYTES = 8192;
-constexpr int ROWS_DYNAMIC_SMEM_BYTES = 0;
+constexpr int ROWS_E_STRIDE = 132;
+constexpr int ROWS_E_TILE_FLOATS = 16896;
+constexpr int ROWS_DYNAMIC_SMEM_BYTES = 67584;
 constexpr int ROWS_SMEM_NEED_BYTES = ROWS_STATIC_SMEM_BYTES + ROWS_DYNAMIC_SMEM_BYTES;
+static_assert(ROWS_E_TILE_FLOATS == 128 * ROWS_E_STRIDE && ROWS_DYNAMIC_SMEM_BYTES == ROWS_E_TILE_FLOATS * static_cast<int>(sizeof(float)), "the dynamic shared memory of the row engine is the E tile: 128 rows of ROWS_E_STRIDE floats");
+// The frozen reference row engine (csrc/cfbi/ref, the oracle) stages nothing: its launch has no dynamic shared memory, whatever the optimised engine's has (its own launch constant, its own
+// occupancy figure and its own binding in the decision record).
+constexpr int ROWS_REF_DYNAMIC_SMEM_BYTES = 0;
+// The budget of the row engine, the resource gate of the optimisation steps: ROWS_BUDGET_CTAS_PER_SM CTAs, each with its static and dynamic shared memory and the reserve of the driver, fit
+// the shared memory of one SM of the devices of the gate (228 KiB on B200 and B300; the occupancy records say 233,472 B). A tile that does not fit is a build error, not a halved occupancy.
+constexpr int ROWS_BUDGET_CTAS_PER_SM = 2;
+constexpr int ROWS_BUDGET_SM_SHARED_BYTES = 228 * 1024;
+constexpr int ROWS_BUDGET_CTA_RESERVE_BYTES = 1024;
+static_assert(ROWS_BUDGET_CTAS_PER_SM * (ROWS_SMEM_NEED_BYTES + ROWS_BUDGET_CTA_RESERVE_BYTES) <= ROWS_BUDGET_SM_SHARED_BYTES,
+              "the shared memory of the optimised row engine (static + dynamic + the driver's reserve) must leave room for ROWS_BUDGET_CTAS_PER_SM CTAs per SM");
 
 // ---- which implementation runs on a device ----------------------------------------------------------------------------------------------------------------------------
 // What the launches of a forward call ask of a device, per CTA, in bytes of shared memory (static plus dynamic, without the driver's per-CTA reserve: the opt-in limit of the device,
