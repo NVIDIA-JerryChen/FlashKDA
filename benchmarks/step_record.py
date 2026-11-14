@@ -219,7 +219,7 @@ def skip_problems(rec, role, substitutes=None):
         if not substitutes:
             out.append("the candidate record skips racecheck (it cannot analyse the kernels): the documented exception needs the substitute controls (suites.<device>.S.substitute_controls) that passed")
         for control in substitutes or []:
-            outcome = rec["tests"].get(control, "absent") if rec.get("tests") else "absent"
+            outcome = (rec.get("tests") or {}).get(control, "absent")
             if outcome != "passed":
                 out.append("the substitute control %s of the skipped racecheck did not pass in the candidate record (%s)" % (control, outcome))
     return out
@@ -229,7 +229,9 @@ def exactness_problems(m, repo=None):
     """Why the exactness gate (Gate G and Suite S on both devices) is not shown by the suite records of the manifest. A record that cannot be read, that is of another commit than the one the
     suites ran on (the step's commit or, after a repair of the tests, a later commit with the same kernel sources: ``suite_commit``) or of another device; a candidate that is not the WHOLE suite
     at that commit (not complete: a subset record, a record that ignores files, a file or a test id of the commit's collection that it lacks or an id that it has beyond it; a verified merge of
-    several runs is complete) or a baseline that is not a complete record of the base; and a candidate that fails the comparison with the baseline (``suite_record.check``)."""
+    several runs is complete) or a baseline that is not the whole suite of the base (held the same way to the collection of the base: ``baseline_collection``); a record of either side
+    that did not run with the CFBI_BIG of the suite (``env_problems``) or that skips a test that may not be skipped (``skip_problems``); and a candidate that fails the comparison with the
+    baseline (``suite_record.check``)."""
     out = []
     repo = repo or default_repo()
     ran_on = m.get("suite_commit") or m["commit"]

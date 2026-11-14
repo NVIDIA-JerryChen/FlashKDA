@@ -46,13 +46,13 @@ def real():
 
 def kernel_text(texts):
     """The tokens of the body of ``rows_kernel`` as the default build reads them, single-spaced."""
-    toks = ps.expand_default_hooks(ps.tokens(ps.default_view(texts)[ROWS]))
-    body = ps.function_body(toks, KERNEL)
+    body = helper_text(texts, ROWS, KERNEL)
     assert body is not None, "rows_kernel is not found"
-    return " ".join(body)
+    return body
 
 
 def helper_text(texts, file, head):
+    """The tokens of the body of the function ``head`` of ``file`` as the default build reads them, single-spaced (None: the function is not found)."""
     toks = ps.expand_default_hooks(ps.tokens(ps.default_view(texts)[file]))
     body = ps.function_body(toks, head)
     return None if body is None else " ".join(body)
@@ -66,6 +66,11 @@ def before(text, a, b):
     """True when the snippet ``a`` is in ``text`` and the first ``b`` after it exists."""
     i = text.find(a)
     return i >= 0 and text.find(b, i + len(a)) > i
+
+
+def name_count(text, name):
+    """How many times the identifier ``name`` is named in ``text``."""
+    return len(re.findall(r"\b%s\b" % name, text))
 
 
 # ---- the pins of the kernel ----------------------------------------------------------------------------------------------------------------------------------
@@ -99,7 +104,7 @@ def stage_problems(texts):
         return ["stage: rows_stage_e is not the pinned copy of the 16 rows of a warp (8 * (warp + 8 * (r >> 3)) + (r & 7), one 16-byte copy per lane, one group): %s" % body]
     probs = []
     s = kernel_text(texts)
-    if s.count(STAGE_CALL) != 1 or len(re.findall(r"\brows_stage_e\b", s)) != 1:
+    if s.count(STAGE_CALL) != 1 or name_count(s, "rows_stage_e") != 1:
         probs.append("stage: rows_stage_e is not called exactly once in rows_kernel, as `%s`" % STAGE_CALL)
     elif not before(s, STAGE_CALL, ROW_LOOP):
         probs.append("stage: the staging is not issued in front of the row loop (inside it the compiler holds the addresses of the copies across the loop and the kernel spills)")
@@ -108,16 +113,17 @@ def stage_problems(texts):
 
 def order_problems(texts):
     s = kernel_text(texts)
-    probs = []
     if s.count(WAIT) != 1:
         return ["order: the wait of the copies is not `%s` exactly once" % WAIT]
     if s.count(BARRIER_C) != 1:
         return ["order: the barrier that ends phase C is not `%s` exactly once" % BARRIER_C]
-    if not s.index(WAIT) < s.index(BARRIER_C):
+    probs = []
+    wait, barrier, first_read = s.index(WAIT), s.index(BARRIER_C), s.find("sEw [")
+    if wait >= barrier:
         probs.append("order: the wait for the copies does not come in front of the barrier that ends phase C (the barrier publishes the copies of the other lanes: a wait behind it is no wait)")
-    if not s.index(WAIT) + len(WAIT) + 1 == s.index(BARRIER_C):
+    if wait + len(WAIT) + 1 != barrier:
         probs.append("order: something stands between the wait and the barrier that ends phase C")
-    if s.index(BARRIER_C) > s.find("sEw [") or s.find("sEw [") < 0:
+    if first_read < 0 or first_read < barrier:
         probs.append("order: the tile is read in front of the barrier that follows the wait (phase D must read it after it)")
     if re.search(r"\bcp_async_(?:commit|16)\b", s):
         probs.append("order: an async copy is issued in rows_kernel itself: only rows_stage_e issues copies")
@@ -138,18 +144,19 @@ def tile_problems(texts):
         return probs
     if [s.index(x) for x in G_WRITES] != sorted(s.index(x) for x in G_WRITES):
         probs.append("tile: the chunk end does not compute the new value, then write the tile, then global memory")
-    uses = re.findall(r"\bEg\b", s)
-    if len(uses) != 3:
-        probs.append("tile: Eg is named %d times in rows_kernel, expected 3 (its definition, the staging call and the chunk-end store): no other access to the state in global memory" % len(uses))
+    uses = name_count(s, "Eg")
+    if uses != 3:
+        probs.append("tile: Eg is named %d times in rows_kernel, expected 3 (its definition, the staging call and the chunk-end store): no other access to the state in global memory" % uses)
     for token in ("eb", "prefetch_state ( eb"):
         if re.search(r"(?<![\w.])%s\b" % re.escape(token), s):
             probs.append("tile: `%s` is in rows_kernel: the gather or the prefetch of E that the tile replaces" % token)
     if not before(s, OPAQUE_DECL, "for ( int mt = 0 ; mt < 8 ; ++ mt )"):
         probs.append("tile: the opaque lane coordinates are not taken in front of the loop over the key tiles of the chunk end")
-    if len(re.findall(r"\brows_opaque\b", s)) != 4:
-        probs.append("tile: rows_opaque is named %d times in rows_kernel, expected 4 (the phase-D base twice, the chunk-end coordinates twice)" % len(re.findall(r"\brows_opaque\b", s)))
-    if len(re.findall(r"\bsE\b", s)) != 5:
-        probs.append("tile: sE is named %d times in rows_kernel, expected 5 (its definition, the staging call, the phase-D base, the chunk-end read and write)" % len(re.findall(r"\bsE\b", s)))
+    opaque, tile = name_count(s, "rows_opaque"), name_count(s, "sE")
+    if opaque != 4:
+        probs.append("tile: rows_opaque is named %d times in rows_kernel, expected 4 (the phase-D base twice, the chunk-end coordinates twice)" % opaque)
+    if tile != 5:
+        probs.append("tile: sE is named %d times in rows_kernel, expected 5 (its definition, the staging call, the phase-D base, the chunk-end read and write)" % tile)
     return probs
 
 
@@ -294,6 +301,11 @@ def lane_names(lane):
     return {"g": lane >> 2, "t": lane & 3}
 
 
+def phase_d(formulas, w, tl, ks, ii, lane, stride):
+    """The tile index that phase D reads for fragment element ``ii`` of key step ``ks`` of a lane, from the expressions of the source."""
+    return evaluate(formulas["d_base"], warp=w, ROWS_E_STRIDE=stride, **lane_names(lane)) + evaluate(formulas["d_read"], tl=tl, ks=ks, ii=ii, ROWS_E_STRIDE=stride)
+
+
 def chunk_end(formulas, w, tl, mt, i, lane, stride):
     """``(v, k, tile index read, tile index written, global index written)`` of the chunk-end update of fragment element ``i`` of a lane, from the expressions of the source."""
     n = lane_names(lane)
@@ -309,15 +321,14 @@ def test_the_rows_of_the_warps_partition_e_and_are_the_rows_that_their_tiles_use
     for w in range(8):
         read_d, written_g = set(), set()
         for lane in range(32):
-            n = lane_names(lane)
-            row0 = evaluate(formulas["d_base"], warp=w, ROWS_E_STRIDE=stride, **n)
             for tl in range(2):
-                read_d.add((row0 + evaluate(formulas["d_read"], tl=tl, ks=0, ii=0, ROWS_E_STRIDE=stride)) // stride)          # the tile row that phase D reads: 8 warp + g + 64 tl
+                read_d.add(phase_d(formulas, w, tl, 0, 0, lane, stride) // stride)                                            # the tile row that phase D reads: 8 warp + g + 64 tl
                 for mt in range(8):
                     for i in range(4):
                         written_g.add(chunk_end(formulas, w, tl, mt, i, lane, stride)[0])
-        assert read_d == set(owned[w]) == written_g or (read_d <= set(owned[w]) and written_g == set(owned[w])), (w, sorted(read_d)[:4])
-        assert set(owned[w]) == {r for r in range(128) if 8 * w <= r % 64 < 8 * w + 8}                # warp w owns value rows 8 w + gg and 64 + 8 w + gg
+        mine = set(owned[w])
+        assert read_d <= mine and written_g == mine, (w, sorted(read_d)[:4])
+        assert mine == {r for r in range(128) if 8 * w <= r % 64 < 8 * w + 8}                         # warp w owns value rows 8 w + gg and 64 + 8 w + gg
 
 
 def test_the_fragment_helpers_of_the_tile_are_the_accumulator_layout_of_the_primitives(real):
@@ -343,7 +354,7 @@ def test_the_tile_fragments_are_the_elements_that_the_global_gather_read(formula
             for tl in range(2):
                 for ks in range(16):
                     for ii in range(2):
-                        got = evaluate(formulas["d_base"], warp=w, ROWS_E_STRIDE=stride, **n) + evaluate(formulas["d_read"], tl=tl, ks=ks, ii=ii, ROWS_E_STRIDE=stride)
+                        got = phase_d(formulas, w, tl, ks, ii, lane, stride)
                         assert divmod(got, stride) == (8 * (w + 8 * tl) + n["g"], 8 * ks + n["t"] + 4 * ii), (w, lane, tl, ks, ii)    # the old gather: Eg[(8 (warp + 8 tl) + g) * HEAD_K + 8 ks + t + 4 ii]
                 for mt in range(8):
                     for i in range(4):
@@ -361,7 +372,7 @@ def test_the_fragment_reads_and_the_chunk_end_updates_are_free_of_bank_conflicts
         for tl in range(2):
             for ks in range(16):
                 for ii in range(2):
-                    addrs = [evaluate(formulas["d_base"], warp=w, ROWS_E_STRIDE=stride, **lane_names(lane)) + evaluate(formulas["d_read"], tl=tl, ks=ks, ii=ii, ROWS_E_STRIDE=stride) for lane in range(32)]
+                    addrs = [phase_d(formulas, w, tl, ks, ii, lane, stride) for lane in range(32)]
                     assert banks(addrs) == list(range(32)), (w, tl, ks, ii)                              # the 32 lanes of a warp read 32 different banks
             for mt in range(8):
                 for i in range(4):
@@ -382,17 +393,13 @@ def test_two_ctas_fit_the_shared_memory_of_an_sm_with_the_numbers_of_the_header(
     h = header_ints()
     need = h["ROWS_STATIC_SMEM_BYTES"] + h["ROWS_DYNAMIC_SMEM_BYTES"]                                       # ROWS_SMEM_NEED_BYTES is this sum in the header
     per_cta = need + h["ROWS_BUDGET_CTA_RESERVE_BYTES"]
-    assert need == h["ROWS_STATIC_SMEM_BYTES"] + h["ROWS_DYNAMIC_SMEM_BYTES"] == 8192 + 67584 == 75776
+    assert need == 8192 + 67584 == 75776
     assert h["ROWS_BUDGET_CTAS_PER_SM"] * per_cta <= h["ROWS_BUDGET_SM_SHARED_BYTES"]
     assert 3 * per_cta <= 233472 and 4 * per_cta > 233472                                                 # a third CTA would fit by shared memory (the registers bound two), a fourth would not
 
 
 def host_compiler():
-    for name in ("g++", "c++"):
-        found = shutil.which(name)
-        if found:
-            return found
-    return None
+    return shutil.which("g++") or shutil.which("c++")
 
 
 def compile_header(tmp, edits):

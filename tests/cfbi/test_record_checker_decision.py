@@ -727,7 +727,7 @@ def test_the_launch_constants_follow_the_launcher_into_the_header(tmp_path):
 
 REF_FROM_HEADER = "constexpr size_t ROWS_REF_DYNAMIC_SMEM = ROWS_REF_DYNAMIC_SMEM_BYTES;   // read from the CUDA-free header\n"
 HEADER_REF = "constexpr int ROWS_REF_DYNAMIC_SMEM_BYTES = %d;\n"
-E_DYNAMIC = 67584
+E_DYNAMIC = E_BYTES                          # the dynamic tile of the optimised row engine: the staged E tile
 
 
 def test_the_launch_constants_name_the_dynamic_shared_memory_of_the_reference_engine_only_when_the_launcher_has_its_own_constant(tmp_path):
@@ -775,15 +775,15 @@ def test_each_occupancy_instance_is_bound_to_the_dynamic_shared_memory_of_its_ow
     def admission(rec, launch=launch):
         return dr.occupancy_admission_problems(rec, "b200", container, launch)
     assert admission(rec) == [], admission(rec)[:3]
-    refd, container = split_launch_record(world, reference=E_DYNAMIC)                                                       # the reference engine launched with the tile of the other
+    refd, _ = split_launch_record(world, reference=E_DYNAMIC)                                                                   # the reference engine launched with the tile of the other
     assert has(admission(refd), "%s: the API says 256 threads and %d B dynamic shared memory, the launch in the sources at the record's commit uses 256 threads and 0 B" % (dr.REFERENCE_KERNEL, E_DYNAMIC)), admission(refd)[:3]
-    bare, container = split_launch_record(world, optimised=0)                                                               # the optimised engines without the tile of their launch
+    bare, _ = split_launch_record(world, optimised=0)                                                                           # the optimised engines without the tile of their launch
     found = admission(bare)
     assert has(found, "cfbi::rows_kernel<false>: the API says 256 threads and 0 B") and has(found, "cfbi::rows_kernel<true>: the API says 256 threads and 0 B") and has(found, "uses 256 threads and %d B" % E_DYNAMIC), found[:3]
     assert not has(found, "%s: the API" % dr.REFERENCE_KERNEL), found[:3]                                                   # the reference engine is as its own launch says
     old = {"threads": 256, "dynamic_smem": E_DYNAMIC}                                                                       # a launch with one constant: it is the launch of every instance
     assert has(admission(rec, old), "%s: the API says 256 threads and 0 B dynamic shared memory, the launch in the sources at the record's commit uses 256 threads and %d B" % (dr.REFERENCE_KERNEL, E_DYNAMIC))
-    other, container = split_launch_record(world, reference=4096)
+    other, _ = split_launch_record(world, reference=4096)
     assert has(admission(other), "%s: the API says 256 threads and 4096 B" % dr.REFERENCE_KERNEL) and not admission(other, dict(launch, reference_dynamic_smem=4096))
 
 

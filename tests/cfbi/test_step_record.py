@@ -282,7 +282,9 @@ def junit_of(files, failed=(), skipped=None):
     def body(n):
         if n in failed:
             return '<failure message="boom">t</failure>'
-        return '<skipped type="pytest.skip" message=%s>skipped</skipped>' % quoteattr(skipped[n]) if n in skipped else ""
+        if n in skipped:
+            return '<skipped type="pytest.skip" message=%s>skipped</skipped>' % quoteattr(skipped[n])
+        return ""
     cases = "".join('<testcase classname="%s" name="%s" time="0.1">%s</testcase>' % (cls, n, body(n)) for cls, names in files.items() for n in names)
     return ('<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="%d" skipped="%d" tests="%d">%s</testsuite></testsuites>'
             % (len(failed), sum(1 for v in files.values() for n in v if n in skipped), sum(len(v) for v in files.values()), cases))
@@ -290,7 +292,9 @@ def junit_of(files, failed=(), skipped=None):
 
 def suite_record(commit, suite, gpu, files, failed=(), ignored=(), subset=False, host="node-a", skipped=None, big=None):
     """A ``cfbi-suite-v1`` record of ``files`` ({classname: names}) as the node pipelines build them from a JUnit file (``big``: the CFBI_BIG that the record says it ran with)."""
-    meta = {"dirty": False, "sm_count": 148, "tree": "at-" + commit[:7], "env": {"CFBI_BIG": big if big is not None else ("1" if suite == "S" else "0")}, "python": "3.12.3", "torch": "2.14.0", "cuda": "13.4",
+    if big is None:
+        big = "1" if suite == "S" else "0"
+    meta = {"dirty": False, "sm_count": 148, "tree": "at-" + commit[:7], "env": {"CFBI_BIG": big}, "python": "3.12.3", "torch": "2.14.0", "cuda": "13.4",
             "host": host, "ignored": list(ignored), "subset": subset, "label": "part", "junit": "part.xml"}
     return tbt.suite_record_of(junit_of(files, failed, skipped), commit=commit, suite=suite, gpu=gpu, **meta)
 
@@ -323,7 +327,9 @@ def exactness_world(tmp_path, failed=()):
     suite = commit_file(repo, "tests/cfbi/test_new_mechanism.py", "# the step's own tests\n", "the tests of the step")
     world = dict(BASE_TESTS, **STEP_TESTS)
     files = sorted("tests/cfbi/%s.py" % c.rsplit(".", 1)[1] for c in world)
-    gate_of = lambda tests: {"tests.cfbi.test_vs_ref": tests["tests.cfbi.test_vs_ref"]}                                                  # noqa: E731
+
+    def gate_of(tests):
+        return {"tests.cfbi.test_vs_ref": tests["tests.cfbi.test_vs_ref"]}
     collections = {"S": collection_file(tmp_path / "collected-S.txt", suite, ids_of(world), 1), "gate": collection_file(tmp_path / "collected-gate.txt", suite, ids_of(gate_of(world)), 0)}
     base_collections = {"S": collection_file(tmp_path / "collected-base-S.txt", base, ids_of(BASE_TESTS), 1), "gate": collection_file(tmp_path / "collected-base-gate.txt", base, ids_of(gate_of(BASE_TESTS)), 0)}
     suites = {}
@@ -352,6 +358,13 @@ def edit_record(m, dev, name, role, edit):
 
 def recount(rec):
     rec["totals"] = dict((k, sum(c[k] for c in rec["files"].values())) for k in rec["totals"])
+
+
+def as_one_run(rec):
+    """An edited record is the record of one run: the parts and the expected collection of a merge no longer describe it."""
+    rec["meta"].pop("parts", None)
+    rec["meta"].pop("expected", None)
+    rec["meta"]["kind"] = "single"
 
 
 def skip_test(tid, reason):
@@ -399,8 +412,7 @@ def one_id_per_file(rec):
     recount(rec)
     rec["failed"] = [t for t in rec["failed"] if t in rec["tests"]]
     rec["skipped"] = [s for s in rec["skipped"] if s["id"] in rec["tests"]]
-    rec["meta"].pop("parts", None), rec["meta"].pop("expected", None)
-    rec["meta"]["kind"] = "single"
+    as_one_run(rec)
 
 
 def test_complete_records_bound_to_the_collection_of_the_suite_commit_are_the_exactness_evidence(tmp_path):
@@ -415,12 +427,12 @@ def test_complete_records_bound_to_the_collection_of_the_suite_commit_are_the_ex
 
 def test_a_record_that_is_not_the_whole_suite_at_the_commit_of_the_suites_is_no_exactness_evidence(tmp_path):
     def subset(rec):                                                          # the run without the sanitizer file, as a subset record: what round 12 had
-        rec["meta"].update(subset=True, ignored=[SANITIZER], kind="single")
-        rec["meta"].pop("parts", None), rec["meta"].pop("expected", None)
+        as_one_run(rec)
+        rec["meta"].update(subset=True, ignored=[SANITIZER])
         for tid in [t for t in rec["tests"] if "k2_dyn" in t]:
             rec["tests"].pop(tid)
         rec["files"].pop("tests/cfbi/test_k2_dyn_sanitizer.py")
-        rec["totals"] = dict((k, sum(c[k] for c in rec["files"].values())) for k in rec["totals"])
+        recount(rec)
         rec["skipped"] = [s for s in rec["skipped"] if "k2_dyn" not in s["id"]]
 
     def without_file(file):
@@ -428,9 +440,8 @@ def test_a_record_that_is_not_the_whole_suite_at_the_commit_of_the_suites_is_no_
             for tid in [t for t in rec["tests"] if t.startswith(file + "::")]:
                 rec["tests"].pop(tid)
             rec["files"].pop(file)
-            rec["totals"] = dict((k, sum(c[k] for c in rec["files"].values())) for k in rec["totals"])
-            rec["meta"].pop("parts", None), rec["meta"].pop("expected", None)
-            rec["meta"]["kind"] = "single"
+            recount(rec)
+            as_one_run(rec)
         return edit
 
     def without_id(tid):
@@ -439,9 +450,8 @@ def test_a_record_that_is_not_the_whole_suite_at_the_commit_of_the_suites_is_no_
             rec["tests"].pop(tid)
             rec["files"][file]["passed"] -= 1
             rec["files"][file]["total"] -= 1
-            rec["totals"] = dict((k, sum(c[k] for c in rec["files"].values())) for k in rec["totals"])
-            rec["meta"].pop("parts", None), rec["meta"].pop("expected", None)
-            rec["meta"]["kind"] = "single"
+            recount(rec)
+            as_one_run(rec)
         return edit
     cases = [("a subset record that ignores the sanitizer file", subset, ["subset record", "ignores " + SANITIZER]),
              ("a record without the whole file of the step's own tests", without_file("tests/cfbi/test_new_mechanism.py"), ["expected file(s) are missing: tests/cfbi/test_new_mechanism.py", "expected test(s) are missing"]),
@@ -561,7 +571,7 @@ def test_the_tests_that_the_tool_allows_to_skip_are_in_the_sources_with_that_rea
 def test_the_environment_of_both_records_is_the_one_of_the_suite_and_the_header_of_a_collection_is_read_as_a_field(tmp_path):
     """The collection says which CFBI_BIG the ids were collected with; the records say which they ran with. Both are bound to the suite (S: 1, Gate G: 0) for the baseline and the candidate alike:
     records that both ran with the other value, a record that says nothing and a header with another value that has the right one as its beginning are all refused."""
-    m, repo, facts = exactness_world(tmp_path)
+    m, repo, _ = exactness_world(tmp_path)
     assert sp.exactness_problems(m, repo) == []
     cases = [("both records of Suite S ran with CFBI_BIG=0", "S", {"baseline": set_env({"CFBI_BIG": "0"}), "candidate": set_env({"CFBI_BIG": "0"})}, ["the baseline record ran with CFBI_BIG='0'", "the candidate record ran with CFBI_BIG='0'"]),
              ("both records of Suite S ran with CFBI_BIG=10", "S", {"baseline": set_env({"CFBI_BIG": "10"}), "candidate": set_env({"CFBI_BIG": "10"})}, ["the candidate record ran with CFBI_BIG='10'"]),
@@ -594,21 +604,20 @@ def test_the_baseline_is_complete_against_the_collection_of_the_base_and_the_man
     each is no baseline. The manifest names the collection, and its header names the base and the environment of the suite."""
     m, repo, facts = exactness_world(tmp_path)
     assert sp.exactness_problems(m, repo) == []
-    cut = tmp_path / "cut"
-    cut.mkdir()
-    mm, rr, _ = exactness_world(cut)
+    mm, rr, _ = exactness_world(tmp_path / "cut")
     edit_record(mm, "b300", "S", "baseline", one_id_per_file)
     found = sp.exactness_problems(mm, rr)
     assert any(p.startswith("b300, suite S") and "the baseline record is not complete" in p and "expected test(s) are missing" in p for p in found), found[:3]
-    old = tmp_path / "old"
-    old.mkdir()
-    mm, rr, _ = exactness_world(old)                                                                # a baseline record of the older format: counts per file, no outcome per test
+    mm, rr, _ = exactness_world(tmp_path / "old")                                                   # a baseline record of the older format: counts per file, no outcome per test
     edit_record(mm, "b200", "gate", "baseline", lambda rec: rec.pop("tests"))
     assert any(p.startswith("b200, suite gate") and "the baseline record is not complete" in p and "no per-test outcomes" in p for p in sp.exactness_problems(mm, rr))
-    more = tmp_path / "more"
-    more.mkdir()
-    mm, rr, _ = exactness_world(more)                                                               # an id that the base never had
-    edit_record(mm, "b200", "S", "baseline", lambda rec: (rec["tests"].update({"tests/cfbi/test_x.py::test_extra": "passed"}), rec["files"]["tests/cfbi/test_x.py"].update(passed=3, total=3), recount(rec)))
+
+    def with_an_id_that_the_base_never_had(rec):
+        rec["tests"]["tests/cfbi/test_x.py::test_extra"] = "passed"
+        rec["files"]["tests/cfbi/test_x.py"].update(passed=3, total=3)
+        recount(rec)
+    mm, rr, _ = exactness_world(tmp_path / "more")
+    edit_record(mm, "b200", "S", "baseline", with_an_id_that_the_base_never_had)
     assert any("the baseline record is not complete" in p and "1 test(s) are not expected" in p for p in sp.exactness_problems(mm, rr))
     spec = m["suites"]["b200"]["S"]
     path = Path(facts["base_collections"]["S"])

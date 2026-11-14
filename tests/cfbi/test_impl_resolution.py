@@ -87,11 +87,7 @@ def matrix():
 
 
 def host_compiler():
-    for name in ("g++", "c++"):
-        found = shutil.which(name)
-        if found:
-            return found
-    return None
+    return shutil.which("g++") or shutil.which("c++")
 
 
 def run_probe(csrc, rows, tmp):
@@ -117,35 +113,37 @@ def cpp_on_the_matrix(tmp_path_factory):
 
 # ---- the specification on hand-checked points -----------------------------------------------------------------------------------------------------------------
 def test_the_specification_on_hand_checked_points():
+    def point(requested, cc, smem, rows=ROWS_TILE):
+        """The specification with the needs of K1 of both families and of the row engine (``ROWS_TILE`` unless given)."""
+        return spec(requested, cc, smem, K1, K1_REF, rows)
     gate = LIMITS["sm_90 / 100 / 103"]
     for cc in (90, 100, 103):                                                                   # the devices that run the optimised kernels: nothing to fall back from
-        assert spec(0, cc, gate, K1, K1_REF, ROWS_TILE) == 0
-        assert spec(REF_ROWS, cc, gate, K1, K1_REF, ROWS_TILE) == REF_ROWS and spec(PLAN, cc, gate, K1, K1_REF, ROWS_TILE) == PLAN
-    assert spec(UMMA, 100, gate, K1, K1_REF, ROWS_TILE) == UMMA and spec(UMMA, 90, gate, K1, K1_REF, ROWS_TILE) == 0 and spec(UMMA | DYN, 100, gate, K1, K1_REF, ROWS_TILE) == UMMA
-    assert spec(DYN, 100, gate, K1, K1_REF, ROWS_TILE) == DYN and spec(DYN | REF_CHUNK, 100, gate, K1, K1_REF, ROWS_TILE) == REF_CHUNK and spec(OLD, 100, gate, K1, K1_REF, ROWS_TILE) == 0
+        assert point(0, cc, gate) == 0
+        assert point(REF_ROWS, cc, gate) == REF_ROWS and point(PLAN, cc, gate) == PLAN
+    assert point(UMMA, 100, gate) == UMMA and point(UMMA, 90, gate) == 0 and point(UMMA | DYN, 100, gate) == UMMA
+    assert point(DYN, 100, gate) == DYN and point(DYN | REF_CHUNK, 100, gate) == REF_CHUNK and point(OLD, 100, gate) == 0
     for cc in (80, 86, 89):                                                                     # below sm_90: the reference kernels
-        assert spec(0, cc, LIMITS["sm_80"], K1, K1_REF, ROWS_TILE) == REF_ROWS | REF_CHUNK | ROWS_ONLY                 # 163 KiB are below the 218 KiB of the reference K1
+        assert point(0, cc, LIMITS["sm_80"]) == REF_ROWS | REF_CHUNK | ROWS_ONLY                                       # 163 KiB are below the 218 KiB of the reference K1
     # sm_120 and the other 99 KiB devices: K1 does not fit, every row goes through the reference row engine, whatever the row engine needs
-    assert spec(0, 120, LIMITS["sm_86 / 89 / 120"], K1, K1_REF, ROWS_TILE) == ROWS_ONLY | REF_ROWS
+    assert point(0, 120, LIMITS["sm_86 / 89 / 120"]) == ROWS_ONLY | REF_ROWS
     # an explicit rows-only request skips the K1 check: the row engine is checked on its own need
-    assert spec(ROWS_ONLY, 120, LIMITS["sm_86 / 89 / 120"], K1, K1_REF, ROWS_TILE) == ROWS_ONLY                  # 75,776 B fit 99 KiB: the optimised row engine stays
-    assert spec(ROWS_ONLY, 100, ROWS_TILE, K1, K1_REF, ROWS_TILE) == ROWS_ONLY                                      # kept at its need
-    assert spec(ROWS_ONLY, 100, ROWS_TILE - 1, K1, K1_REF, ROWS_TILE) == ROWS_ONLY | REF_ROWS                      # the reference row engine one byte below it
-    assert spec(ROWS_ONLY | DYN, 100, ROWS_TILE - 1, K1, K1_REF, ROWS_TILE) == ROWS_ONLY | REF_ROWS               # the K2 bit is dropped with rows-only, as before
-    assert spec(ROWS_ONLY, 100, ROWS_STATIC, K1, K1_REF, ROWS_STATIC) == ROWS_ONLY and spec(ROWS_ONLY, 100, ROWS_STATIC - 1, K1, K1_REF, ROWS_STATIC) == ROWS_ONLY | REF_ROWS
-    assert spec(ROWS_ONLY | REF_ROWS, 100, 0, K1, K1_REF, ROWS_TILE) == ROWS_ONLY | REF_ROWS                      # an explicit reference row engine is never replaced
-    assert spec(0, 100, K1 - 1, K1, K1_REF, ROWS_TILE) == ROWS_ONLY | REF_ROWS and spec(0, 100, K1, K1, K1_REF, ROWS_TILE) == 0                  # K1 at its need and one byte below it
-    assert spec(REF_CHUNK, 100, K1_REF - 1, K1, K1_REF, ROWS_TILE) == REF_CHUNK | ROWS_ONLY | REF_ROWS and spec(REF_CHUNK, 100, K1_REF, K1, K1_REF, ROWS_TILE) == REF_CHUNK
+    assert point(ROWS_ONLY, 120, LIMITS["sm_86 / 89 / 120"]) == ROWS_ONLY                                        # 75,776 B fit 99 KiB: the optimised row engine stays
+    assert point(ROWS_ONLY, 100, ROWS_TILE) == ROWS_ONLY                                                            # kept at its need
+    assert point(ROWS_ONLY, 100, ROWS_TILE - 1) == ROWS_ONLY | REF_ROWS                                            # the reference row engine one byte below it
+    assert point(ROWS_ONLY | DYN, 100, ROWS_TILE - 1) == ROWS_ONLY | REF_ROWS                                     # the K2 bit is dropped with rows-only, as before
+    assert point(ROWS_ONLY, 100, ROWS_STATIC, ROWS_STATIC) == ROWS_ONLY and point(ROWS_ONLY, 100, ROWS_STATIC - 1, ROWS_STATIC) == ROWS_ONLY | REF_ROWS
+    assert point(ROWS_ONLY | REF_ROWS, 100, 0) == ROWS_ONLY | REF_ROWS                                            # an explicit reference row engine is never replaced
+    assert point(0, 100, K1 - 1) == ROWS_ONLY | REF_ROWS and point(0, 100, K1) == 0                                                              # K1 at its need and one byte below it
+    assert point(REF_CHUNK, 100, K1_REF - 1) == REF_CHUNK | ROWS_ONLY | REF_ROWS and point(REF_CHUNK, 100, K1_REF) == REF_CHUNK
 
 
 def test_the_matrix_straddles_every_condition():
     rows = matrix()
     got = [spec(*r) for r in rows]
-    assert {g for g in got} >= {0, REF_ROWS, ROWS_ONLY, ROWS_ONLY | REF_ROWS, REF_ROWS | REF_CHUNK, UMMA, DYN, PLAN}
-    for cc in (90, 100, 103, 120):
-        for req in (ROWS_ONLY,):                                                                 # at a limit between the row engine's need and K1's the explicit request is kept, below it falls back
-            at, below = (req, cc, ROWS_TILE, K1, K1_REF, ROWS_TILE), (req, cc, ROWS_TILE - 1, K1, K1_REF, ROWS_TILE)
-            assert at in rows and below in rows and spec(*at) == ROWS_ONLY and spec(*below) == ROWS_ONLY | REF_ROWS
+    assert set(got) >= {0, REF_ROWS, ROWS_ONLY, ROWS_ONLY | REF_ROWS, REF_ROWS | REF_CHUNK, UMMA, DYN, PLAN}
+    for cc in (90, 100, 103, 120):                                                               # at a limit between the row engine's need and K1's the explicit request is kept, below it falls back
+        at, below = (ROWS_ONLY, cc, ROWS_TILE, K1, K1_REF, ROWS_TILE), (ROWS_ONLY, cc, ROWS_TILE - 1, K1, K1_REF, ROWS_TILE)
+        assert at in rows and below in rows and spec(*at) == ROWS_ONLY and spec(*below) == ROWS_ONLY | REF_ROWS
     assert {r[2] for r in rows} >= set(LIMITS.values()) | {ROWS_TILE - 1, ROWS_TILE, ROWS_STATIC - 1, ROWS_STATIC, K1 - 1, K1, K1_REF - 1, K1_REF}
 
 
