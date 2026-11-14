@@ -24,8 +24,11 @@ from rows_workload import Family
 
 GROUP_TIMEOUT_S = 1200      # two JIT builds of a variant (a few minutes each on a first run) and eight launches of a family
 CONTROLS = {"shifted_row": ("CFBI_ROWS_NEG_E_ROW=1",), "late_issue": ("CFBI_ROWS_NEG_E_LATE=1",)}
+# The sequences must start where E matters: the cumulative decay of the gates (the contract's regime) takes the E terms of a row (GQ = Gamma * q, W) and the old E of a chunk end (GEND) below the
+# range of fp32 at the late positions of a chunk, so a wrong tile there changes no bit of any result (the first version of this module started every sequence of its multi-row family at a
+# position of 57 .. 63 and both controls matched the reference on all of them). The fills of the mixed kind include the early positions.
 FAMILIES = [Family("e_decode", fixed=1, pool=True, pad=0.3, fills="mixed", steps=1),                  # one row per sequence: the production decode launch
-            Family("e_multirow", fixed=5, pool=True, pad=0.2, fills="crossing", steps=1)]             # five rows across chunk ends: the tile is read again and written at the chunk end
+            Family("e_multirow", fixed=5, pool=True, pad=0.2, fills="mixed", steps=1)]                # five rows per sequence: the tile is read again by every row after the first
 PATH_NAMES = ["single", "two_launch"]
 HEADS = 12
 
