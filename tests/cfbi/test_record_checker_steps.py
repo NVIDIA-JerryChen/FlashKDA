@@ -2584,3 +2584,17 @@ def test_a_termination_belongs_to_a_budget_row_only(tmp_path):
                       ("a step that failed at the code generation", not_adopted("e_tile", "codegen", commit=C1, revert=C2))):
         assert has(step_check(mutated(row, lambda r: r.update(termination=proof))), "only a step that ended by the budget"), what
     assert has(step_check(mutated(skipped("e_tile"), lambda r: r.update(termination=proof))), "a skipped step has no termination")
+
+
+def test_the_reason_why_an_attempt_does_not_count_is_named(tmp_path):
+    row = budget_row(sub(tmp_path, "r"), 4, 1)
+    first, a = cg.load_dump(row["termination"]["first_failed_gate"]["dump"]), row["termination"]["attempts"]
+    content, why = rc.counted_repair(first, a[0])
+    assert content is not None and why == "" and rc.repair_candidates(first, a) == set(rc.counted_repair(first, x)[0] for x in a[:4])
+    assert rc.counted_repair(first, a[4]) == (None, "an ablation")
+    early = dict(a[1], dump=stamp(a[1]["dump"], tmp_path, "early.json", "e" * 64, "2026-11-14T08:00:00Z"))
+    assert rc.counted_repair(first, early) == (None, "dumped before the failed gate")
+    itself = dict(a[2], dump=stamp(a[2]["dump"], tmp_path, "itself.json", "f" * 64, ATTEMPT_WHEN % 9))
+    assert rc.counted_repair(first, itself) == (None, "the failed form's own tree")
+    assert rc.counted_repair(first, dict(a[3], dump="/nonexistent/dump.json")) == (None, "no usable dump")
+    assert rc.counted_repair(first, dict(a[3], role="idea")) == (None, "no role")

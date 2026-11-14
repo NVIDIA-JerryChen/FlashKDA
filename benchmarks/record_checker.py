@@ -1211,21 +1211,35 @@ def _stamp(dump, who, problems):
     return content, when
 
 
-def repair_candidates(first_dump, attempts):
-    """The content hashes of the distinct trees that count as repair candidates after ``first_dump`` (the dump of the first failed gate, loaded): the attempts in the role repair whose own dump
-    names a content hash and a moment later than the first failed gate's and is not the failed form's own tree. An attempt that cannot be used does not count (``termination_problems`` says
-    why); the proof and the builder of the row count with this function alone."""
+def counted_repair(first_dump, a):
+    """``(content hash of its tree, "")`` when the attempt ``a`` counts as a repair candidate after ``first_dump`` (the loaded dump of the first failed gate), else ``(None, why it does not)``: it
+    is no repair (an ablation takes something away to see what it costs), its dump cannot be used (``termination_problems`` says why), it was dumped before the first failed gate, or it is the
+    failed form's own tree."""
     sink = []
     gate_hash, gate_when = _stamp(first_dump, "the first failed gate", sink)
+    if a.get("role") != "repair":
+        return None, "an ablation" if a.get("role") == "ablation" else "no role"
+    if gate_when is None or not text(a.get("dump")):
+        return None, "no usable dump"
+    dump, error = _load_dump(a["dump"], "the dump of the attempt")
+    content, when = (None, None) if error else _stamp(dump, "attempt %s" % a.get("id"), sink)
+    if content is None or when is None:
+        return None, "no usable dump"
+    if when <= gate_when:
+        return None, "dumped before the failed gate"
+    if content == gate_hash:
+        return None, "the failed form's own tree"
+    return content, ""
+
+
+def repair_candidates(first_dump, attempts):
+    """The content hashes of the distinct trees that count as repair candidates after ``first_dump`` (``counted_repair`` of every attempt); the proof and the builder of the row count with this
+    function alone."""
     found = set()
-    if gate_when is None:
-        return found
     for a in attempts if isinstance(attempts, list) else []:
-        if isinstance(a, dict) and a.get("role") == "repair" and text(a.get("dump")):
-            dump, error = _load_dump(a["dump"], "the dump of the attempt")
-            content, when = (None, None) if error else _stamp(dump, "attempt %s" % a.get("id"), sink)
-            if content is not None and when is not None and when > gate_when and content != gate_hash:
-                found.add(content)
+        content = counted_repair(first_dump, a)[0] if isinstance(a, dict) else None
+        if content is not None:
+            found.add(content)
     return found
 
 

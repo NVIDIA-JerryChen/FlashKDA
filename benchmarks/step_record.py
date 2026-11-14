@@ -516,11 +516,15 @@ def render_section(m, decision, row, infos, number=10):
 
 
 def attempt_rows(termination):
-    """``[(id, role, moment, content hash of the tree, architectures)]`` of the attempts of a termination, from the dumps that were made of them, in the order they were made."""
+    """``[(id, role, moment, content hash of the tree, architectures, counted)]`` of the attempts of a termination, from the dumps that were made of them, in the order they were made;
+    ``counted`` is ``yes`` or ``no, <why>`` (``record_checker.counted_repair``: an ablation, dumped before the first failed gate, the failed form's own tree)."""
+    first = cg.load_dump(termination["first_failed_gate"]["dump"])
     out = []
     for a in termination["attempts"]:
         dump = cg.load_dump(a["dump"])
-        out.append((a["id"], a["role"], dump["meta"].get("created", "-"), dump["meta"]["tree"]["content_hash"][:12], ", ".join(dump["meta"]["toolchain"].get("archs") or [])))
+        content, why = rc.counted_repair(first, a)
+        out.append((a["id"], a["role"], dump["meta"].get("created", "-"), dump["meta"]["tree"]["content_hash"][:12], ", ".join(dump["meta"]["toolchain"].get("archs") or []),
+                    "yes" if content is not None else "no, " + why))
     return sorted(out, key=lambda r: (r[2], r[0]))
 
 
@@ -550,8 +554,8 @@ def render_termination_section(m, row, number=11):
              "The first failed gate is the resource gate on the conda toolchain (the dump made at %s, compared with the base in change mode): %s." % (first["meta"].get("created"), "; ".join(failures[:3]) or "none"),
              "The budget is %d repair attempts after a failed gate. %d distinct repair candidates were dumped after it (%d ablation(s), which only take something away to see what it costs, are not counted)." % (
                  t["allowed"], t["counted"], ablations), "",
-             "| attempt | role | made | tree content hash | architectures |", "|---|---|---|---|---|"]
-    lines += ["| %s | %s | %s | %s | %s |" % r for r in attempt_rows(t)]
+             "| attempt | role | made | tree content hash | architectures | counted |", "|---|---|---|---|---|---|"]
+    lines += ["| %s | %s | %s | %s | %s | %s |" % r for r in attempt_rows(t)]
     lines += ["", "### What the final form measured", "",
               "Gate G and Suite S (every test file of `tests/cfbi`, the four cases of the K2 sanitizer file included; complete against the collection of the commit of the suites, whose kernel sources are the step's):", "",
               "| device | Gate G passed | Suite S files | Suite S passed | skipped | failed | commit of the suites |", "|---|---|---|---|---|---|---|"]

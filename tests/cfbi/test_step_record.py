@@ -733,6 +733,7 @@ def test_the_section_of_a_step_that_ended_by_the_budget_holds_the_numbers_of_the
     assert any("4 distinct repair candidates were dumped after it (1 ablation(s)" in line for line in lines)
     attempts = [line for line in lines if line.startswith("| V")]
     assert len(attempts) == 5 and sum(1 for line in attempts if "| repair |" in line) == 4 and sum(1 for line in attempts if "| ablation |" in line) == 1
+    assert sum(1 for line in attempts if line.endswith("| yes |")) == 4 and sum(1 for line in attempts if line.endswith("| no, an ablation |")) == 1           # which attempts count, and why one does not
     for dev in rc.DEVICES:                                                           # the suites: the numbers of the complete candidate records, one row per device
         gate, whole = (json.loads(Path(m["suites"][dev][name]["candidate"]).read_text()) for name in ("gate", "S"))
         expected = "| %s | %d | %d | %d | %d | %d | %s |" % (dev, gate["totals"]["passed"], len(whole["files"]), whole["totals"]["passed"], whole["totals"]["skipped"],
