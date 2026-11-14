@@ -46,6 +46,12 @@ Dense multi-token checkpoint output is available through `prepare_consistent_pre
 see the [checkpoint API](docs/consistent-prefill.en.md) ([中文](docs/consistent-prefill.md)).
 These optional Python APIs have their own validated dependencies and platform scope.
 
+For FP32 continuation state, `prepare_fp32_prefill` and `prepare_fp32_decode`
+provide dense/varlen prefill and Q1/Q8 decode, including all eight Q8 checkpoints.
+See [FP32-state API and installation](docs/fp32-state.en.md)
+([中文](docs/fp32-state.md)) and the [example](examples/fp32_state.py).
+This is a separate numerical contract from the BF16-state APIs above.
+
 ## Using FlashKDA as an FLA backend
 
 Once installed, FlashKDA is auto-dispatched from `flash-linear-attention`'s `chunk_kda`. See [fla-org/flash-linear-attention#852](https://github.com/fla-org/flash-linear-attention/pull/852) for integration details.

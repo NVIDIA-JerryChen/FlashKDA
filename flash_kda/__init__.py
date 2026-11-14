@@ -1,3 +1,4 @@
+from .fp32 import FP32PrefillPlan, FP32DecodePlan, prepare_fp32_prefill, prepare_fp32_decode
 import torch
 from .unified_prefill import UnifiedPrefillPlan, prepare_unified_prefill
 from .consistent import consistent_fwd, NUMERICAL_CONTRACT
@@ -9,6 +10,7 @@ from .consistent_prefill import (
 
 
 __all__ = [
+    "FP32PrefillPlan", "FP32DecodePlan", "prepare_fp32_prefill", "prepare_fp32_decode",
     "fwd", "get_workspace_size", "consistent_fwd", "NUMERICAL_CONTRACT",
     "consistent_decode_fwd", "prepare_consistent_decode", "ConsistentDecodePlan",
     "ConsistentPrefillPlan", "prepare_consistent_prefill", "consistent_prefill_fwd",
