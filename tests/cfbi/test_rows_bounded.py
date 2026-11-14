@@ -22,7 +22,7 @@ import pytest
 import rows_bounded as rb
 
 TESTS = Path(__file__).resolve().parent
-STRESS_MODULES = ("test_rows_delay.py", "test_rows_decode_families.py", "test_rows_graph.py", "test_decode_single_launch_variants.py", "test_rows_e_controls.py")
+STRESS_MODULES = ("test_rows_delay.py", "test_rows_decode_families.py", "test_rows_graph.py", "test_decode_single_launch_variants.py")
 LAUNCHING = {"run_family", "run_arm", "run_step", "time_step", "warm_pool", "make_workload", "Replay", "synchronize"}      # helpers that launch kernels or wait on the device
 
 FAKE = textwrap.dedent('''

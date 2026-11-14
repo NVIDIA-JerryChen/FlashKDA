@@ -3,24 +3,16 @@
 the resource gate.
 
 * every instantiation that a launch can use is reported (the optimised row engine behind the plan kernel, its single-launch decode instantiation and the frozen reference) with the
-  threads, static and dynamic shared memory and registers of its launch, and the occupancy API's CTAs per SM; the dynamic shared memory is the one of the launch of that engine: the
-  staged state tile for the optimised instantiations, none for the frozen reference (``csrc/cfbi/cfbi_policy.h``);
+  threads, static and dynamic shared memory and registers of its launch, and the occupancy API's CTAs per SM;
 * the figures obey the arithmetic limits of the device (registers, shared memory with the per-CTA reserve, threads);
 * both instantiations of the optimised row engine keep two CTAs per SM (``__launch_bounds__(256, 2)``) on the devices they run on;
 * the grid of the decode families is derived from the binding, never from a constant.
 """
-import re
-from pathlib import Path
-
 import pytest
 import torch
 
 import helpers
 from helpers import ROWS_DECODE, ROWS_OPTIMISED, ROWS_REFERENCE, rows_instance, sequences_beyond_waves, skip_or_fail
-
-POLICY = Path(__file__).resolve().parents[2] / "csrc" / "cfbi" / "cfbi_policy.h"
-DYNAMIC = {name: int(re.search(r"constexpr int %s = (\d+);" % const, POLICY.read_text()).group(1))
-           for name, const in ((ROWS_OPTIMISED, "ROWS_DYNAMIC_SMEM_BYTES"), (ROWS_DECODE, "ROWS_DYNAMIC_SMEM_BYTES"), (ROWS_REFERENCE, "ROWS_REF_DYNAMIC_SMEM_BYTES"))}     # the launch constant of each engine
 
 
 @pytest.fixture(scope="module")
@@ -31,7 +23,7 @@ def occupancy(ext):
 def test_the_binding_reports_every_instantiation_of_the_row_engine(occupancy):
     assert [i["name"] for i in occupancy["instances"]] == [ROWS_OPTIMISED, ROWS_DECODE, ROWS_REFERENCE]
     for i in occupancy["instances"]:
-        assert i["threads"] == 256 and i["dynamic_smem"] == DYNAMIC[i["name"]], i
+        assert i["threads"] == 256 and i["dynamic_smem"] == 0, i
         assert i["static_smem"] > 0 and 0 < i["registers"] <= 255 and i["ctas_per_sm"] >= 1, i
     assert occupancy["device"]["sm_count"] == torch.cuda.get_device_properties(0).multi_processor_count
 

@@ -18,7 +18,7 @@ import decode_policy as dp
 
 ROOT = Path(__file__).resolve().parents[2]
 CSRC = ROOT / "csrc" / "cfbi"
-HEADER = CSRC / "cfbi_policy.h"
+HEADER, LAUNCH = CSRC / "cfbi_policy.h", CSRC / "cfbi_launch.cu"
 MIRRORS = {"binding": CSRC / "cfbi_binding.cpp", "api": ROOT / "flash_kda" / "cfbi" / "api.py", "verify": ROOT / "flash_kda" / "cfbi" / "verify.py",
            "bench": ROOT / "benchmarks" / "bench_breakdown.py", "arch": ROOT / "tests" / "cfbi" / "test_arch.py", "invalid": ROOT / "tests" / "cfbi" / "test_k2_dyn.py",
            "perf": ROOT / "docs" / "20261103-cfbi-perf.md", "launch_h": CSRC / "cfbi_launch.h"}
@@ -57,15 +57,15 @@ def csrc_sources(skip=("cfbi_policy.h",)):
     return {str(f.relative_to(CSRC)): f.read_text() for f in sorted(CSRC.rglob("*")) if f.suffix in (".cu", ".cuh", ".h", ".cpp") and f.name not in skip}
 
 
-def resolvable_bits(header_text):
-    """The bits that ``resolve_impl`` lets through (the mask of the first statement of ``resolve_impl_for``, in the header): the values that the hardware report can see."""
+def resolvable_bits(header_text, launch_text):
+    """The bits that ``resolve_impl`` lets through (the mask of its first statement): the values that the hardware report can see."""
     consts = header_ints(header_text)
-    mask = re.search(r"int impl = requested & \(([^)]*)\);", header_text)
-    assert mask, "the mask of resolve_impl_for is not found"
+    mask = re.search(r"int impl = requested & \(([^)]*)\);", launch_text)
+    assert mask, "the mask of resolve_impl is not found"
     return sorted(consts[n.strip()] for n in mask.group(1).split("|"))
 
 
-def mirror_problems(header_text, texts):
+def mirror_problems(header_text, launch_text, texts):
     consts = header_ints(header_text)
     top, reserved = consts["IMPL_MAX"], consts["IMPL_ROWS_SWAP_RESERVED"]
     rng = "0..%d" % top
@@ -82,7 +82,7 @@ def mirror_problems(header_text, texts):
     if spaced not in a or "value %d, is reserved" % reserved not in a:
         probs.append("api.py does not state the range %s and the reserved value %d" % (spaced, reserved))
     name_fn = re.search(r"def _impl_name\(impl\):(.*?)\ndef ", texts["verify"], re.S)
-    for bit in resolvable_bits(header_text):
+    for bit in resolvable_bits(header_text, launch_text):
         if name_fn is None or not re.search(r"impl & %d\b" % bit, name_fn.group(1)):
             probs.append("verify.py _impl_name does not name bit %d, which resolve_impl lets through" % bit)
     if spaced not in texts["bench"]:
@@ -103,6 +103,11 @@ def mirror_problems(header_text, texts):
 @pytest.fixture(scope="module")
 def header():
     return HEADER.read_text()
+
+
+@pytest.fixture(scope="module")
+def launch():
+    return LAUNCH.read_text()
 
 
 @pytest.fixture(scope="module")
@@ -142,9 +147,9 @@ def test_a_second_claim_of_a_bit_in_another_source_is_caught(header):
     assert any("IMPL_ROWS_SWAP_RESERVED again" in p for p in bit_problems(header, planted))
 
 
-def test_the_mirrors_state_the_range_and_the_bits(header, texts):
-    assert mirror_problems(header, texts) == []
-    assert resolvable_bits(header) == [1, 2, 4, 8, 16, 64]
+def test_the_mirrors_state_the_range_and_the_bits(header, launch, texts):
+    assert mirror_problems(header, launch, texts) == []
+    assert resolvable_bits(header, launch) == [1, 2, 4, 8, 16, 64]
 
 
 @pytest.mark.parametrize("where,old,new,expect", [
@@ -160,14 +165,14 @@ def test_the_mirrors_state_the_range_and_the_bits(header, texts):
     ("perf", "the accepted values are 0 .. 127", "the accepted values are 0 .. 63", "performance document"),
     ("launch_h", "every value 0 .. 127, IMPL_MAX, is accepted; 128 is reserved and rejected", "every value 0 .. IMPL_MAX is accepted", "cfbi_launch.h does not state"),
 ])
-def test_a_mirror_that_falls_behind_the_header_is_caught(header, texts, where, old, new, expect):
+def test_a_mirror_that_falls_behind_the_header_is_caught(header, launch, texts, where, old, new, expect):
     mutated = dict(texts, **{where: mutate(texts[where], old, new)})
-    assert any(expect in p for p in mirror_problems(header, mutated)), where
+    assert any(expect in p for p in mirror_problems(header, launch, mutated)), where
 
 
-def test_the_report_names_the_bits_that_resolve_impl_can_return(header, texts):
+def test_the_report_names_the_bits_that_resolve_impl_can_return(header, launch, texts):
     """A bit that ``resolve_impl`` starts to let through is a bit that the report must name: the mask is read from the source."""
-    widened = mutate(header, "IMPL_K2_DYN | IMPL_DECODE_PLAN);", "IMPL_K2_DYN | IMPL_DECODE_PLAN | IMPL_K2_OLD);")
-    assert resolvable_bits(widened) == [1, 2, 4, 8, 16, 32, 64]
-    probs = mirror_problems(widened, texts)
+    widened = mutate(launch, "IMPL_K2_DYN | IMPL_DECODE_PLAN);", "IMPL_K2_DYN | IMPL_DECODE_PLAN | IMPL_K2_OLD);")
+    assert resolvable_bits(header, widened) == [1, 2, 4, 8, 16, 32, 64]
+    probs = mirror_problems(header, widened, texts)
     assert any("does not name bit 32" in p for p in probs), probs

@@ -30,7 +30,7 @@ FILES = ("cfbi_common.cuh", "cfbi_primitives.cuh", "cfbi_rows.cuh", "cfbi_launch
 
 # the macros of the variant builds, by prefix (the default build defines none of them)
 TEST_PREFIXES = ("CFBI_ROWS_PROFILE", "CFBI_ROWS_DELAY_NS", "CFBI_ROWS_TEST_", "CFBI_NEG_CONTROL", "CFBI_K1_PROFILE", "CFBI_K2_PROFILE", "CFBI_UMMA_PROFILE", "CFBI_DYN_TEST_",
-                 "CFBI_K2_TEST_", "CFBI_UMMA_NEG_", "CFBI_UMMA_RACE_", "CFBI_CONV_NEG_", "CFBI_LIN_NEG_", "CFBI_DECODE_TEST_", "CFBI_ROWS_NEG_E_")
+                 "CFBI_K2_TEST_", "CFBI_UMMA_NEG_", "CFBI_UMMA_RACE_", "CFBI_CONV_NEG_", "CFBI_LIN_NEG_", "CFBI_DECODE_TEST_")
 
 STRING = r'"(?:[^"\\]|\\.)*"'
 TOKEN = re.compile(STRING + r"|[A-Za-z_]\w*|\d[\w.]*|->|<<=|>>=|<<|>>|<=|>=|==|!=|&&|\|\||::|\+\+|--|\S")

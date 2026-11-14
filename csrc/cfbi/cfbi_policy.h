@@ -42,52 +42,9 @@ static_assert(IMPL_MAX == 2 * IMPL_DECODE_PLAN - 1, "the highest assigned bit is
 // generation gate (ptxas reports 8,192 B on sm_100a / sm_103a and 7,808 B on sm_90a); it is larger than the structure of the source (cfbi_rows.cuh static_asserts that the
 // structure fits and that the difference stays below one allocation unit of 1 KiB), so the need is the compiler's figure, not the structure's. DYNAMIC is the dynamic shared
 // memory of the launch (the launch sites and the occupancy hook read this constant). The per-CTA reserve of the driver (1 KiB) comes on top of both and is a device figure.
-// The dynamic part of the optimised engine is the staged copy of the state E (cfbi_rows.cuh): 128 value rows of ROWS_E_STRIDE floats, a row being the 128 key columns of E and a pad of 4
-// floats (a row stride of 4 banks (mod 32): the fragment reads and the chunk-end updates of the kernel are then free of bank conflicts, and every row starts on a 16-byte boundary for the
-// async copies). The kernel static_asserts that these numbers are its layout; the literals are kept as numbers because the tests and the record checker read them from this file.
 constexpr int ROWS_STATIC_SMEM_BYTES = 8192;
-constexpr int ROWS_E_STRIDE = 132;
-constexpr int ROWS_E_TILE_FLOATS = 16896;
-constexpr int ROWS_DYNAMIC_SMEM_BYTES = 67584;
+constexpr int ROWS_DYNAMIC_SMEM_BYTES = 0;
 constexpr int ROWS_SMEM_NEED_BYTES = ROWS_STATIC_SMEM_BYTES + ROWS_DYNAMIC_SMEM_BYTES;
-static_assert(ROWS_E_TILE_FLOATS == 128 * ROWS_E_STRIDE && ROWS_DYNAMIC_SMEM_BYTES == ROWS_E_TILE_FLOATS * static_cast<int>(sizeof(float)), "the dynamic shared memory of the row engine is the E tile: 128 rows of ROWS_E_STRIDE floats");
-// The frozen reference row engine (csrc/cfbi/ref, the oracle) stages nothing: its launch has no dynamic shared memory, whatever the optimised engine's has (its own launch constant, its own
-// occupancy figure and its own binding in the decision record).
-constexpr int ROWS_REF_DYNAMIC_SMEM_BYTES = 0;
-// The budget of the row engine, the resource gate of the optimisation steps: ROWS_BUDGET_CTAS_PER_SM CTAs, each with its static and dynamic shared memory and the reserve of the driver, fit
-// the shared memory of one SM of the devices of the gate (228 KiB on B200 and B300; the occupancy records say 233,472 B). A tile that does not fit is a build error, not a halved occupancy.
-constexpr int ROWS_BUDGET_CTAS_PER_SM = 2;
-constexpr int ROWS_BUDGET_SM_SHARED_BYTES = 228 * 1024;
-constexpr int ROWS_BUDGET_CTA_RESERVE_BYTES = 1024;
-static_assert(ROWS_BUDGET_CTAS_PER_SM * (ROWS_SMEM_NEED_BYTES + ROWS_BUDGET_CTA_RESERVE_BYTES) <= ROWS_BUDGET_SM_SHARED_BYTES,
-              "the shared memory of the optimised row engine (static + dynamic + the driver's reserve) must leave room for ROWS_BUDGET_CTAS_PER_SM CTAs per SM");
-
-// ---- which implementation runs on a device ----------------------------------------------------------------------------------------------------------------------------
-// What the launches of a forward call ask of a device, per CTA, in bytes of shared memory (static plus dynamic, without the driver's per-CTA reserve: the opt-in limit of the device,
-// cudaDevAttrMaxSharedMemoryPerBlockOptin, bounds exactly this figure): K1 of the optimised and of the reference chunk kernels (dynamic) and the optimised row engine (ROWS_SMEM_NEED_BYTES).
-struct ImplNeeds {
-    int64_t k1;
-    int64_t k1_ref;
-    int64_t rows;
-};
-
-// The pure part of resolve_impl (cfbi_launch.h documents the bits): the implementation bits that run for `requested` on a device of compute capability `cc` (major * 10 + minor) whose
-// opt-in limit of shared memory per block is `smem_optin`. Every input is an argument, so the tests call it with any device and any need. Idempotent.
-//   * the tcgen05 K2 exists in the sm_100a / sm_103a code only (dropped on every other major version); below sm_90 the optimised kernels are compiled as traps: the reference kernels run;
-//   * a device whose opt-in limit is below the need of K1 of the selected family runs every row through the row engine, the reference row engine (the one validated on such devices);
-//   * the optimised row engine needs `needs.rows`: a device whose limit is below it runs the reference row engine, WHATEVER was requested, an explicit rows-only request (IMPL_ROWS_ONLY,
-//     which skips the K1 check above) included, and keeps the optimised one from exactly that need on;
-//   * the dynamic-schedule K2 runs on the optimised K1: the reference chunk kernels, the row-engine-only schedule and a request for the UMMA K2 (which wins, also where it is dropped) clear it.
-constexpr int resolve_impl_for(int requested, int cc, int64_t smem_optin, const ImplNeeds& needs) {
-    int impl = requested & (IMPL_REF_ROWS | IMPL_REF_CHUNK | IMPL_ROWS_ONLY | IMPL_K2_UMMA | IMPL_K2_DYN | IMPL_DECODE_PLAN);
-    const int major = cc / 10;
-    if (major != 10) impl &= ~IMPL_K2_UMMA;
-    if (major < 9) impl |= IMPL_REF_ROWS | IMPL_REF_CHUNK;
-    if (!(impl & IMPL_ROWS_ONLY) && smem_optin < ((impl & IMPL_REF_CHUNK) ? needs.k1_ref : needs.k1)) impl |= IMPL_ROWS_ONLY | IMPL_REF_ROWS;
-    if (!(impl & IMPL_REF_ROWS) && smem_optin < needs.rows) impl |= IMPL_REF_ROWS;
-    if ((impl & (IMPL_REF_CHUNK | IMPL_ROWS_ONLY)) || (requested & IMPL_K2_UMMA)) impl &= ~IMPL_K2_DYN;
-    return impl;
-}
 
 // ---- single-launch decode -----------------------------------------------------------------------------------------------------------------------------------------------
 // Whether a call that runs mode 1 (`mode` and `impl` as resolve_mode / resolve_impl return them: the caller maps mode 0 + IMPL_ROWS_ONLY to 1 and resolves the device's bits) of N

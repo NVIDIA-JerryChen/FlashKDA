@@ -155,7 +155,7 @@ def test_the_decode_arguments_are_a_type_of_their_own(common, rows, launch):
     ("rows", "a kernel on plain Params", "rows_kernel(const RowsParams<DECODE> p)", "rows_kernel(const Params p)", "does not take RowsParams"),
     ("rows", "no if constexpr", "    if constexpr (!DECODE) {\n        return p.plan[n];\n    } else {", "    if (!DECODE) {\n        return p.plan[n];\n    } else {", "if constexpr"),
     ("launch", "the windows in Params", "            const DecodeParams dp{p, a.cu_seqlens, a.fixed_len};", "            p.cu_seqlens = a.cu_seqlens;\n            const DecodeParams dp{p, a.cu_seqlens, a.fixed_len};", "stores the windows in Params"),
-    ("launch", "built twice", "        } else {\n            if (rows_prepare<false>() != cudaSuccess) return;", "        } else {\n            const DecodeParams dq{p, a.cu_seqlens, a.fixed_len};\n            if (rows_prepare<false>() != cudaSuccess) return;", "exactly once"),
+    ("launch", "built twice", "        } else rows_kernel<false>", "            const DecodeParams dq{p, a.cu_seqlens, a.fixed_len};\n        } else rows_kernel<false>", "exactly once"),
 ])
 def test_a_decode_argument_outside_its_type_is_caught(common, rows, launch, where, name, old, new, expect):
     texts = {"common": common, "rows": rows, "launch": launch}

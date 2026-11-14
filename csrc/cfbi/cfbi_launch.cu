@@ -18,47 +18,8 @@ namespace cfbi {
 
 int version() { return 1; }
 
-// Dynamic shared memory of the row-engine launches (defined once, in cfbi_policy.h): the optimised engine stages E in it, the frozen reference engine has none. The launch sites, the
-// preparation of the optimised engine and the occupancy hook below read the same constants, each engine its own.
+// Dynamic shared memory of the row-engine launch: the launch sites and the occupancy hook below read the same constant (defined once, in cfbi_policy.h).
 constexpr size_t ROWS_DYNAMIC_SMEM = ROWS_DYNAMIC_SMEM_BYTES;
-constexpr size_t ROWS_REF_DYNAMIC_SMEM = ROWS_REF_DYNAMIC_SMEM_BYTES;
-
-namespace {
-// The optimised row engine asks for more dynamic shared memory than the 48 KiB that a launch gets without opting in, so an instantiation is prepared before it is launched (and before the
-// occupancy API is asked about it): its maximum dynamic size is set, and the carve-out of the unified L1 / shared memory is pinned to the largest shared-memory configuration, which makes the
-// two CTAs per SM of the budget (ROWS_BUDGET_CTAS_PER_SM, cfbi_policy.h) fit by the configuration and not by the driver's choice. Both are attributes of the function on the device that is
-// current, so they are set once per device and instantiation; the return values are checked, and only a success is remembered: a failure is handed to the caller (which does not launch and
-// leaves the error for the launch check of the binding) and the next call sets them again. The current device is asked from the runtime only in a process that sees more than one.
-constexpr int kRowsDevices = 64;                                  // devices with a kept answer; a higher index sets the attributes on every call
-std::atomic<unsigned char> g_rows_prepared[2][kRowsDevices];      // [instantiation <false>, <true>][device]: 1 once both attributes were set
-
-int visible_devices() {
-    static std::atomic<int> kept{0};
-    int n = kept.load(std::memory_order_relaxed);
-    if (n > 0) return n;
-    if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0) return 0;   // a failed query is not kept
-    kept.store(n, std::memory_order_relaxed);
-    return n;
-}
-
-cudaError_t rows_current_device(int* dev) {
-    *dev = 0;
-    return visible_devices() == 1 ? cudaSuccess : cudaGetDevice(dev);
-}
-
-template <bool DECODE>
-cudaError_t rows_prepare() {
-    int dev = 0;
-    cudaError_t e = rows_current_device(&dev);
-    if (e != cudaSuccess) return e;
-    std::atomic<unsigned char>* kept = (dev >= 0 && dev < kRowsDevices) ? &g_rows_prepared[DECODE ? 1 : 0][dev] : nullptr;
-    if (kept != nullptr && kept->load(std::memory_order_acquire) != 0) return cudaSuccess;
-    e = cudaFuncSetAttribute(rows_kernel<DECODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, ROWS_DYNAMIC_SMEM_BYTES);
-    if (e == cudaSuccess) e = cudaFuncSetAttribute(rows_kernel<DECODE>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-    if (e == cudaSuccess && kept != nullptr) kept->store(1, std::memory_order_release);
-    return e;
-}
-}  // namespace
 
 // The tcgen05 (UMMA) K2: one CTA per (64 value columns, sequence, head); needs K1<16>'s workspace (16-column UT slices).
 static void launch_k2_umma(const Params& p, const ForwardArgs& a, cudaStream_t stream) {
@@ -194,14 +155,22 @@ DeviceCaps device_caps(int device) {
 
 size_t k1_smem_bytes(int impl) { return (impl & IMPL_REF_CHUNK) ? ref::K1_SMEM_BYTES : K1_SMEM_BYTES; }
 
-// What a forward call needs of a device, per CTA (the pure resolution compares it with the opt-in limit, cfbi_policy.h): K1 of the optimised and of the reference chunk kernels, which need
-// 204 KiB / 218 KiB of dynamic shared memory (the opt-in limit is 227 KiB on sm_90 / 100 / 103, but 163 KiB on sm_80 and 99 KiB on sm_86 / 89 / 120: the chunk kernels cannot run there),
-// and the optimised row engine.
-constexpr ImplNeeds kImplNeeds{static_cast<int64_t>(K1_SMEM_BYTES), static_cast<int64_t>(ref::K1_SMEM_BYTES), ROWS_SMEM_NEED_BYTES};
-
 int resolve_impl(int requested, int device) {
     const DeviceCaps c = device_caps(device);
-    return resolve_impl_for(requested, c.major * 10 + c.minor, c.smem_optin, kImplNeeds);
+    int impl = requested & (IMPL_REF_ROWS | IMPL_REF_CHUNK | IMPL_ROWS_ONLY | IMPL_K2_UMMA | IMPL_K2_DYN | IMPL_DECODE_PLAN);
+    // The tcgen05 K2 only exists in the sm_100a / sm_103a code (cfbi_tcgen05.cuh): drop the request everywhere else
+    // (the mma.sync K2 computes the same bits).
+    if (c.major != 10) impl &= ~IMPL_K2_UMMA;
+    // The optimised kernels use sm_90+ instructions (cfbi_async.cuh); below that they are compiled as traps.
+    if (c.major < 9) impl |= IMPL_REF_ROWS | IMPL_REF_CHUNK;
+    // K1 needs 204 KiB (optimised) / 218 KiB (reference) of dynamic shared memory per CTA; where the device cannot
+    // provide it the row engine (which needs 7 KiB) evaluates every row - the same program, just row by row. That
+    // fallback uses the reference row engine, the one validated on such devices (sm_80 / 86 / 89).
+    if (!(impl & IMPL_ROWS_ONLY) && static_cast<size_t>(c.smem_optin) < k1_smem_bytes(impl)) impl |= IMPL_ROWS_ONLY | IMPL_REF_ROWS;
+    // The dynamic-schedule K2 runs on top of the optimised K1: the reference chunk kernels (also what sm < 90 gets) and the row-engine-only schedule
+    // have no K2 stage of this kind, and when the UMMA K2 is requested as well it wins (also where it is dropped: the request alone clears the bit).
+    if ((impl & (IMPL_REF_CHUNK | IMPL_ROWS_ONLY)) || (requested & IMPL_K2_UMMA)) impl &= ~IMPL_K2_DYN;
+    return impl;
 }
 
 // Duration of the schedule builder (units of 0.1 ns) for N sequences and `pairs` = N * H pairs: an upper envelope of the medians measured on B200 / B300, the larger of
@@ -314,15 +283,11 @@ void launch_forward(const ForwardArgs& a, cudaStream_t stream) {
     if (run_k1 && !one_kernel) plan_kernel<<<1, PLAN_THREADS, 0, stream>>>(a.cu_seqlens, a.fixed_len, a.pos, a.slot_ids, a.N, mode == 1 ? 1 : 0, p.plan);
     if (run_k1 && run_k2 && a.E != nullptr) {
         // head rows (finishing the open chunk) or, in mode 1, every row
-        if (a.impl & IMPL_REF_ROWS) ref::rows_kernel<<<dim3(a.N, a.H), NTHREADS, ROWS_REF_DYNAMIC_SMEM, stream>>>(p);
+        if (a.impl & IMPL_REF_ROWS) ref::rows_kernel<<<dim3(a.N, a.H), NTHREADS, ROWS_DYNAMIC_SMEM, stream>>>(p);
         else if (one_kernel) {
-            if (rows_prepare<true>() != cudaSuccess) return;   // the runtime keeps the error for the launch check of the caller; nothing is launched without the opt-in to the dynamic tile
             const DecodeParams dp{p, a.cu_seqlens, a.fixed_len};   // the token windows only this kernel reads (the plan kernel gets them as arguments)
             rows_kernel<true><<<dim3(a.N, a.H), NTHREADS, ROWS_DYNAMIC_SMEM, stream>>>(dp);
-        } else {
-            if (rows_prepare<false>() != cudaSuccess) return;
-            rows_kernel<false><<<dim3(a.N, a.H), NTHREADS, ROWS_DYNAMIC_SMEM, stream>>>(p);
-        }
+        } else rows_kernel<false><<<dim3(a.N, a.H), NTHREADS, ROWS_DYNAMIC_SMEM, stream>>>(p);
     }
     if (mode == 0) {
         const int64_t max_chunks = (a.T_total + BT - 1) / BT + a.N;   // upper bound; extra CTAs exit at once
@@ -365,14 +330,10 @@ namespace {
 struct RowsInstance {
     const char* name;
     const void* fn;
-    size_t dynamic_smem;                 // the dynamic shared memory that the launch of this instantiation passes
-    cudaError_t (*prepare)();            // what its launch does first (null: nothing)
 };
-// every instantiation of the row engine: behind the plan kernel (false), the single-launch decode (true: Lb0E / Lb1E in the machine-code dumps) and the frozen reference; each is asked about
-// with the dynamic shared memory of its own launch, after the preparation that its launch makes
-const RowsInstance kRowsInstances[] = {{"cfbi::rows_kernel<false>", reinterpret_cast<const void*>(&rows_kernel<false>), ROWS_DYNAMIC_SMEM, &rows_prepare<false>},
-                                       {"cfbi::rows_kernel<true>", reinterpret_cast<const void*>(&rows_kernel<true>), ROWS_DYNAMIC_SMEM, &rows_prepare<true>},
-                                       {"cfbi::ref::rows_kernel", reinterpret_cast<const void*>(&ref::rows_kernel), ROWS_REF_DYNAMIC_SMEM, nullptr}};
+// every instantiation of the row engine: behind the plan kernel (false), the single-launch decode (true: Lb0E / Lb1E in the machine-code dumps) and the frozen reference
+const RowsInstance kRowsInstances[] = {{"cfbi::rows_kernel<false>", reinterpret_cast<const void*>(&rows_kernel<false>)}, {"cfbi::rows_kernel<true>", reinterpret_cast<const void*>(&rows_kernel<true>)},
+                                       {"cfbi::ref::rows_kernel", reinterpret_cast<const void*>(&ref::rows_kernel)}};
 }  // namespace
 
 int rows_occupancy_device(RowsDevice* out) {
@@ -395,18 +356,16 @@ int rows_occupancy_count() { return (int)(sizeof(kRowsInstances) / sizeof(kRowsI
 int rows_occupancy(int index, RowsOccupancy* out) {
     if (index < 0 || index >= rows_occupancy_count() || out == nullptr) return (int)cudaErrorInvalidValue;
     const RowsInstance& r = kRowsInstances[index];
-    cudaError_t e = r.prepare != nullptr ? r.prepare() : cudaSuccess;
-    if (e != cudaSuccess) return (int)e;
     cudaFuncAttributes attr;
-    e = cudaFuncGetAttributes(&attr, r.fn);
+    cudaError_t e = cudaFuncGetAttributes(&attr, r.fn);
     if (e != cudaSuccess) return (int)e;
     int blocks = 0;
-    e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, r.fn, NTHREADS, r.dynamic_smem);
+    e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, r.fn, NTHREADS, ROWS_DYNAMIC_SMEM);
     if (e != cudaSuccess) return (int)e;
     out->name = r.name;
     out->threads = NTHREADS;
     out->static_smem = (int)attr.sharedSizeBytes;
-    out->dynamic_smem = (int)r.dynamic_smem;
+    out->dynamic_smem = (int)ROWS_DYNAMIC_SMEM;
     out->registers = attr.numRegs;
     out->ctas_per_sm = blocks;
     return 0;

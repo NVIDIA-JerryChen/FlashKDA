@@ -7,7 +7,7 @@
 // What changed against the reference (v1 measured: Akk/Aqk phase 14-21K cycles, P1/P2 19-41K of ~45K per row, because
 // every k-step of every dot3 waited for its own global load):
 //   * every global load that does not depend on the row's prep is issued at the top of the row (the cached rows of
-//     the UT / W / U recursions, the previous G2 row, v) and the cache lines are prefetched into L2 up front (E is staged in shared memory, below);
+//     the UT / W / U recursions, the previous G2 row, v) and the E / cache lines are prefetched into L2 up front;
 //   * the K loops are fully unrolled with all operand loads hoisted in front of the MMAs;
 //   * rows that share a B operand share one MMA tile: ks and qs (Akk / Aqk, B = kjr) sit in A-row slots s and s^8,
 //     W and GQ (P1 / P2, B = E^T) likewise. The tile-position / neighbour independence of a tensor-core output
@@ -16,14 +16,7 @@
 //   * the cross-block part of O (M2 = dot3(Aqk row, cached U rows)) does not need the new U, so it is computed with
 //     the UT / W cross-block products; what is left after P1 is one subtraction and a short FMA chain over
 //     preloaded cached rows;
-//   * the cache append of khat / G2 and the reference-row copy no longer cost a barrier;
-//   * the state E (64 KiB per (sequence, head): every row's P1 / P2 reads all of it, the chunk end updates it) is staged ONCE per call in dynamic shared memory with 16-byte async
-//     copies, instead of being gathered from global memory by 4-byte loads in every row (a warp request of that gather touched 8 rows x 16 bytes: 8 half-used sectors, 64 requests per
-//     thread and row). Warp w owns the 16 value rows of E that its P1 / P2 / chunk-end tiles use (v = 8 * (w + 8 * tl) + gg for tl < 2, gg < 8: the sets of the 8 warps partition the 128
-//     rows), copies exactly those (rows_stage_e: one whole 512-byte row per warp instruction) before the first row, where the copy overlaps its phases A - C, waits for its own copies and
-//     meets the others at the barrier that ends phase C; every row of E is read and written by its owner warp only. The chunk end writes E' to the tile AND to global memory (the state of
-//     the next call), so the tile never has to be fetched again within a call. The tile is a verbatim copy: every fragment holds the same bits as the global load it replaces, and no
-//     operand, operation or order of the program changes (the 64 registers of the old hoisted loads are free for the compiler).
+//   * the cache append of khat / G2 and the reference-row copy no longer cost a barrier.
 // The cache planes (khat, G2, UT, W, U) and E live in global memory (fp32); plain (non-const, non-restrict)
 // pointers are used so the compiler never turns reads of freshly written rows into .nc loads.
 //
@@ -31,7 +24,6 @@
 // a plan kernel (one launch per decode call, cfbi_launch.h decode_single_launch): it derives its plan entry itself and advances pos by an arrival count, see rows_entry.
 #pragma once
 
-#include "cfbi/cfbi_async.cuh"
 #include "cfbi/cfbi_common.cuh"
 
 #include <cstdio>
@@ -61,9 +53,7 @@ __device__ unsigned g_rows_prof[ROWS_PROF_POS][ROWS_PROF_CTAS][ROWS_PROF_STAMPS]
 // barrier that ends a row (a racy negative control: a warp that sleeps in the chunk-end phase (site 8) then lets the others start the next row and rewrite S.g2 under it),
 // CFBI_ROWS_TEST_POS_OOB moves the accesses to a pos word that the host selects (rows_test_pos_offset takes an offset and an access mask: bit POS_ACCESS_FUSED_STORE = the fused store of the
 // two-launch row engine, POS_ACCESS_ARRIVAL = the arrival atomic and POS_ACCESS_ELECTED_STORE = the elected store of the single launch) to pos[slot + offset] (out-of-bounds controls for
-// memcheck), CFBI_ROWS_TEST_COMPILE_ERROR stops the compilation (the control that shows that a variant that does not build fails its test), and the two negative controls of the staged E
-// tile (both deliberately WRONG): CFBI_ROWS_NEG_E_ROW stages the rows of E shifted by one (the tile holds another row than its index says) and CFBI_ROWS_NEG_E_LATE issues the copies of the
-// tile right in front of its first read and never waits for them (they cannot have landed: the read sees what the shared memory held before).
+// memcheck) and CFBI_ROWS_TEST_COMPILE_ERROR stops the compilation (the control that shows that a variant that does not build fails its test).
 #ifdef CFBI_ROWS_DELAY_NS
 struct RowsDelayConfig {
     unsigned ns;           // length of a delay (0: CFBI_ROWS_DELAY_NS)
@@ -133,12 +123,6 @@ struct RowSmem {
 // figure for it: at least the layout, and less than one allocation unit (1 KiB) more.
 static_assert(sizeof(RowSmem) + sizeof(int) <= ROWS_STATIC_SMEM_BYTES, "ROWS_STATIC_SMEM_BYTES (cfbi_policy.h) must cover the static shared memory of the row engine");
 static_assert(ROWS_STATIC_SMEM_BYTES - (sizeof(RowSmem) + sizeof(int)) < 1024, "ROWS_STATIC_SMEM_BYTES (cfbi_policy.h) is more than an allocation unit above the layout: take the compiler's figure");
-// The staged state tile: E is HEAD_V rows of HEAD_K floats, staged as rows of ROWS_E_STRIDE floats in dynamic shared memory (the launch sites pass ROWS_DYNAMIC_SMEM_BYTES, cfbi_policy.h, which
-// also holds the budget of two CTAs per SM). This is where the numbers of the header are bound to the layout that the kernel reads.
-static_assert(HEAD_V == 128 && NTHREADS == 256, "each of the 8 warps owns 16 value rows of E (2 value tiles of 8 rows, rows_stage_e)");
-static_assert(ROWS_E_STRIDE >= HEAD_K && ROWS_E_STRIDE % 4 == 0, "a row of the E tile holds a whole row of E and starts on a 16-byte boundary (the async copies)");
-static_assert(ROWS_E_STRIDE % 32 == 4, "a row stride of 4 banks (mod 32) keeps the fragment reads of phase D and the chunk-end updates free of bank conflicts");
-static_assert(ROWS_E_TILE_FLOATS == HEAD_V * ROWS_E_STRIDE && ROWS_DYNAMIC_SMEM_BYTES == ROWS_E_TILE_FLOATS * static_cast<int>(sizeof(float)), "the dynamic shared memory of the launch is the E tile");
 
 __device__ __forceinline__ void prefetch_l2(const void* ptr) { asm volatile("prefetch.global.L2 [%0];" ::"l"(ptr)); }
 __device__ __forceinline__ void prefetch_l1(const void* ptr) { asm volatile("prefetch.global.L1 [%0];" ::"l"(ptr)); }
@@ -151,35 +135,6 @@ __device__ __forceinline__ void prefetch_state(const void* ptr) {
 #else
     prefetch_l2(ptr);
 #endif
-}
-
-// An opaque copy of a value: the compiler cannot treat what is computed from it as loop-invariant. The tile addresses of the row loop are functions of the lane's coordinates (g, t), which do
-// not change; taken from the registers that hold them, the compiler computes every one of them ONCE in front of the loop and keeps them live across it (about ten registers), and the kernel,
-// which is at its register limit in the cross-sub-block products of phase C, then spills (on sm_90a 208 B of stack against the 168 B of the base for the single-launch instantiation). Taken
-// from an opaque copy at the point of use they are computed where they are needed (a few integer instructions per row) and nothing is held across the loop.
-__device__ __forceinline__ int rows_opaque(int x) {
-    asm volatile("" : "+r"(x));
-    return x;
-}
-// Row and column slot of element i of an accumulator fragment (c_row, c_col, cfbi_primitives.cuh) for lane coordinates that are given.
-__device__ __forceinline__ int c_row_of(int g, int i) { return g + 8 * (i >> 1); }
-__device__ __forceinline__ int c_col_of(int t, int i) { return 2 * t + (i & 1); }
-
-// Stage the E rows of this warp: row v = 8 * (warp + 8 * tl) + gg (tl < 2, gg < 8) of E goes to the tile row v, one whole 512-byte row (32 lanes x 16 bytes) per warp instruction, and the
-// copies form one group of the thread. The tile is read and written by the owner warp only; the copies have landed when the thread has waited for them (cp_async_wait_all) and the other
-// threads of the warp see them after the next block barrier. CFBI_ROWS_NEG_E_ROW (a negative control for the test harness: the tile holds the rows of E shifted by one, deliberately WRONG).
-__device__ __forceinline__ void rows_stage_e(float* sE, const float* Eg, int warp, int lane) {
-#pragma unroll
-    for (int r = 0; r < 16; ++r) {
-        const int v = 8 * (warp + 8 * (r >> 3)) + (r & 7);
-#ifdef CFBI_ROWS_NEG_E_ROW
-        const int vs = (v + 1) & (HEAD_V - 1);
-#else
-        const int vs = v;
-#endif
-        cp_async_16(sE + v * ROWS_E_STRIDE + 4 * lane, Eg + vs * HEAD_K + 4 * lane);
-    }
-    cp_async_commit();
 }
 
 // Cross-sub-block products of the current row for KS = 2s k-steps: M[which][v] = dot3(A row, X[which][0:16s][v]) with
@@ -322,8 +277,6 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
     ROWS_DELAY(0);   // test hook: kernel entry, before the plan load and the first loads
     __shared__ RowSmem S;
     __shared__ int dec_pos0;   // DECODE only: the fill of the open chunk, from thread 0 (unused, hence not allocated, with DECODE = false)
-    extern __shared__ __align__(128) unsigned char rows_dyn_smem[];   // ROWS_DYNAMIC_SMEM_BYTES (the launcher opts in): the staged copy of E, rows_stage_e
-    float* const sE = reinterpret_cast<float*>(rows_dyn_smem);
     const int n = blockIdx.x, h = blockIdx.y, H = p.H;
     const SeqPlan sp = rows_entry<DECODE>(p, n, dec_pos0);
     const int nrows = sp.hrows;
@@ -349,11 +302,6 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
     int prof_last = -1;   // position of the last row of this CTA that was recorded
 #endif
     int pos = sp.pos0;
-#ifndef CFBI_ROWS_NEG_E_LATE
-    // E goes to shared memory before the first row, so the copy overlaps its phases A - C (it is waited for before the barrier that ends phase C). It is issued here, not inside the row loop
-    // under `i == 0`: the addresses of the 16 copies do not depend on the row, and the compiler holds them in registers across the whole loop when it can (the kernel then spills 90 - 100 B).
-    rows_stage_e(sE, Eg, warp, L.lane);
-#endif
     // cached rows b..pos-1 of UT | W (role column) and of U (value column, tid < 128) of the current sub-block, and the
     // reference row's G2: loaded from global for the first row of the call, afterwards carried in registers
     // (a row's own result is appended to them), so consecutive head rows do not wait for their predecessor's stores.
@@ -375,7 +323,10 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
         // ---- early loads: nothing here depends on this row's prep ------------------------------------
         float gprev = 0.f, vraw = 0.f;
         if (i == 0) {
-            // pull the cache planes this CTA will touch towards L2 so later phases do not pay HBM latency
+            // pull the whole state this CTA will touch towards L2 so later phases do not pay HBM latency
+            const char* eb = reinterpret_cast<const char*>(Eg);
+            prefetch_state(eb + tid * 128);
+            prefetch_state(eb + (tid + NTHREADS) * 128);
             const int lines = pos * 4;   // 512 B per row = 4 lines of 128 B, five planes
             for (int l = tid; l < 5 * lines; l += NTHREADS) prefetch_state(R + (l / lines) * ROW_PLANE_FLOATS + (l % lines) * 32);
 #pragma unroll
@@ -503,18 +454,18 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
                 Rg[pos * HEAD_K + tid] = S.g2[tid];
             }
         }
-        if (i == 0) cp_async_wait_all();   // this thread's copies of the E tile have landed; the barrier below publishes them (a row of E was copied by all 32 lanes of its warp)
         ROWS_SYNC(4);
         ROWS_TS(4);
 
         // ---- D. P1 = dot3(W_t, E^T), P2 = dot3(GQ_t, E^T): W in A-row slot, GQ in slot ^ 8, two V tiles per warp ----
         {
-#ifdef CFBI_ROWS_NEG_E_LATE
-            if (i == 0) rows_stage_e(sE, Eg, warp, L.lane);   // negative control (deliberately WRONG): the copies are issued right in front of their first read and never waited for
-#endif
-            // B fragments of E^T (n = value row v, k = key channel) from the tile: lane 4g + t reads the word (4g + t + const) mod 32, no bank conflict; the values are the ones that the
-            // global gather read (Eg[v * HEAD_K + k]) before the state was staged
-            const float* const sEw = sE + (8 * warp + rows_opaque(g)) * ROWS_E_STRIDE + rows_opaque(t);   // row 8 * (warp + 8 * tl) + g = 64 * tl + 8 * warp + g, column 8 * ks + t + 4 * ii
+            float eb[16][2][2];
+#pragma unroll
+            for (int ks = 0; ks < 16; ++ks)
+#pragma unroll
+                for (int tl = 0; tl < 2; ++tl)
+#pragma unroll
+                    for (int ii = 0; ii < 2; ++ii) eb[ks][tl][ii] = Eg[(8 * (warp + 8 * tl) + g) * HEAD_K + 8 * ks + t + 4 * ii];
             float big[2][4], sml[2][4];
 #pragma unroll
             for (int tl = 0; tl < 2; ++tl)
@@ -534,7 +485,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
                 for (int tl = 0; tl < 2; ++tl) {
                     uint32_t bh[2], bl[2];
 #pragma unroll
-                    for (int ii = 0; ii < 2; ++ii) split_tf32(sEw[64 * tl * ROWS_E_STRIDE + 8 * ks + 4 * ii], bh[ii], bl[ii]);
+                    for (int ii = 0; ii < 2; ++ii) split_tf32(eb[ks][tl][ii], bh[ii], bl[ii]);
                     mma_tf32_m16n8k8(sml[tl], al, bh);
                     mma_tf32_m16n8k8(sml[tl], ah, bl);
                     mma_tf32_m16n8k8(big[tl], ah, bh);
@@ -585,7 +536,6 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
         //         8 key tiles; the KD fragments of a key tile are shared by its two value tiles, operands are loaded in
         //         two batches of four k-steps in front of the MMAs --------------------------------------------------
         if (pos == BT - 1) {
-            const int go = rows_opaque(g), to = rows_opaque(t);   // the lane coordinates of the fragment elements below (see rows_opaque)
             if (tid < HEAD_K) S.gend[tid] = ex2_ftz(S.g2[tid]);
             ROWS_SYNC(6);
             ROWS_DELAY(8);
@@ -597,8 +547,8 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
                     for (int i2 = 0; i2 < 4; ++i2) {
                         big[tl][i2] = neg_zero();
                         sml[tl][i2] = neg_zero();
-                        // this thread is the only owner of these E elements: read them (from the tile) now, use them after the MMAs
-                        eold[tl][i2] = sE[(8 * (warp + 8 * tl) + c_col_of(to, i2)) * ROWS_E_STRIDE + 16 * mt + c_row_of(go, i2)];
+                        // this thread is the only owner of these E elements: read them now, use them after the MMAs
+                        eold[tl][i2] = Eg[(8 * (warp + 8 * tl) + c_col(L, i2)) * HEAD_K + 16 * mt + c_row(L, i2)];
                     }
 #pragma unroll
                 for (int half = 0; half < 2; ++half) {
@@ -640,10 +590,8 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
                 for (int tl = 0; tl < 2; ++tl)
 #pragma unroll
                     for (int ii = 0; ii < 4; ++ii) {
-                        const int k = 16 * mt + c_row_of(go, ii), v = 8 * (warp + 8 * tl) + c_col_of(to, ii);
-                        const float en = fadd(fmul(eold[tl][ii], S.gend[k]), fadd(big[tl][ii], sml[tl][ii]));
-                        sE[v * ROWS_E_STRIDE + k] = en;   // the next row of this call reads E' from the tile
-                        Eg[v * HEAD_K + k] = en;          // and the next call from global memory
+                        const int k = 16 * mt + c_row(L, ii), v = 8 * (warp + 8 * tl) + c_col(L, ii);
+                        Eg[v * HEAD_K + k] = fadd(fmul(eold[tl][ii], S.gend[k]), fadd(big[tl][ii], sml[tl][ii]));
                     }
             }
             pos = 0;
