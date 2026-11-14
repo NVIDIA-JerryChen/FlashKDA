@@ -888,6 +888,13 @@ def _load_dump(path, what):
         return None, "%s %s cannot be used: %s" % (what, path, _first_line(e))
 
 
+def _load_allow(path):
+    try:
+        return cg.load_allow(path), None
+    except (cg.Unusable, OSError, ValueError) as e:
+        return None, "the allow-list %s cannot be used: %s" % (path, _first_line(e))
+
+
 IDENTITY_ALIASES = {cg.GATE_R_REF_INSTANCE: cg.GATE_R_REF}      # the one rename of an identity comparison: the plan kernel's instantiation <Lb0E> onto the plain row engine of the base
 
 
@@ -956,10 +963,8 @@ def comparison_problems(row, key, entry, resources, meta, where, repo=None):
     if entry.get("prev_dump"):
         prev, e3 = _load_dump(entry["prev_dump"], "the previous accepted dump")
     if entry.get("allow"):
-        try:
-            allow = cg.load_allow(entry["allow"])
-        except (cg.Unusable, OSError, ValueError) as e:
-            e3 = e3 or "the allow-list %s cannot be used: %s" % (entry["allow"], _first_line(e))
+        allow, e4 = _load_allow(entry["allow"])
+        e3 = e3 or e4
     errors = [e for e in (e1, e2, e3) if e]
     if errors:
         return ["%s: %s" % (w, e) for e in errors], None
@@ -1144,10 +1149,7 @@ def step_problems(step, waiver=None, meta=None, repo=None):
         return problems + ["%s: a step that was not adopted says where it failed (failed_at is one of %s), got %r" % (where, ", ".join(GATE_PHASES + TERMINATIONS), failed_at)]
     if step.get("termination") is not None:
         problems.append("%s: only a step that ended by the budget of its repairs carries a termination (this one failed at %s)" % (where, failed_at))
-    if not text(step.get("reason")):
-        problems.append("%s: a step that was not adopted carries a reason" % where)
-    if step.get("commit") is not None and step.get("revert_commit") is None:
-        problems.append("%s: not adopted but its commit %s is not reverted (no revert_commit)" % (where, step["commit"]))
+    problems.extend(_not_adopted_problems(step, where))
     reached = GATE_PHASES.index(failed_at)
     expected_gates = {"exactness": (None if reached < 1 else (False if reached == 1 else True)), "codegen": (None if reached < 2 else (False if reached == 2 else True))}
     for g in ("exactness", "codegen"):
@@ -1172,16 +1174,22 @@ def _no_timing_problems(step, where, failed_at):
     return []
 
 
-def _terminated_problems(step, where, gates, meta, repo=None):
-    """A step that ended by the budget of its repairs (``failed_at`` ``repair_budget``). No gate is what ended it, so the row says what the gates of its FINAL form measured and proves the budget
-    (``termination_problems``): the code-generation evidence is that of any row that reached the gate (every comparison bound to its dumps and recomputed, and ``gates.codegen`` is what the
-    comparisons say: a gate that the dumps pass is not called failed, one that they fail is not called passed), exactness is the boolean that the step's evidence gave (null when it was never
-    measured), the phases after it were never reached (no timing, no A/B medians), and the step is removed by a revert commit like every step that was not adopted."""
+def _not_adopted_problems(step, where):
+    """What every step that was not adopted carries, however it ended: a reason, and the revert commit that removed its commit (when it has one)."""
     problems = []
     if not text(step.get("reason")):
         problems.append("%s: a step that was not adopted carries a reason" % where)
     if step.get("commit") is not None and step.get("revert_commit") is None:
         problems.append("%s: not adopted but its commit %s is not reverted (no revert_commit)" % (where, step["commit"]))
+    return problems
+
+
+def _terminated_problems(step, where, gates, meta, repo=None):
+    """A step that ended by the budget of its repairs (``failed_at`` ``repair_budget``). No gate is what ended it, so the row says what the gates of its FINAL form measured and proves the budget
+    (``termination_problems``): the code-generation evidence is that of any row that reached the gate (every comparison bound to its dumps and recomputed, and ``gates.codegen`` is what the
+    comparisons say: a gate that the dumps pass is not called failed, one that they fail is not called passed), exactness is the boolean that the step's evidence gave (null when it was never
+    measured), the phases after it were never reached (no timing, no A/B medians), and the step is removed by a revert commit like every step that was not adopted."""
+    problems = _not_adopted_problems(step, where)
     if not (gates.get("exactness") is None or type(gates.get("exactness")) is bool):
         problems.append("%s: gates.exactness is what the step's evidence gave (true or false), or null when it was never measured, got %r" % (where, gates.get("exactness")))
     probs, results = _codegen_problems(step, where, True, False, meta, repo)          # at least one comparison, every supplied one admitted and recomputed (the step may have ended before every toolchain ran)
@@ -1190,7 +1198,7 @@ def _terminated_problems(step, where, gates, meta, repo=None):
         problems.append("%s: the comparisons of the dumps say %s, the row says gates.codegen %r: a gate that the dumps pass is not called failed and one that they fail is not called passed" % (
             where, "PASS" if all(results) else "FAIL", gates.get("codegen")))
     problems.extend(_no_timing_problems(step, where, "repair_budget") + _ab_problems(step, where, False))
-    return problems + termination_problems(step, where, meta, repo)
+    return problems + termination_problems(step, where)
 
 
 def _stamp(dump, who, problems):
@@ -1243,9 +1251,35 @@ def repair_candidates(first_dump, attempts):
     return found
 
 
-def termination_problems(step, where, meta=None, repo=None):
-    """The proof that a step ended by the budget of its repairs, recomputed from the files that it names and never from what the row says about them (``repo`` is not needed: the evidence is the
-    dumps and the trees). ``termination`` is ``{"rule": "repair_budget", "allowed": 3, "first_failed_gate": {"dump": path}, "attempts": [{"id", "role", "dump", "tree"?, "note"?}], "counted": n}``:
+def _first_failed_gate(first, codegen, w):
+    """``(dump, problems)`` of the first failed gate of a termination as ``termination_problems`` proves it (``first``: its ``first_failed_gate``, ``codegen``: the row's ``codegen_gate``);
+    ``dump`` is the loaded dump of the gate, None when the dumps cannot be used."""
+    conda = codegen.get("conda") if isinstance(codegen, dict) else None
+    if not (isinstance(first, dict) and text(first.get("dump"))):
+        return None, ["%s: first_failed_gate names the dump of the first failed gate (first_failed_gate.dump)" % w]
+    if not (isinstance(conda, dict) and text(conda.get("base_dump"))):
+        return None, ["%s: the first failed gate is compared with the base on the conda toolchain, so the row carries its conda comparison (codegen_gate.conda)" % w]
+    dump, e1 = _load_dump(first["dump"], "the dump of the first failed gate")
+    base, e2 = _load_dump(conda["base_dump"], "the base dump")
+    allow, e3 = _load_allow(conda["allow"]) if conda.get("allow") else (None, None)
+    errors = [e for e in (e1, e2, e3) if e]
+    if errors:
+        return None, ["%s: %s" % (w, e) for e in errors]
+    problems = []
+    _stamp(dump, "%s: the first failed gate" % w, problems)
+    try:
+        report = cg.compare_dumps(base, dump, allow, "change")
+    except cg.Unusable as e:
+        return dump, problems + ["%s: the first failed gate cannot be compared with the base again: %s" % (w, _first_line(e))]
+    if not report["gate_r"]["failures"]:
+        problems.append("%s: the first failed gate does not fail the resource gate when it is compared with the base again (%d Gate R check(s), no failure): there was nothing to repair" % (
+            w, len(report["gate_r"]["checked"])))
+    return dump, problems
+
+
+def termination_problems(step, where):
+    """The proof that a step ended by the budget of its repairs, recomputed from the files that it names and never from what the row says about them (the evidence is the dumps and the
+    trees). ``termination`` is ``{"rule": "repair_budget", "allowed": 3, "first_failed_gate": {"dump": path}, "attempts": [{"id", "role", "dump", "tree"?, "note"?}], "counted": n}``:
     * the budget is the plan's (``REPAIR_BUDGET``), not the row's;
     * the first failed gate is a dump of the conda toolchain that fails the resource gate (Gate R) when it is compared with the base dump of the row's conda comparison again, with the same
       allow-list in change mode (``codegen_gate.compare_dumps``): without a failed gate there was nothing to repair;
@@ -1263,36 +1297,8 @@ def termination_problems(step, where, meta=None, repo=None):
         problems.append("%s: the rule is repair_budget, got %r" % (w, t.get("rule")))
     if type(t.get("allowed")) is not int or t.get("allowed") != REPAIR_BUDGET:
         problems.append("%s: the budget is %d repair attempts after a failed gate, the row says %r" % (w, REPAIR_BUDGET, t.get("allowed")))
-    first = t.get("first_failed_gate")
-    codegen = step.get("codegen_gate") if isinstance(step.get("codegen_gate"), dict) else {}
-    conda = codegen.get("conda")
-    gate_dump = None
-    if not (isinstance(first, dict) and text(first.get("dump"))):
-        problems.append("%s: first_failed_gate names the dump of the first failed gate (first_failed_gate.dump)" % w)
-    elif not (isinstance(conda, dict) and text(conda.get("base_dump"))):
-        problems.append("%s: the first failed gate is compared with the base on the conda toolchain, so the row carries its conda comparison (codegen_gate.conda)" % w)
-    else:
-        dump, e1 = _load_dump(first["dump"], "the dump of the first failed gate")
-        base, e2 = _load_dump(conda["base_dump"], "the base dump")
-        allow, e3 = None, None
-        if conda.get("allow"):
-            try:
-                allow = cg.load_allow(conda["allow"])
-            except (cg.Unusable, OSError, ValueError) as e:
-                e3 = "the allow-list %s cannot be used: %s" % (conda["allow"], _first_line(e))
-        if e1 or e2 or e3:
-            problems.extend("%s: %s" % (w, e) for e in (e1, e2, e3) if e)
-        else:
-            gate_dump = dump
-            _stamp(dump, "%s: the first failed gate" % w, problems)
-            try:
-                report = cg.compare_dumps(base, dump, allow, "change")
-            except cg.Unusable as e:
-                problems.append("%s: the first failed gate cannot be compared with the base again: %s" % (w, _first_line(e)))
-            else:
-                if not report["gate_r"]["failures"]:
-                    problems.append("%s: the first failed gate does not fail the resource gate when it is compared with the base again (%d Gate R check(s), no failure): there was nothing to repair" % (
-                        w, len(report["gate_r"]["checked"])))
+    gate_dump, gate_problems = _first_failed_gate(t.get("first_failed_gate"), step.get("codegen_gate"), w)
+    problems.extend(gate_problems)
     attempts = t.get("attempts")
     if not isinstance(attempts, list):
         problems.append("%s: the attempts are a list of the repair candidates and the ablations, each with the dump that was made of it" % w)
@@ -1319,8 +1325,10 @@ def termination_problems(step, where, meta=None, repo=None):
         if a.get("tree") is not None:
             if not (text(a["tree"]) and os.path.isdir(a["tree"])):
                 problems.append("%s: the tree %r is not a directory" % (who, a["tree"]))
-            elif content is not None and cg.tree_content_hash(a["tree"]) != content:
-                problems.append("%s: the tree %s is not the tree that the dump was made from (content hash %s, the dump says %s)" % (who, a["tree"], cg.tree_content_hash(a["tree"])[:12], content[:12]))
+            elif content is not None:
+                hashed = cg.tree_content_hash(a["tree"])
+                if hashed != content:
+                    problems.append("%s: the tree %s is not the tree that the dump was made from (content hash %s, the dump says %s)" % (who, a["tree"], hashed[:12], content[:12]))
     counted = repair_candidates(gate_dump, attempts) if gate_dump is not None else set()
     declared = t.get("counted")
     if type(declared) is not int or declared != len(counted):

@@ -2560,7 +2560,8 @@ def test_the_final_form_of_a_budget_row_keeps_the_figures_that_it_measured(tmp_p
     def no_comparisons(row):
         row["codegen_gate"], row["resource_gate"] = {}, {}
     assert has(step_check(budget_row(sub(tmp_path, "a"), edit=relabelled)), "the comparisons of the dumps say"), "relabelled"
-    assert step_check(budget_row(sub(tmp_path, "b"), edit=failing_final)) == [], step_check(budget_row(sub(tmp_path, "b2"), edit=failing_final))
+    failing = step_check(budget_row(sub(tmp_path, "b"), edit=failing_final))
+    assert failing == [], failing
     missing = step_check(budget_row(sub(tmp_path, "c"), edit=no_comparisons))
     assert has(missing, "no comparison for any toolchain") or has(missing, "codegen_gate must give"), missing[:3]
 

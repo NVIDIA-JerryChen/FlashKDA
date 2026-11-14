@@ -181,17 +181,22 @@ def test_the_manifest_names_what_the_decision_needs():
         assert any(needle in p for p in sp.manifest_problems(bad)), needle
 
 
+def manifest_codegen(commit, previous, sid):
+    """``codegen`` of a manifest whose dumps are those of the record checker's own tests: per toolchain the dumps of the honest comparison of ``commit`` (and the occupancy record of a
+    device) and the dump of the previous accepted state; the allow-list is empty."""
+    codegen = {}
+    for key in rc.COMPARISONS:
+        entry, _ = trs.comparison(key, commit, sid=sid)
+        codegen[key] = {"base": entry["base_dump"], "cand": entry["cand_dump"], "prev": trs.dump_file(key, previous, "cand")}
+        if key.startswith("container_"):
+            codegen[key]["occupancy"] = entry["occupancy"]
+    return dict(codegen, allow=trs.allow_file({}))
+
+
 def adopted_case(tmp_path, monkeypatch, per_device=None):
     """The manifest, the recomputed campaigns, the decision and the row of a step (adopted unless ``per_device`` says otherwise) whose dumps are those of the record checker's own tests."""
     m = manifest(tmp_path, per_device or ADOPTABLE)
-    codegen = {}
-    for key in rc.COMPARISONS:
-        entry, _ = trs.comparison(key, STEP, sid="trims")
-        prev = trs.dump_file(key, PREV, "cand", rows=None)
-        codegen[key] = {"base": entry["base_dump"], "cand": entry["cand_dump"], "prev": prev}
-        if key.startswith("container_"):
-            codegen[key]["occupancy"] = entry["occupancy"]
-    m["codegen"] = dict(codegen, allow=trs.allow_file({}))
+    m["codegen"] = manifest_codegen(STEP, PREV, "trims")
     m["suites"] = dict((d, {"gate": {"baseline": "x", "candidate": "y"}, "S": {"baseline": "x", "candidate": "y"}}) for d in rc.DEVICES)
     monkeypatch.setattr(sp, "exactness_problems", lambda *args, **kwargs: [])
     infos = sp.campaign_infos(m)
@@ -692,13 +697,7 @@ def budget_case(tmp_path):
     """The manifest of a step (the dumps of the record checker's own tests, the suites of ``exactness_world``), the termination of its repairs and the row that the builder makes of them."""
     m, _, _ = exactness_world(tmp_path / "world")
     m = dict(m, step="e_tile", commit=trs.C2, previous=trs.C1, markers=["tile_marker"], revert_commit=trs.C3)
-    codegen = {}
-    for key in rc.COMPARISONS:
-        entry, _ = trs.comparison(key, m["commit"], sid="e_tile")
-        codegen[key] = {"base": entry["base_dump"], "cand": entry["cand_dump"], "prev": trs.dump_file(key, trs.C1, "cand")}
-        if key.startswith("container_"):
-            codegen[key]["occupancy"] = entry["occupancy"]
-    m["codegen"] = dict(codegen, allow=trs.allow_file({}))
+    m["codegen"] = manifest_codegen(m["commit"], m["previous"], "e_tile")
     (tmp_path / "budget").mkdir()
     termination = trs.budget_row(tmp_path / "budget")["termination"]
     return m, termination, sp.build_termination_row(m, termination, "the repairs of the failed resource gate exceeded the budget of the gate protocol", exactness=[])

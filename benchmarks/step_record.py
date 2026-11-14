@@ -405,12 +405,18 @@ def codegen_entries(m):
     return codegen, resources
 
 
+def measured_gates(m, exactness=None):
+    """``(codegen_gate, resource_gate, gates)`` of a row: the comparisons of the dumps of the manifest (``codegen_entries``) and what they and the suites say of the exactness and the
+    code-generation gates. ``exactness``: the problems of ``exactness_problems`` when the caller has them already."""
+    codegen, resources = codegen_entries(m)
+    exact = exactness_problems(m) if exactness is None else exactness
+    return codegen, resources, {"exactness": not exact, "codegen": all(e["verdict"] == "PASS" for e in codegen.values())}
+
+
 def build_row(m, decision, infos, exactness=None):
     """The ledger row of the step for an ``adopted`` or ``not_adopted`` decision that reached the timing phase (a row that failed earlier has no timing and is written by hand from the phase that
     failed, with ``not_run`` figures: this tool is for the campaigns). ``exactness``: the problems of ``exactness_problems`` when the caller has them already."""
-    codegen, resources = codegen_entries(m)
-    exact = exactness_problems(m) if exactness is None else exactness
-    reached = {"exactness": not exact, "codegen": all(e["verdict"] == "PASS" for e in codegen.values())}
+    codegen, resources, reached = measured_gates(m, exactness)
     adopted = decision["outcome"] == "adopted"
     row = {"id": m["step"], "outcome": decision["outcome"], "commit": m["commit"], "revert_commit": m.get("revert_commit"), "markers": list(m["markers"]),
            "failed_at": None if adopted else "timing", "reason": "" if adopted else "; ".join(decision["reasons"][:3]), "gates": reached, "timing": decision["timing"],
@@ -429,11 +435,10 @@ def build_termination_row(m, termination, reason, exactness=None):
     """The ledger row of a step that ended by the budget of its repairs (``failed_at`` ``repair_budget``): what the gates of its FINAL commit measured (the comparisons of the dumps of the manifest,
     which may pass; the exactness of its suites), no timing (never reached: ``not_run``), the revert commit that removed it (``m["revert_commit"]``) and ``termination``, the proof of the budget
     that the record checker recomputes (``record_checker.termination_problems``). ``exactness``: the problems of ``exactness_problems`` when the caller has them already."""
-    codegen, resources = codegen_entries(m)
-    exact = exactness_problems(m) if exactness is None else exactness
+    codegen, resources, gates = measured_gates(m, exactness)
     return {"id": m["step"], "outcome": "not_adopted", "commit": m["commit"], "revert_commit": m.get("revert_commit"), "markers": list(m["markers"]), "failed_at": "repair_budget",
-            "reason": reason, "gates": {"exactness": not exact, "codegen": all(e["verdict"] == "PASS" for e in codegen.values())},
-            "timing": {"vs_previous": "not_run", "vs_base": "not_run", "chain": "not_run"}, "codegen_gate": codegen, "resource_gate": resources, "ab": None, "termination": termination}
+            "reason": reason, "gates": gates, "timing": {"vs_previous": "not_run", "vs_base": "not_run", "chain": "not_run"}, "codegen_gate": codegen, "resource_gate": resources, "ab": None,
+            "termination": termination}
 
 
 def row_problems(m, row, repo=None):
@@ -484,6 +489,15 @@ def resource_rows(m):
     return out
 
 
+def codegen_lines(m, row):
+    """The lines of a section on the code generation: the Gate X verdict of every comparison of the row and the table of ``resource_rows``."""
+    lines = ["Gate X in change mode (every kernel but the row engine identical to the base): " + "; ".join(
+        "%s %s (%d kernels compared, %d differences)" % (key, e["verdict"], e["compared"], e["differences"]) for key, e in sorted(row["codegen_gate"].items())) + ".",
+             "", "Registers / spill loads / spill stores / stack bytes of the row engine; the base column is the kernel that the resource gate holds the instantiation to.", "",
+             "| toolchain | architecture | instantiation | base | previous accepted state | step |", "|---|---|---|---|---|---|"]
+    return lines + ["| %s | %s | %s | %s | %s | %s |" % r for r in resource_rows(m)]
+
+
 def render_section(m, decision, row, infos, number=10):
     """The section of the performance document for the step: only numbers of ``decide`` / ``timing_rows`` / ``resource_rows`` / the ledger row, i.e. of the raw evidence."""
     hosts = dict((dev, infos[dev]["previous"][1].get("host")) for dev in GATING)
@@ -506,12 +520,7 @@ def render_section(m, decision, row, infos, number=10):
               "| device | against | metric | cells | confirmed slower | confirmed faster | median change | range | noise-limited | judged on the re-run |", "|---|---|---|---|---|---|---|---|---|---|"]
     for dev, kind, metric, cells, slower, faster, med, low, high, noisy, rerun in timing_rows(m, infos):
         lines.append("| %s | %s | %s | %d | %d | %d | %+.2f %% | %+.2f %% to %+.2f %% | %d | %d |" % (dev, AGAINST[kind], metric, cells, slower, faster, med, low, high, noisy, rerun))
-    lines += ["", "### Code generation and resources", ""]
-    lines.append("Gate X in change mode (every kernel but the row engine identical to the base): " + "; ".join(
-        "%s %s (%d kernels compared, %d differences)" % (key, e["verdict"], e["compared"], e["differences"]) for key, e in sorted(row["codegen_gate"].items())) + ".")
-    lines += ["", "Registers / spill loads / spill stores / stack bytes of the row engine; the base column is the kernel that the resource gate holds the instantiation to.", "",
-              "| toolchain | architecture | instantiation | base | previous accepted state | step |", "|---|---|---|---|---|---|"]
-    lines += ["| %s | %s | %s | %s | %s | %s |" % r for r in resource_rows(m)]
+    lines += ["", "### Code generation and resources", ""] + codegen_lines(m, row)
     return "\n".join(lines) + "\n"
 
 
@@ -560,11 +569,7 @@ def render_termination_section(m, row, number=11):
               "Gate G and Suite S (every test file of `tests/cfbi`, the four cases of the K2 sanitizer file included; complete against the collection of the commit of the suites, whose kernel sources are the step's):", "",
               "| device | Gate G passed | Suite S files | Suite S passed | skipped | failed | commit of the suites |", "|---|---|---|---|---|---|---|"]
     lines += ["| %s | %s | %s | %s | %s | %s | %s |" % r for r in suite_rows(m)]
-    lines += ["", "Gate X in change mode (every kernel but the row engine identical to the base): " + "; ".join(
-        "%s %s (%d kernels compared, %d differences)" % (key, e["verdict"], e["compared"], e["differences"]) for key, e in sorted(row["codegen_gate"].items())) + ".",
-              "", "Registers / spill loads / spill stores / stack bytes of the row engine; the base column is the kernel that the resource gate holds the instantiation to.", "",
-              "| toolchain | architecture | instantiation | base | previous accepted state | step |", "|---|---|---|---|---|---|"]
-    lines += ["| %s | %s | %s | %s | %s | %s |" % r for r in resource_rows(m)]
+    lines += [""] + codegen_lines(m, row)
     lines += ["", "Occupancy-API records of the production toolchain (threads of a CTA: 256):", "", "| device | instantiation | registers | static shared memory | dynamic shared memory | CTAs per SM |", "|---|---|---|---|---|---|"]
     for key in rc.COMPARISONS:
         if key.startswith("container_"):
