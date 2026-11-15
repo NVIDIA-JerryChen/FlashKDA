@@ -26,6 +26,7 @@
 
 #include "cfbi/cfbi_common.cuh"
 
+#include <cstddef>
 #include <cstdio>
 
 namespace cfbi {
@@ -54,6 +55,12 @@ __device__ unsigned g_rows_prof[ROWS_PROF_POS][ROWS_PROF_CTAS][ROWS_PROF_STAMPS]
 // CFBI_ROWS_TEST_POS_OOB moves the accesses to a pos word that the host selects (rows_test_pos_offset takes an offset and an access mask: bit POS_ACCESS_FUSED_STORE = the fused store of the
 // two-launch row engine, POS_ACCESS_ARRIVAL = the arrival atomic and POS_ACCESS_ELECTED_STORE = the elected store of the single launch) to pos[slot + offset] (out-of-bounds controls for
 // memcheck) and CFBI_ROWS_TEST_COMPILE_ERROR stops the compilation (the control that shows that a variant that does not build fails its test).
+// The staged A fragments (FragSmem) add barrier 13 of a row, ROWS_SYNC_AB(), between barriers 1 and 2 (it publishes the AB tile; every thread passes it), and two delay sites: 13 = before that
+// barrier and 14 = in the window that a removed barrier leaves open, in front of the stores of the AB producers (the controls that late stores of the AM and AD tiles make use ROWS_DELAY_LATE(),
+// the same site 14). CFBI_ROWS_TEST_NO_AB_BARRIER removes barrier 13 (a racy control: a producer warp that sleeps at site 14 lets the others read AB words that are not written yet).
+// CFBI_ROWS_TEST_AFRAG_CHECK compiles the fragment-level check: every consumer recomputes the fragment that the unstaged kernel built and counts the words that differ (g_afrag_mismatch,
+// read through rows_test_afrag_mismatches); the controls AB_SHIFT_LANE, AB_WRONG_PARITY, AM_STALE_ZERO, NONMINE_TILE, AM_STORES_LATE, AD_STORES_LATE and ZERO_TILE_WRITE (all
+// CFBI_ROWS_TEST_*) break one rule of the staging each, and only that check (or a delay) can see some of them: a word in a row of the A tile that no output reads cannot change a result.
 #ifdef CFBI_ROWS_DELAY_NS
 struct RowsDelayConfig {
     unsigned ns;           // length of a delay (0: CFBI_ROWS_DELAY_NS)
@@ -92,6 +99,17 @@ __device__ __forceinline__ void rows_delay_arrived(int old, int heads) {
 #else
 #define ROWS_SYNC_END() ROWS_SYNC(7)
 #endif
+#ifdef CFBI_ROWS_TEST_NO_AB_BARRIER
+#define ROWS_SYNC_AB() ROWS_DELAY(13)
+#else
+#define ROWS_SYNC_AB() ROWS_SYNC(13)
+#endif
+#ifdef CFBI_ROWS_TEST_AM_STORES_LATE
+#define ROWS_DELAY_LATE() ROWS_DELAY(14)
+#endif
+#ifdef CFBI_ROWS_TEST_AD_STORES_LATE
+#define ROWS_DELAY_LATE() ROWS_DELAY(14)
+#endif
 #ifdef CFBI_ROWS_TEST_COMPILE_ERROR
 #error "CFBI_ROWS_TEST_COMPILE_ERROR: a deliberate compile error (the control that shows that a variant that does not build fails its test)"
 #endif
@@ -111,18 +129,43 @@ struct RowSmem {
     float q[HEAD_K];      // qhat of the current row
     float g2[HEAD_K];     // G2 of the current row
     float gref[HEAD_K];   // G2 of the reference row r(pos)
-    float gq[HEAD_K];     // GQ = Gamma * qhat
     float gend[HEAD_K];   // GEND (chunk end only)
-    float x[2][HEAD_K];   // UT_t, W_t of the current row
+    float x0[HEAD_K];     // UT_t of the current row
     float m[3][HEAD_V];   // cross-sub-block products: UT, W, and U (for O)
     float p1[HEAD_V], p2[HEAD_V], u[HEAD_V];
     float akk[BT], aqk[BT];
     float beta;
+#ifdef CFBI_ROWS_TEST_AFRAG_CHECK
+    float gq[HEAD_K];     // test build only: GQ and the W row of the unstaged kernel, the operands of the fragment check of phase D
+    float x1[HEAD_K];
+#endif
 };
-// The static shared memory of rows_kernel is this structure plus, for rows_kernel<true>, one int (the fill of the open chunk). The need that cfbi_policy.h states is the compiler's
-// figure for it: at least the layout, and less than one allocation unit (1 KiB) more.
-static_assert(sizeof(RowSmem) + sizeof(int) <= ROWS_STATIC_SMEM_BYTES, "ROWS_STATIC_SMEM_BYTES (cfbi_policy.h) must cover the static shared memory of the row engine");
-static_assert(ROWS_STATIC_SMEM_BYTES - (sizeof(RowSmem) + sizeof(int)) < 1024, "ROWS_STATIC_SMEM_BYTES (cfbi_policy.h) is more than an allocation unit above the layout: take the compiler's figure");
+// The A fragments (TF32 hi / lo words of m16n8k8, element ii = row g + 8 (ii & 1), column t + 4 (ii >> 1)) of the three products that built them in every warp, staged once per row: AB = the ks
+// (row slot) and qs (row slot ^ 8) rows of phase B, AM = the akk and aqk rows of the cross-sub-block products (row slot only, KS = 2 s k-steps), AD = the W and GQ rows of phase D. A tile holds,
+// per (k-step, [which,] hi / lo, t), the four words of a lane group as one uint4, so that the four lanes t = 0 .. 3 that own row slot read 64 contiguous bytes; the lanes that do not own it
+// read the zero page at the same offset (a load takes the same immediate for every lane, so the page is as large as the largest tile). The zero page comes first and sits 64 bytes off a 128-byte
+// boundary: its twin of a 64-byte group then lies in the other half of the banks, and the three tiles behind it form one contiguous arena.
+struct alignas(128) FragSmem {
+    uint4 pad0_[4];
+    uint4 zero[16][2][4];
+    uint4 pad1_[4];
+    uint4 ab[16][2][4];
+    uint4 am[6][2][2][4];
+    uint4 ad[16][2][4];
+};
+static_assert(alignof(FragSmem) == 128, "FragSmem is aligned to 128 bytes");
+static_assert(offsetof(FragSmem, ab) % 128 == 0 && offsetof(FragSmem, am) % 128 == 0 && offsetof(FragSmem, ad) % 128 == 0, "the staged tiles are 128-byte aligned");
+static_assert(offsetof(FragSmem, zero) % 128 == 64, "the zero twin of a 64-byte group lies in the other half of the banks");
+static_assert(sizeof(FragSmem::zero) >= sizeof(FragSmem::ab) && sizeof(FragSmem::zero) >= sizeof(FragSmem::am) && sizeof(FragSmem::zero) >= sizeof(FragSmem::ad), "one immediate offset serves every lane");
+static_assert(offsetof(FragSmem, zero) + sizeof(FragSmem::zero) <= offsetof(FragSmem, ab) && offsetof(FragSmem, ab) + sizeof(FragSmem::ab) == offsetof(FragSmem, am) &&
+                  offsetof(FragSmem, am) + sizeof(FragSmem::am) == offsetof(FragSmem, ad) && offsetof(FragSmem, ad) + sizeof(FragSmem::ad) == sizeof(FragSmem),
+              "the overlay arena is one contiguous suffix behind the zero page");
+// The static shared memory of rows_kernel is the working set, padded to the alignment of the fragments, the fragment tiles and, for rows_kernel<true>, one int (the fill of the open chunk).
+// The need that cfbi_policy.h states for the build is the compiler's figure for it: at least the layout, and less than one allocation unit (1 KiB) more.
+constexpr size_t rows_smem_up(size_t x, size_t a) { return (x + a - 1) / a * a; }
+constexpr size_t ROWS_SMEM_LAYOUT_BYTES = rows_smem_up(sizeof(RowSmem), alignof(FragSmem)) + sizeof(FragSmem) + sizeof(int);
+static_assert(ROWS_SMEM_LAYOUT_BYTES <= ROWS_BUILD_STATIC_SMEM_BYTES, "ROWS_STATIC_SMEM_BYTES (cfbi_policy.h; ROWS_ORACLE_STATIC_SMEM_BYTES in the fragment-check build) must cover the static shared memory of the row engine");
+static_assert(ROWS_BUILD_STATIC_SMEM_BYTES - ROWS_SMEM_LAYOUT_BYTES < 1024, "ROWS_STATIC_SMEM_BYTES (cfbi_policy.h; ROWS_ORACLE_STATIC_SMEM_BYTES in the fragment-check build) is more than an allocation unit above the layout: take the compiler's figure");
 
 __device__ __forceinline__ void prefetch_l2(const void* ptr) { asm volatile("prefetch.global.L2 [%0];" ::"l"(ptr)); }
 __device__ __forceinline__ void prefetch_l1(const void* ptr) { asm volatile("prefetch.global.L1 [%0];" ::"l"(ptr)); }
@@ -137,11 +180,147 @@ __device__ __forceinline__ void prefetch_state(const void* ptr) {
 #endif
 }
 
+// ---- the staged A fragments: the only code that touches the tiles (every access to ab, am, ad and zero goes through these functions) -------------------------------------------------
+// The +0 page is written once, by the threads 0 .. 127, in front of the row loop, and never again (the first barrier of the first row orders it before every read).
+__device__ __forceinline__ void afrag_zero_init(FragSmem& Fr, int tid) {
+    if (tid < 128) reinterpret_cast<uint4*>(&Fr.zero[0][0][0])[tid] = make_uint4(0u, 0u, 0u, 0u);
+#ifdef CFBI_ROWS_TEST_AM_STALE_ZERO
+    if (tid < 96) reinterpret_cast<uint4*>(&Fr.am[0][0][0][0])[tid] = make_uint4(0u, 0u, 0u, 0u);   // control: the zero words of the AM tile are stored here, once, and never rewritten
+#endif
+}
+
+// The base of the loads of a lane: its tile when it owns row slot of the A tile (mine), the zero page otherwise, plus t (the lane group of the words).
+__device__ __forceinline__ const uint4* afrag_ptr_ab(const FragSmem& Fr, bool mine, int t) {
+#ifdef CFBI_ROWS_TEST_NONMINE_TILE
+    (void)mine;   // control: the lanes that do not own the row read the tile
+    return reinterpret_cast<const uint4*>(&Fr.ab[0][0][0]) + t;
+#else
+    return (mine ? reinterpret_cast<const uint4*>(&Fr.ab[0][0][0]) : reinterpret_cast<const uint4*>(&Fr.zero[0][0][0])) + t;
+#endif
+}
+__device__ __forceinline__ const uint4* afrag_ptr_am(const FragSmem& Fr, bool mine, int t) {
+#ifdef CFBI_ROWS_TEST_NONMINE_TILE
+    (void)mine;
+    return reinterpret_cast<const uint4*>(&Fr.am[0][0][0][0]) + t;
+#else
+    return (mine ? reinterpret_cast<const uint4*>(&Fr.am[0][0][0][0]) : reinterpret_cast<const uint4*>(&Fr.zero[0][0][0])) + t;
+#endif
+}
+__device__ __forceinline__ const uint4* afrag_ptr_ad(const FragSmem& Fr, bool mine, int t) {
+#ifdef CFBI_ROWS_TEST_NONMINE_TILE
+    (void)mine;
+    return reinterpret_cast<const uint4*>(&Fr.ad[0][0][0]) + t;
+#else
+    return (mine ? reinterpret_cast<const uint4*>(&Fr.ad[0][0][0]) : reinterpret_cast<const uint4*>(&Fr.zero[0][0][0])) + t;
+#endif
+}
+
+// AB: the words of channel ch (ks = ch >> 3, t = ch & 3, half = (ch >> 2) & 1): hi to [ks][0][t], lo to [ks][1][t]; the ks row has the element parity slot_hi, the qs row the other one,
+// element ii = parity + 2 half.
+__device__ __forceinline__ void afrag_store_ab(FragSmem& Fr, int ch, int slot_hi, uint32_t kh, uint32_t kl, uint32_t qh, uint32_t ql) {
+    const int ks = ch >> 3, half = (ch >> 2) & 1;
+#ifdef CFBI_ROWS_TEST_AB_SHIFT_LANE
+    const int tt = ((ch & 3) + 1) & 3;   // control: the t of the stores shifted by one lane
+#else
+    const int tt = ch & 3;
+#endif
+#ifdef CFBI_ROWS_TEST_AB_WRONG_PARITY
+    const int iik = (1 - slot_hi) + 2 * half, iiq = slot_hi + 2 * half;   // control: the ks and qs rows swapped
+#else
+    const int iik = slot_hi + 2 * half, iiq = (1 - slot_hi) + 2 * half;
+#endif
+    uint32_t* wh = reinterpret_cast<uint32_t*>(&Fr.ab[ks][0][tt]);
+    uint32_t* wl = reinterpret_cast<uint32_t*>(&Fr.ab[ks][1][tt]);
+    wh[iik] = kh;
+    wl[iik] = kl;
+    wh[iiq] = qh;
+    wl[iiq] = ql;
+#ifdef CFBI_ROWS_TEST_ZERO_TILE_WRITE
+    if (ch == 0) reinterpret_cast<uint32_t*>(&Fr.zero[0][0][0])[0] = 0x3f800000u;   // control: a producer writes into the zero page
+#endif
+}
+
+// AM: the akk and aqk values of the columns 8 w + r (r = 2 t + e), from the lane that owns row slot: the element ii = slot_hi + 2 half of the lane group tt = r & 3 holds the value, the element of
+// the other row parity holds +0, which is stored in every row because the parity changes with slot.
+__device__ __forceinline__ void afrag_store_am(FragSmem& Fr, int w, int r, int slot_hi, float akk_v, float aqk_v) {
+    const int tt = r & 3, half = r >> 2, iiv = slot_hi + 2 * half, iiz = (1 - slot_hi) + 2 * half;
+    uint32_t h, l;
+    split_tf32(akk_v, h, l);
+    reinterpret_cast<uint32_t*>(&Fr.am[w][0][0][tt])[iiv] = h;
+    reinterpret_cast<uint32_t*>(&Fr.am[w][0][1][tt])[iiv] = l;
+#ifndef CFBI_ROWS_TEST_AM_STALE_ZERO
+    reinterpret_cast<uint32_t*>(&Fr.am[w][0][0][tt])[iiz] = 0u;
+    reinterpret_cast<uint32_t*>(&Fr.am[w][0][1][tt])[iiz] = 0u;
+#endif
+    split_tf32(aqk_v, h, l);
+    reinterpret_cast<uint32_t*>(&Fr.am[w][1][0][tt])[iiv] = h;
+    reinterpret_cast<uint32_t*>(&Fr.am[w][1][1][tt])[iiv] = l;
+#ifndef CFBI_ROWS_TEST_AM_STALE_ZERO
+    reinterpret_cast<uint32_t*>(&Fr.am[w][1][0][tt])[iiz] = 0u;
+    reinterpret_cast<uint32_t*>(&Fr.am[w][1][1][tt])[iiz] = 0u;
+#endif
+}
+
+// AD: the words of the value of channel col (the GQ row of the UT threads, which = 0, or the W row of the W threads, which = 1): ks = col >> 3, t = col & 3, half = (col >> 2) & 1.
+__device__ __forceinline__ void afrag_store_ad(FragSmem& Fr, int col, int which, int slot_hi, float val) {
+    const int ks = col >> 3, tt = col & 3, half = (col >> 2) & 1, ii = (which ? slot_hi : 1 - slot_hi) + 2 * half;
+    uint32_t h, l;
+    split_tf32(val, h, l);
+    reinterpret_cast<uint32_t*>(&Fr.ad[ks][0][tt])[ii] = h;
+    reinterpret_cast<uint32_t*>(&Fr.ad[ks][1][tt])[ii] = l;
+}
+
+#ifdef CFBI_ROWS_TEST_AFRAG_CHECK
+// The fragment-level check (test build only): the fragments of the unstaged kernel, recomputed from the operands that the working set still holds, against the words that the lane loaded.
+// A word that differs in a row of the A tile that no output reads cannot change a result, so only this check sees such a defect.
+__device__ unsigned long long g_afrag_mismatch;
+__device__ __forceinline__ void afrag_count(bool differs) {
+    if (differs) atomicAdd(&g_afrag_mismatch, 1ull);
+}
+// phase B: the ks row (A row slot) and the qs row (slot ^ 8) of the k-step ks
+__device__ __forceinline__ void afrag_check_ab(const RowSmem& S, bool mine, int slot_hi, int t, int ks, const uint32_t (&ah)[4], const uint32_t (&al)[4]) {
+#pragma unroll
+    for (int ii = 0; ii < 4; ++ii) {
+        const int ch = 8 * ks + t + 4 * (ii >> 1);
+        const float f = ex2_ftz(fsub(S.g2[ch], S.gref[ch]));
+        const float ksv = fmul(S.k[ch], f), qsv = fmul(S.q[ch], f);
+        const float v = mine ? (((ii & 1) == slot_hi) ? ksv : qsv) : 0.f;
+        uint32_t h, l;
+        split_tf32(v, h, l);
+        afrag_count(h != ah[ii] || l != al[ii]);
+    }
+}
+// phase C: the akk and aqk rows (A row slot only) of the k-step ks
+__device__ __forceinline__ void afrag_check_am(const RowSmem& S, const LaneIdx& L, int slot, int ks, const uint32_t (&kh)[4], const uint32_t (&kl)[4], const uint32_t (&qh)[4], const uint32_t (&ql)[4]) {
+#pragma unroll
+    for (int ii = 0; ii < 4; ++ii) {
+        const int row = L.g + 8 * (ii & 1), kk = 8 * ks + L.t + 4 * (ii >> 1);
+        const float av = S.akk[kk], aq = S.aqk[kk];
+        uint32_t h, l, h2, l2;
+        split_tf32(row == slot ? av : 0.f, h, l);
+        split_tf32(row == slot ? aq : 0.f, h2, l2);
+        afrag_count(h != kh[ii] || l != kl[ii] || h2 != qh[ii] || l2 != ql[ii]);
+    }
+}
+// phase D: the W row (A row slot) and the GQ row (slot ^ 8) of the k-step ks
+__device__ __forceinline__ void afrag_check_ad(const RowSmem& S, bool mine, int slot_hi, int t, int ks, const uint32_t (&ah)[4], const uint32_t (&al)[4]) {
+#pragma unroll
+    for (int ii = 0; ii < 4; ++ii) {
+        const int kk = 8 * ks + t + 4 * (ii >> 1);
+        const float wv = S.x1[kk], gv = S.gq[kk];
+        const float v = mine ? (((ii & 1) == slot_hi) ? wv : gv) : 0.f;
+        uint32_t h, l;
+        split_tf32(v, h, l);
+        afrag_count(h != ah[ii] || l != al[ii]);
+    }
+}
+#endif
+
 // Cross-sub-block products of the current row for KS = 2s k-steps: M[which][v] = dot3(A row, X[which][0:16s][v]) with
 // which = 0: akk row x UT rows, 1: akk row x W rows, 2: aqk row x U rows. 48 column tiles, 6 per warp, all B fragments
-// loaded up front. The A row sits in A-row slot `slot`.
+// loaded up front. The A row sits in A-row slot `slot`; its fragments are read from the AM tile (amp).
 template <int KS>
-__device__ __forceinline__ void rows_m_tiles(RowSmem& S, const float* Rut, const float* Rw, const float* Ru, int warp,
+__device__ __forceinline__ void rows_m_tiles(RowSmem& S, const uint4* amp, const float* Rut, const float* Rw, const float* Ru, int warp,
                                              const LaneIdx& L, int slot) {
     float bv[6][KS][2];
 #pragma unroll
@@ -161,13 +340,14 @@ __device__ __forceinline__ void rows_m_tiles(RowSmem& S, const float* Rut, const
 #pragma unroll
     for (int ks = 0; ks < KS; ++ks) {
         uint32_t kh[4], kl[4], qh[4], ql[4];
-#pragma unroll
-        for (int ii = 0; ii < 4; ++ii) {
-            const int row = L.g + 8 * (ii & 1), kk = 8 * ks + L.t + 4 * (ii >> 1);
-            const float av = S.akk[kk], aq = S.aqk[kk];   // unconditional loads, select (no divergent branch)
-            split_tf32(row == slot ? av : 0.f, kh[ii], kl[ii]);
-            split_tf32(row == slot ? aq : 0.f, qh[ii], ql[ii]);
-        }
+        const uint4 vkh = amp[ks * 16], vkl = amp[ks * 16 + 4], vqh = amp[ks * 16 + 8], vql = amp[ks * 16 + 12];
+        kh[0] = vkh.x; kh[1] = vkh.y; kh[2] = vkh.z; kh[3] = vkh.w;
+        kl[0] = vkl.x; kl[1] = vkl.y; kl[2] = vkl.z; kl[3] = vkl.w;
+        qh[0] = vqh.x; qh[1] = vqh.y; qh[2] = vqh.z; qh[3] = vqh.w;
+        ql[0] = vql.x; ql[1] = vql.y; ql[2] = vql.z; ql[3] = vql.w;
+#ifdef CFBI_ROWS_TEST_AFRAG_CHECK
+        afrag_check_am(S, L, slot, ks, kh, kl, qh, ql);
+#endif
 #pragma unroll
         for (int q = 0; q < 6; ++q) {
             uint32_t bh[2], bl[2];
@@ -276,6 +456,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
 #endif
     ROWS_DELAY(0);   // test hook: kernel entry, before the plan load and the first loads
     __shared__ RowSmem S;
+    __shared__ FragSmem Fr;
     __shared__ int dec_pos0;   // DECODE only: the fill of the open chunk, from thread 0 (unused, hence not allocated, with DECODE = false)
     const int n = blockIdx.x, h = blockIdx.y, H = p.H;
     const SeqPlan sp = rows_entry<DECODE>(p, n, dec_pos0);
@@ -284,6 +465,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
     const int tid = threadIdx.x, warp = tid >> 5;
     const LaneIdx L;
     const int g = L.g, t = L.t;
+    afrag_zero_init(Fr, tid);   // the +0 page of the staged A fragments: written once here, ordered by the first barrier of the first row
 
     float* R = p.rows + ((int64_t)sp.slot * H + h) * ROWS_PER_HEAD_FLOATS;
     float* Rk = R + PLANE_KHAT * ROW_PLANE_FLOATS;
@@ -319,6 +501,9 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
         const int s = pos >> 4, b = pos & ~15, slot = pos & 15;
         const int slot_hi = slot >> 3;   // the current row is in A/C rows g (0) or g+8 (1) of the lanes with g == slot & 7
         const bool mine = g == (slot & 7);
+        const uint4* const abp = afrag_ptr_ab(Fr, mine, t);   // the bases of the fragment loads: the tile of the lanes that own row slot, the zero page for the others
+        const uint4* const amp = afrag_ptr_am(Fr, mine, t);
+        const uint4* const adp = afrag_ptr_ad(Fr, mine, t);
 
         // ---- early loads: nothing here depends on this row's prep ------------------------------------
         float gprev = 0.f, vraw = 0.f;
@@ -368,10 +553,12 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
         ROWS_TS(1);
 
         // ---- B. Akk / Aqk row against the cached rows (and the row itself): one 8-column tile per warp, ks and qs
-        //         packed into one A tile (rows slot and slot ^ 8), B = kjr shared ----------------------------------
+        //         packed into one A tile (rows slot and slot ^ 8), B = kjr shared. The A fragments of ks and qs are
+        //         built once per row, one channel per thread, into the AB tile and published by barrier 13; the loads
+        //         of the B operands are issued in front of that barrier, so that their latency overlaps the producers ----
+        const int j0 = 8 * warp, j = j0 + g;
+        float rk[16][2], rgv[16][2];
         if (warp <= (pos >> 3)) {
-            const int j0 = 8 * warp, j = j0 + g;
-            float rk[16][2], rgv[16][2];
             const int jc = (j < pos) ? j : 0;   // clamped row: every lane loads, the select below discards unused values
 #pragma unroll
             for (int ks = 0; ks < 16; ++ks)
@@ -383,20 +570,30 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
                     rk[ks][ii] = (j < pos) ? ak : ((j == pos) ? sk : 0.f);
                     rgv[ks][ii] = (j < pos) ? bg : ((j == pos) ? sg : 0.f);
                 }
+        }
+        if (tid < HEAD_K) {   // the AB producer: channel tid, the expressions that every lane evaluated for itself before
+            ROWS_DELAY(14);   // test hook: the window of barrier 13, in front of the stores
+            const float f = ex2_ftz(fsub(S.g2[tid], S.gref[tid]));
+            const float ksv = fmul(S.k[tid], f), qsv = fmul(S.q[tid], f);
+            uint32_t kh, kl, qh, ql;
+            split_tf32(ksv, kh, kl);
+            split_tf32(qsv, qh, ql);
+            afrag_store_ab(Fr, tid, slot_hi, kh, kl, qh, ql);
+        }
+        ROWS_SYNC_AB();
+        if (warp <= (pos >> 3)) {
             float big[4], sml[4];
 #pragma unroll
             for (int i = 0; i < 4; ++i) { big[i] = neg_zero(); sml[i] = neg_zero(); }
 #pragma unroll
             for (int ks = 0; ks < 16; ++ks) {
                 uint32_t ah[4], al[4];
-#pragma unroll
-                for (int ii = 0; ii < 4; ++ii) {
-                    const int ch = 8 * ks + t + 4 * (ii >> 1);
-                    const float f = ex2_ftz(fsub(S.g2[ch], S.gref[ch]));
-                    const float ksv = fmul(S.k[ch], f), qsv = fmul(S.q[ch], f);
-                    const float v = mine ? (((ii & 1) == slot_hi) ? ksv : qsv) : 0.f;
-                    split_tf32(v, ah[ii], al[ii]);
-                }
+                const uint4 vh = abp[ks * 8], vl = abp[ks * 8 + 4];
+                ah[0] = vh.x; ah[1] = vh.y; ah[2] = vh.z; ah[3] = vh.w;
+                al[0] = vl.x; al[1] = vl.y; al[2] = vl.z; al[3] = vl.w;
+#ifdef CFBI_ROWS_TEST_AFRAG_CHECK
+                afrag_check_ab(S, mine, slot_hi, t, ks, ah, al);
+#endif
                 uint32_t bh[2], bl[2];
 #pragma unroll
                 for (int ii = 0; ii < 2; ++ii) {
@@ -412,23 +609,38 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
 #pragma unroll
                 for (int e = 0; e < 2; ++e) {
                     const int c = j0 + 2 * t + e;
-                    S.akk[c] = fmul(S.beta, fadd(big[2 * slot_hi + e], sml[2 * slot_hi + e]));
-                    S.aqk[c] = fadd(big[2 * (1 - slot_hi) + e], sml[2 * (1 - slot_hi) + e]);
+                    const float akk_v = fmul(S.beta, fadd(big[2 * slot_hi + e], sml[2 * slot_hi + e]));
+                    const float aqk_v = fadd(big[2 * (1 - slot_hi) + e], sml[2 * (1 - slot_hi) + e]);
+                    S.akk[c] = akk_v;
+                    S.aqk[c] = aqk_v;
+#ifndef CFBI_ROWS_TEST_AM_STORES_LATE
+                    if (warp < 2 * s) afrag_store_am(Fr, warp, 2 * t + e, slot_hi, akk_v, aqk_v);   // the A fragments of the cross-sub-block products: the columns below 16 s
+#endif
                 }
             }
         }
         ROWS_SYNC(2);
         ROWS_TS(2);
+#ifdef CFBI_ROWS_TEST_AM_STORES_LATE
+        ROWS_DELAY_LATE();   // control: the AM words are stored behind the barrier that publishes them (the window of the late stores)
+        if (mine && warp < 2 * s) {
+#pragma unroll
+            for (int e = 0; e < 2; ++e) afrag_store_am(Fr, warp, 2 * t + e, slot_hi, S.akk[j0 + 2 * t + e], S.aqk[j0 + 2 * t + e]);
+        }
+#endif
 
         // ---- C. cross-sub-block products (UT, W rows for the recursion; U rows for O), then the UT / W row -------
         if (s > 0) {
-            if (s == 1) rows_m_tiles<2>(S, Rut, Rw, Ru, warp, L, slot);
-            else if (s == 2) rows_m_tiles<4>(S, Rut, Rw, Ru, warp, L, slot);
-            else rows_m_tiles<6>(S, Rut, Rw, Ru, warp, L, slot);
+            if (s == 1) rows_m_tiles<2>(S, amp, Rut, Rw, Ru, warp, L, slot);
+            else if (s == 2) rows_m_tiles<4>(S, amp, Rut, Rw, Ru, warp, L, slot);
+            else rows_m_tiles<6>(S, amp, Rut, Rw, Ru, warp, L, slot);
             ROWS_SYNC(3);
         }
         ROWS_TS(3);
         float x_row = 0.f, u_row = 0.f;
+#ifdef CFBI_ROWS_TEST_AD_STORES_LATE
+        float afrag_late_value = 0.f;   // control: the AD value is held until behind the barrier that publishes the tile
+#endif
         {   // right-hand side, cross-block subtraction, in-sub-block FMA chain over the cached rows; thread = (UT|W, column)
             float rhs;
             if (which == 0) rhs = fmul(S.beta, vraw);
@@ -446,9 +658,18 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
                 x = (b + jj < pos) ? xn : x;
             }
             Xg[pos * HEAD_K + col] = x;
-            S.x[which][col] = x;
+            if (which == 0) S.x0[col] = x;
             x_row = x;
-            if (which == 0) S.gq[col] = fmul(ex2_ftz(S.g2[col]), S.q[col]);
+            const float gw = which ? x : fmul(ex2_ftz(S.g2[col]), S.q[col]);   // the W row of the W threads, GQ of the channel for the UT threads: the two rows of the A tile of phase D
+#ifdef CFBI_ROWS_TEST_AFRAG_CHECK
+            if (which == 1) S.x1[col] = x;   // the buffers of the unstaged kernel, the operands of the fragment check
+            if (which == 0) S.gq[col] = gw;
+#endif
+#ifdef CFBI_ROWS_TEST_AD_STORES_LATE
+            afrag_late_value = gw;
+#else
+            afrag_store_ad(Fr, col, which, slot_hi, gw);
+#endif
             if (tid < HEAD_K) {   // append khat / G2 of this row to the cache (later rows read them)
                 Rk[pos * HEAD_K + tid] = S.k[tid];
                 Rg[pos * HEAD_K + tid] = S.g2[tid];
@@ -456,6 +677,10 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
         }
         ROWS_SYNC(4);
         ROWS_TS(4);
+#ifdef CFBI_ROWS_TEST_AD_STORES_LATE
+        ROWS_DELAY_LATE();   // control: the AD words are stored behind the barrier that publishes them (the window of the late stores)
+        afrag_store_ad(Fr, col, which, slot_hi, afrag_late_value);
+#endif
 
         // ---- D. P1 = dot3(W_t, E^T), P2 = dot3(GQ_t, E^T): W in A-row slot, GQ in slot ^ 8, two V tiles per warp ----
         {
@@ -474,13 +699,12 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
 #pragma unroll
             for (int ks = 0; ks < 16; ++ks) {
                 uint32_t ah[4], al[4];
-#pragma unroll
-                for (int ii = 0; ii < 4; ++ii) {
-                    const int kk = 8 * ks + t + 4 * (ii >> 1);
-                    const float wv = S.x[1][kk], gv = S.gq[kk];
-                    const float v = mine ? (((ii & 1) == slot_hi) ? wv : gv) : 0.f;
-                    split_tf32(v, ah[ii], al[ii]);
-                }
+                const uint4 vh = adp[ks * 8], vl = adp[ks * 8 + 4];
+                ah[0] = vh.x; ah[1] = vh.y; ah[2] = vh.z; ah[3] = vh.w;
+                al[0] = vl.x; al[1] = vl.y; al[2] = vl.z; al[3] = vl.w;
+#ifdef CFBI_ROWS_TEST_AFRAG_CHECK
+                afrag_check_ad(S, mine, slot_hi, t, ks, ah, al);
+#endif
 #pragma unroll
                 for (int tl = 0; tl < 2; ++tl) {
                     uint32_t bh[2], bl[2];
@@ -507,7 +731,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
 
         // ---- E, F. U = UT - P1, O = P2 (+ M2) then the FMA chain over j = b..t -------------------------------
         if (tid < HEAD_V) {
-            const float u = fsub(S.x[0][tid], S.p1[tid]);
+            const float u = fsub(S.x0[tid], S.p1[tid]);
             u_row = u;
             S.u[tid] = u;
             Ru[pos * HEAD_V + tid] = u;

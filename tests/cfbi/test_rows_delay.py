@@ -1,7 +1,8 @@
 """The delay variant of the row engine (``-DCFBI_ROWS_DELAY_NS``, a separate JIT build of the extension, see ``rows_workload.build_variant``): bits that do not depend on timing.
 
 A build with the delay hook lets a chosen warp of chosen CTAs sleep (``__nanosleep``) at the delay sites of the row engine: the kernel entry before the first loads (site 0), before each
-of the barriers of a row (sites 1 .. 7, barrier 7 ends the row) and right after barrier 6, inside the chunk-end phase (site 8). The host chooses sites, warp, CTAs and length at run time
+of the barriers of a row (sites 1 .. 7, barrier 7 ends the row) and right after barrier 6, inside the chunk-end phase (site 8); the staged A fragments add site 13 (before barrier 13, which publishes
+the AB tile) and site 14 (in the window of that barrier, in front of the stores of the AB producers: only the warps 0 .. 3, the threads below HEAD_K, pass it). The host chooses sites, warp, CTAs and length at run time
 (``rows_test_delay_config``) and reads back how many warps slept (``rows_test_delay_hits``), so one build covers every configuration.
 
 * The default build has no hook: its setters raise (a test of a variant that ran on the wrong build would otherwise pass without having delayed anything).
@@ -35,9 +36,12 @@ RACY = DELAY + ("CFBI_ROWS_TEST_NO_END_BARRIER=1",)
 H = 12
 REPS = 5
 NS = (2000, 20000)
-SITES = {"entry": 0, "barrier1": 1, "barrier2": 2, "barrier3": 3, "barrier4": 4, "barrier5": 5, "barrier6": 6, "end_of_row": 7, "chunk_end_phase": 8}
+SITES = {"entry": 0, "barrier1": 1, "barrier2": 2, "barrier3": 3, "barrier4": 4, "barrier5": 5, "barrier6": 6, "end_of_row": 7, "chunk_end_phase": 8, "barrier13": 13, "ab_window": 14}
 ALL_SITES = sum(1 << s for s in SITES.values())
 TARGETS = {"all_warps": (-1, 0, 0), "warp0": (0, 0, 0), "warp7_of_every_third_cta": (7, 3, 1)}    # warp, cta_mod, cta_rem
+SITE_WARPS = {14: 4}      # the sites that only the first warps pass: site 14 is inside ``if (tid < HEAD_K)`` (the AB producers), the other sites are passed by all WARPS warps
+# a configuration that names a warp that never passes the site would be vacuous: the warp that stands in for warp 7 there is the last one that does
+SITE_TARGETS = {site: dict(TARGETS, warp7_of_every_third_cta=(min(7, w - 1), 3, 1)) for site, w in SITE_WARPS.items()}
 MIXED = Family("delay_multirow", fixed=5, pool=True, pad=0.3, fills="crossing", steps=1)
 DECODE = Family("delay_decode", fixed=1, pool=True, pad=0.3, fills="mixed", steps=1)         # one row per sequence: the production decode launch
 CROSSING = Family("racy_multirow", fixed=5, pool=True, pad=0.0, fills="sixty", steps=1)
@@ -77,7 +81,7 @@ def rows_through(step, warm, n, site):
         return 0
     pos0 = int(warm.pos[step.slot(n)])
     positions = [(pos0 + r) % rw.BT for r in range(step.lens[n])]
-    if site in (1, 2, 4, 5, 7):
+    if site in (1, 2, 4, 5, 7, 13, 14):
         return len(positions)
     if site == 3:
         return sum(1 for p in positions if p >= 16)        # the cross-sub-block barrier runs for rows beyond the first 16 positions
@@ -86,22 +90,27 @@ def rows_through(step, warm, n, site):
     raise ValueError(site)
 
 
+def warps_at(site, warp):
+    """How many warps of a CTA that pass ``site`` sleep when the configuration names ``warp`` (-1: every warp): the chosen warp counts only if the site is passed by it."""
+    passing = SITE_WARPS.get(site, WARPS)
+    return passing if warp < 0 else int(warp < passing)
+
+
 def expected_hits(step, warm, mask, target):
-    """The warps that must have slept: per CTA (sequence n, head h; cta = n * H + h) in the chosen set, the rows that pass each chosen site times the warps chosen."""
+    """The warps that must have slept: per CTA (sequence n, head h; cta = n * H + h) in the chosen set, the rows that pass each chosen site times the warps chosen (that pass it)."""
     warp, cta_mod, cta_rem = target
-    per_cta_warps = WARPS if warp < 0 else 1
     total = 0
     for n in range(step.N):
         for h in range(step.H):
             if cta_mod and (n * step.H + h) % cta_mod != cta_rem:
                 continue
-            total += per_cta_warps * sum(rows_through(step, warm, n, s) for s in range(9) if mask >> s & 1)
+            total += sum(warps_at(s, warp) * rows_through(step, warm, n, s) for s in SITES.values() if mask >> s & 1)
     return total
 
 
 def serial_sleeps(step, warm, mask):
     """The most sleeps that one CTA must go through one after the other: its rows that pass the chosen sites (a lower bound of the launch time is this times the length of a sleep)."""
-    return max(sum(rows_through(step, warm, n, s) for s in range(9) if mask >> s & 1) for n in range(step.N))
+    return max(sum(rows_through(step, warm, n, s) for s in SITES.values() if mask >> s & 1) for n in range(step.N))
 
 
 # ---- the hook is inert where it was not compiled ----------------------------------------------------------------------------------------------------------------
@@ -129,7 +138,7 @@ def site_case(dly, shaped, ns, site, path):
     step, warm, ref, opt = shaped
     on_path(dly, path)
     mask = ALL_SITES if site == "all_sites" else 1 << SITES[site]
-    for tname, target in TARGETS.items():
+    for tname, target in SITE_TARGETS.get(SITES.get(site), TARGETS).items():
         want = expected_hits(step, warm, mask, target)
         assert want > 0, (site, tname, "the configuration cannot hit anything on this workload: the test would be vacuous")
         for rep in range(REPS):

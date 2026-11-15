@@ -402,6 +402,29 @@ int rows_test_pos_offset(int offset, unsigned accesses) {
 #endif
 }
 
+// The counter of the fragment-level check (CFBI_ROWS_TEST_AFRAG_CHECK, cfbi_rows.cuh): the number of fragment words, of every lane and k-step, that differ from the ones that the unstaged kernel builds.
+int rows_test_afrag_reset() {
+#ifdef CFBI_ROWS_TEST_AFRAG_CHECK
+    const unsigned long long zero = 0;
+    cudaError_t e = cudaDeviceSynchronize();
+    if (e == cudaSuccess) e = cudaMemcpyToSymbol(g_afrag_mismatch, &zero, sizeof(zero));
+    return (int)e;
+#else
+    return (int)cudaErrorNotSupported;
+#endif
+}
+
+int rows_test_afrag_mismatches(unsigned long long* count) {
+#ifdef CFBI_ROWS_TEST_AFRAG_CHECK
+    cudaError_t e = cudaDeviceSynchronize();
+    if (e == cudaSuccess) e = cudaMemcpyFromSymbol(count, g_afrag_mismatch, sizeof(*count));
+    return (int)e;
+#else
+    (void)count;
+    return (int)cudaErrorNotSupported;
+#endif
+}
+
 // ---- row-engine profile (see cfbi_rows.cuh and cfbi_launch.h): host access to the device buffer, inert in every build without CFBI_ROWS_PROFILE ----------------
 void rows_profile_dims(int* positions, int* ctas, int* stamps) {
 #ifdef CFBI_ROWS_PROFILE

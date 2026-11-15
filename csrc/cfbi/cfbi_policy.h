@@ -38,13 +38,20 @@ static_assert(IMPL_MAX == IMPL_ROWS_SWAP_RESERVED - 1, "every bit below the rese
 static_assert(IMPL_MAX == 2 * IMPL_DECODE_PLAN - 1, "the highest assigned bit is IMPL_DECODE_PLAN");
 
 // ---- shared memory of the row-engine launch ------------------------------------------------------------------------------------------------------------------------
-// Bytes per CTA of the optimised row engine (rows_kernel, both instantiations): STATIC is what the compiler allocates for its static __shared__ variables, the figure of the code
-// generation gate (ptxas reports 8,192 B on sm_100a / sm_103a and 7,808 B on sm_90a); it is larger than the structure of the source (cfbi_rows.cuh static_asserts that the
-// structure fits and that the difference stays below one allocation unit of 1 KiB), so the need is the compiler's figure, not the structure's. DYNAMIC is the dynamic shared
-// memory of the launch (the launch sites and the occupancy hook read this constant). The per-CTA reserve of the driver (1 KiB) comes on top of both and is a device figure.
-constexpr int ROWS_STATIC_SMEM_BYTES = 8192;
+// Bytes per CTA of the optimised row engine (rows_kernel, both instantiations): STATIC is what the compiler allocates for its static __shared__ variables (the row's working set and the
+// staged A fragments); it is larger than the structures of the source (cfbi_rows.cuh static_asserts that they fit and that the difference stays below one allocation unit of 1 KiB), so
+// the need is the compiler's figure, not the structure's. The test build that carries the fragment-level check (CFBI_ROWS_TEST_AFRAG_CHECK) keeps two buffers more of the working set
+// (1,024 B) and has its own figure, which is never the production one and never loosens it. DYNAMIC is the dynamic shared memory of the launch (the launch sites and the occupancy hook
+// read this constant). The per-CTA reserve of the driver (1 KiB) comes on top of both and is a device figure.
+constexpr int ROWS_STATIC_SMEM_BYTES = 15360;
+constexpr int ROWS_ORACLE_STATIC_SMEM_BYTES = 16384;
+#ifdef CFBI_ROWS_TEST_AFRAG_CHECK
+constexpr int ROWS_BUILD_STATIC_SMEM_BYTES = ROWS_ORACLE_STATIC_SMEM_BYTES;
+#else
+constexpr int ROWS_BUILD_STATIC_SMEM_BYTES = ROWS_STATIC_SMEM_BYTES;
+#endif
 constexpr int ROWS_DYNAMIC_SMEM_BYTES = 0;
-constexpr int ROWS_SMEM_NEED_BYTES = ROWS_STATIC_SMEM_BYTES + ROWS_DYNAMIC_SMEM_BYTES;
+constexpr int ROWS_SMEM_NEED_BYTES = ROWS_BUILD_STATIC_SMEM_BYTES + ROWS_DYNAMIC_SMEM_BYTES;
 
 // ---- which implementation runs on a device ----------------------------------------------------------------------------------------------------------------------------
 // What the launches of a forward call ask of a device, per CTA, in bytes of shared memory (static plus dynamic, without the driver's per-CTA reserve: the opt-in limit of the device,

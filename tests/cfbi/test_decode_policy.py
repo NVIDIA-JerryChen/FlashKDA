@@ -309,17 +309,23 @@ def need_problems(static_need, dynamic_need, figures):
     return out
 
 
-FIGURES = {"sm_90a": {"cfbi::rows_kernel<Lb0E>": 8832, "cfbi::rows_kernel<Lb1E>": 8832}, "sm_100a": {"cfbi::rows_kernel<Lb0E>": 9216, "cfbi::rows_kernel<Lb1E>": 9216},
-           "sm_103a": {"cfbi::rows_kernel<Lb0E>": 9216, "cfbi::rows_kernel<Lb1E>": 9216}}      # the figures of the dumps (8,192 B on Blackwell, 7,808 B on sm_90a, plus the reserve)
+# The figures and thresholds below are worked out for ONE state: the production row engine with its staged A fragments (RowSmem 6660 B, FragSmem 7808 B, the int of the decode kernel: a raw layout
+# of 14,596 B), whose static shared memory the compiler allocates in units of 1 KiB on Blackwell (15,360 B) and of 128 B on sm_90a (14,720 B for the decode kernel; the plain kernel, without the int, 14,592 B), the
+# reserve of the driver on top; the need of the header is the largest of them. The test
+# that reads the shipped constant is ``test_the_header_states_the_need_that_the_figures_ask_for`` (and the compile of the launcher below); the others use their own numbers.
+BLACKWELL_STATIC, HOPPER_STATIC = 15360, 14720
+FIGURES = {"sm_90a": {"cfbi::rows_kernel<Lb0E>": HOPPER_STATIC + RESERVE, "cfbi::rows_kernel<Lb1E>": HOPPER_STATIC + RESERVE},
+           "sm_100a": {"cfbi::rows_kernel<Lb0E>": BLACKWELL_STATIC + RESERVE, "cfbi::rows_kernel<Lb1E>": BLACKWELL_STATIC + RESERVE},
+           "sm_103a": {"cfbi::rows_kernel<Lb0E>": BLACKWELL_STATIC + RESERVE, "cfbi::rows_kernel<Lb1E>": BLACKWELL_STATIC + RESERVE}}      # the figures of the dumps plus the reserve
 
 
-@pytest.mark.parametrize("static,dynamic,expect", [(8192, 0, 0), (8192 + 512, 0, 0), (7808, 0, 4), (7680, 0, 6), (7684, 0, 6), (8191, 0, 4), (8192, 4096, 0)])
+@pytest.mark.parametrize("static,dynamic,expect", [(15360, 0, 0), (15360 + 512, 0, 0), (14720, 0, 4), (14592, 0, 6), (14596, 0, 6), (15359, 0, 4), (15360, 4096, 0)])
 def test_the_need_is_judged_against_the_compilers_figure(static, dynamic, expect):
     assert len(need_problems(static, dynamic, FIGURES)) == expect, need_problems(static, dynamic, FIGURES)
 
 
 def test_a_missing_figure_is_a_problem():
-    assert need_problems(8192, 0, {"sm_90a": {}})
+    assert need_problems(15360, 0, {"sm_90a": {}})
 
 
 def test_the_header_states_the_need_that_the_figures_ask_for():
@@ -342,7 +348,10 @@ def test_the_static_need_of_the_header_covers_the_ptxas_figure_of_every_architec
     assert all(len(v) == 2 for v in figures.values()), figures
     v = header_values(header_text())
     assert need_problems(v["ROWS_STATIC_SMEM_BYTES"], v["ROWS_DYNAMIC_SMEM_BYTES"], figures) == [], figures
-    assert {arch: sorted(set(f.values())) for arch, f in figures.items()} == {"sm_90a": [7808 + RESERVE], "sm_100a": [8192 + RESERVE], "sm_103a": [8192 + RESERVE]}
+    assert {arch: max(f.values()) for arch, f in figures.items()} == {"sm_90a": HOPPER_STATIC + RESERVE, "sm_100a": BLACKWELL_STATIC + RESERVE, "sm_103a": BLACKWELL_STATIC + RESERVE}      # the need is the largest figure
+    # the units of 1 KiB (Blackwell) absorb the fill word of the decode kernel, the units of 128 B (sm_90a) do not: the plain kernel is one unit smaller there
+    assert figures["sm_90a"] == {"cfbi::rows_kernel<Lb0E>": HOPPER_STATIC - 128 + RESERVE, "cfbi::rows_kernel<Lb1E>": HOPPER_STATIC + RESERVE}, figures["sm_90a"]
+    assert all(len(set(figures[arch].values())) == 1 for arch in ("sm_100a", "sm_103a")), figures
 
 
 def _compile_rows_header(tc, tree):
@@ -359,15 +368,15 @@ def _tree_with_need(tmp, need):
     if need is not None:
         target = tree / "csrc" / "cfbi" / "cfbi_policy.h"
         text = target.read_text()
-        assert text.count("ROWS_STATIC_SMEM_BYTES = 8192;") == 1
-        target.write_text(text.replace("ROWS_STATIC_SMEM_BYTES = 8192;", "ROWS_STATIC_SMEM_BYTES = %d;" % need))
+        assert text.count("ROWS_STATIC_SMEM_BYTES = 15360;") == 1       # the production constant (the oracle build has its own, ROWS_ORACLE_STATIC_SMEM_BYTES: test_rows_afrag_layout.py)
+        target.write_text(text.replace("ROWS_STATIC_SMEM_BYTES = 15360;", "ROWS_STATIC_SMEM_BYTES = %d;" % need))
     return tree
 
 
 def test_a_need_that_does_not_match_the_layout_fails_the_build(tmp_path):
     tc = _toolchain_or_skip()
     assert _compile_rows_header(tc, _tree_with_need(tmp_path, None))[0] == 0                                  # the real header builds: the control is not vacuous
-    rc, text = _compile_rows_header(tc, _tree_with_need(tmp_path, 7680))                                       # the size of the structure without its padding and the fill word
+    rc, text = _compile_rows_header(tc, _tree_with_need(tmp_path, 14595))                                      # one byte below the layout (14,596 B: RowSmem padded to 128, FragSmem, the fill word)
     assert rc != 0 and "must cover the static shared memory of the row engine" in text, text[-1500:]
-    rc, text = _compile_rows_header(tc, _tree_with_need(tmp_path, 9000))                                       # more than an allocation unit above the layout
+    rc, text = _compile_rows_header(tc, _tree_with_need(tmp_path, 15620))                                      # more than an allocation unit above the layout
     assert rc != 0 and "more than an allocation unit above the layout" in text, text[-1500:]

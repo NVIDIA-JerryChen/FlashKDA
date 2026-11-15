@@ -42,16 +42,17 @@ LAUNCH_PROFILE_NAMES = re.compile(r"\bg_rows_prof\b|\bROWS_PROF_\w+")
 KERNEL_HEAD = re.compile(r"^__global__ void __launch_bounds__\(NTHREADS, CFBI_ROWS_MINB\) rows_kernel\(const RowsParams<DECODE> p\) \{")
 ENTRY_CALL = "rows_entry<DECODE>("   # the plan load of rows_kernel<false> and the derived entry of rows_kernel<true>
 STAMP = re.compile(r"\bROWS_TS\((\d)\)")
-BARRIER = re.compile(r"\bROWS_SYNC(?:_END)?\(\d?\);")     # every barrier of the row engine is one of the numbered barrier macros (cfbi_rows.cuh): barrier n is ROWS_SYNC(n), the one that ends a row ROWS_SYNC_END()
+BARRIER = re.compile(r"\bROWS_SYNC(?:_END|_AB)?\(\d?\);")     # every barrier of the row engine is one of the numbered barrier macros (cfbi_rows.cuh): barrier n is ROWS_SYNC(n), the one that ends a row ROWS_SYNC_END(), the one that publishes the AB tile ROWS_SYNC_AB() (barrier 13)
 EXIT_STAMP = re.compile(r"\[8\] = \(unsigned\)\(clock64\(\) - prof_entry\)")
 GLOBAL_STORE = re.compile(r"\b(?:Xg|Rk|Rg|Ru|Rut|Rw|R|Eg|p\.out|p\.out_f32|p\.pos|p\.E|p\.rows)\[[^\]]*\]\s*=[^=]")
 ROW_LOOP = re.compile(r"^    for \(int i = 0; i < nrows; \+\+i\) \{")
 AFTER_LOOP = "    if (DECODE) {"          # the first statement behind the row loop: the end of the kernel (the position word of the call, then the exit stamp)
 POS_STORE = "p.pos[ROWS_POS_INDEX(POS_ACCESS_FUSED_STORE, sp.slot)] ="
 
-# the barriers and stamps of one row in source order (a barrier inside an ``if`` is still one entry; SYNC<n> is barrier n, SYNC7 the barrier that ends the row): changes with the barrier
+# the barriers and stamps of one row in source order (a barrier inside an ``if`` is still one entry; SYNC<n> is barrier n, SYNC7 the barrier that ends the row, SYNC13 the barrier that publishes
+# the AB tile of the staged A fragments, between barriers 1 and 2: it has no stamp of its own, the interval TS1 .. TS2 holds the AB production and that barrier): changes with the barrier
 # structure of the row engine, not with the profile; the delay variant's sites are these barrier numbers (test_rows_hooks.py)
-ROW_SEQUENCE = ["TS0", "SYNC1", "TS1", "SYNC2", "TS2", "SYNC3", "TS3", "SYNC4", "TS4", "SYNC5", "TS5", "TS6", "SYNC6", "SYNC7", "TS7"]
+ROW_SEQUENCE = ["TS0", "SYNC1", "TS1", "SYNC13", "SYNC2", "TS2", "SYNC3", "TS3", "SYNC4", "TS4", "SYNC5", "TS5", "TS6", "SYNC6", "SYNC7", "TS7"]
 ADJACENT_TO_BARRIER = (1, 2, 4, 5, 7)   # stamps that must directly follow a barrier (stamp 3 follows the optional cross-block barrier block, stamp 6 the output stores)
 
 
@@ -149,8 +150,13 @@ def row_tokens(body, first, last):
         line = body[k][1]
         if line.strip().startswith("//"):
             continue
-        for m in re.finditer(r"\bROWS_TS\((\d)\)|\bROWS_SYNC\((\d)\);|\bROWS_SYNC_END\(\);", line):
-            toks.append("TS" + m.group(1) if m.group(1) is not None else ("SYNC" + m.group(2) if m.group(2) is not None else "SYNC7"))
+        for m in re.finditer(r"\bROWS_TS\((\d)\)|\bROWS_SYNC\((\d)\);|\bROWS_SYNC_END\(\);|\bROWS_SYNC_AB\(\);", line):      # barrier 13 is a macro of its own: a two-digit ROWS_SYNC(13) would be missed by (\d)
+            if m.group(1) is not None:
+                toks.append("TS" + m.group(1))
+            elif m.group(2) is not None:
+                toks.append("SYNC" + m.group(2))
+            else:
+                toks.append("SYNC13" if m.group(0).startswith("ROWS_SYNC_AB") else "SYNC7")
     return toks
 
 
@@ -272,6 +278,8 @@ def test_the_stamps_keep_their_barriers(rows_text):
     ("stamp 5 moved behind a statement", "        ROWS_TS(5);\n", "        const int prof_dummy = 0; (void)prof_dummy;\n        ROWS_TS(5);\n"),
     ("stamp 7 before the last barrier", "        ROWS_SYNC_END();\n#ifdef CFBI_ROWS_PROFILE\n        ROWS_TS(7);\n",
      "#ifdef CFBI_ROWS_PROFILE\n        ROWS_TS(7);\n#endif\n        ROWS_SYNC_END();\n#ifdef CFBI_ROWS_PROFILE\n"),
+    ("barrier 13 dropped", "        ROWS_SYNC_AB();\n", ""),
+    ("barrier 13 behind barrier 2", "        ROWS_SYNC_AB();\n", "        ROWS_SYNC(2);\n"),
 ])
 def test_a_moved_stamp_is_caught(rows_text, name, old, new):
     assert order_problems(mutate(rows_text, old, new)), name

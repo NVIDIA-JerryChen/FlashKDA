@@ -219,6 +219,10 @@ int rows_occupancy(int index, RowsOccupancy* out);
 int rows_test_delay_config(unsigned ns, int warp, int cta_mod, int cta_rem, unsigned sites);
 int rows_test_delay_hits(unsigned long long* hits);
 int rows_test_pos_offset(int offset, unsigned accesses);
+// The fragment-level check of the staged A fragments (a build compiled with CFBI_ROWS_TEST_AFRAG_CHECK; sites 13 and 14 of the delay hook belong to the staging too, see cfbi_rows.cuh):
+// rows_test_afrag_reset zeroes the counter and rows_test_afrag_mismatches reads it (the fragment words that differ from the unstaged kernel's, of every lane and k-step since the reset).
+int rows_test_afrag_reset();
+int rows_test_afrag_mismatches(unsigned long long* count);
 
 // Row-engine profile (cfbi_rows.cuh): the dimensions [row position][CTA][stamp] of the device buffer of a build compiled with CFBI_ROWS_PROFILE (all zero in any other
 // build), a copy of its first ``count`` unsigned words to the host (returns the number copied, 0 without a profile build) and a reset to zero.

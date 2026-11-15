@@ -5,8 +5,8 @@ barriers of a row, remove the barrier that ends a row, write the position at an 
 has none of this, nor that a barrier added later has a delay site, so the rules are pinned as text:
 
 * sites: no raw ``__syncthreads`` is left in ``rows_kernel`` (every barrier is a numbered ``ROWS_SYNC`` macro and so has a delay site; the order of the numbers is pinned together with the
-  clock-profile stamps in ``test_rows_profile.py``); the only direct delay calls are site 0 (kernel entry, after the profile entry stamp and before the plan load) and site 8 (right after
-  barrier 6, inside the chunk-end phase);
+  clock-profile stamps in ``test_rows_profile.py``); the only direct delay calls are site 0 (kernel entry, after the profile entry stamp and before the plan load), site 14 (the window of
+  barrier 13 of the staged A fragments, in front of the stores of the AB producers: between barrier 1 and ``ROWS_SYNC_AB()``) and site 8 (right after barrier 6, inside the chunk-end phase);
 * default build: read with every test macro undefined, the hook macros are what the unhooked kernel contained (``ROWS_SYNC(n)`` is a barrier, ``ROWS_SYNC_END()`` is ``ROWS_SYNC(7)``,
   ``ROWS_DELAY`` and the other hooks are empty, ``ROWS_POS_INDEX(slot)`` is the slot) and none of the machinery of the variants is left; the host setters only return an error;
 * macro guard: no source defines a test macro, no build flag of the default build carries one, and every macro that the sources test is classified (a test macro of a known prefix or a
@@ -53,7 +53,7 @@ def launch_text():
 # ---- sites ------------------------------------------------------------------------------------------------------------------------------------------------------
 ENTRY_CALL = "rows_entry<DECODE>("          # the plan load of rows_kernel<false> and the derived entry of rows_kernel<true>: one call, so one site before it
 RAW_BARRIER = re.compile(r"\b__syncthreads\b")
-BARRIER_MACRO = re.compile(r"\bROWS_SYNC(?:_END)?\(")
+BARRIER_MACRO = re.compile(r"\bROWS_SYNC(?:_END|_AB)?\(")
 DELAY_CALL = re.compile(r"\bROWS_DELAY\((\d+)\)")
 
 
@@ -69,10 +69,15 @@ def site_problems(text):
         if BARRIER_MACRO.search(l) and not first <= k <= last:
             probs.append("line %d: a barrier macro outside the row loop: %s" % (n, l.strip()))
     sites = [(k, int(m.group(1))) for k, (n, l, g) in enumerate(body) if not l.strip().startswith("//") for m in DELAY_CALL.finditer(l)]
-    if [s for k, s in sites] != [0, 8]:
-        return probs + ["the delay sites called directly in rows_kernel are %s, expected [0, 8] (the others are inside the barrier macros)" % [s for k, s in sites]]
+    if [s for k, s in sites] != [0, 14, 8]:
+        return probs + ["the delay sites called directly in rows_kernel are %s, expected [0, 14, 8] (the others are inside the barrier macros)" % [s for k, s in sites]]
     code = trp.code_lines(body)
-    entry, chunk = sites[0][0], sites[1][0]
+    entry, window, chunk = sites[0][0], sites[1][0], sites[2][0]
+    barriers = [(k, l) for k, l in code if BARRIER_MACRO.match(l)]
+    behind = [l for k, l in barriers if k < window]
+    ahead = [l for k, l in barriers if k > window]
+    if not behind or not behind[-1].startswith("ROWS_SYNC(1);") or not ahead or not ahead[0].startswith("ROWS_SYNC_AB();"):
+        probs.append("site 14 is not in the window between barrier 1 and barrier 13 (ROWS_SYNC_AB)")
     plan = [k for k, l in code if ENTRY_CALL in l]
     if not plan or entry > plan[0]:
         probs.append("site 0 does not come before the plan load (the sequence entry of the kernel)")
@@ -92,10 +97,13 @@ def test_every_barrier_of_the_row_engine_has_a_delay_site(rows_text):
 @pytest.mark.parametrize("name,old,new,expect", [
     ("a raw barrier", "        ROWS_SYNC(4);\n", "        __syncthreads();\n", "raw barrier"),
     ("a raw barrier added", "        ROWS_TS(5);\n", "        ROWS_TS(5);\n        __syncthreads();\n", "raw barrier"),
-    ("site 8 dropped", "            ROWS_DELAY(8);\n", "", "expected [0, 8]"),
-    ("a direct call of site 3", "        ROWS_SYNC(4);\n", "        ROWS_DELAY(3);\n        ROWS_SYNC(4);\n", "expected [0, 8]"),
-    ("site 0 behind the plan load", "    ROWS_DELAY(0);   // test hook: kernel entry, before the plan load and the first loads\n", "", "expected [0, 8]"),
+    ("site 8 dropped", "            ROWS_DELAY(8);\n", "", "expected [0, 14, 8]"),
+    ("a direct call of site 3", "        ROWS_SYNC(4);\n", "        ROWS_DELAY(3);\n        ROWS_SYNC(4);\n", "expected [0, 14, 8]"),
+    ("site 0 behind the plan load", "    ROWS_DELAY(0);   // test hook: kernel entry, before the plan load and the first loads\n", "", "expected [0, 14, 8]"),
     ("site 8 before barrier 6", "            ROWS_SYNC(6);\n            ROWS_DELAY(8);\n", "            ROWS_DELAY(8);\n            ROWS_SYNC(6);\n", "directly follow barrier 6"),
+    ("site 14 dropped", "            ROWS_DELAY(14);   // test hook: the window of barrier 13, in front of the stores\n", "", "expected [0, 14, 8]"),
+    ("a second call of site 14", "        ROWS_SYNC(4);\n", "        ROWS_DELAY(14);\n        ROWS_SYNC(4);\n", "expected [0, 14, 8]"),
+    ("a raw barrier for barrier 13", "        ROWS_SYNC_AB();\n", "        __syncthreads();\n", "raw barrier"),
 ])
 def test_a_missing_or_misplaced_delay_site_is_caught(rows_text, name, old, new, expect):
     probs = site_problems(mutate(rows_text, old, new))
@@ -108,8 +116,22 @@ def test_site_0_after_the_plan_load_is_caught(rows_text):
     assert any("before the plan load" in p for p in site_problems(moved))
 
 
+SITE_14 = "            ROWS_DELAY(14);   // test hook: the window of barrier 13, in front of the stores\n"
+
+
+@pytest.mark.parametrize("name,anchor,placed", [
+    ("before barrier 1", "        ROWS_SYNC(1);\n", "        ROWS_DELAY(14);\n        ROWS_SYNC(1);\n"),
+    ("behind barrier 13", "        ROWS_SYNC_AB();\n", "        ROWS_SYNC_AB();\n        ROWS_DELAY(14);\n"),
+    ("behind barrier 2", "        ROWS_SYNC(2);\n", "        ROWS_SYNC(2);\n        ROWS_DELAY(14);\n"),
+])
+def test_site_14_outside_the_window_of_barrier_13_is_caught(rows_text, name, anchor, placed):
+    moved = mutate(mutate(rows_text, SITE_14, ""), anchor, placed)
+    assert any("not in the window between barrier 1 and barrier 13" in p for p in site_problems(moved)), name
+
+
 # ---- the default build ------------------------------------------------------------------------------------------------------------------------------------
-VARIANT_NAMES = re.compile(r"\bg_rows_delay\w*|\brows_delay\b|\brows_delay_arrived\b|\bRowsDelayConfig\b|\bg_rows_test_pos_\w+|\bld_relaxed_gpu\b|__nanosleep|__threadfence_block|^\s*#\s*error\b", re.M)
+VARIANT_NAMES = re.compile(r"\bg_rows_delay\w*|\brows_delay\b|\brows_delay_arrived\b|\bRowsDelayConfig\b|\bg_rows_test_pos_\w+|\bld_relaxed_gpu\b|__nanosleep|__threadfence_block|^\s*#\s*error\b"
+                           r"|\bg_afrag_\w+|\bafrag_check_\w+|\bafrag_count\b|\bafrag_late_value\b|\bROWS_DELAY_LATE\b", re.M)
 
 
 DECODE_ENTRY = ("atomicAdd(p.pos + ROWS_POS_INDEX(POS_ACCESS_ARRIVAL, w.slot), 1 << POS_COUNT_SHIFT)", "if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(p.pos + ROWS_POS_INDEX(POS_ACCESS_ELECTED_STORE, w.slot),")
@@ -122,7 +144,7 @@ def default_build_problems(rows_text, launch_text):
     launch = default_text(launch_text, macros)
     probs = []
     for want in ("#define ROWS_DELAY(n) do {} while (0)", "#define ROWS_SYNC(n) do { ROWS_DELAY(n); __syncthreads(); } while (0)", "#define ROWS_SYNC_END() ROWS_SYNC(7)",
-                 "#define ROWS_POS_INDEX(access, slot) (slot)", "#define ROWS_DECODE_ARRIVED(old, heads) do {} while (0)"):
+                 "#define ROWS_SYNC_AB() ROWS_SYNC(13)", "#define ROWS_POS_INDEX(access, slot) (slot)", "#define ROWS_DECODE_ARRIVED(old, heads) do {} while (0)"):
         if want not in rows:
             probs.append("the default build does not read %r" % want)
     for m in VARIANT_NAMES.finditer(rows):
@@ -133,7 +155,7 @@ def default_build_problems(rows_text, launch_text):
     for bad in DECODE_WRONG:
         if bad in rows:
             probs.append("the default build of the decode entry still contains the wrong protocol %r" % bad)
-    for fn in ("rows_test_delay_config", "rows_test_delay_hits", "rows_test_pos_offset"):
+    for fn in ("rows_test_delay_config", "rows_test_delay_hits", "rows_test_pos_offset", "rows_test_afrag_reset", "rows_test_afrag_mismatches"):
         body = re.search(r"^int %s\([^)]*\) \{\n(.*?)^\}" % fn, launch, re.M | re.S)
         if body is None:
             probs.append("cfbi_launch.cu: the setter %s is missing" % fn)
@@ -145,6 +167,8 @@ def default_build_problems(rows_text, launch_text):
 def test_the_variant_macros_of_the_row_engine_are_found(rows_text, launch_text):
     found = macros_in([rows_text, launch_text])
     assert {"CFBI_ROWS_DELAY_NS", "CFBI_ROWS_TEST_NO_END_BARRIER", "CFBI_ROWS_TEST_POS_OOB", "CFBI_ROWS_TEST_COMPILE_ERROR", "CFBI_ROWS_PROFILE", "CFBI_NEG_CONTROL"} <= found
+    assert {"CFBI_ROWS_TEST_AFRAG_CHECK", "CFBI_ROWS_TEST_NO_AB_BARRIER", "CFBI_ROWS_TEST_AM_STORES_LATE", "CFBI_ROWS_TEST_AD_STORES_LATE", "CFBI_ROWS_TEST_AB_SHIFT_LANE",
+            "CFBI_ROWS_TEST_AB_WRONG_PARITY", "CFBI_ROWS_TEST_AM_STALE_ZERO", "CFBI_ROWS_TEST_NONMINE_TILE", "CFBI_ROWS_TEST_ZERO_TILE_WRITE"} <= found      # the oracle build and the controls of the staged A fragments
     assert {"CFBI_DECODE_TEST_EVERY_CTA_WRITES", "CFBI_DECODE_TEST_FIRST_ARRIVER", "CFBI_DECODE_TEST_SNAPSHOT_AFTER_ARRIVAL", "CFBI_DECODE_TEST_NO_ELECTED_STORE"} <= found      # the wrong protocols of the single-launch decode entry
     assert "CFBI_DECODE_TEST_DELAY_NS" not in found      # retired: the delays of the decode entry are the sites 9 .. 12 of the row-engine delay hook
 
@@ -158,6 +182,11 @@ def test_the_default_build_of_the_hooks_is_the_unhooked_kernel(rows_text, launch
     ("the arrival delays compiled in", "rows", "#else\n#define ROWS_DELAY(n) do {} while (0)\n#define ROWS_DECODE_ARRIVED(old, heads) do {} while (0)\n#endif", "#else\n#define ROWS_DELAY(n) do {} while (0)\n#define ROWS_DECODE_ARRIVED(old, heads) rows_delay_arrived(old, heads)\n#endif", "ROWS_DECODE_ARRIVED(old, heads) do {}"),
     ("the end barrier removed by default", "rows", "#else\n#define ROWS_SYNC_END() ROWS_SYNC(7)\n#endif", "#else\n#define ROWS_SYNC_END() ROWS_DELAY(7)\n#endif", "ROWS_SYNC_END() ROWS_SYNC(7)"),
     ("the position offset compiled in", "rows", "#else\n#define ROWS_POS_INDEX(access, slot) (slot)\n#endif", "#else\n#define ROWS_POS_INDEX(access, slot) ((slot) + 1)\n#endif", "ROWS_POS_INDEX(access, slot) (slot)"),
+    ("the barrier of the AB tile removed by default", "rows", "#else\n#define ROWS_SYNC_AB() ROWS_SYNC(13)\n#endif", "#else\n#define ROWS_SYNC_AB() ROWS_DELAY(13)\n#endif", "ROWS_SYNC_AB() ROWS_SYNC(13)"),
+    ("the fragment counter compiled in", "rows", "#ifdef CFBI_ROWS_TEST_AFRAG_CHECK\n// The fragment-level check (test build only)", "#if 1\n// The fragment-level check (test build only)", "g_afrag_mismatch"),
+    ("the late-store delay compiled in", "rows", "#ifdef CFBI_ROWS_TEST_AM_STORES_LATE\n#define ROWS_DELAY_LATE() ROWS_DELAY(14)\n#endif", "#if 1\n#define ROWS_DELAY_LATE() ROWS_DELAY(14)\n#endif", "ROWS_DELAY_LATE"),
+    ("the late AD store compiled in", "rows", "#ifdef CFBI_ROWS_TEST_AD_STORES_LATE\n        float afrag_late_value = 0.f;", "#if 1\n        float afrag_late_value = 0.f;", "afrag_late_value"),
+    ("a fragment setter that works by default", "launch", "#else\n    return (int)cudaErrorNotSupported;\n#endif\n}\n\nint rows_test_afrag_mismatches(", "#else\n    return (int)cudaDeviceSynchronize();\n#endif\n}\n\nint rows_test_afrag_mismatches(", "rows_test_afrag_reset"),
     ("a sleep outside the macro", "rows", "    ROWS_DELAY(0);   // test hook", "    __nanosleep(1);\n    ROWS_DELAY(0);   // test hook", "__nanosleep"),
     ("the first-arriver election by default", "rows", "#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(", "#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == 0) st_relaxed_gpu(", "== p.H - 1) st_relaxed_gpu"),
     ("the elected store missing by default", "rows", "#ifndef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(", "#ifdef CFBI_DECODE_TEST_NO_ELECTED_STORE\n            if ((old >> POS_COUNT_SHIFT) == p.H - 1) st_relaxed_gpu(", "== p.H - 1) st_relaxed_gpu"),
