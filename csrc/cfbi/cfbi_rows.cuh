@@ -189,29 +189,44 @@ __device__ __forceinline__ void afrag_zero_init(FragSmem& Fr, int tid) {
 #endif
 }
 
-// The base of the loads of a lane: its tile when it owns row slot of the A tile (mine), the zero page otherwise, plus t (the lane group of the words).
-__device__ __forceinline__ const uint4* afrag_ptr_ab(const FragSmem& Fr, bool mine, int t) {
+// The loads of the staged words (the ordering anchors of the first repair of the step): a volatile shared load of one uint4, so that the loads of a phase keep the order of the source (one k-step
+// ahead of the products for AB and AD, at the top of the k-step for AM) instead of being scheduled together at the top of the phase, where their registers would all be live at once.
+__device__ __forceinline__ uint4 afrag_lds(uint32_t addr) {
+    uint4 v;
+    asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(addr) : "memory");
+    return v;
+}
+// The shared address of a tile or of the zero page, and its anchor: the base of the loads of a phase is computed in the phase by a volatile move, so that it is not carried across the phases in between.
+__device__ __forceinline__ uint32_t afrag_shared(const void* p) { return static_cast<uint32_t>(__cvta_generic_to_shared(p)); }
+__device__ __forceinline__ uint32_t afrag_anchor(uint32_t addr) {
+    uint32_t r;
+    asm volatile("mov.u32 %0, %1;" : "=r"(r) : "r"(addr));
+    return r;
+}
+
+// The base of the loads of a lane: its tile when it owns row slot of the A tile (mine), the zero page otherwise, plus 16 t bytes (the lane group of the words).
+__device__ __forceinline__ uint32_t afrag_ptr_ab(const FragSmem& Fr, bool mine, int t) {
 #ifdef CFBI_ROWS_TEST_NONMINE_TILE
     (void)mine;   // control: the lanes that do not own the row read the tile
-    return reinterpret_cast<const uint4*>(&Fr.ab[0][0][0]) + t;
+    return afrag_anchor(afrag_shared(&Fr.ab[0][0][0]) + 16u * static_cast<uint32_t>(t));
 #else
-    return (mine ? reinterpret_cast<const uint4*>(&Fr.ab[0][0][0]) : reinterpret_cast<const uint4*>(&Fr.zero[0][0][0])) + t;
+    return afrag_anchor((mine ? afrag_shared(&Fr.ab[0][0][0]) : afrag_shared(&Fr.zero[0][0][0])) + 16u * static_cast<uint32_t>(t));
 #endif
 }
-__device__ __forceinline__ const uint4* afrag_ptr_am(const FragSmem& Fr, bool mine, int t) {
+__device__ __forceinline__ uint32_t afrag_ptr_am(const FragSmem& Fr, bool mine, int t) {
 #ifdef CFBI_ROWS_TEST_NONMINE_TILE
     (void)mine;
-    return reinterpret_cast<const uint4*>(&Fr.am[0][0][0][0]) + t;
+    return afrag_anchor(afrag_shared(&Fr.am[0][0][0][0]) + 16u * static_cast<uint32_t>(t));
 #else
-    return (mine ? reinterpret_cast<const uint4*>(&Fr.am[0][0][0][0]) : reinterpret_cast<const uint4*>(&Fr.zero[0][0][0])) + t;
+    return afrag_anchor((mine ? afrag_shared(&Fr.am[0][0][0][0]) : afrag_shared(&Fr.zero[0][0][0])) + 16u * static_cast<uint32_t>(t));
 #endif
 }
-__device__ __forceinline__ const uint4* afrag_ptr_ad(const FragSmem& Fr, bool mine, int t) {
+__device__ __forceinline__ uint32_t afrag_ptr_ad(const FragSmem& Fr, bool mine, int t) {
 #ifdef CFBI_ROWS_TEST_NONMINE_TILE
     (void)mine;
-    return reinterpret_cast<const uint4*>(&Fr.ad[0][0][0]) + t;
+    return afrag_anchor(afrag_shared(&Fr.ad[0][0][0]) + 16u * static_cast<uint32_t>(t));
 #else
-    return (mine ? reinterpret_cast<const uint4*>(&Fr.ad[0][0][0]) : reinterpret_cast<const uint4*>(&Fr.zero[0][0][0])) + t;
+    return afrag_anchor((mine ? afrag_shared(&Fr.ad[0][0][0]) : afrag_shared(&Fr.zero[0][0][0])) + 16u * static_cast<uint32_t>(t));
 #endif
 }
 
@@ -318,9 +333,9 @@ __device__ __forceinline__ void afrag_check_ad(const RowSmem& S, bool mine, int 
 
 // Cross-sub-block products of the current row for KS = 2s k-steps: M[which][v] = dot3(A row, X[which][0:16s][v]) with
 // which = 0: akk row x UT rows, 1: akk row x W rows, 2: aqk row x U rows. 48 column tiles, 6 per warp, all B fragments
-// loaded up front. The A row sits in A-row slot `slot`; its fragments are read from the AM tile (amp).
+// loaded up front. The A row sits in A-row slot `slot`; its fragments are read from the AM tile (amp, the shared address of the base of the lane).
 template <int KS>
-__device__ __forceinline__ void rows_m_tiles(RowSmem& S, const uint4* amp, const float* Rut, const float* Rw, const float* Ru, int warp,
+__device__ __forceinline__ void rows_m_tiles(RowSmem& S, uint32_t amp, const float* Rut, const float* Rw, const float* Ru, int warp,
                                              const LaneIdx& L, int slot) {
     float bv[6][KS][2];
 #pragma unroll
@@ -340,7 +355,7 @@ __device__ __forceinline__ void rows_m_tiles(RowSmem& S, const uint4* amp, const
 #pragma unroll
     for (int ks = 0; ks < KS; ++ks) {
         uint32_t kh[4], kl[4], qh[4], ql[4];
-        const uint4 vkh = amp[ks * 16], vkl = amp[ks * 16 + 4], vqh = amp[ks * 16 + 8], vql = amp[ks * 16 + 12];
+        const uint4 vkh = afrag_lds(amp + ks * 256), vkl = afrag_lds(amp + ks * 256 + 64), vqh = afrag_lds(amp + ks * 256 + 128), vql = afrag_lds(amp + ks * 256 + 192);
         kh[0] = vkh.x; kh[1] = vkh.y; kh[2] = vkh.z; kh[3] = vkh.w;
         kl[0] = vkl.x; kl[1] = vkl.y; kl[2] = vkl.z; kl[3] = vkl.w;
         qh[0] = vqh.x; qh[1] = vqh.y; qh[2] = vqh.z; qh[3] = vqh.w;
@@ -501,9 +516,6 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
         const int s = pos >> 4, b = pos & ~15, slot = pos & 15;
         const int slot_hi = slot >> 3;   // the current row is in A/C rows g (0) or g+8 (1) of the lanes with g == slot & 7
         const bool mine = g == (slot & 7);
-        const uint4* const abp = afrag_ptr_ab(Fr, mine, t);   // the bases of the fragment loads: the tile of the lanes that own row slot, the zero page for the others
-        const uint4* const amp = afrag_ptr_am(Fr, mine, t);
-        const uint4* const adp = afrag_ptr_ad(Fr, mine, t);
 
         // ---- early loads: nothing here depends on this row's prep ------------------------------------
         float gprev = 0.f, vraw = 0.f;
@@ -555,22 +567,9 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
         // ---- B. Akk / Aqk row against the cached rows (and the row itself): one 8-column tile per warp, ks and qs
         //         packed into one A tile (rows slot and slot ^ 8), B = kjr shared. The A fragments of ks and qs are
         //         built once per row, one channel per thread, into the AB tile and published by barrier 13; the loads
-        //         of the B operands are issued in front of that barrier, so that their latency overlaps the producers ----
+        //         of the B operands are issued behind that barrier, right in front of their use (the order of the
+        //         unstaged kernel: 64 registers that lived across the barrier and the producers were spilled) ----
         const int j0 = 8 * warp, j = j0 + g;
-        float rk[16][2], rgv[16][2];
-        if (warp <= (pos >> 3)) {
-            const int jc = (j < pos) ? j : 0;   // clamped row: every lane loads, the select below discards unused values
-#pragma unroll
-            for (int ks = 0; ks < 16; ++ks)
-#pragma unroll
-                for (int ii = 0; ii < 2; ++ii) {
-                    const int ch = 8 * ks + t + 4 * ii;
-                    const float ak = Rk[jc * HEAD_K + ch], bg = Rg[jc * HEAD_K + ch];
-                    const float sk = S.k[ch], sg = S.g2[ch];
-                    rk[ks][ii] = (j < pos) ? ak : ((j == pos) ? sk : 0.f);
-                    rgv[ks][ii] = (j < pos) ? bg : ((j == pos) ? sg : 0.f);
-                }
-        }
         if (tid < HEAD_K) {   // the AB producer: channel tid, the expressions that every lane evaluated for itself before
             ROWS_DELAY(14);   // test hook: the window of barrier 13, in front of the stores
             const float f = ex2_ftz(fsub(S.g2[tid], S.gref[tid]));
@@ -582,13 +581,28 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
         }
         ROWS_SYNC_AB();
         if (warp <= (pos >> 3)) {
+            float rk[16][2], rgv[16][2];
+            const int jc = (j < pos) ? j : 0;   // clamped row: every lane loads, the select below discards unused values
+#pragma unroll
+            for (int ks = 0; ks < 16; ++ks)
+#pragma unroll
+                for (int ii = 0; ii < 2; ++ii) {
+                    const int ch = 8 * ks + t + 4 * ii;
+                    const float ak = Rk[jc * HEAD_K + ch], bg = Rg[jc * HEAD_K + ch];
+                    const float sk = S.k[ch], sg = S.g2[ch];
+                    rk[ks][ii] = (j < pos) ? ak : ((j == pos) ? sk : 0.f);
+                    rgv[ks][ii] = (j < pos) ? bg : ((j == pos) ? sg : 0.f);
+                }
             float big[4], sml[4];
 #pragma unroll
             for (int i = 0; i < 4; ++i) { big[i] = neg_zero(); sml[i] = neg_zero(); }
+            const uint32_t abp = afrag_ptr_ab(Fr, mine, t);   // the base of the loads, computed here: the tile of the lanes that own row slot, the zero page for the others
+            uint4 nh = afrag_lds(abp), nl = afrag_lds(abp + 64);   // the words of k-step 0
 #pragma unroll
             for (int ks = 0; ks < 16; ++ks) {
                 uint32_t ah[4], al[4];
-                const uint4 vh = abp[ks * 8], vl = abp[ks * 8 + 4];
+                const uint4 vh = nh, vl = nl;
+                if (ks < 15) { nh = afrag_lds(abp + 128 * (ks + 1)); nl = afrag_lds(abp + 128 * (ks + 1) + 64); }   // one k-step ahead of the products
                 ah[0] = vh.x; ah[1] = vh.y; ah[2] = vh.z; ah[3] = vh.w;
                 al[0] = vl.x; al[1] = vl.y; al[2] = vl.z; al[3] = vl.w;
 #ifdef CFBI_ROWS_TEST_AFRAG_CHECK
@@ -631,6 +645,7 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
 
         // ---- C. cross-sub-block products (UT, W rows for the recursion; U rows for O), then the UT / W row -------
         if (s > 0) {
+            const uint32_t amp = afrag_ptr_am(Fr, mine, t);   // the base of the loads of the AM tile, computed here
             if (s == 1) rows_m_tiles<2>(S, amp, Rut, Rw, Ru, warp, L, slot);
             else if (s == 2) rows_m_tiles<4>(S, amp, Rut, Rw, Ru, warp, L, slot);
             else rows_m_tiles<6>(S, amp, Rut, Rw, Ru, warp, L, slot);
@@ -696,10 +711,13 @@ __global__ void __launch_bounds__(NTHREADS, CFBI_ROWS_MINB) rows_kernel(const Ro
             for (int tl = 0; tl < 2; ++tl)
 #pragma unroll
                 for (int i = 0; i < 4; ++i) { big[tl][i] = neg_zero(); sml[tl][i] = neg_zero(); }
+            const uint32_t adp = afrag_ptr_ad(Fr, mine, t);   // the base of the loads, computed here: the tile of the lanes that own row slot, the zero page for the others
+            uint4 nh = afrag_lds(adp), nl = afrag_lds(adp + 64);   // the words of k-step 0
 #pragma unroll
             for (int ks = 0; ks < 16; ++ks) {
                 uint32_t ah[4], al[4];
-                const uint4 vh = adp[ks * 8], vl = adp[ks * 8 + 4];
+                const uint4 vh = nh, vl = nl;
+                if (ks < 15) { nh = afrag_lds(adp + 128 * (ks + 1)); nl = afrag_lds(adp + 128 * (ks + 1) + 64); }   // one k-step ahead of the products
                 ah[0] = vh.x; ah[1] = vh.y; ah[2] = vh.z; ah[3] = vh.w;
                 al[0] = vl.x; al[1] = vl.y; al[2] = vl.z; al[3] = vl.w;
 #ifdef CFBI_ROWS_TEST_AFRAG_CHECK

@@ -143,13 +143,22 @@ def test_a_layout_defect_is_caught(rows_text, name, old, new, expect):
 
 
 # ---- the helpers: the only code that touches the tiles --------------------------------------------------------------------------------------------------------
-PTR_TAIL = "(mine ? reinterpret_cast<const uint4*>(&Fr.%s) : reinterpret_cast<const uint4*>(&Fr.zero[0][0][0])) + t;"
+PTR_TAIL = "afrag_anchor((mine ? afrag_shared(&Fr.%s) : afrag_shared(&Fr.zero[0][0][0])) + 16u * static_cast<uint32_t>(t));"
 HELPERS = {
     "afrag_zero_init": ("__device__ __forceinline__ void", "FragSmem& Fr, int tid", """
         if (tid < 128) reinterpret_cast<uint4*>(&Fr.zero[0][0][0])[tid] = make_uint4(0u, 0u, 0u, 0u);"""),
-    "afrag_ptr_ab": ("__device__ __forceinline__ const uint4*", "const FragSmem& Fr, bool mine, int t", "return " + PTR_TAIL % "ab[0][0][0]"),
-    "afrag_ptr_am": ("__device__ __forceinline__ const uint4*", "const FragSmem& Fr, bool mine, int t", "return " + PTR_TAIL % "am[0][0][0][0]"),
-    "afrag_ptr_ad": ("__device__ __forceinline__ const uint4*", "const FragSmem& Fr, bool mine, int t", "return " + PTR_TAIL % "ad[0][0][0]"),
+    "afrag_lds": ("__device__ __forceinline__ uint4", "uint32_t addr", """
+        uint4 v;
+        asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(addr) : "memory");
+        return v;"""),
+    "afrag_shared": ("__device__ __forceinline__ uint32_t", "const void* p", "return static_cast<uint32_t>(__cvta_generic_to_shared(p));"),
+    "afrag_anchor": ("__device__ __forceinline__ uint32_t", "uint32_t addr", """
+        uint32_t r;
+        asm volatile("mov.u32 %0, %1;" : "=r"(r) : "r"(addr));
+        return r;"""),
+    "afrag_ptr_ab": ("__device__ __forceinline__ uint32_t", "const FragSmem& Fr, bool mine, int t", "return " + PTR_TAIL % "ab[0][0][0]"),
+    "afrag_ptr_am": ("__device__ __forceinline__ uint32_t", "const FragSmem& Fr, bool mine, int t", "return " + PTR_TAIL % "am[0][0][0][0]"),
+    "afrag_ptr_ad": ("__device__ __forceinline__ uint32_t", "const FragSmem& Fr, bool mine, int t", "return " + PTR_TAIL % "ad[0][0][0]"),
     "afrag_store_ab": ("__device__ __forceinline__ void", "FragSmem& Fr, int ch, int slot_hi, uint32_t kh, uint32_t kl, uint32_t qh, uint32_t ql", """
         const int ks = ch >> 3, half = (ch >> 2) & 1;
         const int tt = ch & 3;
@@ -209,9 +218,15 @@ def test_the_helpers_of_the_staged_fragments_are_the_pinned_ones(rows_text):
 @pytest.mark.parametrize("name,old,new,helper", [
     ("the zero page written by 64 threads only", "if (tid < 128) reinterpret_cast<uint4*>(&Fr.zero[0][0][0])[tid] = make_uint4(0u, 0u, 0u, 0u);", "if (tid < 64) reinterpret_cast<uint4*>(&Fr.zero[0][0][0])[tid] = make_uint4(0u, 0u, 0u, 0u);", "afrag_zero_init"),
     ("the zero page filled with ones", "[tid] = make_uint4(0u, 0u, 0u, 0u);\n#ifdef", "[tid] = make_uint4(1u, 0u, 0u, 0u);\n#ifdef", "afrag_zero_init"),
-    ("the AB pointer of every lane is the tile", "(mine ? reinterpret_cast<const uint4*>(&Fr.ab[0][0][0]) : reinterpret_cast<const uint4*>(&Fr.zero[0][0][0])) + t;", "reinterpret_cast<const uint4*>(&Fr.ab[0][0][0]) + t;", "afrag_ptr_ab"),
-    ("the AM pointer of the lanes that do not own the row is the AD tile", "(mine ? reinterpret_cast<const uint4*>(&Fr.am[0][0][0][0]) : reinterpret_cast<const uint4*>(&Fr.zero[0][0][0])) + t;", "(mine ? reinterpret_cast<const uint4*>(&Fr.am[0][0][0][0]) : reinterpret_cast<const uint4*>(&Fr.ad[0][0][0])) + t;", "afrag_ptr_am"),
-    ("the AD pointer without the lane group", "(mine ? reinterpret_cast<const uint4*>(&Fr.ad[0][0][0]) : reinterpret_cast<const uint4*>(&Fr.zero[0][0][0])) + t;", "(mine ? reinterpret_cast<const uint4*>(&Fr.ad[0][0][0]) : reinterpret_cast<const uint4*>(&Fr.zero[0][0][0]));", "afrag_ptr_ad"),
+    ("the AB pointer of every lane is the tile", "afrag_anchor((mine ? afrag_shared(&Fr.ab[0][0][0]) : afrag_shared(&Fr.zero[0][0][0])) + 16u * static_cast<uint32_t>(t));", "afrag_anchor(afrag_shared(&Fr.ab[0][0][0]) + 16u * static_cast<uint32_t>(t));", "afrag_ptr_ab"),
+    ("the AM pointer of the lanes that do not own the row is the AD tile", "afrag_anchor((mine ? afrag_shared(&Fr.am[0][0][0][0]) : afrag_shared(&Fr.zero[0][0][0])) + 16u * static_cast<uint32_t>(t));", "afrag_anchor((mine ? afrag_shared(&Fr.am[0][0][0][0]) : afrag_shared(&Fr.ad[0][0][0])) + 16u * static_cast<uint32_t>(t));", "afrag_ptr_am"),
+    ("the AD pointer without the lane group", "afrag_anchor((mine ? afrag_shared(&Fr.ad[0][0][0]) : afrag_shared(&Fr.zero[0][0][0])) + 16u * static_cast<uint32_t>(t));", "afrag_anchor((mine ? afrag_shared(&Fr.ad[0][0][0]) : afrag_shared(&Fr.zero[0][0][0])));", "afrag_ptr_ad"),
+    ("the AD pointer in words, not bytes", "afrag_anchor((mine ? afrag_shared(&Fr.ad[0][0][0]) : afrag_shared(&Fr.zero[0][0][0])) + 16u * static_cast<uint32_t>(t));", "afrag_anchor((mine ? afrag_shared(&Fr.ad[0][0][0]) : afrag_shared(&Fr.zero[0][0][0])) + 4u * static_cast<uint32_t>(t));", "afrag_ptr_ad"),
+    ("the staged load without its ordering (not volatile)", "asm volatile(\"ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];\"", "asm(\"ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];\"", "afrag_lds"),
+    ("the staged load without its memory clobber", ": \"r\"(addr) : \"memory\");", ": \"r\"(addr));", "afrag_lds"),
+    ("the staged load as two 64-bit loads", "asm volatile(\"ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];\"", "asm volatile(\"ld.shared.v2.u32 {%0, %1}, [%4];\"", "afrag_lds"),
+    ("the anchor of a base not volatile", "asm volatile(\"mov.u32 %0, %1;\"", "asm(\"mov.u32 %0, %1;\"", "afrag_anchor"),
+    ("the shared address cast dropped", "return static_cast<uint32_t>(__cvta_generic_to_shared(p));", "return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p));", "afrag_shared"),
     ("the AB stores shifted by one lane", "    const int tt = ch & 3;\n", "    const int tt = (ch + 1) & 3;\n", "afrag_store_ab"),
     ("the AB rows swapped", "const int iik = slot_hi + 2 * half, iiq = (1 - slot_hi) + 2 * half;", "const int iik = (1 - slot_hi) + 2 * half, iiq = slot_hi + 2 * half;", "afrag_store_ab"),
     ("the AB lo word of the qs row dropped", "    wl[iiq] = ql;\n", "", "afrag_store_ab"),
@@ -223,8 +238,8 @@ def test_the_helpers_of_the_staged_fragments_are_the_pinned_ones(rows_text):
     ("the AD lo word of the hi tile", "reinterpret_cast<uint32_t*>(&Fr.ad[ks][1][tt])[ii] = l;", "reinterpret_cast<uint32_t*>(&Fr.ad[ks][1][tt])[ii] = h;", "afrag_store_ad"),
     ("the zero page written by a producer", "#ifdef CFBI_ROWS_TEST_ZERO_TILE_WRITE\n    if (ch == 0)", "#if 1\n    if (ch == 0)", "afrag_store_ab"),
     ("the zero page of the AM tile rewritten once by default", "#ifdef CFBI_ROWS_TEST_AM_STALE_ZERO\n    if (tid < 96)", "#if 1\n    if (tid < 96)", "afrag_zero_init"),
-    ("every lane reads the tile by default", "#ifdef CFBI_ROWS_TEST_NONMINE_TILE\n    (void)mine;   // control: the lanes that do not own the row read the tile\n    return reinterpret_cast<const uint4*>(&Fr.ab[0][0][0]) + t;\n#else",
-     "#if 1\n    (void)mine;   // control: the lanes that do not own the row read the tile\n    return reinterpret_cast<const uint4*>(&Fr.ab[0][0][0]) + t;\n#else", "afrag_ptr_ab"),
+    ("every lane reads the tile by default", "#ifdef CFBI_ROWS_TEST_NONMINE_TILE\n    (void)mine;   // control: the lanes that do not own the row read the tile\n    return afrag_anchor(afrag_shared(&Fr.ab[0][0][0]) + 16u * static_cast<uint32_t>(t));\n#else",
+     "#if 1\n    (void)mine;   // control: the lanes that do not own the row read the tile\n    return afrag_anchor(afrag_shared(&Fr.ab[0][0][0]) + 16u * static_cast<uint32_t>(t));\n#else", "afrag_ptr_ab"),
 ])
 def test_a_defect_in_a_helper_is_caught(rows_text, name, old, new, helper):
     probs = helper_problems(mutate(rows_text, old, new))
@@ -265,7 +280,7 @@ def test_no_other_source_names_the_fragment_tiles():
 
 
 @pytest.mark.parametrize("name,old,new", [
-    ("a consumer reads the tile itself", "const uint4 vh = abp[ks * 8], vl = abp[ks * 8 + 4];", "const uint4 vh = Fr.ab[ks][0][t], vl = Fr.ab[ks][1][t];"),
+    ("a consumer reads the tile itself", "uint4 nh = afrag_lds(abp), nl = afrag_lds(abp + 64);", "uint4 nh = Fr.ab[0][0][t], nl = Fr.ab[0][1][t];"),
     ("a store of the tile in a phase", "        ROWS_SYNC(3);\n        }\n        ROWS_TS(3);\n", "        ROWS_SYNC(3);\n        }\n        Fr.am[0][0][0][0].x = 0u;\n        ROWS_TS(3);\n"),
     ("the zero page written in the kernel", "    afrag_zero_init(Fr, tid);", "    Fr.zero[0][0][0].x = 0u;\n    afrag_zero_init(Fr, tid);"),
     ("the object passed to a function of another name", "    afrag_zero_init(Fr, tid);", "    afrag_zero_init(Fr, tid);\n    helper_copy(Fr, tid);"),
@@ -276,19 +291,25 @@ def test_a_tile_access_outside_the_helpers_is_caught(rows_text, name, old, new):
     assert probs, name
 
 
-# ---- the consumers: plain loads through the base pointers --------------------------------------------------------------------------------------------------------
-CONSUMER_LINES = (
-    "const uint4 vh = abp[ks * 8], vl = abp[ks * 8 + 4];",
-    "const uint4 vh = adp[ks * 8], vl = adp[ks * 8 + 4];",
-    "const uint4 vkh = amp[ks * 16], vkl = amp[ks * 16 + 4], vqh = amp[ks * 16 + 8], vql = amp[ks * 16 + 12];",
-)
+# ---- the consumers: volatile shared loads through a base that the phase computes itself, in the order of the source ---------------------------------------------------------
+# line -> how often it is in the kernel (AB and AD have the same words per k-step, the AM loads are in rows_m_tiles)
+CONSUMER_LINES = {
+    "uint4 nh = afrag_lds(abp), nl = afrag_lds(abp + 64);": 1,                       # the words of k-step 0 of AB ...
+    "uint4 nh = afrag_lds(adp), nl = afrag_lds(adp + 64);": 1,                       # ... and of AD
+    "const uint4 vh = nh, vl = nl;": 2,
+    "if (ks < 15) { nh = afrag_lds(abp + 128 * (ks + 1)); nl = afrag_lds(abp + 128 * (ks + 1) + 64); }": 1,      # one k-step ahead of the products
+    "if (ks < 15) { nh = afrag_lds(adp + 128 * (ks + 1)); nl = afrag_lds(adp + 128 * (ks + 1) + 64); }": 1,
+    "const uint4 vkh = afrag_lds(amp + ks * 256), vkl = afrag_lds(amp + ks * 256 + 64), vqh = afrag_lds(amp + ks * 256 + 128), vql = afrag_lds(amp + ks * 256 + 192);": 1,    # the top of the k-step
+}
 POINTER_LINES = (
-    "const uint4* const abp = afrag_ptr_ab(Fr, mine, t);",
-    "const uint4* const amp = afrag_ptr_am(Fr, mine, t);",
-    "const uint4* const adp = afrag_ptr_ad(Fr, mine, t);",
+    "const uint32_t abp = afrag_ptr_ab(Fr, mine, t);",
+    "const uint32_t amp = afrag_ptr_am(Fr, mine, t);",
+    "const uint32_t adp = afrag_ptr_ad(Fr, mine, t);",
     "const bool mine = g == (slot & 7);",
     "const int slot_hi = slot >> 3;",
 )
+# a staged word is read by afrag_lds only: no other load of a base, a tile or the zero page (the helpers' goldens say what afrag_lds is)
+BASE_NAMES = {"abp": 5, "adp": 5}     # the base, the two words of k-step 0, the two words of the prefetch
 # the A side of the products of phases B, C and D is loaded, never split again. The splits of the kernel body: the AB producer (2), the B sides of phases B and D (1 + 1) and the two of the chunk-end
 # phase (its A fragment and its B side, not staged by F); rows_m_tiles splits the B side of the cross-sub-block products only
 SPLIT_CALLS = {"rows_kernel": 6, "rows_m_tiles": 1}
@@ -298,16 +319,15 @@ def consumer_problems(text):
     toks = tokens(view(text))
     joined = " " + " ".join(toks) + " "
     probs = []
-    for line in CONSUMER_LINES + POINTER_LINES:
+    for line, want in list(CONSUMER_LINES.items()) + [(l, 1) for l in POINTER_LINES]:
         n = joined.count(" " + norm(line) + " ")
-        if n != 1:
-            probs.append("the pinned line %r occurs %d times (expected once)" % (line, n))
-    for base in ("abp", "adp"):
-        if toks.count(base) != 3:
-            probs.append("%s is named %d times (the pointer and its two loads)" % (base, toks.count(base)))
-    kernel = function_def(toks, "rows_kernel")
-    if kernel is not None and toks.count("amp") < 1:
-        probs.append("amp is not used")
+        if n != want:
+            probs.append("the pinned line %r occurs %d times (expected %d)" % (line, n, want))
+    for base, want in BASE_NAMES.items():
+        if toks.count(base) != want:
+            probs.append("%s is named %d times (expected %d: the base, the words of k-step 0, the words of the prefetch)" % (base, toks.count(base), want))
+    if toks.count("afrag_lds") != 1 + 2 + 2 + 2 + 2 + 4:      # the definition, k-step 0 and prefetch of AB and of AD (two words each), the four words of a k-step of AM
+        probs.append("afrag_lds is named %d times: a staged word is loaded in another way or place" % toks.count("afrag_lds"))
     for name, want in SPLIT_CALLS.items():
         d = function_def(toks, name)
         got = None if d is None else d[2].count("split_tf32")
@@ -321,10 +341,15 @@ def test_the_consumers_load_the_staged_words_only(rows_text):
 
 
 @pytest.mark.parametrize("name,old,new,expect", [
-    ("an AB load at the wrong offset", "abp[ks * 8 + 4]", "abp[ks * 8 + 5]", "abp[ks * 8 + 4]"),
-    ("an AD load of the wrong k-step stride", "const uint4 vh = adp[ks * 8], vl = adp[ks * 8 + 4];", "const uint4 vh = adp[ks * 4], vl = adp[ks * 8 + 4];", "adp[ks * 8]"),
-    ("an AM load of the aqk lo word at the wrong offset", "vql = amp[ks * 16 + 12]", "vql = amp[ks * 16 + 11]", "amp[ks * 16 + 12]"),
-    ("the AB base from the AM family", "const uint4* const abp = afrag_ptr_ab(Fr, mine, t);", "const uint4* const abp = afrag_ptr_am(Fr, mine, t);", "afrag_ptr_ab"),
+    ("an AB prefetch of the lo word at the wrong offset", "nl = afrag_lds(abp + 128 * (ks + 1) + 64); }", "nl = afrag_lds(abp + 128 * (ks + 1) + 32); }", "abp + 128 * (ks + 1) + 64"),
+    ("an AD prefetch of the wrong k-step stride", "nh = afrag_lds(adp + 128 * (ks + 1)); nl", "nh = afrag_lds(adp + 64 * (ks + 1)); nl", "adp + 128 * (ks + 1)"),
+    ("an AB prefetch of the last k-step", "if (ks < 15) { nh = afrag_lds(abp + 128 * (ks + 1));", "if (ks < 16) { nh = afrag_lds(abp + 128 * (ks + 1));", "abp + 128 * (ks + 1)"),
+    ("the words of k-step 0 of AD loaded from the AB base", "uint4 nh = afrag_lds(adp), nl = afrag_lds(adp + 64);", "uint4 nh = afrag_lds(abp), nl = afrag_lds(abp + 64);", "adp"),
+    ("an AM load of the aqk lo word at the wrong offset", "vql = afrag_lds(amp + ks * 256 + 192)", "vql = afrag_lds(amp + ks * 256 + 191)", "amp + ks * 256 + 192"),
+    ("an AM load through a scalar read", "vkh = afrag_lds(amp + ks * 256),", "vkh = *reinterpret_cast<const uint4*>(amp + ks * 256),", "afrag_lds"),
+    ("the AB base from the AM family", "const uint32_t abp = afrag_ptr_ab(Fr, mine, t);", "const uint32_t abp = afrag_ptr_am(Fr, mine, t);", "afrag_ptr_ab"),
+    ("the AB base carried from the top of the row", "            const uint32_t abp = afrag_ptr_ab(Fr, mine, t);   // the base of the loads, computed here: the tile of the lanes that own row slot, the zero page for the others\n",
+     "            const uint32_t abp = afrag_shared(&Fr.zero[0][0][0]);\n", "afrag_ptr_ab"),
     ("the lanes that own the row chosen by another test", "const bool mine = g == (slot & 7);", "const bool mine = g == (slot & 3);", "const bool mine"),
     ("the AB words split again by the consumer", "                uint32_t bh[2], bl[2];\n#pragma unroll\n                for (int ii = 0; ii < 2; ++ii) {\n                    const int ch = 8 * ks + t + 4 * ii;",
      "                split_tf32(0.f, ah[0], al[0]);\n                uint32_t bh[2], bl[2];\n#pragma unroll\n                for (int ii = 0; ii < 2; ++ii) {\n                    const int ch = 8 * ks + t + 4 * ii;", "split_tf32"),
@@ -338,20 +363,21 @@ def test_a_consumer_defect_is_caught(rows_text, name, old, new, expect):
 EVENTS = (
     ("ZINIT", re.compile(r"^afrag_zero_init\(Fr, tid\);")),
     ("LOOP", re.compile(r"^for \(int i = 0; i < nrows; \+\+i\) \{")),
-    ("PTR_AB", re.compile(r"^const uint4\* const abp = ")),
-    ("PTR_AM", re.compile(r"^const uint4\* const amp = ")),
-    ("PTR_AD", re.compile(r"^const uint4\* const adp = ")),
+    ("ANCH_AB", re.compile(r"^const uint32_t abp = ")),
+    ("ANCH_AM", re.compile(r"^const uint32_t amp = ")),
+    ("ANCH_AD", re.compile(r"^const uint32_t adp = ")),
     ("S13", re.compile(r"^ROWS_SYNC_AB\(\);")),
     ("S7", re.compile(r"^ROWS_SYNC_END\(\);")),
     ("S%s", re.compile(r"^ROWS_SYNC\((\d)\);")),
     ("ST_AB", re.compile(r"\bafrag_store_ab\(Fr, ")),
     ("ST_AM", re.compile(r"\bafrag_store_am\(Fr, ")),
     ("ST_AD", re.compile(r"\bafrag_store_ad\(Fr, ")),
-    ("LD_AB", re.compile(r"\babp\[")),
-    ("LD_AD", re.compile(r"\badp\[")),
+    ("LD_B", re.compile(r"\bRk\[jc \* HEAD_K \+ ch\]")),             # the loads of the B operands of phase B: behind barrier 13, in front of their use
+    ("LD_AB", re.compile(r"\bafrag_lds\(abp\b")),
+    ("LD_AD", re.compile(r"\bafrag_lds\(adp\b")),
     ("LD_AM", re.compile(r"\brows_m_tiles<\d>\(S, amp, ")),
 )
-GOLDEN_EVENTS = ["ZINIT", "LOOP", "PTR_AB", "PTR_AM", "PTR_AD", "S1", "ST_AB", "S13", "LD_AB", "ST_AM", "S2", "LD_AM", "LD_AM", "LD_AM", "S3", "ST_AD", "S4", "LD_AD", "S5", "S6", "S7"]
+GOLDEN_EVENTS = ["ZINIT", "LOOP", "S1", "ST_AB", "S13", "LD_B", "ANCH_AB", "LD_AB", "LD_AB", "ST_AM", "S2", "ANCH_AM", "LD_AM", "LD_AM", "LD_AM", "S3", "ST_AD", "S4", "ANCH_AD", "LD_AD", "LD_AD", "S5", "S6", "S7"]
 
 
 def events(text):
@@ -377,12 +403,14 @@ def moved(text, line, anchor, after=True, keep=False):
 
 
 AB_STORE = "            afrag_store_ab(Fr, tid, slot_hi, kh, kl, qh, ql);\n"
-AB_LOAD = "                const uint4 vh = abp[ks * 8], vl = abp[ks * 8 + 4];\n"
+AB_LOAD = "            uint4 nh = afrag_lds(abp), nl = afrag_lds(abp + 64);   // the words of k-step 0\n"
 AM_STORE = "                    if (warp < 2 * s) afrag_store_am(Fr, warp, 2 * t + e, slot_hi, akk_v, aqk_v);   // the A fragments of the cross-sub-block products: the columns below 16 s\n"
 AD_STORE = "            afrag_store_ad(Fr, col, which, slot_hi, gw);\n"
-AD_LOAD = "                const uint4 vh = adp[ks * 8], vl = adp[ks * 8 + 4];\n"
+AD_LOAD = "            uint4 nh = afrag_lds(adp), nl = afrag_lds(adp + 64);   // the words of k-step 0\n"
 ZERO_INIT = "    afrag_zero_init(Fr, tid);   // the +0 page of the staged A fragments: written once here, ordered by the first barrier of the first row\n"
-AB_POINTER = "        const uint4* const abp = afrag_ptr_ab(Fr, mine, t);   // the bases of the fragment loads: the tile of the lanes that own row slot, the zero page for the others\n"
+AB_POINTER = "            const uint32_t abp = afrag_ptr_ab(Fr, mine, t);   // the base of the loads, computed here: the tile of the lanes that own row slot, the zero page for the others\n"
+AM_POINTER = "            const uint32_t amp = afrag_ptr_am(Fr, mine, t);   // the base of the loads of the AM tile, computed here\n"
+B_LOAD = "                    const float ak = Rk[jc * HEAD_K + ch], bg = Rg[jc * HEAD_K + ch];\n"
 
 
 @pytest.mark.parametrize("name,make", [
@@ -400,7 +428,11 @@ AB_POINTER = "        const uint4* const abp = afrag_ptr_ab(Fr, mine, t);   // t
     ("the zero page written in the row loop", lambda t: moved(t, ZERO_INIT, "        ROWS_SYNC(1);\n")),
     ("the zero page never written", lambda t: mutate(t, ZERO_INIT, "")),
     ("the zero page written as the first statement of the row loop", lambda t: moved(t, ZERO_INIT, "    for (int i = 0; i < nrows; ++i) {\n")),
-    ("a base pointer computed behind its barrier", lambda t: moved(t, AB_POINTER, "        ROWS_SYNC(1);\n")),
+    ("the AB base computed in front of barrier 13", lambda t: moved(t, AB_POINTER, "        ROWS_SYNC(1);\n")),
+    ("the AM base computed in front of barrier 2", lambda t: moved(t, AM_POINTER, "        ROWS_SYNC(1);\n")),
+    ("the AM base computed behind the first loads", lambda t: moved(t, AM_POINTER, "            if (s == 1) rows_m_tiles<2>(S, amp, Rut, Rw, Ru, warp, L, slot);\n")),
+    ("the B operands loaded in front of barrier 13", lambda t: mutate(t, "        ROWS_SYNC_AB();\n", B_LOAD + "        ROWS_SYNC_AB();\n")),
+    ("the B operands never loaded behind barrier 13", lambda t: mutate(t, B_LOAD, "")),
 ])
 def test_a_store_or_load_on_the_wrong_side_of_its_barrier_is_caught(rows_text, name, make):
     assert events(make(rows_text)) != GOLDEN_EVENTS, name
@@ -414,10 +446,11 @@ UNPACK_AM = (r"kh\[0\] = vkh\.x; kh\[1\] = vkh\.y; kh\[2\] = vkh\.z; kh\[3\] = v
              r"qh\[0\] = vqh\.x; qh\[1\] = vqh\.y; qh\[2\] = vqh\.z; qh\[3\] = vqh\.w;\n\s*"
              r"ql\[0\] = vql\.x; ql\[1\] = vql\.y; ql\[2\] = vql\.z; ql\[3\] = vql\.w;\n")
 GUARDED = r"#ifdef CFBI_ROWS_TEST_AFRAG_CHECK\n\s*%s;\n#endif\n"
+PREFETCH = r"const uint4 vh = nh, vl = nl;\n\s*if \(ks < 15\) \{ nh = afrag_lds\(%s \+ 128 \* \(ks \+ 1\)\); nl = afrag_lds\(%s \+ 128 \* \(ks \+ 1\) \+ 64\); \}[^\n]*\n\s*"
 ORACLE_CALLS = {
-    "afrag_check_ab": r"abp\[ks \* 8 \+ 4\];\n\s*" + UNPACK_A + GUARDED % r"afrag_check_ab\(S, mine, slot_hi, t, ks, ah, al\)",
-    "afrag_check_ad": r"adp\[ks \* 8 \+ 4\];\n\s*" + UNPACK_A + GUARDED % r"afrag_check_ad\(S, mine, slot_hi, t, ks, ah, al\)",
-    "afrag_check_am": r"amp\[ks \* 16 \+ 12\];\n\s*" + UNPACK_AM + GUARDED % r"afrag_check_am\(S, L, slot, ks, kh, kl, qh, ql\)",
+    "afrag_check_ab": PREFETCH % ("abp", "abp") + UNPACK_A + GUARDED % r"afrag_check_ab\(S, mine, slot_hi, t, ks, ah, al\)",
+    "afrag_check_ad": PREFETCH % ("adp", "adp") + UNPACK_A + GUARDED % r"afrag_check_ad\(S, mine, slot_hi, t, ks, ah, al\)",
+    "afrag_check_am": r"vql = afrag_lds\(amp \+ ks \* 256 \+ 192\);\n\s*" + UNPACK_AM + GUARDED % r"afrag_check_am\(S, L, slot, ks, kh, kl, qh, ql\)",
 }
 ORACLE_COUNTS = {
     "afrag_check_ab": "afrag_count(h != ah[ii] || l != al[ii]);",
