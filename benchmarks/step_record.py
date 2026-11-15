@@ -424,18 +424,28 @@ def build_row(m, decision, infos, exactness=None):
     return row
 
 
-def repair_termination(first_dump, attempts):
+def repair_termination(first_dump, attempts, kind=None, terminal_failure=None):
     """``termination`` of a row for a step that ended by the budget of its repairs: ``first_dump`` is the path of the dump of the first failed resource gate, ``attempts`` the repair candidates and
-    ablations (``[{"id", "role", "dump", "tree"?, "note"?}]``); the count is the record checker's own (``record_checker.repair_candidates``), so the row says what the checker recomputes."""
+    ablations (``[{"id", "role", "dump", "tree"?, "note"?}]``); the count is the record checker's own (``record_checker.repair_candidates``), so the row says what the checker recomputes.
+    ``kind`` (``overrun``, ``exhausted``) and ``terminal_failure`` (``codegen``, ``exactness``: the gate that the last repair of an exhausted budget still fails) are written only when given: a call
+    without them makes the historical row of the staged E tile, key for key."""
     counted = len(rc.repair_candidates(cg.load_dump(first_dump), attempts))
-    return {"rule": "repair_budget", "allowed": rc.REPAIR_BUDGET, "first_failed_gate": {"dump": first_dump}, "attempts": attempts, "counted": counted}
+    termination = {"rule": "repair_budget", "allowed": rc.REPAIR_BUDGET, "first_failed_gate": {"dump": first_dump}, "attempts": attempts, "counted": counted}
+    if kind is not None:
+        termination["kind"] = kind
+    if terminal_failure is not None:
+        termination["terminal_failure"] = terminal_failure
+    return termination
 
 
-def build_termination_row(m, termination, reason, exactness=None):
+def build_termination_row(m, termination, reason, exactness=None, exactness_measured=True):
     """The ledger row of a step that ended by the budget of its repairs (``failed_at`` ``repair_budget``): what the gates of its FINAL commit measured (the comparisons of the dumps of the manifest,
     which may pass; the exactness of its suites), no timing (never reached: ``not_run``), the revert commit that removed it (``m["revert_commit"]``) and ``termination``, the proof of the budget
-    that the record checker recomputes (``record_checker.termination_problems``). ``exactness``: the problems of ``exactness_problems`` when the caller has them already."""
-    codegen, resources, gates = measured_gates(m, exactness)
+    that the record checker recomputes (``record_checker.termination_problems``). ``exactness``: the problems of ``exactness_problems`` when the caller has them already;
+    ``exactness_measured`` False for a final form whose exactness was never measured (the code generation was gated first and the last repair still fails it): ``gates.exactness`` is then null."""
+    codegen, resources, gates = measured_gates(m, exactness if exactness_measured else [])
+    if not exactness_measured:
+        gates = dict(gates, exactness=None)
     return {"id": m["step"], "outcome": "not_adopted", "commit": m["commit"], "revert_commit": m.get("revert_commit"), "markers": list(m["markers"]), "failed_at": "repair_budget",
             "reason": reason, "gates": gates, "timing": {"vs_previous": "not_run", "vs_base": "not_run", "chain": "not_run"}, "codegen_gate": codegen, "resource_gate": resources, "ab": None,
             "termination": termination}
@@ -565,14 +575,17 @@ def render_termination_section(m, row, number=11):
                  t["allowed"], t["counted"], ablations), "",
              "| attempt | role | made | tree content hash | architectures | counted |", "|---|---|---|---|---|---|"]
     lines += ["| %s | %s | %s | %s | %s | %s |" % r for r in attempt_rows(t)]
-    lines += ["", "### What the final form measured", "",
-              "Gate G and Suite S (every test file of `tests/cfbi`, the four cases of the K2 sanitizer file included; complete against the collection of the commit of the suites, whose kernel sources are the step's):", "",
-              "| device | Gate G passed | Suite S files | Suite S passed | skipped | failed | commit of the suites |", "|---|---|---|---|---|---|---|"]
-    lines += ["| %s | %s | %s | %s | %s | %s | %s |" % r for r in suite_rows(m)]
+    lines += ["", "### What the final form measured", ""]
+    if row["gates"]["exactness"] is None:                                  # the code generation was gated first and the last repair still fails it: the suites were never run for the final form
+        lines += ["Gate G and Suite S were not run for the final form: its exactness was never measured."]
+    else:
+        lines += ["Gate G and Suite S (every test file of `tests/cfbi`, the four cases of the K2 sanitizer file included; complete against the collection of the commit of the suites, whose kernel sources are the step's):", "",
+                  "| device | Gate G passed | Suite S files | Suite S passed | skipped | failed | commit of the suites |", "|---|---|---|---|---|---|---|"]
+        lines += ["| %s | %s | %s | %s | %s | %s | %s |" % r for r in suite_rows(m)]
     lines += [""] + codegen_lines(m, row)
     lines += ["", "Occupancy-API records of the production toolchain (threads of a CTA: 256):", "", "| device | instantiation | registers | static shared memory | dynamic shared memory | CTAs per SM |", "|---|---|---|---|---|---|"]
     for key in rc.COMPARISONS:
-        if key.startswith("container_"):
+        if key.startswith("container_") and key in row["codegen_gate"]:
             for i in load_json(row["codegen_gate"][key]["occupancy"])["occupancy"]["instances"]:
                 lines.append("| %s | %s | %d | %d B | %d B | %d |" % (key.split("_", 1)[1], i["name"], i["registers"], i["static_smem"], i["dynamic_smem"], i["ctas_per_sm"]))
     lines += ["", "### Timing", "", "Not run: the step ended before the timing phase (vs previous accepted state, vs base and layer chain: %s)." % ", ".join(

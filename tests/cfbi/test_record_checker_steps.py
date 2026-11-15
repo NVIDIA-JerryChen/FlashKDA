@@ -2599,3 +2599,159 @@ def test_the_reason_why_an_attempt_does_not_count_is_named(tmp_path):
     assert rc.counted_repair(first, itself) == (None, "the failed form's own tree")
     assert rc.counted_repair(first, dict(a[3], dump="/nonexistent/dump.json")) == (None, "no usable dump")
     assert rc.counted_repair(first, dict(a[3], role="idea")) == (None, "no role")
+
+
+# ---- the compliant end by the budget: exactly three repairs, the last one still fails a gate (termination.kind = exhausted), and the stops that come earlier ----------------------------------
+def exhausted_row(tmp_path, repairs=3, ablations=0, terminal="codegen", edit=None):
+    """A row-engine step that ended by the budget of its repairs the way a compliant loop ends: the first failed resource gate (129 registers), ``repairs`` dumps of distinct trees after it, and a
+    final form that is the tree of the LAST of them and still fails ``terminal`` (the resource gate on every toolchain, or the exactness); the phases it never reached are null / not_run. ``edit``
+    damages the row."""
+    d = Path(str(tmp_path))
+    failing = stamp(dump_file("conda", C4, "cand", rows={"reg": 129}), d, "first-failed-gate.json", "f" * 64, GATE_WHEN)
+    attempts, contents = [], []
+    for i in range(repairs + ablations):
+        root, content = tree_of(d, "tree-%d" % i, "// variant %d\n" % i)
+        entry = {"id": "V%d" % i, "role": "repair" if i < repairs else "ablation", "dump": stamp(dump_file("conda", C3, "cand"), d, "attempt-%d.json" % i, content, ATTEMPT_WHEN % i), "tree": root}
+        if entry["role"] == "ablation":
+            entry["note"] = "takes the staging away to see what it costs"
+        attempts.append(entry)
+        contents.append(content)
+    codegen, resources = gate_evidence(C2, sid="a_fragments", rows={"reg": 129} if terminal == "codegen" else None)
+    last = max(i for i in range(repairs)) if repairs else 0
+    codegen["conda"]["cand_dump"] = stamp(codegen["conda"]["cand_dump"], d, "final-form-conda.json", contents[last] if contents else "a" * 64, ATTEMPT_WHEN % last)      # the final form is the last repair
+    step = {"id": "a_fragments", "outcome": "not_adopted", "commit": C2, "revert_commit": C3, "markers": ["afrag_marker"], "failed_at": "repair_budget",
+            "reason": "the third repair of the failed resource gate still fails it: the budget of the gate protocol is spent",
+            "gates": {"exactness": None if terminal == "codegen" else False, "codegen": terminal != "codegen"}, "timing": {"vs_previous": "not_run", "vs_base": "not_run", "chain": "not_run"},
+            "codegen_gate": codegen, "resource_gate": resources, "ab": None,
+            "termination": {"rule": "repair_budget", "kind": "exhausted", "terminal_failure": terminal, "allowed": 3, "first_failed_gate": {"dump": failing}, "attempts": attempts, "counted": repairs}}
+    if edit is not None:
+        edit(step)
+    return step
+
+
+def test_a_compliant_end_by_exactly_three_repairs_that_still_fail_is_a_valid_row(tmp_path):
+    for terminal in ("codegen", "exactness"):
+        row = exhausted_row(sub(tmp_path, terminal), terminal=terminal)
+        assert row["termination"]["kind"] == "exhausted" and row["gates"]["exactness"] is (None if terminal == "codegen" else False)
+        assert step_check(row) == [], (terminal, step_check(row))
+        ledger = {"schema": rc.LEDGER_SCHEMA, "meta": META, "steps": [adopted("single_launch"), row]}
+        assert rc.ledger_problems(ledger) == [], rc.ledger_problems(ledger)
+
+
+def test_an_ablation_is_not_a_repair_of_the_compliant_end_either(tmp_path):
+    assert step_check(exhausted_row(tmp_path, 3, 4)) == []
+
+
+def test_the_historical_overrun_contract_is_what_a_row_without_a_kind_keeps(tmp_path):
+    assert step_check(budget_row(sub(tmp_path, "a"), 4, 1)) == []                                           # more than three, passing final form, no kind: the round-15 row
+    assert has(step_check(budget_row(sub(tmp_path, "b"), 3, 0)), "not exhausted")                           # three is not an overrun
+    explicit = budget_row(sub(tmp_path, "c"), 4, 0, edit=lambda r: r["termination"].update(kind="overrun"))
+    assert step_check(explicit) == []
+    assert has(step_check(budget_row(sub(tmp_path, "d"), 3, 0, edit=lambda r: r["termination"].update(kind="overrun"))), "not exhausted")
+    assert has(step_check(budget_row(sub(tmp_path, "e"), 4, 0, edit=lambda r: r["termination"].update(kind="something"))), "overrun or exhausted")
+
+
+def test_a_compliant_end_refuses_what_is_not_three_repairs_that_still_fail(tmp_path):
+    def passing_final(row):                                              # the third repair passes every gate it was measured on: the budget is not what ended the step
+        codegen, resources = gate_evidence(C2, sid="a_fragments")
+        codegen["conda"]["cand_dump"] = stamp(codegen["conda"]["cand_dump"], tmp_path, "pass-final.json", cg.load_dump(row["termination"]["attempts"][2]["dump"])["meta"]["tree"]["content_hash"], ATTEMPT_WHEN % 2)
+        row["codegen_gate"], row["resource_gate"], row["gates"] = codegen, resources, {"exactness": None, "codegen": True}
+    def no_terminal(row):
+        row["termination"].pop("terminal_failure")
+    def other_terminal(row):
+        row["termination"]["terminal_failure"] = "timing"
+    def exactness_claimed_but_true(row):
+        row["termination"]["terminal_failure"] = "exactness"
+        row["gates"]["exactness"] = True
+    def codegen_claimed_but_passing(row):                                # says the code generation is the gate that the last repair fails, the comparisons pass
+        codegen, resources = gate_evidence(C2, sid="a_fragments")
+        codegen["conda"]["cand_dump"] = stamp(codegen["conda"]["cand_dump"], tmp_path, "pass2.json", cg.load_dump(row["termination"]["attempts"][2]["dump"])["meta"]["tree"]["content_hash"], ATTEMPT_WHEN % 2)
+        row["codegen_gate"], row["resource_gate"] = codegen, resources
+    cases = {
+        "a third repair that passes everything": (passing_final, "terminal_failure"),
+        "no terminal failure named": (no_terminal, "terminal_failure"),
+        "a terminal failure that is not a gate of the step": (other_terminal, "terminal_failure"),
+        "exactness named but not failed": (exactness_claimed_but_true, "gates.exactness"),
+        "code generation named but the comparisons pass": (codegen_claimed_but_passing, "the comparisons of the dumps say PASS"),
+    }
+    for i, (name, (edit, expected)) in enumerate(cases.items()):
+        problems = step_check(exhausted_row(sub(tmp_path, "n%d" % i), edit=edit))
+        assert has(problems, expected), (name, expected, problems[:4])
+
+
+def test_a_compliant_end_counts_exactly_three_distinct_repair_trees_after_the_failed_gate(tmp_path):
+    def twice(row):                                                      # two of three entries made from the same tree: two distinct candidates
+        a = row["termination"]["attempts"]
+        a[1]["dump"], a[1]["tree"] = a[0]["dump"], a[0]["tree"]
+        row["termination"]["counted"] = 2
+    def early(row):                                                      # one of three was dumped before the gate failed: it was not a repair of it
+        rec = json.load(open(row["termination"]["attempts"][0]["dump"]))
+        rec["meta"]["created"] = "2026-11-14T08:30:00Z"
+        with open(row["termination"]["attempts"][0]["dump"], "w") as f:
+            json.dump(rec, f)
+        row["termination"]["counted"] = 2
+    def forged(row):
+        row["termination"]["counted"] = 4
+    for name, edit in (("twice", twice), ("early", early)):
+        problems = step_check(exhausted_row(sub(tmp_path, name), edit=edit))
+        assert has(problems, "not spent"), (name, problems[:3])
+        assert not has(problems, "counted repair attempts, the dumps give"), (name, problems[:3])
+    assert has(step_check(exhausted_row(sub(tmp_path, "forged"), edit=forged)), "says 4 counted repair attempts, the dumps give 3")
+    two = step_check(exhausted_row(sub(tmp_path, "two"), repairs=2))
+    assert has(two, "not spent") and has(two, "failed_at"), two[:3]                                          # a stop after two repairs ends by its failed phase, never by the budget
+    zero = step_check(exhausted_row(sub(tmp_path, "zero"), repairs=0))
+    assert has(zero, "not spent"), zero[:3]
+    four = step_check(exhausted_row(sub(tmp_path, "four"), repairs=4))
+    assert has(four, "a fourth repair tree"), four[:3]                                                       # a compliant trajectory never builds it: that row is an overrun
+
+
+def test_the_final_form_of_a_compliant_end_is_the_tree_of_the_last_repair(tmp_path):
+    def first_tree(row):                                                 # the comparison that is the terminal evidence was made from the FIRST repair, not the last
+        a = row["termination"]["attempts"]
+        row["codegen_gate"]["conda"]["cand_dump"] = stamp(row["codegen_gate"]["conda"]["cand_dump"], tmp_path, "wrong-final.json", cg.load_dump(a[0]["dump"])["meta"]["tree"]["content_hash"], ATTEMPT_WHEN % 2)
+    def foreign_tree(row):
+        row["codegen_gate"]["conda"]["cand_dump"] = stamp(row["codegen_gate"]["conda"]["cand_dump"], tmp_path, "foreign-final.json", "9" * 64, ATTEMPT_WHEN % 2)
+    for name, edit in (("first", first_tree), ("foreign", foreign_tree)):
+        problems = step_check(exhausted_row(sub(tmp_path, name), edit=edit))
+        assert has(problems, "last repair"), (name, problems[:3])
+
+
+def test_a_compliant_end_keeps_the_phases_it_never_reached_unmeasured_and_the_step_removed(tmp_path):
+    damage = {
+        "a measured timing": (lambda r: r.update(timing={"vs_previous": "pass", "vs_base": "pass", "chain": "pass"}), "no timing was measured"),
+        "A/B medians": (lambda r: r.update(ab=ab_figures()), "ab has medians for a phase the step never reached"),
+        "a kept commit": (lambda r: r.update(revert_commit=None), "is not reverted"),
+        "exactness that is not a boolean": (lambda r: r["gates"].update(exactness="yes"), "gates.exactness is what the step's evidence gave"),
+        "no termination": (lambda r: r.pop("termination"), "carries the proof"),
+    }
+    for i, (name, (edit, expected)) in enumerate(damage.items()):
+        problems = step_check(exhausted_row(sub(tmp_path, "d%d" % i), edit=edit))
+        assert has(problems, expected), (name, problems[:3])
+
+
+def test_a_stop_after_fewer_repairs_ends_by_the_phase_where_it_failed_with_the_unmeasured_phases_left_null(tmp_path):
+    early = not_adopted("a_fragments", "codegen", commit=C1, revert=C2)
+    early["gates"]["exactness"] = None                                   # the code generation was gated first: the exactness was never measured, and the row says so
+    assert step_check(early) == [], step_check(early)
+    assert step_check(not_adopted("a_fragments", "codegen", commit=C1, revert=C2)) == []                     # the old reading (exactness passed) is still a valid row
+    claimed = not_adopted("a_fragments", "codegen", commit=C1, revert=C2)
+    claimed["gates"]["exactness"] = False                                # a failed exactness would have ended it at the exactness phase
+    assert has(step_check(claimed), "failed at codegen, so the exactness gate is")
+    spent = mutated(early, lambda r: r.update(failed_at="repair_budget", termination=exhausted_row(sub(tmp_path, "s"), repairs=2)["termination"]))
+    assert has(step_check(spent), "not spent")                           # a stop at two repairs that calls itself a spent budget is refused
+
+
+def test_an_attempt_without_a_usable_id_is_a_problem_and_never_an_exception(tmp_path):
+    def bad(value):
+        def edit(row):
+            row["termination"]["attempts"][1]["id"] = value
+        return edit
+    for i, value in enumerate((["V1"], {"id": "V1"}, None, "", "  ", 7, True)):
+        problems = step_check(exhausted_row(sub(tmp_path, "i%d" % i), edit=bad(value)))
+        assert has(problems, "attempt has an id"), (value, problems[:3])
+    missing = step_check(exhausted_row(sub(tmp_path, "gone"), edit=lambda r: r["termination"]["attempts"][1].pop("id")))
+    assert has(missing, "attempt has an id"), missing[:3]
+    legacy = step_check(budget_row(sub(tmp_path, "legacy"), edit=lambda r: r["termination"]["attempts"][1].update(id=["V1"])))
+    assert has(legacy, "attempt has an id"), legacy[:3]
+    dupes = step_check(exhausted_row(sub(tmp_path, "dupes"), edit=lambda r: r["termination"]["attempts"][1].update(id="V0")))
+    assert has(dupes, "more than one attempt is named V0"), dupes[:3]

@@ -181,12 +181,12 @@ def test_the_manifest_names_what_the_decision_needs():
         assert any(needle in p for p in sp.manifest_problems(bad)), needle
 
 
-def manifest_codegen(commit, previous, sid):
+def manifest_codegen(commit, previous, sid, **kw):
     """``codegen`` of a manifest whose dumps are those of the record checker's own tests: per toolchain the dumps of the honest comparison of ``commit`` (and the occupancy record of a
-    device) and the dump of the previous accepted state; the allow-list is empty."""
+    device) and the dump of the previous accepted state; the allow-list is empty. ``kw`` edits the candidate dumps (``rows={"reg": 129}``: a final form that fails the resource gate)."""
     codegen = {}
     for key in rc.COMPARISONS:
-        entry, _ = trs.comparison(key, commit, sid=sid)
+        entry, _ = trs.comparison(key, commit, sid=sid, **kw)
         codegen[key] = {"base": entry["base_dump"], "cand": entry["cand_dump"], "prev": trs.dump_file(key, previous, "cand")}
         if key.startswith("container_"):
             codegen[key]["occupancy"] = entry["occupancy"]
@@ -744,3 +744,54 @@ def test_the_section_of_a_step_that_ended_by_the_budget_holds_the_numbers_of_the
     assert text.endswith("\n") and not text.endswith("\n\n")
     assert not rc.PLAN_VOCABULARY.search(text), rc.PLAN_VOCABULARY.search(text).group(0)
     assert not re.search(r"\b(Q|B|M|R)[0-9]{1,2}\b", text)                           # nor the loop's numbers
+
+
+# ---- a step that ended AT the budget (exactly three repairs, the last still failing the resource gate, its exactness never measured): the same builder, the same checker --------------------------
+def exhausted_case(tmp_path):
+    """The manifest of a step whose final form is the tree of its last repair and fails the resource gate on every toolchain, the termination of its three repairs and the row that the builder
+    makes of them for a final form whose exactness was never measured."""
+    m, _, _ = exactness_world(tmp_path / "world")
+    m = dict(m, step="a_fragments", commit=trs.C2, previous=trs.C1, markers=["afrag_marker"], revert_commit=trs.C3)
+    m["codegen"] = manifest_codegen(m["commit"], m["previous"], "a_fragments", rows={"reg": 129})
+    (tmp_path / "exhausted").mkdir()
+    termination = trs.exhausted_row(tmp_path / "exhausted")["termination"]
+    content = trs.cg.load_dump(termination["attempts"][2]["dump"])["meta"]["tree"]["content_hash"]              # the final form is the tree of the last repair
+    m["codegen"]["conda"]["cand"] = trs.stamp(m["codegen"]["conda"]["cand"], tmp_path, "final-conda.json", content, trs.ATTEMPT_WHEN % 2)
+    reason = "the third repair of the failed resource gate still fails it: the budget of the gate protocol is spent"
+    return m, termination, sp.build_termination_row(m, termination, reason, exactness_measured=False)
+
+
+def test_the_row_of_a_step_that_ended_at_the_budget_is_built_from_the_evidence_and_passes_the_record_checker(tmp_path):
+    m, termination, row = exhausted_case(tmp_path)
+    assert row["failed_at"] == "repair_budget" and row["outcome"] == "not_adopted" and row["gates"] == {"exactness": None, "codegen": False}      # the exactness was never measured: null
+    assert row["timing"] == {"vs_previous": "not_run", "vs_base": "not_run", "chain": "not_run"} and row["ab"] is None and row["revert_commit"] == trs.C3
+    assert row["termination"]["kind"] == "exhausted" and row["termination"]["terminal_failure"] == "codegen" and row["termination"]["counted"] == 3
+    assert rc.step_problems(row, None, trs.META) == [], rc.step_problems(row, None, trs.META)
+    rebuilt = sp.repair_termination(termination["first_failed_gate"]["dump"], termination["attempts"], kind="exhausted", terminal_failure="codegen")
+    assert rebuilt == termination
+    measured = sp.build_termination_row(m, termination, "x", exactness=["a suite did not pass"])                   # a measured exactness is what the evidence gave: this one failed too
+    assert measured["gates"] == {"exactness": False, "codegen": False} and rc.step_problems(measured, None, trs.META) == []
+    passed = sp.build_termination_row(m, termination, "x", exactness=[])                                           # measured and passing, the code generation fails: still a valid row
+    assert passed["gates"] == {"exactness": True, "codegen": False} and rc.step_problems(passed, None, trs.META) == []
+    clean = dict(m, codegen=manifest_codegen(m["commit"], m["previous"], "a_fragments"))                          # a final form that passes everything did not exhaust the budget
+    ok = sp.build_termination_row(clean, termination, "x", exactness=[])
+    assert any("terminal_failure" in p for p in rc.step_problems(ok, None, trs.META)), rc.step_problems(ok, None, trs.META)[:3]
+
+
+def test_a_termination_without_a_kind_is_the_historical_row_key_for_key(tmp_path):
+    m, termination, row = budget_case(tmp_path)
+    rebuilt = sp.repair_termination(termination["first_failed_gate"]["dump"], termination["attempts"])
+    assert rebuilt == termination and "kind" not in rebuilt and "terminal_failure" not in rebuilt
+    assert sp.repair_termination(termination["first_failed_gate"]["dump"], termination["attempts"], kind="overrun")["kind"] == "overrun"
+    explicit = dict(row, termination=dict(termination, kind="overrun"))
+    assert rc.step_problems(explicit, None, trs.META) == [], rc.step_problems(explicit, None, trs.META)
+
+
+def test_the_section_of_an_exhausted_budget_says_that_the_exactness_was_never_measured(tmp_path):
+    m, termination, row = exhausted_case(tmp_path)
+    text = sp.render_termination_section(m, row, number=11)
+    assert text.split("\n")[0] == "## 11. Row engine step 3: the once-per-row A fragments"
+    assert "Gate G and Suite S were not run for the final form: its exactness was never measured." in text and "| device | Gate G passed" not in text
+    assert "3 distinct repair candidates were dumped after it (0 ablation(s)" in text
+    assert not rc.PLAN_VOCABULARY.search(text), rc.PLAN_VOCABULARY.search(text).group(0)
+    assert not re.search(r"\b(Q|B|M|R)[0-9]{1,2}\b", text)
