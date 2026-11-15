@@ -305,16 +305,23 @@ __device__ __forceinline__ void afrag_check_ab(const RowSmem& S, bool mine, int 
         afrag_count(h != ah[ii] || l != al[ii]);
     }
 }
-// phase C: the akk and aqk rows (A row slot only) of the k-step ks
-__device__ __forceinline__ void afrag_check_am(const RowSmem& S, const LaneIdx& L, int slot, int ks, const uint32_t (&kh)[4], const uint32_t (&kl)[4], const uint32_t (&qh)[4], const uint32_t (&ql)[4]) {
+// phase C: the akk row and the aqk row (A row slot only) of the k-step ks, each where rows_m_tiles loads it
+__device__ __forceinline__ void afrag_check_am_k(const RowSmem& S, const LaneIdx& L, int slot, int ks, const uint32_t (&kh)[4], const uint32_t (&kl)[4]) {
 #pragma unroll
     for (int ii = 0; ii < 4; ++ii) {
         const int row = L.g + 8 * (ii & 1), kk = 8 * ks + L.t + 4 * (ii >> 1);
-        const float av = S.akk[kk], aq = S.aqk[kk];
-        uint32_t h, l, h2, l2;
-        split_tf32(row == slot ? av : 0.f, h, l);
-        split_tf32(row == slot ? aq : 0.f, h2, l2);
-        afrag_count(h != kh[ii] || l != kl[ii] || h2 != qh[ii] || l2 != ql[ii]);
+        uint32_t h, l;
+        split_tf32(row == slot ? S.akk[kk] : 0.f, h, l);
+        afrag_count(h != kh[ii] || l != kl[ii]);
+    }
+}
+__device__ __forceinline__ void afrag_check_am_q(const RowSmem& S, const LaneIdx& L, int slot, int ks, const uint32_t (&qh)[4], const uint32_t (&ql)[4]) {
+#pragma unroll
+    for (int ii = 0; ii < 4; ++ii) {
+        const int row = L.g + 8 * (ii & 1), kk = 8 * ks + L.t + 4 * (ii >> 1);
+        uint32_t h, l;
+        split_tf32(row == slot ? S.aqk[kk] : 0.f, h, l);
+        afrag_count(h != qh[ii] || l != ql[ii]);
     }
 }
 // phase D: the W row (A row slot) and the GQ row (slot ^ 8) of the k-step ks
@@ -355,16 +362,22 @@ __device__ __forceinline__ void rows_m_tiles(RowSmem& S, uint32_t amp, const flo
 #pragma unroll
     for (int ks = 0; ks < KS; ++ks) {
         uint32_t kh[4], kl[4], qh[4], ql[4];
-        const uint4 vkh = afrag_lds(amp + ks * 256), vkl = afrag_lds(amp + ks * 256 + 64), vqh = afrag_lds(amp + ks * 256 + 128), vql = afrag_lds(amp + ks * 256 + 192);
+        const uint4 vkh = afrag_lds(amp + ks * 256), vkl = afrag_lds(amp + ks * 256 + 64);   // the akk words at the top of the k-step
         kh[0] = vkh.x; kh[1] = vkh.y; kh[2] = vkh.z; kh[3] = vkh.w;
         kl[0] = vkl.x; kl[1] = vkl.y; kl[2] = vkl.z; kl[3] = vkl.w;
-        qh[0] = vqh.x; qh[1] = vqh.y; qh[2] = vqh.z; qh[3] = vqh.w;
-        ql[0] = vql.x; ql[1] = vql.y; ql[2] = vql.z; ql[3] = vql.w;
 #ifdef CFBI_ROWS_TEST_AFRAG_CHECK
-        afrag_check_am(S, L, slot, ks, kh, kl, qh, ql);
+        afrag_check_am_k(S, L, slot, ks, kh, kl);
 #endif
 #pragma unroll
         for (int q = 0; q < 6; ++q) {
+            if (q == 4) {   // the aqk words where the first product that needs them starts: the akk words are dead by then, so the two pairs are never live together
+                const uint4 vqh = afrag_lds(amp + ks * 256 + 128), vql = afrag_lds(amp + ks * 256 + 192);
+                qh[0] = vqh.x; qh[1] = vqh.y; qh[2] = vqh.z; qh[3] = vqh.w;
+                ql[0] = vql.x; ql[1] = vql.y; ql[2] = vql.z; ql[3] = vql.w;
+#ifdef CFBI_ROWS_TEST_AFRAG_CHECK
+                afrag_check_am_q(S, L, slot, ks, qh, ql);
+#endif
+            }
             uint32_t bh[2], bl[2];
 #pragma unroll
             for (int ii = 0; ii < 2; ++ii) split_tf32(bv[q][ks][ii], bh[ii], bl[ii]);

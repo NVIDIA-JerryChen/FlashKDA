@@ -299,7 +299,8 @@ CONSUMER_LINES = {
     "const uint4 vh = nh, vl = nl;": 2,
     "if (ks < 15) { nh = afrag_lds(abp + 128 * (ks + 1)); nl = afrag_lds(abp + 128 * (ks + 1) + 64); }": 1,      # one k-step ahead of the products
     "if (ks < 15) { nh = afrag_lds(adp + 128 * (ks + 1)); nl = afrag_lds(adp + 128 * (ks + 1) + 64); }": 1,
-    "const uint4 vkh = afrag_lds(amp + ks * 256), vkl = afrag_lds(amp + ks * 256 + 64), vqh = afrag_lds(amp + ks * 256 + 128), vql = afrag_lds(amp + ks * 256 + 192);": 1,    # the top of the k-step
+    "const uint4 vkh = afrag_lds(amp + ks * 256), vkl = afrag_lds(amp + ks * 256 + 64);": 1,                       # the akk words: the top of the k-step
+    "const uint4 vqh = afrag_lds(amp + ks * 256 + 128), vql = afrag_lds(amp + ks * 256 + 192);": 1,                # the aqk words: where the first product that needs them starts
 }
 POINTER_LINES = (
     "const uint32_t abp = afrag_ptr_ab(Fr, mine, t);",
@@ -313,6 +314,42 @@ BASE_NAMES = {"abp": 5, "adp": 5}     # the base, the two words of k-step 0, the
 # the A side of the products of phases B, C and D is loaded, never split again. The splits of the kernel body: the AB producer (2), the B sides of phases B and D (1 + 1) and the two of the chunk-end
 # phase (its A fragment and its B side, not staged by F); rows_m_tiles splits the B side of the cross-sub-block products only
 SPLIT_CALLS = {"rows_kernel": 6, "rows_m_tiles": 1}
+
+
+def am_split_problems(text):
+    """The aqk words of rows_m_tiles are loaded inside the ``q == 4`` block (the first tile of the aqk products), the akk words in front of the q loop: the two pairs are never live together."""
+    d = function_def(tokens(view(text)), "rows_m_tiles")
+    if d is None:
+        return ["rows_m_tiles is missing"]
+    body = d[2]
+    probs = []
+    names = [i for i, t in enumerate(body) if t in ("vkh", "vqh")]
+    blocks = [i for i in range(len(body) - 5) if body[i:i + 5] == ["if", "(", "q", "==", "4"]]
+    if len(blocks) != 1 or len(names) < 2:
+        return probs + ["rows_m_tiles has %d blocks of q == 4 (expected one)" % len(blocks)]
+    brace = body.index("{", blocks[0])
+    end = match_close(body, brace, "{", "}")
+    inside = [t for t in body[brace:end] if t in ("vkh", "vqh")]
+    if set(inside) != {"vqh"}:
+        probs.append("the q == 4 block of rows_m_tiles does not hold the aqk loads alone: %s" % inside)
+    top = [t for t in body[:blocks[0]] if t in ("vkh", "vqh")]
+    if "vqh" in top or "vkh" not in top:
+        probs.append("the akk loads are not in front of the q loop, or the aqk loads are: %s" % top)
+    return probs
+
+
+def test_the_aqk_words_are_loaded_where_the_akk_words_are_dead(rows_text):
+    assert am_split_problems(rows_text) == []
+
+
+@pytest.mark.parametrize("name,old,new", [
+    ("the aqk words loaded with the first tile", "if (q == 4) {   // the aqk words", "if (q == 0) {   // the aqk words"),
+    ("the aqk words loaded behind their first product", "if (q == 4) {   // the aqk words", "if (q == 5) {   // the aqk words"),
+    ("the aqk words loaded at the top again", "const uint4 vkh = afrag_lds(amp + ks * 256), vkl = afrag_lds(amp + ks * 256 + 64);",
+     "const uint4 vqh = afrag_lds(amp + ks * 256 + 128), vkh = afrag_lds(amp + ks * 256), vkl = afrag_lds(amp + ks * 256 + 64);"),
+])
+def test_an_aqk_load_that_is_not_where_the_akk_words_are_dead_is_caught(rows_text, name, old, new):
+    assert am_split_problems(mutate(rows_text, old, new)), name
 
 
 def consumer_problems(text):
@@ -441,21 +478,23 @@ def test_a_store_or_load_on_the_wrong_side_of_its_barrier_is_caught(rows_text, n
 # ---- the oracle: a consumer that is not checked, or a check that never counts, is blind ----------------------------------------------------------------------------
 UNPACK_A = (r"ah\[0\] = vh\.x; ah\[1\] = vh\.y; ah\[2\] = vh\.z; ah\[3\] = vh\.w;\n\s*"
             r"al\[0\] = vl\.x; al\[1\] = vl\.y; al\[2\] = vl\.z; al\[3\] = vl\.w;\n")
-UNPACK_AM = (r"kh\[0\] = vkh\.x; kh\[1\] = vkh\.y; kh\[2\] = vkh\.z; kh\[3\] = vkh\.w;\n\s*"
-             r"kl\[0\] = vkl\.x; kl\[1\] = vkl\.y; kl\[2\] = vkl\.z; kl\[3\] = vkl\.w;\n\s*"
-             r"qh\[0\] = vqh\.x; qh\[1\] = vqh\.y; qh\[2\] = vqh\.z; qh\[3\] = vqh\.w;\n\s*"
-             r"ql\[0\] = vql\.x; ql\[1\] = vql\.y; ql\[2\] = vql\.z; ql\[3\] = vql\.w;\n")
+UNPACK_AMK = (r"kh\[0\] = vkh\.x; kh\[1\] = vkh\.y; kh\[2\] = vkh\.z; kh\[3\] = vkh\.w;\n\s*"
+              r"kl\[0\] = vkl\.x; kl\[1\] = vkl\.y; kl\[2\] = vkl\.z; kl\[3\] = vkl\.w;\n")
+UNPACK_AMQ = (r"qh\[0\] = vqh\.x; qh\[1\] = vqh\.y; qh\[2\] = vqh\.z; qh\[3\] = vqh\.w;\n\s*"
+              r"ql\[0\] = vql\.x; ql\[1\] = vql\.y; ql\[2\] = vql\.z; ql\[3\] = vql\.w;\n")
 GUARDED = r"#ifdef CFBI_ROWS_TEST_AFRAG_CHECK\n\s*%s;\n#endif\n"
 PREFETCH = r"const uint4 vh = nh, vl = nl;\n\s*if \(ks < 15\) \{ nh = afrag_lds\(%s \+ 128 \* \(ks \+ 1\)\); nl = afrag_lds\(%s \+ 128 \* \(ks \+ 1\) \+ 64\); \}[^\n]*\n\s*"
 ORACLE_CALLS = {
     "afrag_check_ab": PREFETCH % ("abp", "abp") + UNPACK_A + GUARDED % r"afrag_check_ab\(S, mine, slot_hi, t, ks, ah, al\)",
     "afrag_check_ad": PREFETCH % ("adp", "adp") + UNPACK_A + GUARDED % r"afrag_check_ad\(S, mine, slot_hi, t, ks, ah, al\)",
-    "afrag_check_am": r"vql = afrag_lds\(amp \+ ks \* 256 \+ 192\);\n\s*" + UNPACK_AM + GUARDED % r"afrag_check_am\(S, L, slot, ks, kh, kl, qh, ql\)",
+    "afrag_check_am_k": r"vkl = afrag_lds\(amp \+ ks \* 256 \+ 64\);[^\n]*\n\s*" + UNPACK_AMK + GUARDED % r"afrag_check_am_k\(S, L, slot, ks, kh, kl\)",
+    "afrag_check_am_q": r"vql = afrag_lds\(amp \+ ks \* 256 \+ 192\);\n\s*" + UNPACK_AMQ + GUARDED % r"afrag_check_am_q\(S, L, slot, ks, qh, ql\)",
 }
 ORACLE_COUNTS = {
     "afrag_check_ab": "afrag_count(h != ah[ii] || l != al[ii]);",
     "afrag_check_ad": "afrag_count(h != ah[ii] || l != al[ii]);",
-    "afrag_check_am": "afrag_count(h != kh[ii] || l != kl[ii] || h2 != qh[ii] || l2 != ql[ii]);",
+    "afrag_check_am_k": "afrag_count(h != kh[ii] || l != kl[ii]);",
+    "afrag_check_am_q": "afrag_count(h != qh[ii] || l != ql[ii]);",
 }
 
 
@@ -482,13 +521,15 @@ def test_every_consumer_family_is_checked_by_the_oracle(rows_text):
 @pytest.mark.parametrize("name,old,new,expect", [
     ("the AB check dropped", "#ifdef CFBI_ROWS_TEST_AFRAG_CHECK\n                afrag_check_ab(S, mine, slot_hi, t, ks, ah, al);\n#endif\n", "", "afrag_check_ab is not called"),
     ("the AD check dropped", "#ifdef CFBI_ROWS_TEST_AFRAG_CHECK\n                afrag_check_ad(S, mine, slot_hi, t, ks, ah, al);\n#endif\n", "", "afrag_check_ad is not called"),
-    ("the AM check dropped", "#ifdef CFBI_ROWS_TEST_AFRAG_CHECK\n        afrag_check_am(S, L, slot, ks, kh, kl, qh, ql);\n#endif\n", "", "afrag_check_am is not called"),
+    ("the AM akk check dropped", "#ifdef CFBI_ROWS_TEST_AFRAG_CHECK\n        afrag_check_am_k(S, L, slot, ks, kh, kl);\n#endif\n", "", "afrag_check_am_k is not called"),
+    ("the AM aqk check dropped", "#ifdef CFBI_ROWS_TEST_AFRAG_CHECK\n                afrag_check_am_q(S, L, slot, ks, qh, ql);\n#endif\n", "", "afrag_check_am_q is not called"),
     ("the AB check outside its guard", "#ifdef CFBI_ROWS_TEST_AFRAG_CHECK\n                afrag_check_ab(S, mine, slot_hi, t, ks, ah, al);\n#endif\n", "                afrag_check_ab(S, mine, slot_hi, t, ks, ah, al);\n", "afrag_check_ab is not called"),
     ("the AB check behind the products", "#ifdef CFBI_ROWS_TEST_AFRAG_CHECK\n                afrag_check_ab(S, mine, slot_hi, t, ks, ah, al);\n#endif\n", "", "afrag_check_ab is not called"),
     ("the AD check looks at the AB words of the other row", "afrag_check_ad(S, mine, slot_hi, t, ks, ah, al);", "afrag_check_ad(S, mine, 1 - slot_hi, t, ks, ah, al);", "afrag_check_ad is not called"),
     ("the AB check never counts", "        const float v = mine ? (((ii & 1) == slot_hi) ? ksv : qsv) : 0.f;\n        uint32_t h, l;\n        split_tf32(v, h, l);\n        afrag_count(h != ah[ii] || l != al[ii]);",
      "        const float v = mine ? (((ii & 1) == slot_hi) ? ksv : qsv) : 0.f;\n        uint32_t h, l;\n        split_tf32(v, h, l);\n        afrag_count(false);", "the check afrag_check_ab does not count"),
-    ("the AM check counts the hi words only", "afrag_count(h != kh[ii] || l != kl[ii] || h2 != qh[ii] || l2 != ql[ii]);", "afrag_count(h != kh[ii] || h2 != qh[ii]);", "the check afrag_check_am does not count"),
+    ("the AM akk check counts the hi words only", "afrag_count(h != kh[ii] || l != kl[ii]);", "afrag_count(h != kh[ii]);", "the check afrag_check_am_k does not count"),
+    ("the AM aqk check counts the lo words only", "afrag_count(h != qh[ii] || l != ql[ii]);", "afrag_count(l != ql[ii]);", "the check afrag_check_am_q does not count"),
     ("the AD check compares the word with itself", "        const float v = mine ? (((ii & 1) == slot_hi) ? wv : gv) : 0.f;\n        uint32_t h, l;\n        split_tf32(v, h, l);\n        afrag_count(h != ah[ii] || l != al[ii]);",
      "        const float v = mine ? (((ii & 1) == slot_hi) ? wv : gv) : 0.f;\n        uint32_t h, l;\n        split_tf32(v, h, l);\n        afrag_count(ah[ii] != ah[ii] || al[ii] != al[ii]);", "the check afrag_check_ad does not count"),
 ])
