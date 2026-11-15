@@ -342,6 +342,43 @@ def test_the_aqk_words_are_loaded_where_the_akk_words_are_dead(rows_text):
     assert am_split_problems(rows_text) == []
 
 
+def am_anchor_problems(text):
+    """Every k-step of rows_m_tiles starts with a warp barrier: ptxas does not move a memory operation across it, so the staged words of a k-step are loaded behind the products of the k-step before it
+    (without it ptxas hoisted eight of them in front of the loads of the B operands of the cross-sub-block products, where the registers are most needed)."""
+    d = function_def(tokens(view(text)), "rows_m_tiles")
+    if d is None:
+        return ["rows_m_tiles is missing"]
+    body = d[2]
+    head = ["for", "(", "int", "ks", "=", "0", ";", "ks", "<", "KS", ";", "++", "ks", ")"]
+    starts = [i for i in range(len(body) - len(head)) if body[i:i + len(head)] == head]
+    probs = []
+    if len(starts) != 2:
+        return ["rows_m_tiles has %d loops over the k-steps (expected the gather and the products)" % len(starts)]
+    loop = starts[1] + len(head)                      # the loop of the products (the first one is the gather of the B operands, which has no braces)
+    if body[loop] != "{" or body[loop + 1:loop + 5] != ["__syncwarp", "(", ")", ";"]:
+        probs.append("the k-step loop of the products does not start with __syncwarp(): %s" % " ".join(body[loop:loop + 7]))
+    if body.count("__syncwarp") != 1:
+        probs.append("rows_m_tiles has %d warp barriers (expected the one at the top of the k-step)" % body.count("__syncwarp"))
+    if "__syncthreads" in body:
+        probs.append("rows_m_tiles has a CTA barrier: the barriers of a row are the numbered ones of the kernel")
+    return probs
+
+
+def test_every_k_step_of_the_cross_sub_block_products_starts_with_a_warp_barrier(rows_text):
+    assert am_anchor_problems(rows_text) == []
+
+
+@pytest.mark.parametrize("name,old,new", [
+    ("the warp barrier dropped", "        __syncwarp();   // a boundary that ptxas does not move", "        // a boundary that ptxas does not move"),
+    ("a CTA barrier instead", "        __syncwarp();   // a boundary that ptxas does not move", "        __syncthreads();   // a boundary that ptxas does not move"),
+    ("the warp barrier behind the akk loads", "        __syncwarp();   // a boundary that ptxas does not move memory operations across: the words of a k-step are loaded behind the products of the k-step before it (ptxas hoisted eight of them in front of the loads of the B operands, where the registers are most needed)\n        uint32_t kh[4], kl[4], qh[4], ql[4];\n",
+     "        uint32_t kh[4], kl[4], qh[4], ql[4];\n        __syncwarp();\n"),
+    ("a second warp barrier", "        kl[0] = vkl.x; kl[1] = vkl.y; kl[2] = vkl.z; kl[3] = vkl.w;\n", "        kl[0] = vkl.x; kl[1] = vkl.y; kl[2] = vkl.z; kl[3] = vkl.w;\n        __syncwarp();\n"),
+])
+def test_a_k_step_without_its_warp_barrier_is_caught(rows_text, name, old, new):
+    assert am_anchor_problems(mutate(rows_text, old, new)), name
+
+
 @pytest.mark.parametrize("name,old,new", [
     ("the aqk words loaded with the first tile", "if (q == 4) {   // the aqk words", "if (q == 0) {   // the aqk words"),
     ("the aqk words loaded behind their first product", "if (q == 4) {   // the aqk words", "if (q == 5) {   // the aqk words"),

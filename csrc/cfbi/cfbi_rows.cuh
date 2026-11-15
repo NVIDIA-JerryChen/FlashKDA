@@ -361,6 +361,7 @@ __device__ __forceinline__ void rows_m_tiles(RowSmem& S, uint32_t amp, const flo
         for (int i = 0; i < 4; ++i) { big[q][i] = neg_zero(); sml[q][i] = neg_zero(); }
 #pragma unroll
     for (int ks = 0; ks < KS; ++ks) {
+        __syncwarp();   // a boundary that ptxas does not move memory operations across: the words of a k-step are loaded behind the products of the k-step before it (ptxas hoisted eight of them in front of the loads of the B operands, where the registers are most needed)
         uint32_t kh[4], kl[4], qh[4], ql[4];
         const uint4 vkh = afrag_lds(amp + ks * 256), vkl = afrag_lds(amp + ks * 256 + 64);   // the akk words at the top of the k-step
         kh[0] = vkh.x; kh[1] = vkh.y; kh[2] = vkh.z; kh[3] = vkh.w;
