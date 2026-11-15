@@ -162,19 +162,13 @@ void rows_test_check(int err, const char* what) {
     TORCH_CHECK(err == 0, what, ": ", cudaGetErrorString((cudaError_t)err));
 }
 void rows_test_delay_config_py(int64_t ns, int warp, int cta_mod, int cta_rem, int64_t sites) {
-    TORCH_CHECK(ns >= 0 && ns <= 1000000 && sites >= 0 && sites < (1 << 15) && cta_mod >= 0 && warp >= -1 && warp < 8, "rows_test_delay_config: argument out of range");
+    TORCH_CHECK(ns >= 0 && ns <= 1000000 && sites >= 0 && sites < (1 << 13) && cta_mod >= 0 && warp >= -1 && warp < 8, "rows_test_delay_config: argument out of range");
     rows_test_check(cfbi::rows_test_delay_config((unsigned)ns, warp, cta_mod, cta_rem, (unsigned)sites), "rows_test_delay_config");
 }
 int64_t rows_test_delay_hits_py() {
     unsigned long long hits = 0;
     rows_test_check(cfbi::rows_test_delay_hits(&hits), "rows_test_delay_hits");
     return (int64_t)hits;
-}
-void rows_test_afrag_reset_py() { rows_test_check(cfbi::rows_test_afrag_reset(), "rows_test_afrag_reset"); }
-int64_t rows_test_afrag_mismatches_py() {
-    unsigned long long count = 0;
-    rows_test_check(cfbi::rows_test_afrag_mismatches(&count), "rows_test_afrag_mismatches");
-    return (int64_t)count;
 }
 void rows_test_pos_offset_py(int64_t offset, int64_t accesses) {
     TORCH_CHECK(offset >= INT32_MIN && offset <= INT32_MAX, "rows_test_pos_offset: offset out of range");
@@ -399,9 +393,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rows_test_delay_config", &rows_test_delay_config_py, "hidden (CFBI_ROWS_DELAY_NS builds): ns of a delay (0: compiled default), sleeping warp (-1: all), sleeping CTAs (cta % cta_mod == cta_rem, 0: all), site bit mask",
           py::arg("ns"), py::arg("warp"), py::arg("cta_mod"), py::arg("cta_rem"), py::arg("sites"));
     m.def("rows_test_delay_hits", &rows_test_delay_hits_py, "hidden (CFBI_ROWS_DELAY_NS builds): warps that slept since rows_test_delay_config");
-    m.def("rows_test_afrag_reset", &rows_test_afrag_reset_py, "hidden (CFBI_ROWS_TEST_AFRAG_CHECK builds): zero the counter of the fragment-level check");
-    m.def("rows_test_afrag_mismatches", &rows_test_afrag_mismatches_py,
-          "hidden (CFBI_ROWS_TEST_AFRAG_CHECK builds): fragment words of every lane and k-step that differ from the unstaged kernel's since rows_test_afrag_reset");
     m.def("rows_test_pos_offset", &rows_test_pos_offset_py,
           "hidden (CFBI_ROWS_TEST_POS_OOB builds): offset added to the slot of the position accesses selected by the mask (bit 0: fused store of the two-launch row engine, bit 1: arrival atomic, bit 2: elected store of the single launch; default: all)",
           py::arg("offset"), py::arg("accesses") = 7);
