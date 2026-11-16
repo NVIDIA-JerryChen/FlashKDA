@@ -108,6 +108,66 @@ flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
 - When `cu_seqlens` is provided, `B` must be 1, `T` is the total length across all sequences, and `initial_state` / `final_state` have shape `[N, H, V, K]`.
 - When `cu_seqlens` is `None`, each batch element is treated as an independent sequence, and the state shape is `[B, H, V, K]`.
 
+## Bitwise train/infer-consistent kernels (`flash_kda.cfbi`)
+
+`flash_kda.cfbi` evaluates ONE fixed-order, chunk-form floating-point program ("CF-BI": chunk 64 anchored at the
+sequence start, fp32 state, three-term TF32 tensor-core products). Prefill and the training forward evaluate many
+rows of it at once, decode evaluates one more row: the output and the continuation state have the **same bits**
+however the sequence is cut into calls, whatever else is in the batch, and whether it ran as prefill, decode or
+the training forward. Optimised kernels (bulk-copy/mbarrier pipelines, fragment-native workspace, packed decode tiles;
+see [perf doc](docs/20261103-cfbi-perf.md)) that are checked bit for bit against the frozen v1 reference kernels
+(`_impl=3`). Validated on B300 (`sm_103a`) and, with the caveats of
+[docs/20261102-cfbi-design.md](docs/20261102-cfbi-design.md) section 7a, on B200, H100, A100, A10 and L40S (Ampere/Ada run the row
+engine only, and their bits differ from Hopper/Blackwell: bit equality holds within one architecture family). The first call on a
+device runs `flash_kda.cfbi.verify_hardware()`, an empirical check of the tensor-core premise.
+
+```python
+from flash_kda.cfbi import alloc_state, prefill, decode, chunk_kda
+
+state = alloc_state(N, H)                       # E fp32 [N,H,128,128], open-chunk row cache, pos
+prefill(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, state, cu_seqlens)   # any cut, in place
+decode(q1, k1, v1, g1, beta1, scale, out1, A_log, dt_bias, lower_bound, state)          # one token per sequence
+y = chunk_kda(q, k, v, g, beta, scale, A_log, dt_bias, lower_bound)                      # training: autograd
+
+# one state POOL for a serving engine: sequence n of the call uses slot slot_ids[n] (-1 = padding entry)
+pool = alloc_state(num_slots, H)
+decode(q1, k1, v1, g1, beta1, scale, out1, A_log, dt_bias, lower_bound, pool, slot_ids=slots)   # int32 [N]
+
+# context parallelism: K1 (no E needed) on every rank at once, K2 chained through E; same bits as one prefill call
+from flash_kda.cfbi import cp_prefill       # shards cut at multiples of 64 tokens from the sequence start
+```
+
+Same argument names/shapes as `flash_kda.fwd`; extra constraints and the backward (FLA's chunk backward on a
+recomputed forward, needs `flash-linear-attention`; `lower_bound` in `[-5, 0)` for gradients) are in the
+[design doc](docs/20261102-cfbi-design.md); the floating-point program is specified in the
+[numerical contract](docs/20261102-cfbi-numerical-contract.md).
+
+```bash
+FLASH_KDA_BUILD_EXTS=cfbi pip install -v --no-build-isolation .   # only the cfbi extensions (no CUTLASS needed)
+python -m pytest tests/cfbi -q                                    # JIT-builds the extensions if they are not installed
+CFBI_BIG=1 python -m pytest tests/cfbi -q                         # + 32K-token and N=512 runs
+python benchmarks/accuracy_cfbi.py && python benchmarks/bench_cfbi.py
+```
+
+### The layers around the core: short conv and projections
+
+The same guarantee for the layers that feed the core (`flash_kda.cfbi.short_conv`, `flash_kda.cfbi.bi_linear`, extension
+`flash_kda_cfbi_conv_C`): the causal depthwise conv + SiLU on q/k/v is one fixed fp32 program (ascending-tap `fma` chain, SiLU from
+`ex2` / `rcp`, bf16 round-to-nearest-even; the conv state holds the last `W-1` inputs), and the projection GEMM is a fixed-K-order
+`mma.sync` kernel whose row `m` does not depend on `M` or on the other rows (cuBLAS's does). Output and state bits are identical for
+one prefill call = any cuts = `T = 1` decode = a varlen batch = the training forward.
+
+```python
+from flash_kda.cfbi import alloc_conv_state, bi_linear, short_conv
+
+q_pre = bi_linear(x, Wq)                                                  # bf16 [..., N], K % 16 == 0
+state = alloc_conv_state(N, D, W=4)                                       # bf16 [N, D, W-1], updated in place
+q = short_conv(q_pre.view(B, T, D), conv_weight, None, state, "silu")     # prefill / decode; state=None: differentiable training forward
+```
+
+Validated on B300 only. Specification, hardware-premise probes, controls (cuBLAS is not batch invariant), speed and limits:
+[docs/20261103-cfbi-conv-linear.md](docs/20261103-cfbi-conv-linear.md).
+
 ## Development
 
 To set up IntelliSense (clangd) for the CUDA/C++ sources, run:
