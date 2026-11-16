@@ -787,6 +787,29 @@ def test_a_termination_without_a_kind_is_the_historical_row_key_for_key(tmp_path
     assert rc.step_problems(explicit, None, trs.META) == [], rc.step_problems(explicit, None, trs.META)
 
 
+def test_a_step_that_ended_at_the_conda_gate_has_its_row_and_its_section_from_the_comparison_that_was_made(tmp_path):
+    """The gate protocol stops a step at the first toolchain that fails it: a step whose repairs were spent on the conda gate never reached the production toolchain, so its manifest names the
+    conda comparison alone; the row and the section say what was compared and no more, and the record checker admits the row."""
+    m, termination, full = exhausted_case(tmp_path)
+    conda = dict(m, codegen={"conda": m["codegen"]["conda"], "allow": m["codegen"]["allow"]})
+    row = sp.build_termination_row(conda, termination, "x", exactness_measured=False)
+    assert sorted(row["codegen_gate"]) == ["conda"] and sorted(row["resource_gate"]) == ["conda"]
+    assert row["codegen_gate"]["conda"] == full["codegen_gate"]["conda"] and row["resource_gate"]["conda"] == full["resource_gate"]["conda"]
+    assert row["gates"] == {"exactness": None, "codegen": False}
+    assert rc.step_problems(row, None, trs.META) == [], rc.step_problems(row, None, trs.META)
+    text, whole = sp.render_termination_section(conda, row, number=12), sp.render_termination_section(m, full, number=12)
+    lines = text.split("\n")
+    assert lines[0] == "## 12. Row engine step 3: the once-per-row A fragments"
+    assert [l for l in lines if l.startswith("| conda |")] and [l for l in lines if l.startswith("| conda |")] == [l for l in whole.split("\n") if l.startswith("| conda |")]
+    assert not any("container_" in l for l in lines) and not rc.PLAN_VOCABULARY.search(text), rc.PLAN_VOCABULARY.search(text)
+    assert "The production toolchain was never reached: there is no occupancy-API record of the step." in lines and "| device | instantiation |" not in text      # no table without a row
+    assert any(l.startswith("| b200 |") for l in whole.split("\n"))                                                                          # a step that reached the devices keeps its table
+    with pytest.raises(ValueError, match="conda"):                                                  # the first failed gate is a conda comparison: a manifest without one is no manifest of this kind
+        sp.build_termination_row(dict(m, codegen={"allow": m["codegen"]["allow"]}), termination, "x", exactness_measured=False)
+    with pytest.raises(KeyError):                                                                   # a step that is judged on every toolchain keeps that rule: the tolerance is the termination's alone
+        sp.measured_gates(conda, [])
+
+
 def test_the_section_of_an_exhausted_budget_says_that_the_exactness_was_never_measured(tmp_path):
     m, termination, row = exhausted_case(tmp_path)
     text = sp.render_termination_section(m, row, number=11)

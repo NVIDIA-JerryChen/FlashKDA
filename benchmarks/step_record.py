@@ -381,12 +381,15 @@ def owned_instantiations(dump, arch):
     return sorted(k for k in dump["kernels"][arch] if cg.family(k) in cg.DEFAULT_OWNED)
 
 
-def codegen_entries(m):
+def codegen_entries(m, partial=False):
     """``(codegen_gate, resource_gate)`` of the row from the dumps of the manifest: one comparison in change mode per toolchain (the previous accepted dump, the allow-list, the occupancy record of a
-    device), the verdict as ``codegen_gate.compare_dumps`` gives it (and, on a device, the occupancy verdict with it), and the resource figures of the row engine."""
+    device), the verdict as ``codegen_gate.compare_dumps`` gives it (and, on a device, the occupancy verdict with it), and the resource figures of the row engine. ``partial``: the manifest of a step
+    that ended at the first toolchain that failed it names the comparisons that were made, the conda one at least (it is the toolchain of the first failed gate), and the row says no more than that."""
     codegen, resources = {}, {}
     cgm = m["codegen"]
-    for key in rc.COMPARISONS:
+    if partial and "conda" not in cgm:
+        raise ValueError("a step that ended at the code generation was compared on the conda toolchain first: the manifest names no conda comparison")
+    for key in [k for k in rc.COMPARISONS if k in cgm] if partial else rc.COMPARISONS:
         spec = cgm[key]
         base, cand = cg.load_dump(spec["base"]), cg.load_dump(spec["cand"])
         report = cg.compare_dumps(base, cand, cg.load_allow(cgm["allow"]), "change", cg.load_dump(spec["prev"]))
@@ -405,10 +408,10 @@ def codegen_entries(m):
     return codegen, resources
 
 
-def measured_gates(m, exactness=None):
+def measured_gates(m, exactness=None, partial=False):
     """``(codegen_gate, resource_gate, gates)`` of a row: the comparisons of the dumps of the manifest (``codegen_entries``) and what they and the suites say of the exactness and the
-    code-generation gates. ``exactness``: the problems of ``exactness_problems`` when the caller has them already."""
-    codegen, resources = codegen_entries(m)
+    code-generation gates. ``exactness``: the problems of ``exactness_problems`` when the caller has them already; ``partial``: see ``codegen_entries``."""
+    codegen, resources = codegen_entries(m, partial)
     exact = exactness_problems(m) if exactness is None else exactness
     return codegen, resources, {"exactness": not exact, "codegen": all(e["verdict"] == "PASS" for e in codegen.values())}
 
@@ -443,7 +446,7 @@ def build_termination_row(m, termination, reason, exactness=None, exactness_meas
     which may pass; the exactness of its suites), no timing (never reached: ``not_run``), the revert commit that removed it (``m["revert_commit"]``) and ``termination``, the proof of the budget
     that the record checker recomputes (``record_checker.termination_problems``). ``exactness``: the problems of ``exactness_problems`` when the caller has them already;
     ``exactness_measured`` False for a final form whose exactness was never measured (the code generation was gated first and the last repair still fails it): ``gates.exactness`` is then null."""
-    codegen, resources, gates = measured_gates(m, exactness if exactness_measured else [])
+    codegen, resources, gates = measured_gates(m, exactness if exactness_measured else [], partial=True)    # the step may have ended before every toolchain ran
     if not exactness_measured:
         gates = dict(gates, exactness=None)
     return {"id": m["step"], "outcome": "not_adopted", "commit": m["commit"], "revert_commit": m.get("revert_commit"), "markers": list(m["markers"]), "failed_at": "repair_budget",
@@ -486,11 +489,11 @@ def _figures(rec):
     return " / ".join(str(rec.get(f)) for f in rc.RESOURCE_FIGURES) if isinstance(rec, dict) else "-"
 
 
-def resource_rows(m):
+def resource_rows(m, keys=rc.COMPARISONS):
     """``[(toolchain, architecture, instantiation, base reference, previous accepted state, step)]`` as ``registers / spill loads / spill stores / stack``: the base figure is the kernel that the
-    resource gate holds the instantiation to (``codegen_gate.gate_r_reference``)."""
+    resource gate holds the instantiation to (``codegen_gate.gate_r_reference``); ``keys``: the toolchains of the row (a step that ended at the conda gate has no other)."""
     out = []
-    for key in rc.COMPARISONS:
+    for key in keys:
         spec = m["codegen"][key]
         base, cand, prev = (cg.load_dump(spec[name]) for name in ("base", "cand", "prev"))
         for arch in rc.COMPARISON_ARCHS[key]:
@@ -505,7 +508,7 @@ def codegen_lines(m, row):
         "%s %s (%d kernels compared, %d differences)" % (key, e["verdict"], e["compared"], e["differences"]) for key, e in sorted(row["codegen_gate"].items())) + ".",
              "", "Registers / spill loads / spill stores / stack bytes of the row engine; the base column is the kernel that the resource gate holds the instantiation to.", "",
              "| toolchain | architecture | instantiation | base | previous accepted state | step |", "|---|---|---|---|---|---|"]
-    return lines + ["| %s | %s | %s | %s | %s | %s |" % r for r in resource_rows(m)]
+    return lines + ["| %s | %s | %s | %s | %s | %s |" % r for r in resource_rows(m, [k for k in rc.COMPARISONS if k in row["codegen_gate"]])]
 
 
 def render_section(m, decision, row, infos, number=10):
@@ -583,11 +586,14 @@ def render_termination_section(m, row, number=11):
                   "| device | Gate G passed | Suite S files | Suite S passed | skipped | failed | commit of the suites |", "|---|---|---|---|---|---|---|"]
         lines += ["| %s | %s | %s | %s | %s | %s | %s |" % r for r in suite_rows(m)]
     lines += [""] + codegen_lines(m, row)
-    lines += ["", "Occupancy-API records of the production toolchain (threads of a CTA: 256):", "", "| device | instantiation | registers | static shared memory | dynamic shared memory | CTAs per SM |", "|---|---|---|---|---|---|"]
-    for key in rc.COMPARISONS:
-        if key.startswith("container_") and key in row["codegen_gate"]:
+    devices = [key for key in rc.COMPARISONS if key.startswith("container_") and key in row["codegen_gate"]]
+    if devices:
+        lines += ["", "Occupancy-API records of the production toolchain (threads of a CTA: 256):", "", "| device | instantiation | registers | static shared memory | dynamic shared memory | CTAs per SM |", "|---|---|---|---|---|---|"]
+        for key in devices:
             for i in load_json(row["codegen_gate"][key]["occupancy"])["occupancy"]["instances"]:
                 lines.append("| %s | %s | %d | %d B | %d B | %d |" % (key.split("_", 1)[1], i["name"], i["registers"], i["static_smem"], i["dynamic_smem"], i["ctas_per_sm"]))
+    else:                                                                  # the step ended at the conda gate: there is nothing to tabulate
+        lines += ["", "The production toolchain was never reached: there is no occupancy-API record of the step."]
     lines += ["", "### Timing", "", "Not run: the step ended before the timing phase (vs previous accepted state, vs base and layer chain: %s)." % ", ".join(
         "%s %s" % (k, row["timing"][k]) for k in ("vs_previous", "vs_base", "chain"))]
     return "\n".join(lines) + "\n"
