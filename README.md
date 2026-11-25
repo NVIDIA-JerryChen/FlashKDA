@@ -74,6 +74,7 @@ bash tests/test.sh
 ```
 
 - `tests/test_fwd.py` — correctness tests (exact match against the torch reference; compared with `flash-linear-attention`)
+- `tests/test_replay.py` — `flash_kda.replay` prefill/decode bit-for-bit against one `flash_kda.fwd` call over the whole sequence
 
 
 ## Kernel API
@@ -107,6 +108,25 @@ flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
 - `initial_state` / `final_state` accept `None` (stateless), bf16, or fp32 tensors. When both are provided, their dtypes must match.
 - When `cu_seqlens` is provided, `B` must be 1, `T` is the total length across all sequences, and `initial_state` / `final_state` have shape `[N, H, V, K]`.
 - When `cu_seqlens` is `None`, each batch element is treated as an independent sequence, and the state shape is `[B, H, V, K]`.
+
+### `flash_kda.replay`: decode that is bitwise equal to the prefill
+
+`flash_kda.fwd` stays the prefill kernel (unchanged). `flash_kda.replay` adds a per-sequence state and a decode kernel
+that replays `flash_kda.fwd`'s own chunk arithmetic for the rows of the chunk that is still open, so every output is
+bit-for-bit the row of ONE `flash_kda.fwd` call over the whole sequence, however the sequence is cut into prefill /
+decode calls. Design and limits: [docs/20261124-replay-decode.md](docs/20261124-replay-decode.md).
+
+```python
+from flash_kda import replay
+
+state = replay.alloc_state(num_slots, H)               # or initial_state=[N, H, V, K] bf16/fp32
+replay.prefill(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, state, cu_seqlens=cu)  # [1, T, H, 128]
+replay.decode(q1, k1, v1, g1, beta1, scale, out1, A_log, dt_bias, lower_bound, state)          # [N, H, 128]
+final = replay.final_state(state, A_log, dt_bias, lower_bound)   # == flash_kda.fwd's final_state; state unchanged
+```
+
+`slot_ids` (int32 `[N]`) maps the call's sequences to state slots (`-1` = padding entry in `decode`). The 16-aligned
+part of a prefill runs through `flash_kda.fwd`; prompt tails and decode tokens run through the replay kernel.
 
 ## Development
 
