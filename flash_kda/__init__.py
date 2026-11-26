@@ -39,3 +39,10 @@ def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state
 
     _fwd_raw(q, k, v, g, beta, float(scale), out, workspace, A_log, dt_bias, lower_bound,
              initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens)
+
+
+# Prefill / decode that are bit-for-bit equal to one fwd call over the whole sequence (fwd itself is unchanged).
+from . import replay  # noqa: E402,F401
+
+# Chunk-64 bf16 program: fwd64 prefill + a bit-for-bit aligned decode (separate extension flash_kda_C64).
+from . import replay64  # noqa: E402,F401
