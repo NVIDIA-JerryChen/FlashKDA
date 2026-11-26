@@ -83,7 +83,29 @@ ext_modules = [
                 *get_arch_flags(),
             ],
         },
-    )
+    ),
+    # chunk-64 bf16 program (prefill fwd64 + open-chunk replay): raw CUDA, no CUTLASS, no fast-math, no FMA contraction
+    # (every fp32 operation in the numerics is an explicit intrinsic; -fmad=false only guards what is not)
+    CUDAExtension(
+        name='flash_kda_C64',
+        sources=[
+            'csrc/c64/c64_binding.cpp',
+            'csrc/c64/c64_fwd.cu',
+            'csrc/c64/c64_replay.cu',
+        ],
+        include_dirs=[os.path.join(this_dir, 'csrc', 'c64')],
+        extra_compile_args={
+            'cxx': ['-O3', '-Wno-psabi'],
+            'nvcc': [
+                '-O3',
+                '--fmad=false',
+                '--ptxas-options=-v,--warn-on-spills',
+                '-lineinfo',
+                *get_nvcc_thread_args(),
+                *get_arch_flags(),
+            ],
+        },
+    ),
 ]
 cmdclass = {"build_ext": BuildExtension}
 
