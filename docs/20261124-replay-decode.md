@@ -123,9 +123,9 @@ same kernels built from master's sources with the same container (md5 of the add
 
 Setup: NVIDIA B300 SXM6 AC, driver 580.126.09, NGC pytorch 26.08 (nvcc 13.4, torch 2.14), sm_103a build. All 88 tests
 pass (`tests/test_replay.py`: 86, `tests/test_replay_codegen.py`: 2; master's `tests/test_fwd.py::test_fwd` and
-`::test_fwd_varlen` pass on the same build). Timings: the cross-implementation harness of this investigation
-(`bench_vs_rec.py`, identical inputs for every implementation, complete API calls replayed from a CUDA graph; decode =
-64 consecutive steps in one graph, per-step time; "staggered" = sequences spread over the chunk rows).
+`::test_fwd_varlen` pass on the same build). Timings: a cross-implementation harness outside this repository
+(identical inputs for every implementation, complete API calls replayed from a CUDA graph; decode = 64 consecutive
+steps in one graph, per-step time; "staggered" = sequences spread over the chunk rows).
 
 What is compared (configuration first; the ratios below only isolate one variable where the contracts match):
 
@@ -190,9 +190,6 @@ How the decode got there (same kernel arithmetic throughout, bits unchanged): th
 PyTorch kernels for `pos`, synchronous state load, 166 registers = 1 CTA/SM) took 13.6 / 18.4 / 39.2 / 67.6 us at
 H12 N = 1 / 16 / 64 / 128; one launch per step, the `cp.async` state load and 123 registers (2 CTAs/SM) brought it to
 5.6 / 7.6 / 21.0 / 38.8 us.
-
-Raw data: `xcmp-bench/results-replay/` of this investigation (vsrec_replay_v2.json decode, vsrec_replay_v3.json
-prefill, vsrec_cfbi.json, vsrec_base.json, bench_replay_v2.json).
 
 ## 7. Scope and limits
 

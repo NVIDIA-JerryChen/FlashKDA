@@ -75,6 +75,7 @@ bash tests/test.sh
 
 - `tests/test_fwd.py` — correctness tests (exact match against the torch reference; compared with `flash-linear-attention`)
 - `tests/test_replay.py` — `flash_kda.replay` prefill/decode bit-for-bit against one `flash_kda.fwd` call over the whole sequence
+- `tests/test_replay64.py` — `flash_kda.replay64` prefill/decode bit-for-bit against one `flash_kda.replay64.fwd64` call
 
 
 ## Kernel API
@@ -127,6 +128,24 @@ final = replay.final_state(state, A_log, dt_bias, lower_bound)   # == flash_kda.
 
 `slot_ids` (int32 `[N]`) maps the call's sequences to state slots (`-1` = padding entry in `decode`). The 16-aligned
 part of a prefill runs through `flash_kda.fwd`; prompt tails and decode tokens run through the replay kernel.
+
+### `flash_kda.replay64`: the same contract with a 64-token chunk
+
+`flash_kda.replay64.fwd64` is a chunk-64 bf16 prefill (same call signature as `flash_kda.fwd`, bf16 states) built as a
+separate extension (`flash_kda_C64`); `flash_kda.replay64.prefill` / `decode` / `final_state` have the API of
+`flash_kda.replay` and are bit-for-bit equal to ONE `fwd64` call over the whole sequence. Compared with chunk 16 it has
+4x fewer serial chunk steps (faster prefill of long sequences), a larger decode state (80 KiB per sequence and head)
+and slower decode steps. Design, accuracy and results: [docs/20261125-replay-c64.md](docs/20261125-replay-c64.md).
+
+```python
+from flash_kda import replay64
+
+state = replay64.alloc_state(num_slots, H)
+replay64.prefill(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, state, cu_seqlens=cu,
+                 context_lens_cpu=ctx, cu_seqlens_cpu=cu_host)       # host plan; omit both for the device plan
+replay64.decode(q1, k1, v1, g1, beta1, scale, out1, A_log, dt_bias, lower_bound, state)
+final = replay64.final_state(state, A_log, dt_bias, lower_bound)   # == fwd64's final_state; state unchanged
+```
 
 ## Development
 
